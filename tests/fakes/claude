@@ -1,0 +1,21 @@
+#!/usr/bin/python3
+"""Atrapa `claude auth login`: loguje konto i zapisuje wpis Pęku kluczy dla CLAUDE_CONFIG_DIR."""
+import hashlib, json, os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _store
+
+time.sleep(float(os.environ.get("FAKE_LOGIN_DELAY", "0")))
+if os.environ.get("FAKE_LOGIN_FAIL"):
+    print("Login failed: user closed the browser", file=sys.stderr)
+    sys.exit(1)
+email = os.environ.get("FAKE_LOGIN_AS") or sys.argv[sys.argv.index("--email") + 1]
+server = _store.load("server.json", {})
+access, refresh = _store.issue(server, email)
+_store.save("server.json", server)
+service = "Claude Code-credentials-" + hashlib.sha256(os.environ["CLAUDE_CONFIG_DIR"].encode()).hexdigest()[:8]
+kc = _store.load("keychain.json", {})
+kc[f"{service}|{os.environ['USER']}"] = json.dumps({"claudeAiOauth": {
+    "accessToken": access, "refreshToken": refresh,
+    "expiresAt": int(time.time() * 1000) + 28800000, "scopes": ["user:inference"]}})
+_store.save("keychain.json", kc)
+print("Login successful.")

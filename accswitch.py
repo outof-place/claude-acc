@@ -1,0 +1,1229 @@
+#!/usr/bin/env python3
+"""Zarządzanie limitami kont Claude Code trzymanych przez Orca.
+
+Konto Claude Code to po prostu zawartość wpisu w Pęku kluczy. Orca trzyma
+kopię każdego konta pod usługą "Orca Claude Code Managed Credentials"
+(nazwa konta = uuid konta w Orca), a każdy katalog konfiguracji ma swój wpis
+runtime: "Claude Code-credentials-<sha256(katalog)[:8]>" plus wpis bazowy
+"Claude Code-credentials". Przełączenie konta to podmiana wpisu runtime,
+dokładnie to samo, co robi menu kont w Orca.
+
+Warunek: w Orca musi być wybrany tryb "System default". Przy wybranym koncie
+zarządzanym Orca wymusza swoje konto przy starcie terminala i co 15 minut.
+
+Komendy:
+  status [--json]   limity wszystkich kont, kolejka do palenia (--json dla aplikacji w pasku menu)
+  who               konto aktywne w zarządzanym katalogu i prognoza
+  plan              kolejność, w jakiej warto palić konta, z uzasadnieniem
+  heal [--deep]     odzyskaj konta z martwym tokenem (--deep skanuje cały Pęk kluczy)
+  switch <email>    przełącz na konkretne konto
+  switch --auto     przełącz na następne z kolejki
+  login <email>     zaloguj konto ponownie w przeglądarce, bez Orca i terminala
+  tick              jeden przebieg pilnowania (uruchamiany przez launchd)
+  watch [sekundy]   pętla ticków na pierwszym planie
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+ACCOUNTS_DIR = os.path.join(HOME, "Library/Application Support/orca/claude-accounts")
+STATE_DIR = os.path.join(HOME, ".local/share/claude-acc")
+CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
+STATE_PATH = os.path.join(STATE_DIR, "state.json")
+HISTORY_PATH = os.path.join(STATE_DIR, "history.jsonl")
+LOG_PATH = os.path.join(STATE_DIR, "switch.log")
+LOCK_PATH = os.path.join(STATE_DIR, "lock")
+LOGIN_LOCK_PATH = os.path.join(STATE_DIR, "login.lock")
+USAGE_CACHE_PATH = os.path.join(STATE_DIR, "usage-cache.json")
+
+MANAGED_SERVICE = "Orca Claude Code Managed Credentials"
+ACTIVE_SERVICE = "Claude Code-credentials"
+KEYCHAIN_USER = os.environ.get("USER", "user")
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+USER_AGENT = "claude-code/2.1.0"
+LOG_MAX_BYTES = 512 * 1024
+
+DEFAULT_CONFIG = {
+    # katalog konfiguracji, którym zarządzamy (ten, w którym pracujesz na co dzień)
+    "config_dir": os.path.join(HOME, ".claude"),
+    # pozostałe katalogi, których wpisów NIE przełączamy, ale które trzeba
+    # aktualizować przy odświeżeniu tokenu, żeby ich sesje nie padły
+    "other_config_dirs": [],
+    # przełączamy dopiero, gdy konto realnie padło
+    "hard_session_left": 5,
+    "hard_weekly_left": 3,
+    # kandydat musi mieć przynajmniej tyle zapasu (nigdy ostrzej niż progi wyżej)
+    "min_weekly_left": 8,
+    "min_session_left": 15,
+    # konta brane dopiero, gdy nie ma innego wyjścia (firmowe na końcu)
+    "last_resort": [],
+    # konta całkiem wyłączone z rotacji
+    "never": [],
+    "history_keep_hours": 48,
+}
+
+
+# ---------- drobne narzędzia ----------
+
+def log(line):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+        tail = open(LOG_PATH).readlines()[-500:]
+        open(LOG_PATH, "w").writelines(tail)
+    with open(LOG_PATH, "a") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+
+
+def notify(title, text):
+    subprocess.run(["osascript", "-e",
+                    f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
+                   capture_output=True)
+
+
+def parse_ts(value):
+    """Czas z API na obiekt świadomy strefy. Python 3.9 nie łyka sufiksu Z."""
+    if not value:
+        return None
+    text = value.replace("Z", "+00:00")
+    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+    return datetime.fromisoformat(text)
+
+
+def minutes_until(value):
+    ts = parse_ts(value)
+    return None if ts is None else (ts - datetime.now(timezone.utc)).total_seconds() / 60
+
+
+def human_left(minutes):
+    if minutes is None:
+        return "-"
+    h, m = divmod(int(max(minutes, 0)), 60)
+    return f"{h // 24}d {h % 24}h" if h >= 24 else f"{h}h {m}m"
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_PATH):
+        cfg.update(json.load(open(CONFIG_PATH)))
+    # kandydat nigdy ostrzej niż moment porzucenia, inaczej powstaje martwa strefa
+    cfg["min_weekly_left"] = max(cfg["min_weekly_left"], cfg["hard_weekly_left"] + 1)
+    cfg["min_session_left"] = max(cfg["min_session_left"], cfg["hard_session_left"] + 1)
+    return cfg
+
+
+def load_state():
+    return json.load(open(STATE_PATH)) if os.path.exists(STATE_PATH) else {}
+
+
+def write_json(path, data, **kwargs):
+    """Zapis przez plik tymczasowy: przerwany proces nie zostawi uciętego JSON-a."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, **kwargs)
+    os.replace(tmp, path)
+
+
+def load_json(path, default):
+    return json.load(open(path)) if os.path.exists(path) else default
+
+
+def save_state(state):
+    write_json(STATE_PATH, state, indent=1)
+
+
+def update_state(**fields):
+    """Zmiana kilku pól na świeżym odczycie stanu.
+
+    Stan trzymany w pamięci przez cały przebieg i zapisany na końcu kasował to,
+    co w międzyczasie zapisały inne funkcje: wycofanie po 429 i znaczniki kont
+    do zalogowania, przez co powiadomienia wracały co dwie minuty.
+    """
+    state = load_state()
+    state.update(fields)
+    save_state(state)
+
+
+def take_lock(wait=0):
+    """Jeden przebieg naraz. Bez tego dwa procesy potrafią sobie nadpisać tokeny.
+
+    Przy wait > 0 czekamy tyle sekund na zwolnienie blokady, zamiast od razu
+    się poddawać: tak działają polecenia z aplikacji w pasku menu.
+    """
+    os.makedirs(STATE_DIR, exist_ok=True)
+    handle = open(LOCK_PATH, "w")
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except OSError:
+            if time.time() >= deadline:
+                handle.close()
+                return None
+            time.sleep(0.5)
+
+
+# ---------- Pęk kluczy ----------
+
+def kc_read(service, account):
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                       capture_output=True, text=True, timeout=30)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def kc_write(service, account, contents):
+    r = subprocess.run(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"zapis do Keychain nieudany ({service}): {r.stderr.strip()}")
+
+
+def kc_delete(service, account):
+    subprocess.run(["security", "delete-generic-password", "-s", service, "-a", account],
+                   capture_output=True, text=True, timeout=30)
+
+
+def scoped_service(config_dir):
+    return f"{ACTIVE_SERVICE}-{hashlib.sha256(config_dir.encode()).hexdigest()[:8]}"
+
+
+def runtime_services(cfg):
+    """Wszystkie wpisy runtime: zarządzany katalog, pozostałe katalogi i bazowy."""
+    services = [scoped_service(cfg["config_dir"])]
+    services += [scoped_service(d) for d in cfg["other_config_dirs"]]
+    services.append(ACTIVE_SERVICE)
+    return services
+
+
+def oauth_of(creds_json):
+    try:
+        return json.loads(creds_json).get("claudeAiOauth", {})
+    except (ValueError, AttributeError, TypeError):  # TypeError: brak wpisu w Pęku kluczy
+        return {}
+
+
+def with_oauth(creds_json, oauth):
+    """Blob danych logowania z podmienionym wyłącznie kontem Claude.
+
+    Obok `claudeAiOauth` leżą tokeny serwerów MCP (`mcpOAuth`), które należą do
+    katalogu konfiguracji, a nie do konta. Nadpisanie całego blobu wylogowywało
+    sesje ze wszystkich serwerów MCP, więc zawsze podmieniamy tylko konto.
+    """
+    try:
+        blob = json.loads(creds_json) if creds_json else {}
+    except ValueError:
+        blob = {}
+    if not isinstance(blob, dict):
+        blob = {}
+    blob["claudeAiOauth"] = oauth
+    return json.dumps(blob, separators=(",", ":"))
+
+
+def http(url, data=None, headers=None):
+    """curl przez stdin, żeby token nie trafił do listy procesów."""
+    lines = [f'url = "{url}"', "silent", "max-time = 20", 'write-out = "\\n%{http_code}"']
+    lines += [f'header = "{k}: {v}"' for k, v in (headers or {}).items()]
+    if data is not None:
+        lines.append(f'data = "{data}"')
+    r = subprocess.run(["curl", "-K", "-"], input="\n".join(lines), capture_output=True, text=True, timeout=40)
+    body, _, code = r.stdout.rpartition("\n")
+    try:
+        return int(code), json.loads(body)
+    except ValueError:
+        return int(code or 0), None
+
+
+# ---------- konta ----------
+
+class Account:
+    def __init__(self, acct_id, email):
+        self.id = acct_id
+        self.email = email
+
+    @property
+    def creds_json(self):
+        """Zawsze świeży odczyt: inny proces mógł w międzyczasie obrócić token."""
+        return kc_read(MANAGED_SERVICE, self.id)
+
+    @property
+    def oauth(self):
+        return oauth_of(self.creds_json)
+
+    def __repr__(self):
+        return f"<{self.email}>"
+
+
+def load_accounts():
+    out = []
+    if not os.path.isdir(ACCOUNTS_DIR):
+        return out
+    for acct_id in sorted(os.listdir(ACCOUNTS_DIR)):
+        info = os.path.join(ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json")
+        if not os.path.exists(info) or not kc_read(MANAGED_SERVICE, acct_id):
+            continue
+        out.append(Account(acct_id, json.load(open(info)).get("emailAddress")))
+    return out
+
+
+def propagate(old_refresh, new_creds_json, cfg):
+    """Wstawia odświeżone dane wszędzie, gdzie leżał stary token tego konta.
+
+    Odświeżenie wymienia refresh token i unieważnia stary. Gdyby zaktualizować
+    tylko kopię w Orca, sesja czytająca wpis runtime zostałaby z martwym tokenem
+    i przy najbliższym odświeżeniu poprosiłaby o ponowne logowanie. Dotyczy to
+    także pozostałych katalogów konfiguracji, których wpisów nigdy nie przełączamy.
+    """
+    oauth = oauth_of(new_creds_json)
+    for service in runtime_services(cfg):
+        current = kc_read(service, KEYCHAIN_USER)
+        if current and oauth_of(current).get("refreshToken") == old_refresh:
+            kc_write(service, KEYCHAIN_USER, with_oauth(current, oauth))
+            log(f"propagacja odświeżonego tokenu do wpisu {service}")
+
+
+def token_mark(creds_json):
+    """Skrót refresh tokenu: po nim poznajemy, że konto dostało nowe dane logowania."""
+    refresh = oauth_of(creds_json or "").get("refreshToken") or ""
+    return hashlib.sha256(refresh.encode()).hexdigest()[:12]
+
+
+def mark_needs_login(account, failed_creds_json):
+    """Martwy token odświeżający: konto odstawiamy i mówimy o tym raz.
+
+    Bez tego tick dobijał się do takiego konta co dwie minuty i zapisywał setki
+    identycznych linii błędu, a użytkownik i tak nie wiedział, że ma je zalogować.
+    Zapamiętujemy też, który token umarł, żeby ponowne logowanie zdjęło blokadę
+    od razu, a nie po kilku godzinach.
+    """
+    state = load_state()
+    marks = state.setdefault("needs_login", {})
+    if account.email not in marks:
+        log(f"konto {account.email} wymaga ponownego logowania")
+        notify("Claude: konto wypadło", f"{account.email} wymaga ponownego logowania (Claude Acc w pasku menu)")
+    marks[account.email] = int(time.time())
+    # hasz tokenu, który naprawdę padł: ponowny odczyt Pęku kluczy potrafił złapać
+    # świeży token innego procesu i zablokować zdrowe konto na kilka godzin
+    state.setdefault("needs_login_token", {})[account.email] = token_mark(failed_creds_json)
+    save_state(state)
+
+
+def clear_needs_login(account):
+    state = load_state()
+    token = state.get("needs_login_token", {}).pop(account.email, None)
+    if state.get("needs_login", {}).pop(account.email, None) is not None:
+        log(f"konto {account.email} znowu działa")
+    elif token is None:
+        return  # nie było czego zdejmować, oszczędzamy zapis
+    save_state(state)
+
+
+def needs_login(account, retry_after_hours=6):
+    """Czy konto jest odstawione. Nowe dane logowania (z Orca albo z `login`)
+    zdejmują blokadę od razu, a co kilka godzin i tak dajemy mu jeszcze jedną szansę."""
+    state = load_state()
+    stamp = state.get("needs_login", {}).get(account.email)
+    if not stamp or time.time() - stamp >= retry_after_hours * 3600:
+        return False
+    dead = state.get("needs_login_token", {}).get(account.email)
+    return dead is not None and dead == token_mark(account.creds_json)
+
+
+def ensure_fresh(account, cfg, force=False):
+    """Odświeża token konta, gdy wygasa, i rozsyła go do wszystkich kopii."""
+    creds_json = account.creds_json
+    if not creds_json:
+        return None, "brak danych w Keychain"
+    oauth = oauth_of(creds_json)
+    if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
+        return creds_json, "token ważny"
+    old_refresh = oauth.get("refreshToken")
+    body = f"grant_type=refresh_token&refresh_token={old_refresh}&client_id={CLIENT_ID}"
+    status, resp = http(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT})
+    if status != 200 or not resp or not resp.get("access_token"):
+        if status == 400:
+            mark_needs_login(account, creds_json)
+            return None, "wymaga ponownego logowania"
+        return None, f"odświeżenie tokenu nieudane (HTTP {status})"
+    clear_needs_login(account)
+    creds = json.loads(creds_json)
+    fresh = dict(creds["claudeAiOauth"])
+    fresh["accessToken"] = resp["access_token"]
+    if isinstance(resp.get("expires_in"), (int, float)):
+        fresh["expiresAt"] = int(time.time() * 1000) + int(resp["expires_in"] * 1000)
+    if resp.get("refresh_token"):
+        fresh["refreshToken"] = resp["refresh_token"]
+    if resp.get("scope"):
+        fresh["scopes"] = resp["scope"].split(" ")
+    creds["claudeAiOauth"] = fresh
+    new_json = json.dumps(creds, separators=(",", ":"))
+    kc_write(MANAGED_SERVICE, account.id, new_json)
+    propagate(old_refresh, new_json, cfg)
+    return new_json, "token odświeżony"
+
+
+def fetch_usage(access_token):
+    """Odpytanie API o limity, z hamulcem na 429.
+
+    Endpoint limitów jest liczony na adres IP, a osiem kont razy kilka procesów
+    potrafi go zdławić. Po 429 wstrzymujemy zapytania na kwadrans, zamiast
+    dobijać się dalej i przedłużać blokadę.
+    """
+    until = load_state().get("api_backoff_until", 0)
+    if time.time() < until:
+        return 429, None
+    status, data = http(USAGE_URL, headers={
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": USER_AGENT,
+    })
+    if status == 429:
+        update_state(api_backoff_until=time.time() + 900)
+        log("API limitów zwróciło 429, wstrzymuję odpytywanie na 15 minut")
+    elif until:
+        state = load_state()
+        state.pop("api_backoff_until", None)
+        save_state(state)
+    return status, data
+
+
+def settled(data):
+    """Stare limity po resecie okna: zużycie wraca do zera, czas resetu przepada."""
+    out = dict(data)
+    for key in ("five_hour", "seven_day"):
+        window = out.get(key) or {}
+        reset = parse_ts(window.get("resets_at"))
+        if reset and reset.timestamp() <= time.time():
+            out[key] = dict(window, utilization=0.0, resets_at=None)
+    return out
+
+
+def cached_usage(account, cfg, max_age=90, refresh=True):
+    """Limity z krótką pamięcią podręczną: kilka komend pod rząd nie mnoży zapytań.
+
+    Bez odświeżania (panel w pasku menu) przy nieudanym odczycie oddajemy
+    ostatnie znane liczby: lepsze stare dane z wiekiem niż pusty wiersz.
+    """
+    hit = load_json(USAGE_CACHE_PATH, {}).get(account.email)
+    if hit and time.time() - hit["ts"] <= max_age:
+        return settled(hit["data"]), "z pamięci podręcznej"
+    data, note = usage(account, cfg, refresh)
+    if data:
+        cache = load_json(USAGE_CACHE_PATH, {})
+        cache[account.email] = {"ts": time.time(), "data": data}
+        write_json(USAGE_CACHE_PATH, cache)
+        return data, note
+    if hit and not refresh:
+        return settled(hit["data"]), f"dane z pamięci ({note})"
+    return None, note
+
+
+def usage(account, cfg, refresh=True):
+    """Limity konta. Zwraca (dane, notatka) albo (None, powód błędu).
+
+    Token bywa unieważniony przed czasem, gdy odświeżyła go sesja pracująca w
+    innym katalogu konfiguracji. Wtedy data ważności kłamie, więc przy 401
+    wymuszamy odświeżenie i próbujemy jeszcze raz.
+
+    refresh=False nigdy nie odświeża tokenu. Tak czyta panel w pasku menu: pyta
+    co minutę, a każde odświeżenie obraca refresh token, którego właścicielem
+    bywa działająca sesja. Odświeżanie zostaje przy automacie i przełączaniu.
+    """
+    if refresh:
+        creds_json, note = ensure_fresh(account, cfg)
+        if not creds_json:
+            return None, note
+    else:
+        creds_json, note = account.creds_json, "bez odświeżania"
+        oauth = oauth_of(creds_json)
+        if not oauth.get("accessToken") or oauth.get("expiresAt", 0) <= time.time() * 1000:
+            return None, "token wygasł, odświeży się przy przełączeniu"
+    status, data = fetch_usage(oauth_of(creds_json)["accessToken"])
+    if status == 401 and refresh:
+        creds_json, note = ensure_fresh(account, cfg, force=True)
+        if not creds_json:
+            return None, note
+        status, data = fetch_usage(oauth_of(creds_json)["accessToken"])
+    if status != 200 or not data:
+        return None, f"odczyt limitów nieudany (HTTP {status})"
+    clear_needs_login(account)  # token odpowiedział, więc stary znacznik martwego tokenu kłamie
+    return data, note
+
+
+def headroom(data):
+    """Ile zostało: (sesja 5h, tydzień), w procentach."""
+    return 100 - data["five_hour"]["utilization"], 100 - data["seven_day"]["utilization"]
+
+
+def fetch_profile(access_token):
+    status, profile = http("https://api.anthropic.com/api/oauth/profile", headers={
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": USER_AGENT,
+    })
+    return profile if status == 200 and profile else None
+
+
+def identity(account, cfg, max_age=12 * 3600, refresh=True):
+    """Kim naprawdę jest konto w tym wpisie, prosto z API.
+
+    Nazwa katalogu w Orca to tylko etykieta i potrafi kłamać: przy krzyżowym
+    nadpisaniu danych logowania wpis konta A trzymał konto B. Profil zwraca
+    e-mail, plan i datę startu subskrypcji, więc bierzemy prawdę stamtąd.
+    """
+    hit = load_state().get("identity", {}).get(account.id)
+    if hit and time.time() - hit.get("ts", 0) <= max_age:
+        return hit
+    if refresh:
+        creds, _ = ensure_fresh(account, cfg)
+    else:
+        creds = account.creds_json
+        if oauth_of(creds).get("expiresAt", 0) <= time.time() * 1000:
+            return hit
+    if not creds:
+        return hit
+    profile = fetch_profile(oauth_of(creds)["accessToken"])
+    if not profile:
+        return hit
+    org = profile.get("organization") or {}
+    info = {
+        "ts": int(time.time()),
+        "email": (profile.get("account") or {}).get("email"),
+        "tier": org.get("rate_limit_tier"),
+        "subscription_since": (org.get("subscription_created_at") or "")[:10],
+        "status": org.get("subscription_status"),
+    }
+    state = load_state()  # ensure_fresh mógł w międzyczasie zapisać stan
+    state.setdefault("identity", {})[account.id] = info
+    save_state(state)
+    if info["email"] and info["email"] != account.email:
+        log(f"uwaga: wpis {account.email} zawiera konto {info['email']}")
+    return info
+
+
+def next_renewal(since):
+    """Kolejna miesięczna rocznica startu subskrypcji."""
+    if not since:
+        return None
+    start = datetime.strptime(since, "%Y-%m-%d")
+    today = datetime.now()
+    year, month = today.year, today.month
+    if today.day >= start.day:
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    day = min(start.day, [31, 29 if year % 4 == 0 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+    return datetime(year, month, day)
+
+
+# ---------- historia i tempo spalania ----------
+
+def record_history(email, data):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(HISTORY_PATH, "a") as f:
+        f.write(json.dumps({
+            "ts": int(time.time()),
+            "email": email,
+            "session_used": data["five_hour"]["utilization"],
+            "weekly_used": data["seven_day"]["utilization"],
+        }) + "\n")
+
+
+def read_history(email, minutes, keep_hours):
+    """Próbki konta z ostatnich minut, przy okazji przycina plik."""
+    if not os.path.exists(HISTORY_PATH):
+        return []
+    now, kept, rows, dropped = time.time(), [], [], False
+    for line in open(HISTORY_PATH):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            dropped = True
+            continue
+        if row["ts"] < now - keep_hours * 3600:
+            dropped = True
+            continue
+        kept.append(line)
+        if row["email"] == email and row["ts"] >= now - minutes * 60:
+            rows.append(row)
+    if dropped:
+        with open(HISTORY_PATH, "w") as f:
+            f.writelines(kept)
+    return rows
+
+
+def burn_rate(rows, field):
+    """Procenty na godzinę. Spadek wartości to reset okna, czyli brak danych."""
+    if len(rows) < 2:
+        return None
+    hours = (rows[-1]["ts"] - rows[0]["ts"]) / 3600
+    delta = rows[-1][field] - rows[0][field]
+    if hours < 0.05 or delta <= 0:
+        return None
+    return delta / hours
+
+
+def time_to_wall(data, rows):
+    """Za ile minut konto przestanie odpowiadać, albo None gdy nie wiadomo.
+
+    Okno, które odnowi się przed wypaleniem, nie jest wąskim gardłem, więc
+    przy krótkiej sesji i zdrowym tygodniu narzędzie nie przełącza na zapas.
+    """
+    session_left, weekly_left = headroom(data)
+    out = []
+    for field, left, reset_at in (("session_used", session_left, data["five_hour"]["resets_at"]),
+                                  ("weekly_used", weekly_left, data["seven_day"]["resets_at"])):
+        rate = burn_rate(rows, field)
+        if not rate:
+            continue
+        minutes = left / rate * 60
+        to_reset = minutes_until(reset_at)
+        if to_reset is not None and to_reset < minutes:
+            continue
+        out.append(minutes)
+    return min(out) if out else None
+
+
+# ---------- aktywne konto ----------
+
+def find_active(accounts, cfg):
+    """Które konto leży w zarządzanym wpisie runtime. None, gdy obce dane.
+
+    Dopasowanie wyłącznie po tokenach. Zgadywanie po ostatnio zapisanym stanie
+    prowadziło do wpisania danych jednego konta pod uuid drugiego.
+    """
+    raw = kc_read(scoped_service(cfg["config_dir"]), KEYCHAIN_USER) or kc_read(ACTIVE_SERVICE, KEYCHAIN_USER)
+    if not raw:
+        return None
+    live = oauth_of(raw)
+    for a in accounts:
+        stored = a.oauth
+        if stored.get("refreshToken") == live.get("refreshToken") or stored.get("accessToken") == live.get("accessToken"):
+            return a
+    return None
+
+
+def works(creds_json):
+    """Czy tym tokenem da się cokolwiek zrobić. Data ważności to za mało.
+
+    Token bywa unieważniony przed czasem, gdy ktoś inny (sesja Claude Code albo
+    Orca) odświeżył konto i dostał nową parę. Kopia z późniejszą datą ważności
+    potrafiła więc być martwa, a mimo to wygrywała porównanie i kasowała żywy
+    token. Dlatego przed każdym zapisem pytamy API.
+    """
+    return check(creds_json) == 200
+
+
+def check(creds_json):
+    """Odpowiedź API dla tego tokenu: 200 działa, 401 martwy, reszta to brak wiedzy
+    (429, sieć), po której niczego nie wolno odświeżać ani oznaczać."""
+    token = oauth_of(creds_json).get("accessToken")
+    return fetch_usage(token)[0] if token else 401
+
+
+def sync_back(account, cfg):
+    """Przepisuje token z runtime do kopii w Orca. Nigdy w drugą stronę.
+
+    Właścicielem żywego tokenu jest sesja Claude Code: to ona go odświeża w
+    trakcie pracy. Nasza kopia ma za nią nadążać, a nie odwrotnie.
+    """
+    runtime_raw = kc_read(scoped_service(cfg["config_dir"]), KEYCHAIN_USER)
+    managed_raw = account.creds_json
+    # porównujemy samo konto: tokeny MCP w obu blobach różnią się z założenia
+    if not runtime_raw or oauth_of(runtime_raw) == oauth_of(managed_raw):
+        return
+    if works(runtime_raw):
+        kc_write(MANAGED_SERVICE, account.id, with_oauth(managed_raw, oauth_of(runtime_raw)))
+        log(f"read-back: żywy token z runtime zapisany do konta {account.email}")
+
+
+def adopt_runtime(accounts, cfg):
+    """Runtime z tokenem, którego nie zna żadna kopia w Orca, zanim go nadpiszemy.
+
+    Zwykle to nasze konto, któremu sesja obróciła token, a kopia została w tyle.
+    Przełączenie bez tego kroku kasowało jedyny żywy token i konto wymagało
+    ponownego logowania. Obce konto (spoza Orca) zostaje nadpisane, bo o to
+    użytkownik prosi, przełączając.
+    """
+    raw = kc_read(scoped_service(cfg["config_dir"]), KEYCHAIN_USER)
+    token = oauth_of(raw).get("accessToken")
+    if not token:
+        return
+    owner = ((fetch_profile(token) or {}).get("account") or {}).get("email") or ""
+    account = next((a for a in accounts if a.email.lower() == owner.lower()), None)
+    if account:
+        kc_write(MANAGED_SERVICE, account.id, with_oauth(account.creds_json, oauth_of(raw)))
+        clear_needs_login(account)
+        log(f"żywy token {owner} z runtime zapisany do jego kopii w Orca")
+
+
+def switch_to(account, cfg, reason=""):
+    creds_json, note = ensure_fresh(account, cfg)
+    if not creds_json:
+        raise RuntimeError(f"{account.email}: {note}")
+    # nigdy nie wkładamy do runtime tokenu, którym nie udało się nic zrobić:
+    # tak właśnie kasuje się działającą sesję
+    status = check(creds_json)
+    if status == 401:
+        creds_json, note = ensure_fresh(account, cfg, force=True)
+        if not creds_json:
+            raise RuntimeError(f"{account.email}: {note}")
+        status = check(creds_json)
+        if status == 401:
+            mark_needs_login(account, creds_json)
+            raise RuntimeError(f"{account.email}: token nie działa, zaloguj konto ponownie")
+    if status != 200:
+        # 429 albo sieć: nie wiemy, czy token żyje, więc go nie ruszamy
+        raise RuntimeError(f"API limitów chwilowo nie odpowiada (HTTP {status}), spróbuj za kilka minut")
+    oauth = oauth_of(creds_json)
+    for service in (scoped_service(cfg["config_dir"]), ACTIVE_SERVICE):
+        kc_write(service, KEYCHAIN_USER, with_oauth(kc_read(service, KEYCHAIN_USER), oauth))
+    state = load_state()
+    state.update({"active_email": account.email, "switched_at": int(time.time()), "hands_off_notified": False})
+    save_state(state)
+    log(f"przełączono na {account.email} ({note}){'; ' + reason if reason else ''}")
+
+
+# ---------- kolejka kont ----------
+
+def rank(account, data, cfg):
+    """Najwięcej zapasu wygrywa, konto firmowe zawsze na końcu.
+
+    Wcześniejsza wersja ustawiała kolejkę po terminie resetu, żeby nie marnować
+    limitu, który i tak przepadnie. W praktyce powodowało to skakanie między
+    kontami w trakcie pracy, więc zasada wypadła: prościej i przewidywalniej.
+    """
+    session_left, weekly_left = headroom(data)
+    return (1 if account.email in cfg["last_resort"] else 0, -weekly_left, -session_left)
+
+
+def all_runtime_blobs():
+    """Wszystkie wpisy runtime Claude Code w Pęku kluczy, nie tylko nasze katalogi.
+
+    Sesje uruchamiane z innym CLAUDE_CONFIG_DIR mają własne wpisy i to właśnie
+    tam potrafi wylądować świeży token konta, którego kopia w Orca już umarła.
+    """
+    dump = subprocess.run(["security", "dump-keychain"], capture_output=True, text=True, timeout=60).stdout
+    services = sorted({m for m in re.findall(r'"svce"<blob>="(Claude Code-credentials[^"]*)"', dump)})
+    blobs = {}
+    for service in services:
+        raw = kc_read(service, KEYCHAIN_USER)
+        if raw and oauth_of(raw).get("accessToken"):
+            blobs[service] = raw
+    return blobs
+
+
+def fingerprint(data):
+    """Znacznik konta: godziny resetów są dla każdego konta inne."""
+    return (data["seven_day"]["resets_at"] or "")[:16]
+
+
+def cmd_heal(cfg, args):
+    """Odzyskuje konta, którym token w kopii Orca umarł po rotacji gdzie indziej."""
+    lock = take_lock()
+    if not lock:
+        print("inny przebieg właśnie trwa")
+        return 1
+    accounts = load_accounts()
+    healthy, broken = {}, []
+    for a in accounts:
+        data, note = usage(a, cfg)
+        if data:
+            healthy[fingerprint(data)] = a.email
+        else:
+            broken.append((a, note))
+    if not broken:
+        print("wszystkie konta odpowiadają, nie ma czego ratować")
+        return 0
+
+    state = load_state()
+    marks = state.get("fingerprints", {})
+    print(f"konta bez odpowiedzi: {', '.join(a.email for a, _ in broken)}")
+    orphans = []
+    deep = bool(args) and args[0] == "--deep"
+    pool = all_runtime_blobs() if deep else {s: kc_read(s, KEYCHAIN_USER) for s in runtime_services(cfg)}
+    for service, raw in pool.items():
+        if not raw:
+            continue
+        status, data = fetch_usage(oauth_of(raw)["accessToken"])
+        if status != 200 or not data:
+            continue
+        mark = fingerprint(data)
+        if mark in healthy:
+            continue  # ten token należy do konta, które i tak działa
+        orphans.append((service, raw, mark))
+
+    fixed = 0
+    for account, _ in broken:
+        wanted = marks.get(account.email)
+        match = next((o for o in orphans if o[2] == wanted), None)
+        if not match and len(broken) == 1 and len(orphans) == 1:
+            match = orphans[0]  # jedno chore konto, jeden bezpański token
+        if not match:
+            print(f"  {account.email}: nie znalazłem żywego tokenu, zaloguj konto w Orca")
+            continue
+        kc_write(MANAGED_SERVICE, account.id, with_oauth(account.creds_json, oauth_of(match[1])))
+        orphans.remove(match)
+        fixed += 1
+        print(f"  {account.email}: odzyskany z wpisu {match[0]}")
+        log(f"heal: konto {account.email} odzyskane z {match[0]}")
+    return 0 if fixed else 1
+
+
+def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
+    """Limity wszystkich kont z oceną przydatności. Błąd odczytu to nie to samo,
+    co wypalone konto, więc niesie osobną etykietę."""
+    rows = []
+    for a in accounts:
+        if a.id == exclude_id or a.email in cfg["never"]:
+            continue
+        if needs_login(a):
+            rows.append({"account": a, "data": None, "why": "wymaga ponownego logowania",
+                         "usable": False, "error": True})
+            continue
+        data, note = cached_usage(a, cfg, max_age=max_age, refresh=refresh)
+        if not data:
+            rows.append({"account": a, "data": None, "why": note, "usable": False, "error": True})
+            continue
+        session_left, weekly_left = headroom(data)
+        usable = weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]
+        remember_fingerprint(a.email, data)
+        rows.append({
+            "account": a, "data": data, "usable": usable, "error": False,
+            "why": f"zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji",
+            "rank": rank(a, data, cfg),
+        })
+    return rows
+
+
+def remember_fingerprint(email, data):
+    """Znacznik konta zapisany na czarną godzinę: po nim `heal` rozpozna token."""
+    state = load_state()
+    marks = state.setdefault("fingerprints", {})
+    mark = fingerprint(data)
+    if marks.get(email) != mark:
+        marks[email] = mark
+        save_state(state)
+
+
+def queue(rows):
+    """Kandydaci w kolejności palenia."""
+    return sorted([r for r in rows if r["usable"]], key=lambda r: r["rank"])
+
+
+
+
+# ---------- komendy ----------
+
+def window_view(window):
+    """Okno limitu dla aplikacji: procent zużycia i reset jako czas unixowy."""
+    window = window or {}
+    reset = parse_ts(window.get("resets_at"))
+    return {"used": window.get("utilization"), "resets_at": reset.timestamp() if reset else None}
+
+
+def forecast(data, rows, cfg):
+    """Dokąd dojdzie aktywne konto w obecnym tempie: zużycie w chwili resetu
+    albo godzina, o której automat przełączy konto. None, gdy za mało próbek."""
+    out = {}
+    now = time.time()
+    for key, field, api_key, hard in (("session", "session_used", "five_hour", cfg["hard_session_left"]),
+                                       ("weekly", "weekly_used", "seven_day", cfg["hard_weekly_left"])):
+        rate = burn_rate(rows, field)
+        used = (data.get(api_key) or {}).get("utilization")
+        reset = parse_ts((data.get(api_key) or {}).get("resets_at"))
+        if not rate or used is None or reset is None:
+            out[key] = None
+            continue
+        at_reset = used + rate * max(reset.timestamp() - now, 0) / 3600
+        switch_at = None
+        if at_reset >= 100 - hard:
+            switch_at = now + max(100 - hard - used, 0) / rate * 3600
+        out[key] = {"rate": round(rate, 2), "at_reset": round(min(at_reset, 100), 1), "switch_at": switch_at}
+    return out
+
+
+def snapshot(cfg):
+    """Stan wszystkich kont w jednym słowniku. To czyta aplikacja w pasku menu."""
+    accounts = load_accounts()
+    active = find_active(accounts, cfg)
+    # aplikacja pyta co minutę, więc nie odświeża żadnych tokenów (to robią sesje
+    # i automat), a świeże limity bierze tylko dla aktywnego konta; reszta z
+    # pamięci do 10 minut, bo endpoint limitów dławi 429 i blokuje wtedy automat
+    if active:
+        sync_back(active, cfg)
+        cached_usage(active, cfg, max_age=60, refresh=False)
+    rows = survey(accounts, cfg, max_age=600, refresh=False)
+    cache = load_json(USAGE_CACHE_PATH, {})
+    order = {r["account"].id: i for i, r in enumerate(queue(rows), 1)}
+    now = time.time()
+    items = []
+    for r in rows:
+        a = r["account"]
+        who = identity(a, cfg, refresh=False) or {}
+        status = "needs_login" if needs_login(a) else ("error" if r["error"] else "ok")
+        # przy błędzie odczytu pokazujemy ostatnie znane limity z ich wiekiem
+        hit = cache.get(a.email)
+        data = r["data"] or (settled(hit["data"]) if hit else None)
+        renewal = next_renewal(who.get("subscription_since"))
+        items.append({
+            "id": a.id,
+            "email": a.email,
+            "real_email": who.get("email"),
+            "tier": (who.get("tier") or "").replace("default_claude_", "").replace("max_", "Max "),
+            "active": bool(active and a.id == active.id),
+            "last_resort": a.email in cfg["last_resort"],
+            "status": status,
+            "note": r["why"],
+            "usable": r["usable"],
+            "queue": order.get(a.id),
+            "session": window_view(data.get("five_hour")) if data else None,
+            "weekly": window_view(data.get("seven_day")) if data else None,
+            "data_age": int(now - hit["ts"]) if hit and data else None,
+            # API podaje tylko start subskrypcji, więc to miesięczna rocznica, nie data z rachunku
+            "renews_at": renewal.timestamp() if renewal else None,
+            "subscription_status": who.get("status"),
+        })
+    # najpierw kolejka automatu, potem wypalone od najbliższego resetu tygodnia
+    items.sort(key=lambda i: (not i["active"], i["queue"] or 99, i["status"] != "ok",
+                              (i["weekly"] or {}).get("resets_at") or 9e12))
+
+    active_row = next((r for r in rows if active and r["account"].id == active.id and r["data"]), None)
+    state = load_state()
+    return {
+        "generated_at": now,
+        "active_email": active.email if active else None,
+        "foreign_runtime": active is None,
+        "thresholds": {"session_left": cfg["hard_session_left"], "weekly_left": cfg["hard_weekly_left"]},
+        "forecast": forecast(active_row["data"], read_history(active.email, 60, cfg["history_keep_hours"]), cfg)
+        if active_row else None,
+        "api_backoff_until": state.get("api_backoff_until"),
+        "last_tick": state.get("last_tick"),
+        "switched_at": state.get("switched_at"),
+        "accounts": items,
+    }
+
+
+def cmd_status(cfg, args):
+    if args and args[0] == "--json":
+        lock = take_lock(wait=25)
+        if not lock:
+            print("inny przebieg trwa zbyt długo, spróbuj za chwilę", file=sys.stderr)
+            return 1
+        print(json.dumps(snapshot(cfg), ensure_ascii=False))
+        return 0
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg trwa zbyt długo, spróbuj za chwilę")
+        return 1
+    accounts = load_accounts()
+    active = find_active(accounts, cfg)
+    rows = survey(accounts, cfg)
+    print(f"{'konto':<28}{'tydzień':>9}{'sesja 5h':>10}   {'reset tygodnia':<22}{'plan':<8}odnowienie")
+    for r in sorted(rows, key=lambda r: r["rank"] if not r["error"] else (9, 9e9, 0, 0)):
+        a = r["account"]
+        mark = "→" if active and a.id == active.id else " "
+        if r["error"]:
+            print(f"{mark} {a.email:<26} {r['why']}")
+            continue
+        who = identity(a, cfg) or {}
+        label = who.get("email") or a.email
+        if who.get("email") and who["email"] != a.email:
+            label += f" (wpis {a.email})"
+        session_left, weekly_left = headroom(r["data"])
+        resets = minutes_until(r["data"]["seven_day"]["resets_at"])
+        tier = (who.get("tier") or "").replace("default_claude_", "").replace("max_", "max ")
+        renewal = next_renewal(who.get("subscription_since"))
+        flag = "" if r["usable"] else "  (za mało zapasu)"
+        print(f"{mark} {label:<26}{weekly_left:>7.0f}% {session_left:>8.0f}%   "
+              f"{(datetime.now() + timedelta(minutes=resets or 0)):%d.%m %H:%M} za {human_left(resets):<9}"
+              f"{tier:<8}{renewal:%d.%m}{flag}" if renewal else
+              f"{mark} {label:<26}{weekly_left:>7.0f}% {session_left:>8.0f}%   "
+              f"{(datetime.now() + timedelta(minutes=resets or 0)):%d.%m %H:%M} za {human_left(resets):<9}{tier}{flag}")
+    nxt = queue(rows)
+    if nxt:
+        print(f"\nnastępne w kolejce: {', '.join(r['account'].email for r in nxt[:3])}")
+    return 0
+
+
+def cmd_plan(cfg, _args):
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg trwa zbyt długo, spróbuj za chwilę")
+        return 1
+    rows = queue(survey(load_accounts(), cfg))
+    if not rows:
+        print("żadne konto nie ma sensownego zapasu")
+        return 1
+    print("kolejność palenia (najpierw to, czemu limit najszybciej przepadnie):")
+    for i, r in enumerate(rows, 1):
+        session_left, weekly_left = headroom(r["data"])
+        resets = minutes_until(r["data"]["seven_day"]["resets_at"])
+        extra = " [konto firmowe, ostatnia deska ratunku]" if r["account"].email in cfg["last_resort"] else ""
+        print(f"{i}. {r['account'].email:<26} tydzień {weekly_left:>3.0f}%, sesja {session_left:>3.0f}%, "
+              f"reset za {human_left(resets)}{extra}")
+    return 0
+
+
+def cmd_who(cfg, _args):
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg trwa zbyt długo, spróbuj za chwilę")
+        return 1
+    accounts = load_accounts()
+    active = find_active(accounts, cfg)
+    if not active:
+        print(f"we wpisie {scoped_service(cfg['config_dir'])} leżą dane spoza Orca, nie ruszam ich")
+        return 1
+    data, note = cached_usage(active, cfg)
+    if not data:
+        print(f"{active.email} ({note})")
+        return 1
+    session_left, weekly_left = headroom(data)
+    rows = read_history(active.email, 90, cfg["history_keep_hours"])
+    wall = time_to_wall(data, rows)
+    rate = burn_rate(rows, "weekly_used")
+    print(f"{active.email}: zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji 5h")
+    print(f"  reset tygodnia za {human_left(minutes_until(data['seven_day']['resets_at']))}, "
+          f"sesji za {human_left(minutes_until(data['five_hour']['resets_at']))}")
+    if rate:
+        print(f"  tempo: {rate:.1f}% tygodnia na godzinę")
+    print(f"  prognoza ściany: {'za ' + human_left(wall) if wall else 'brak danych, za mało próbek'}")
+    return 0
+
+
+def cmd_switch(cfg, args):
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę")
+        return 1
+    accounts = load_accounts()
+    if not accounts:
+        print("brak kont zarządzanych przez Orca")
+        return 1
+    active = find_active(accounts, cfg)
+    if active:
+        sync_back(active, cfg)
+    else:
+        adopt_runtime(accounts, cfg)
+    if args and args[0] != "--auto":
+        target = next((a for a in accounts if a.email == args[0]), None)
+        if not target:
+            print(f"nie znam konta {args[0]}")
+            return 1
+        switch_to(target, cfg, "ręcznie")
+        print(f"przełączono na {target.email}")
+        return 0
+    rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None))
+    if not rows:
+        print("żadne konto nie ma zapasu, sprawdź claude-acc status")
+        return 1
+    switch_to(rows[0]["account"], cfg, "ręcznie --auto")
+    print(f"przełączono na {rows[0]['account'].email}")
+    return 0
+
+
+def plain(text):
+    """Tekst z terminala bez sekwencji ANSI i hiperłączy OSC 8."""
+    text = re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", "", text or "")
+    return re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text).strip()
+
+
+def cmd_login(cfg, args):
+    """Ponowne logowanie konta z Orca, bez terminala i bez klikania w Orca.
+
+    Uruchamia zwykłe `claude auth login` w pustym katalogu konfiguracji, więc to
+    Claude Code prowadzi logowanie w przeglądarce i zapisuje dane do własnego,
+    tymczasowego wpisu w Pęku kluczy. Stamtąd, po sprawdzeniu w API, czyje to
+    konto, przenosimy je do kopii w Orca. Tymczasowy wpis zawsze sprzątamy.
+    """
+    if not args:
+        print("użycie: claude-acc login <email>")
+        return 2
+    email = args[0]
+    target = next((a for a in load_accounts() if a.email == email), None)
+    if not target:
+        print(f"nie znam konta {email}")
+        return 1
+    # jedno logowanie naraz: dwa przebiegi dzieliłyby katalog i wpis tymczasowy
+    login_lock = open(LOGIN_LOCK_PATH, "w")
+    try:
+        fcntl.flock(login_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("inne logowanie właśnie trwa, dokończ je albo anuluj")
+        return 1
+    workdir = os.path.join(STATE_DIR, "login")
+    service = scoped_service(workdir)
+    kc_delete(service, KEYCHAIN_USER)  # resztka po przerwanym przebiegu wygrałaby ze świeżym logowaniem
+    shutil.rmtree(workdir, ignore_errors=True)
+    os.makedirs(workdir)
+    env = dict(os.environ, CLAUDE_CONFIG_DIR=workdir)
+    env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+    claude = shutil.which("claude") or os.path.join(HOME, ".local/bin/claude")
+    # Anuluj w aplikacji wysyła SIGTERM: wyjątek w run() zabija też proces claude
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
+    try:
+        r = subprocess.run([claude, "auth", "login", "--claudeai", "--email", email], env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
+        raw = kc_read(service, KEYCHAIN_USER)
+        creds_file = os.path.join(workdir, ".credentials.json")
+        if not raw and os.path.exists(creds_file):
+            raw = open(creds_file).read().strip()
+    except subprocess.TimeoutExpired:
+        print("logowanie przerwane: przez 10 minut nie wróciła odpowiedź z przeglądarki")
+        return 1
+    finally:
+        # od powrotu z przeglądarki do końca zapisu Anuluj już nie przerywa:
+        # urwany zapis zostawiłby kopię Orca i runtime w rozjeździe
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        kc_delete(service, KEYCHAIN_USER)
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    fresh = oauth_of(raw)
+    token = fresh.get("accessToken")
+    if r.returncode != 0 or not token or not fresh.get("refreshToken"):
+        lines = plain(r.stderr or r.stdout).splitlines()
+        print(f"logowanie nieudane: {lines[-1] if lines else f'kod wyjścia {r.returncode}'}")
+        return 1
+    profile = fetch_profile(token)
+    who = ((profile or {}).get("account") or {}).get("email")
+    if not who:
+        print("nie udało się sprawdzić, na jakie konto się zalogowano, spróbuj jeszcze raz")
+        return 1
+    if who.lower() != email.lower():
+        # nigdy nie zapisujemy cudzego konta pod tym wpisem: tak etykiety w Orca zaczęły kłamać
+        print(f"przeglądarka zalogowała {who}, a nie {email}. Wyloguj się z claude.ai albo użyj okna prywatnego")
+        return 1
+
+    lock = take_lock(wait=60)
+    if not lock:
+        print("inny przebieg trwa zbyt długo, zaloguj się jeszcze raz za chwilę")
+        return 1
+    old_refresh = target.oauth.get("refreshToken")
+    kc_write(MANAGED_SERVICE, target.id, with_oauth(target.creds_json, fresh))
+    # Wpisy runtime tego konta dostają nowy token, więc sesje wstają same. Które
+    # to wpisy, rozstrzyga API profilu, a nie etykieta: wpis Orca potrafi trzymać
+    # inne konto, a runtime nowszy token niż kopia.
+    for runtime in runtime_services(cfg):
+        current = kc_read(runtime, KEYCHAIN_USER)
+        live = oauth_of(current)
+        if not live.get("accessToken"):
+            continue
+        owner = ((fetch_profile(live["accessToken"]) or {}).get("account") or {}).get("email")
+        if (owner or "").lower() == email.lower() or (owner is None and live.get("refreshToken") == old_refresh):
+            kc_write(runtime, KEYCHAIN_USER, with_oauth(current, fresh))
+            log(f"login: nowy token {email} wpisany do {runtime}")
+    clear_needs_login(target)
+    cache = load_json(USAGE_CACHE_PATH, {})
+    if cache.pop(email, None) is not None:
+        write_json(USAGE_CACHE_PATH, cache)
+    log(f"login: konto {email} zalogowane ponownie")
+    print(f"zalogowano {email}")
+    return 0
+
+
+def cmd_tick(cfg, _args):
+    """Jeden przebieg pilnowania. Uruchamiany przez launchd co 2 minuty."""
+    lock = take_lock(wait=10)
+    if not lock:
+        return 0
+    update_state(last_tick=int(time.time()))  # aplikacja w pasku menu po tym widzi, że automat żyje
+    accounts = load_accounts()
+    if not accounts:
+        return 1
+    state = load_state()
+    active = find_active(accounts, cfg)
+
+    if not active:
+        # ktoś zalogował się ręcznie albo trwa /login: ręce precz, tylko jedno ostrzeżenie
+        if not state.get("hands_off_notified"):
+            log("tick: wpis runtime zawiera dane spoza Orca, nie przełączam")
+            notify("Claude: nieznane konto", "Runtime ma dane spoza Orca. Automat nic nie zmienia.")
+            update_state(hands_off_notified=True)
+        return 0
+    if state.get("hands_off_notified"):
+        update_state(hands_off_notified=False)
+
+    sync_back(active, cfg)
+    dead = needs_login(active)
+    data, note = (None, "token nie działa") if dead else cached_usage(active, cfg, max_age=60)
+    if not data and not dead:
+        dead = needs_login(active)  # odczyt właśnie trafił na martwy refresh token
+    if not data and not dead:
+        # odświeżanie tokenu aktywnego konta zostawiamy sesji Claude Code:
+        # dwa procesy rotujące ten sam token to pewna droga do wylogowania
+        log(f"tick: {active.email}: {note}")  # błąd sieci lub API, nie przełączamy w ciemno
+        return 1
+
+    if dead:
+        # refresh token padł (400), więc sesje i tak zaraz się wylogują: to jest
+        # "konto realnie padło", przechodzimy na konto z zapasem
+        reason = f"{active.email}: token nie działa"
+    else:
+        record_history(active.email, data)
+        session_left, weekly_left = headroom(data)
+        if session_left > cfg["hard_session_left"] and weekly_left > cfg["hard_weekly_left"]:
+            return 0  # konto jeszcze niesie, nie ruszamy go
+        reason = f"{active.email}: tydzień {weekly_left:.0f}%, sesja {session_left:.0f}%"
+    candidates = queue(survey(accounts, cfg, exclude_id=active.id))
+    if not candidates:
+        log(f"tick: {reason}, brak konta z zapasem")
+        if state.get("last_warning") != "brak-kont":
+            notify("Claude: koniec limitów", "Żadne konto nie ma zapasu. Sprawdź Claude Acc w pasku menu")
+            update_state(last_warning="brak-kont")
+        return 1
+
+    target = candidates[0]["account"]
+    switch_to(target, cfg, reason)
+    left = headroom(candidates[0]["data"])[1]
+    if target.email in cfg["last_resort"]:
+        notify("Claude: wchodzę na konto firmowe",
+               f"Prywatne konta bez zapasu, przełączam na {target.email}")
+    else:
+        notify("Claude: zmiana konta", f"{active.email} → {target.email} (zostało {left:.0f}% tygodnia)")
+    update_state(last_warning=None)
+    return 0
+
+
+def cmd_watch(cfg, args):
+    interval = int(args[0]) if args else 120
+    print(f"pilnuję limitów co {interval}s, Ctrl+C przerywa")
+    while True:
+        try:
+            cmd_tick(cfg, [])
+        except Exception as err:  # pętla ma przeżyć chwilowy błąd sieci
+            log(f"tick: błąd {err}")
+        time.sleep(interval)
+
+
+COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
+            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "watch": cmd_watch}
+
+
+def main(argv):
+    cmd = argv[0] if argv else "status"
+    if cmd not in COMMANDS:
+        print(__doc__)
+        return 2
+    cfg = load_config()
+    try:
+        return COMMANDS[cmd](cfg, argv[1:])
+    except Exception as err:
+        log(f"{cmd}: błąd {err}")
+        print(f"błąd: {err}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

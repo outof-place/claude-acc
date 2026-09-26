@@ -1,0 +1,247 @@
+"""Testy e2e claude-acc na atrapach Pęku kluczy, API Anthropic i `claude`.
+
+Każdy test stawia osobny $HOME z kontami Orca, uruchamia prawdziwy skrypt jako
+proces i sprawdza to, co widać z zewnątrz: wpisy w Pęku kluczy, stan i kod
+wyjścia. Żywe konta nie są dotykane.
+
+Uruchomienie: /usr/bin/python3 -m unittest discover -s ~/.local/share/claude-acc/tests
+"""
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = os.path.join(os.path.dirname(HERE), "accswitch.py")
+FAKES = os.path.join(HERE, "fakes")
+USER = "tester"
+MANAGED = "Orca Claude Code Managed Credentials"
+BASE = "Claude Code-credentials"
+
+
+def scoped(config_dir):
+    return f"{BASE}-{hashlib.sha256(config_dir.encode()).hexdigest()[:8]}"
+
+
+class Env:
+    """Świat jednego testu: konta, serwer i Pęk kluczy w plikach."""
+
+    def __init__(self):
+        self.home = tempfile.mkdtemp(prefix="claude-acc-test-")
+        self.fake = os.path.join(self.home, "fake")
+        self.state_dir = os.path.join(self.home, ".local/share/claude-acc")
+        os.makedirs(self.fake)
+        os.makedirs(self.state_dir)
+        self.config_dir = os.path.join(self.home, ".claude")
+        self.other_dir = os.path.join(self.home, ".claude-work")
+        json.dump({"config_dir": self.config_dir, "other_config_dirs": [self.other_dir],
+                   "hard_session_left": 5, "hard_weekly_left": 3, "min_weekly_left": 6,
+                   "min_session_left": 10, "last_resort": [], "never": []},
+                  open(os.path.join(self.state_dir, "config.json"), "w"))
+        self.server = {"access": {}, "refresh": {}, "usage": {}, "log": [], "counter": 0}
+        self.keychain = {}
+        self.ids = {}
+
+    # --- budowanie świata ---
+
+    def account(self, email, session_used=10, weekly_used=10, alive=True, expired=False, mcp=None):
+        acct_id = f"id-{email.split('@')[0]}"
+        self.ids[email] = acct_id
+        info = os.path.join(self.home, "Library/Application Support/orca/claude-accounts", acct_id, "auth")
+        os.makedirs(info)
+        json.dump({"emailAddress": email}, open(os.path.join(info, "oauth-account.json"), "w"))
+        self.server["counter"] += 1
+        n = self.server["counter"]
+        access, refresh = f"at-{email}-{n}", f"rt-{email}-{n}"
+        if alive:
+            self.server["access"][access] = email
+            self.server["refresh"][refresh] = email
+        reset = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 3 * 3600))
+        week = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 3 * 86400))
+        self.server["usage"][email] = {"five_hour": {"utilization": session_used, "resets_at": reset},
+                                       "seven_day": {"utilization": weekly_used, "resets_at": week}}
+        expires = (time.time() - 60 if expired else time.time() + 8 * 3600) * 1000
+        blob = {"claudeAiOauth": {"accessToken": access, "refreshToken": refresh, "expiresAt": int(expires)}}
+        if mcp is not None:
+            blob["mcpOAuth"] = mcp
+        self.keychain[f"{MANAGED}|{acct_id}"] = json.dumps(blob)
+        return blob
+
+    def runtime(self, blob, mcp=None, services=None):
+        """Wpisy runtime zarządzanego katalogu z danymi konta i własnymi tokenami MCP."""
+        blob = dict(blob)
+        if mcp is not None:
+            blob["mcpOAuth"] = mcp
+        for service in services or (scoped(self.config_dir), BASE):
+            self.keychain[f"{service}|{USER}"] = json.dumps(blob)
+
+    def write(self):
+        json.dump(self.server, open(os.path.join(self.fake, "server.json"), "w"))
+        json.dump(self.keychain, open(os.path.join(self.fake, "keychain.json"), "w"))
+
+    def state(self, **fields):
+        path = os.path.join(self.state_dir, "state.json")
+        current = json.load(open(path)) if os.path.exists(path) else {}
+        current.update(fields)
+        json.dump(current, open(path, "w"))
+
+    # --- uruchamianie ---
+
+    def env(self, **extra):
+        env = {"HOME": self.home, "USER": USER, "PATH": f"{FAKES}:/usr/bin:/bin"}
+        env.update(extra)
+        return env
+
+    def run(self, *args, **extra):
+        return subprocess.run(["/usr/bin/python3", SCRIPT, *args], env=self.env(**extra),
+                              capture_output=True, text=True, timeout=60)
+
+    def spawn(self, *args, **extra):
+        return subprocess.Popen(["/usr/bin/python3", SCRIPT, *args], env=self.env(**extra),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    # --- odczyt ---
+
+    def entry(self, service, account=USER):
+        raw = json.load(open(os.path.join(self.fake, "keychain.json"))).get(f"{service}|{account}")
+        return json.loads(raw) if raw else None
+
+    def managed(self, email):
+        return self.entry(MANAGED, self.ids[email])
+
+    def calls(self, suffix):
+        log = json.load(open(os.path.join(self.fake, "server.json")))["log"]
+        return [u for u in log if u.endswith(suffix)]
+
+    def saved_state(self):
+        return json.load(open(os.path.join(self.state_dir, "state.json")))
+
+    def login_entry(self):
+        return self.entry(scoped(os.path.join(self.state_dir, "login")))
+
+
+class LoginTest(unittest.TestCase):
+    def test_login_keeps_mcp_tokens_everywhere(self):
+        # konto aktywne padło: martwy token w kopii Orca i w runtime
+        w = Env()
+        dead = w.account("a@x", alive=False, mcp={"srv": "orca-copy"})
+        w.runtime(dead, mcp={"srv": "runtime-own"})
+        w.write()
+
+        r = w.run("login", "a@x")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        managed = w.managed("a@x")
+        self.assertNotEqual(managed["claudeAiOauth"]["accessToken"], dead["claudeAiOauth"]["accessToken"])
+        self.assertEqual(managed.get("mcpOAuth"), {"srv": "orca-copy"})
+        for service in (scoped(w.config_dir), BASE):
+            live = w.entry(service)
+            self.assertEqual(live["claudeAiOauth"], managed["claudeAiOauth"], service)
+            self.assertEqual(live.get("mcpOAuth"), {"srv": "runtime-own"}, service)
+        self.assertIsNone(w.login_entry())
+
+    def test_login_as_other_account_changes_nothing(self):
+        w = Env()
+        before = w.account("a@x", alive=False)
+        w.account("b@x")
+        w.write()
+
+        r = w.run("login", "a@x", FAKE_LOGIN_AS="b@x")
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("b@x", r.stdout)
+        self.assertEqual(w.managed("a@x"), before)
+        self.assertIsNone(w.login_entry())
+
+    def test_cancel_during_write_phase_finishes_consistently(self):
+        # Anuluj po powrocie z przeglądarki nie może zostawić kopii Orca i runtime w rozjeździe
+        w = Env()
+        dead = w.account("a@x", alive=False)
+        w.runtime(dead)
+        w.write()
+
+        proc = w.spawn("login", "a@x", FAKE_SLOW_WRITE_SERVICE=MANAGED)
+        marker = os.path.join(w.fake, "slow-write-started")
+        deadline = time.time() + 20
+        while not os.path.exists(marker) and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(os.path.exists(marker), "zapis do kopii Orca się nie zaczął")
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+
+        self.assertEqual(proc.returncode, 0, out + err)
+        managed = w.managed("a@x")
+        self.assertEqual(w.entry(scoped(w.config_dir))["claudeAiOauth"], managed["claudeAiOauth"])
+        self.assertIsNone(w.login_entry())
+
+
+class SwitchTest(unittest.TestCase):
+    def test_switch_keeps_runtime_mcp_tokens(self):
+        w = Env()
+        a = w.account("a@x", mcp={"srv": "a-copy"})
+        b = w.account("b@x", mcp={"srv": "b-copy"})
+        w.runtime(a, mcp={"srv": "runtime-own"})
+        w.write()
+
+        r = w.run("switch", "b@x")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        live = w.entry(scoped(w.config_dir))
+        self.assertEqual(live["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+        self.assertEqual(live.get("mcpOAuth"), {"srv": "runtime-own"})
+
+    def test_switch_during_rate_limit_does_not_rotate_or_mark(self):
+        w = Env()
+        a = w.account("a@x")
+        b = w.account("b@x")
+        w.runtime(a)
+        w.write()
+        w.state(api_backoff_until=time.time() + 600)
+
+        r = w.run("switch", "b@x")
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(w.managed("b@x")["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+        self.assertNotIn("b@x", w.saved_state().get("needs_login", {}))
+
+
+class StatusTest(unittest.TestCase):
+    def test_status_json_never_refreshes_tokens(self):
+        # panel pyta co minutę: odświeżanie tokenów zostaje przy automacie i sesjach
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", expired=True)
+        w.runtime(a)
+        w.write()
+
+        r = w.run("status", "--json")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        emails = [x["email"] for x in json.loads(r.stdout)["accounts"]]
+        self.assertEqual(sorted(emails), ["a@x", "b@x"])
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+
+
+class TickTest(unittest.TestCase):
+    def test_tick_leaves_dead_active_account(self):
+        # aktywne konto ma martwe tokeny w runtime i w kopii Orca: automat przechodzi na zdrowe
+        w = Env()
+        dead = w.account("a@x", alive=False)
+        b = w.account("b@x")
+        w.runtime(dead)
+        w.write()
+
+        w.run("tick")
+        w.run("tick")
+
+        live = w.entry(scoped(w.config_dir))
+        self.assertEqual(live["claudeAiOauth"]["accessToken"], w.managed("b@x")["claudeAiOauth"]["accessToken"])
+
+
+if __name__ == "__main__":
+    unittest.main()

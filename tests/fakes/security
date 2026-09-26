@@ -1,0 +1,32 @@
+#!/usr/bin/python3
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _store
+
+args = sys.argv[1:]
+cmd = args[0]
+opt = lambda flag: args[args.index(flag) + 1] if flag in args else None
+key = f"{opt('-s')}|{opt('-a')}"
+kc = _store.load("keychain.json", {})
+if cmd == "find-generic-password":
+    if key in kc:
+        print(kc[key])
+        sys.exit(0)
+    sys.exit(44)
+if cmd == "add-generic-password":
+    if os.environ.get("FAKE_SLOW_WRITE_SERVICE") == opt("-s"):
+        open(os.path.join(_store.ROOT, "slow-write-started"), "w").close()
+        time.sleep(3)
+    kc = _store.load("keychain.json", {})
+    kc[key] = opt("-w")
+    _store.save("keychain.json", kc)
+    sys.exit(0)
+if cmd == "delete-generic-password":
+    existed = kc.pop(key, None) is not None
+    _store.save("keychain.json", kc)
+    sys.exit(0 if existed else 44)
+if cmd == "dump-keychain":
+    for k in kc:
+        print(f'    "svce"<blob>="{k.split("|")[0]}"')
+    sys.exit(0)
+sys.exit(1)

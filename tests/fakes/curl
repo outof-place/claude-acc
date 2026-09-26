@@ -1,0 +1,48 @@
+#!/usr/bin/python3
+"""Atrapa curl -K -: API limitów, profilu i tokenów Anthropic z rotacją refresh tokenów."""
+import json, os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _store
+
+conf, headers = {}, {}
+for line in sys.stdin.read().splitlines():
+    k, _, v = line.partition(" = ")
+    v = v.strip().strip('"')
+    if k == "header":
+        hk, _, hv = v.partition(": ")
+        headers[hk] = hv
+    else:
+        conf[k.strip()] = v
+url = conf.get("url", "")
+server = _store.load("server.json", {})
+server.setdefault("log", []).append(url)
+
+
+def reply(code, obj):
+    _store.save("server.json", server)
+    sys.stdout.write(json.dumps(obj) + "\n" + str(code))
+    sys.exit(0)
+
+
+email = server.get("access", {}).get(headers.get("Authorization", "").replace("Bearer ", ""))
+if url.endswith("/api/oauth/usage"):
+    if server.get("rate_limited"):
+        reply(429, {"error": "rate_limited"})
+    if not email:
+        reply(401, {"error": "invalid token"})
+    reply(200, server["usage"][email])
+if url.endswith("/api/oauth/profile"):
+    if not email:
+        reply(401, {"error": "invalid token"})
+    reply(200, {"account": {"email": email},
+                "organization": {"rate_limit_tier": "default_claude_max_20x",
+                                 "subscription_created_at": "2026-09-15T10:00:00Z",
+                                 "subscription_status": "active"}})
+if url.endswith("/v1/oauth/token"):
+    params = dict(p.split("=", 1) for p in conf.get("data", "").split("&"))
+    owner = server.get("refresh", {}).pop(params.get("refresh_token"), None)
+    if not owner:
+        reply(400, {"error": "invalid_grant"})
+    access, refresh = _store.issue(server, owner)
+    reply(200, {"access_token": access, "refresh_token": refresh, "expires_in": 28800})
+reply(404, {"error": "unknown url"})
