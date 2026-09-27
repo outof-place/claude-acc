@@ -40,9 +40,17 @@ if url.endswith("/api/oauth/profile"):
                                  "subscription_status": "active"}})
 if url.endswith("/v1/oauth/token"):
     params = dict(p.split("=", 1) for p in conf.get("data", "").split("&"))
-    owner = server.get("refresh", {}).pop(params.get("refresh_token"), None)
+    token = params.get("refresh_token")
+    reused = server.get("consumed", {}).get(token)
+    if reused:
+        # ponowne użycie zużytego refresh tokenu: serwer unieważnia wszystkie tokeny konta
+        server["access"] = {k: v for k, v in server["access"].items() if v != reused}
+        server["refresh"] = {k: v for k, v in server["refresh"].items() if v != reused}
+        reply(400, {"error": "invalid_grant", "reason": "refresh token reuse"})
+    owner = server.get("refresh", {}).pop(token, None)
     if not owner:
         reply(400, {"error": "invalid_grant"})
+    server.setdefault("consumed", {})[token] = owner
     access, refresh = _store.issue(server, owner)
     reply(200, {"access_token": access, "refresh_token": refresh, "expires_in": 28800})
 reply(404, {"error": "unknown url"})

@@ -26,7 +26,8 @@ A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Cla
 
 Each of these rules comes from an account that actually lost its login while the tool was being built:
 
-- Refreshing a token rotates it and kills the old refresh token. Only the watcher and your clicks ever refresh, one process at a time behind a file lock. The panel only reads.
+- Refreshing a token rotates it, and presenting a refresh token that was already used got the whole account logged out. Claude Code sessions refresh the active account on their own, about 5 minutes before the token expires, so the watcher never refreshes the active account while a session could. It copies the pair the session wrote instead, from whichever Keychain entry the sessions use (`Claude Code-credentials` without `CLAUDE_CONFIG_DIR`, the hashed one with it). It refreshes the active account itself only once the token has been expired for 15 minutes, when no session is running.
+- Inactive accounts are refreshed only by the watcher and your clicks, one process at a time behind a file lock. The panel only reads.
 - It never writes a token it hasn't checked against the API first. A future expiry date doesn't prove the token still works.
 - It replaces only `claudeAiOauth`. The same Keychain entry holds `mcpOAuth`, the tokens of your MCP servers, which belong to the config directory and survive every switch.
 - A 429 from the usage endpoint means "unknown", never "dead". It backs off for 15 minutes and doesn't refresh or flag anything in the meantime.

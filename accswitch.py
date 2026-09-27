@@ -45,6 +45,9 @@ LOG_PATH = os.path.join(STATE_DIR, "switch.log")
 LOCK_PATH = os.path.join(STATE_DIR, "lock")
 LOGIN_LOCK_PATH = os.path.join(STATE_DIR, "login.lock")
 USAGE_CACHE_PATH = os.path.join(STATE_DIR, "usage-cache.json")
+# ile token aktywnego konta musi być przeterminowany, zanim automat sam go odświeży:
+# wcześniej robią to sesje Claude Code i drugi odświeżający zabija konto
+IDLE_REFRESH_AFTER = 15 * 60
 
 MANAGED_SERVICE = "Orca Claude Code Managed Credentials"
 ACTIVE_SERVICE = "Claude Code-credentials"
@@ -207,6 +210,23 @@ def runtime_services(cfg):
     services += [scoped_service(d) for d in cfg["other_config_dirs"]]
     services.append(ACTIVE_SERVICE)
     return services
+
+
+def live_services(cfg):
+    """Wpisy, z których mogą czytać sesje zarządzanego katalogu.
+
+    Claude Code uruchomione bez CLAUDE_CONFIG_DIR używa wpisu bazowego, a z tą
+    zmienną wpisu z hashem katalogu. Sesje odświeżają token tylko w swoim wpisie,
+    więc patrzymy na oba i wierzymy temu, który odświeżono ostatnio.
+    """
+    return [ACTIVE_SERVICE, scoped_service(cfg["config_dir"])]
+
+
+def freshest_runtime(cfg):
+    """Blob z wpisu runtime z najpóźniejszą ważnością: tam leży ostatnie odświeżenie sesji."""
+    blobs = [kc_read(s, KEYCHAIN_USER) for s in live_services(cfg)]
+    blobs = [b for b in blobs if oauth_of(b).get("accessToken")]
+    return max(blobs, key=lambda b: oauth_of(b).get("expiresAt", 0), default=None)
 
 
 def oauth_of(creds_json):
@@ -411,7 +431,7 @@ def settled(data):
     return out
 
 
-def cached_usage(account, cfg, max_age=90, refresh=True):
+def cached_usage(account, cfg, max_age=90, refresh=True, stale_ok=None):
     """Limity z krótką pamięcią podręczną: kilka komend pod rząd nie mnoży zapytań.
 
     Bez odświeżania (panel w pasku menu) przy nieudanym odczycie oddajemy
@@ -426,7 +446,7 @@ def cached_usage(account, cfg, max_age=90, refresh=True):
         cache[account.email] = {"ts": time.time(), "data": data}
         write_json(USAGE_CACHE_PATH, cache)
         return data, note
-    if hit and not refresh:
+    if hit and (not refresh if stale_ok is None else stale_ok):
         return settled(hit["data"]), f"dane z pamięci ({note})"
     return None, note
 
@@ -603,15 +623,31 @@ def find_active(accounts, cfg):
     Dopasowanie wyłącznie po tokenach. Zgadywanie po ostatnio zapisanym stanie
     prowadziło do wpisania danych jednego konta pod uuid drugiego.
     """
-    raw = kc_read(scoped_service(cfg["config_dir"]), KEYCHAIN_USER) or kc_read(ACTIVE_SERVICE, KEYCHAIN_USER)
-    if not raw:
+    for service in live_services(cfg):
+        live = oauth_of(kc_read(service, KEYCHAIN_USER))
+        if not live.get("accessToken"):
+            continue
+        for a in accounts:
+            stored = a.oauth
+            if stored.get("refreshToken") == live.get("refreshToken") or stored.get("accessToken") == live.get("accessToken"):
+                return a
+    # sesja odświeżyła token po ostatniej kopii: tokeny nie pasują do żadnej kopii,
+    # więc właściciela mówi API profilu
+    return owner_of(freshest_runtime(cfg), accounts)
+
+
+def owner_of(creds_json, accounts):
+    """Konto z Orca, do którego należy ten token, według API profilu. None, gdy obce albo nie wiadomo."""
+    token = oauth_of(creds_json).get("accessToken")
+    if not token:
         return None
-    live = oauth_of(raw)
-    for a in accounts:
-        stored = a.oauth
-        if stored.get("refreshToken") == live.get("refreshToken") or stored.get("accessToken") == live.get("accessToken"):
-            return a
-    return None
+    email = (((fetch_profile(token) or {}).get("account") or {}).get("email") or "").lower()
+    if not email:
+        return None
+    # etykieta z Orca potrafi kłamać, więc liczy się też prawdziwy e-mail z pamięci profilu
+    known = load_state().get("identity", {})
+    return next((a for a in accounts
+                 if email in (a.email.lower(), ((known.get(a.id) or {}).get("email") or "").lower())), None)
 
 
 def works(creds_json):
@@ -638,14 +674,30 @@ def sync_back(account, cfg):
     Właścicielem żywego tokenu jest sesja Claude Code: to ona go odświeża w
     trakcie pracy. Nasza kopia ma za nią nadążać, a nie odwrotnie.
     """
-    runtime_raw = kc_read(scoped_service(cfg["config_dir"]), KEYCHAIN_USER)
+    runtime_raw = freshest_runtime(cfg)
     managed_raw = account.creds_json
+    live, stored = oauth_of(runtime_raw), oauth_of(managed_raw)
     # porównujemy samo konto: tokeny MCP w obu blobach różnią się z założenia
-    if not runtime_raw or oauth_of(runtime_raw) == oauth_of(managed_raw):
+    if not live or live == stored:
+        align_runtime(cfg, stored)
         return
-    if works(runtime_raw):
-        kc_write(MANAGED_SERVICE, account.id, with_oauth(managed_raw, oauth_of(runtime_raw)))
-        log(f"read-back: żywy token z runtime zapisany do konta {account.email}")
+    same_pair = live.get("refreshToken") == stored.get("refreshToken")
+    if not same_pair and (owner_of(runtime_raw, [account]) is None):
+        return  # obce konto albo API milczy: niczego nie kopiujemy w ciemno
+    kc_write(MANAGED_SERVICE, account.id, with_oauth(managed_raw, live))
+    align_runtime(cfg, live)
+    log(f"read-back: token odświeżony przez sesję zapisany do konta {account.email}")
+
+
+def align_runtime(cfg, oauth):
+    """Oba wpisy runtime z tą samą, najnowszą parą: inaczej wpis, którego sesje nie
+    odświeżają, trzyma zużyty refresh token i kusi do ponownego użycia."""
+    if not oauth.get("accessToken"):
+        return
+    for service in live_services(cfg):
+        current = kc_read(service, KEYCHAIN_USER)
+        if current and oauth_of(current) != oauth:
+            kc_write(service, KEYCHAIN_USER, with_oauth(current, oauth))
 
 
 def adopt_runtime(accounts, cfg):
@@ -656,16 +708,12 @@ def adopt_runtime(accounts, cfg):
     ponownego logowania. Obce konto (spoza Orca) zostaje nadpisane, bo o to
     użytkownik prosi, przełączając.
     """
-    raw = kc_read(scoped_service(cfg["config_dir"]), KEYCHAIN_USER)
-    token = oauth_of(raw).get("accessToken")
-    if not token:
-        return
-    owner = ((fetch_profile(token) or {}).get("account") or {}).get("email") or ""
-    account = next((a for a in accounts if a.email.lower() == owner.lower()), None)
+    raw = freshest_runtime(cfg)
+    account = owner_of(raw, accounts)
     if account:
         kc_write(MANAGED_SERVICE, account.id, with_oauth(account.creds_json, oauth_of(raw)))
         clear_needs_login(account)
-        log(f"żywy token {owner} z runtime zapisany do jego kopii w Orca")
+        log(f"żywy token {account.email} z runtime zapisany do jego kopii w Orca")
 
 
 def switch_to(account, cfg, reason=""):
@@ -1133,6 +1181,32 @@ def cmd_login(cfg, args):
     return 0
 
 
+def active_usage(account, cfg):
+    """Limity aktywnego konta bez wchodzenia sesjom w drogę.
+
+    Token aktywnego konta odświeżają sesje Claude Code, około 5 minut przed końcem
+    ważności. Automat robił to samo z własnej kopii i jeden z dwóch zawsze używał
+    zużytego refresh tokenu, a serwer unieważniał wtedy całe konto: stąd codzienne
+    wylogowania. Teraz automat odświeża sam tylko token przeterminowany od kwadransa
+    (sesje śpią), a odrzucony ważny token (401) oznacza konto do zalogowania.
+    """
+    oauth = account.oauth
+    expired_for = time.time() - oauth.get("expiresAt", 0) / 1000
+    if expired_for > IDLE_REFRESH_AFTER:
+        return cached_usage(account, cfg, max_age=60)
+    if expired_for > 0:
+        return None, "token właśnie wygasł, czekam, aż odświeży go sesja"
+    # stare liczby z pamięci nie mogą decydować o przełączeniu, więc stale_ok=False
+    data, note = cached_usage(account, cfg, max_age=60, refresh=False, stale_ok=False)
+    if data or check(account.creds_json) != 401:
+        return data, note
+    sync_back(account, cfg)  # sesja mogła odświeżyć token między odczytami
+    if check(account.creds_json) == 401:
+        mark_needs_login(account, account.creds_json)
+        return None, "token odrzucony przez API"
+    return cached_usage(account, cfg, max_age=0, refresh=False, stale_ok=False)
+
+
 def cmd_tick(cfg, _args):
     """Jeden przebieg pilnowania. Uruchamiany przez launchd co 2 minuty."""
     lock = take_lock(wait=10)
@@ -1157,9 +1231,9 @@ def cmd_tick(cfg, _args):
 
     sync_back(active, cfg)
     dead = needs_login(active)
-    data, note = (None, "token nie działa") if dead else cached_usage(active, cfg, max_age=60)
+    data, note = (None, "token nie działa") if dead else active_usage(active, cfg)
     if not data and not dead:
-        dead = needs_login(active)  # odczyt właśnie trafił na martwy refresh token
+        dead = needs_login(active)  # odczyt właśnie trafił na martwy token
     if not data and not dead:
         # odświeżanie tokenu aktywnego konta zostawiamy sesji Claude Code:
         # dwa procesy rotujące ten sam token to pewna droga do wylogowania

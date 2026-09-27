@@ -48,7 +48,8 @@ class Env:
 
     # --- budowanie świata ---
 
-    def account(self, email, session_used=10, weekly_used=10, alive=True, expired=False, mcp=None):
+    def account(self, email, session_used=10, weekly_used=10, alive=True, expired=False, mcp=None,
+                expires_in=8 * 3600):
         acct_id = f"id-{email.split('@')[0]}"
         self.ids[email] = acct_id
         info = os.path.join(self.home, "Library/Application Support/orca/claude-accounts", acct_id, "auth")
@@ -64,7 +65,7 @@ class Env:
         week = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 3 * 86400))
         self.server["usage"][email] = {"five_hour": {"utilization": session_used, "resets_at": reset},
                                        "seven_day": {"utilization": weekly_used, "resets_at": week}}
-        expires = (time.time() - 60 if expired else time.time() + 8 * 3600) * 1000
+        expires = (time.time() - 60 if expired else time.time() + expires_in) * 1000
         blob = {"claudeAiOauth": {"accessToken": access, "refreshToken": refresh, "expiresAt": int(expires)}}
         if mcp is not None:
             blob["mcpOAuth"] = mcp
@@ -103,6 +104,26 @@ class Env:
     def spawn(self, *args, **extra):
         return subprocess.Popen(["/usr/bin/python3", SCRIPT, *args], env=self.env(**extra),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def session_refresh(self, email, service=BASE):
+        """Sesja Claude Code odświeża token konta i zapisuje nową parę tylko do swojego wpisu."""
+        server = json.load(open(os.path.join(self.fake, "server.json")))
+        keychain = json.load(open(os.path.join(self.fake, "keychain.json")))
+        blob = json.loads(keychain[f"{service}|{USER}"])
+        old = blob["claudeAiOauth"]["refreshToken"]
+        assert server["refresh"].pop(old) == email
+        server.setdefault("consumed", {})[old] = email
+        server["counter"] += 1
+        n = server["counter"]
+        access, refresh = f"at-{email}-{n}", f"rt-{email}-{n}"
+        server["access"][access] = email
+        server["refresh"][refresh] = email
+        blob["claudeAiOauth"] = {"accessToken": access, "refreshToken": refresh,
+                                 "expiresAt": int((time.time() + 8 * 3600) * 1000)}
+        keychain[f"{service}|{USER}"] = json.dumps(blob)
+        json.dump(server, open(os.path.join(self.fake, "server.json"), "w"))
+        json.dump(keychain, open(os.path.join(self.fake, "keychain.json"), "w"))
+        return blob
 
     # --- odczyt ---
 
@@ -228,6 +249,49 @@ class StatusTest(unittest.TestCase):
 
 
 class TickTest(unittest.TestCase):
+    def test_tick_follows_session_refresh_instead_of_refreshing_itself(self):
+        # Codzienne wylogowania: 5 minut przed końcem ważności sesja odświeża token we
+        # wpisie bazowym, a tick odświeżał tę samą, już zużytą parę ze swojej kopii.
+        # Serwer traktował to jako kradzież i unieważniał całe konto.
+        w = Env()
+        a = w.account("a@x", expires_in=3 * 60)
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        live = w.session_refresh("a@x")
+
+        w.run("tick")
+
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+        self.assertEqual(w.managed("a@x")["claudeAiOauth"], live["claudeAiOauth"])
+        self.assertEqual(w.entry(scoped(w.config_dir))["claudeAiOauth"], live["claudeAiOauth"])
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], live["claudeAiOauth"])
+        self.assertNotIn("a@x", w.saved_state().get("needs_login", {}))
+
+    def test_tick_leaves_token_refresh_of_active_account_to_sessions(self):
+        w = Env()
+        a = w.account("a@x", expires_in=3 * 60)
+        w.runtime(a)
+        w.write()
+
+        w.run("tick")
+
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+
+    def test_tick_refreshes_active_account_when_sessions_are_idle(self):
+        # token wygasł dawno, więc żadna sesja go nie odświeża: wtedy robi to automat
+        w = Env()
+        a = w.account("a@x", expires_in=-30 * 60)
+        w.runtime(a)
+        w.write()
+
+        w.run("tick")
+
+        self.assertEqual(len(w.calls("/v1/oauth/token")), 1)
+        fresh = w.managed("a@x")["claudeAiOauth"]
+        self.assertNotEqual(fresh["refreshToken"], a["claudeAiOauth"]["refreshToken"])
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], fresh)
+
     def test_tick_leaves_dead_active_account(self):
         # aktywne konto ma martwe tokeny w runtime i w kopii Orca: automat przechodzi na zdrowe
         w = Env()
