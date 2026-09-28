@@ -352,6 +352,20 @@ class TickTest(unittest.TestCase):
         self.assertEqual(w.entry(BASE)["claudeAiOauth"], a["claudeAiOauth"])
         self.assertEqual(w.calls("/v1/oauth/token"), [])
 
+    def test_tick_never_switches_to_account_with_canceled_subscription(self):
+        w = Env()
+        a = w.account("a@x", session_used=99)
+        w.account("b@x", weekly_used=10)
+        w.account("c@x", weekly_used=50)
+        w.runtime(a)
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()), "email": "b@x", "status": "canceled"}})
+
+        w.run("tick")
+
+        live = w.entry(BASE)["claudeAiOauth"]["accessToken"]
+        self.assertEqual(live, w.managed("c@x")["claudeAiOauth"]["accessToken"])
+
     def test_tick_leaves_dead_active_account(self):
         # aktywne konto ma martwe tokeny w runtime i w kopii Orca: automat przechodzi na zdrowe
         w = Env()

@@ -886,11 +886,16 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
             continue
         session_left, weekly_left = headroom(data)
         usable = weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]
+        why = f"zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji"
+        # status subskrypcji z pamięci profilu: anulowane konto automat pomija, a po
+        # odnowieniu samo wraca do rotacji, bez ręcznego dopisywania do "never"
+        status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
+        if status and status != "active":
+            usable, why = False, f"subskrypcja: {status}, automat pomija"
         remember_fingerprint(a.email, data)
         rows.append({
             "account": a, "data": data, "usable": usable, "error": False,
-            "why": f"zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji",
-            "rank": rank(a, data, cfg),
+            "why": why, "rank": rank(a, data, cfg),
         })
     return rows
 

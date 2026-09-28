@@ -237,7 +237,7 @@ private struct SubscriptionText: View {
 
     var body: some View {
         if let status = account.subscriptionStatus, status != "active" {
-            Text("subskrypcja: \(status)").foregroundStyle(.orange)
+            Text("subskrypcja: \(status), automat pomija").foregroundStyle(.orange)
         } else if let renews = account.renewsAt {
             Text("odnowienie \(Format.day(renews)) · \(Format.inDays(renews))")
         }
