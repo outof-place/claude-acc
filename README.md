@@ -30,7 +30,7 @@ Each of these rules comes from an account that actually lost its login while the
 - Inactive accounts are refreshed only by the watcher and your clicks, one process at a time behind a file lock. The panel only reads.
 - It never writes a token it hasn't checked against the API first. A future expiry date doesn't prove the token still works.
 - It replaces only `claudeAiOauth`. The same Keychain entry holds `mcpOAuth`, the tokens of your MCP servers, which belong to the config directory and survive every switch.
-- A 429 from the usage endpoint means "unknown", never "dead". It backs off for 15 minutes and doesn't refresh or flag anything in the meantime.
+- A 429 from the usage endpoint means "unknown", never "dead". It backs off for 15 minutes and doesn't refresh or flag anything in the meantime. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled.
 - Before overwriting the live entry it copies the token there back to its Orca copy, because the running session may have rotated it since the last switch.
 
 ## Requirements
@@ -38,7 +38,7 @@ Each of these rules comes from an account that actually lost its login while the
 - macOS 14 or newer, with Swift 6 (Xcode or the command line tools) to build the app.
 - `/usr/bin/python3` (ships with the command line tools).
 - Claude Code. Tested with 2.1.282.
-- Orca with your Claude accounts added as managed accounts, and **System default** selected as the active Claude account in Orca. With a managed account selected, Orca puts its own account back whenever a terminal starts and every 15 minutes, undoing every switch.
+- Orca with your Claude accounts added as managed accounts, and **System default** selected as the active Claude account in Orca. With a managed account selected, Orca puts its own account back whenever a terminal starts and every 15 minutes, undoing every switch, and it refreshes that account's token itself. claude-acc reads Orca's settings, and while an account is selected there the watcher stands down, switching is blocked and the panel tells you to pick System default.
 
 ## Install
 

@@ -24,6 +24,7 @@ Komendy:
 """
 
 import fcntl
+import glob
 import hashlib
 import json
 import os
@@ -36,7 +37,8 @@ import time
 from datetime import datetime, timedelta, timezone
 
 HOME = os.path.expanduser("~")
-ACCOUNTS_DIR = os.path.join(HOME, "Library/Application Support/orca/claude-accounts")
+ORCA_DIR = os.path.join(HOME, "Library/Application Support/orca")
+ACCOUNTS_DIR = os.path.join(ORCA_DIR, "claude-accounts")
 STATE_DIR = os.path.join(HOME, ".local/share/claude-acc")
 CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
@@ -210,6 +212,36 @@ def runtime_services(cfg):
     services += [scoped_service(d) for d in cfg["other_config_dirs"]]
     services.append(ACTIVE_SERVICE)
     return services
+
+
+def orca_selected_id():
+    """Konto wybrane w menu Orca (tryb kont zarządzanych) albo None przy "System default".
+
+    Ta sama reguła co w Orca: activeClaudeManagedAccountIdsByRuntime.host, a gdy
+    go brak, activeClaudeManagedAccountId; "System default" zapisuje tam null.
+    Orca trzyma ustawienia per profil, więc czytamy najświeższy orca-data.json.
+    """
+    paths = glob.glob(os.path.join(ORCA_DIR, "profiles", "*", "orca-data.json"))
+    paths += [p for p in [os.path.join(ORCA_DIR, "orca-data.json")] if os.path.exists(p)]
+    if not paths:
+        return None
+    try:
+        settings = json.load(open(max(paths, key=os.path.getmtime))).get("settings") or {}
+    except (ValueError, OSError):
+        return None
+    host = (settings.get("activeClaudeManagedAccountIdsByRuntime") or {}).get("host")
+    if host is None:
+        host = settings.get("activeClaudeManagedAccountId")
+    return host if isinstance(host, str) and host else None
+
+
+def orca_selected(accounts):
+    """E-mail konta wybranego w Orca albo None. W tym trybie Orca cofa nasze przełączenia
+    i sama odświeża tokeny, więc automat, który by się z nią przepychał, wylogowuje konta."""
+    selected = orca_selected_id()
+    if not selected:
+        return None
+    return next((a.email for a in accounts if a.id == selected), selected)
 
 
 def live_services(cfg):
@@ -488,12 +520,16 @@ def headroom(data):
     return 100 - data["five_hour"]["utilization"], 100 - data["seven_day"]["utilization"]
 
 
-def fetch_profile(access_token):
-    status, profile = http("https://api.anthropic.com/api/oauth/profile", headers={
+def profile_request(access_token):
+    return http("https://api.anthropic.com/api/oauth/profile", headers={
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": USER_AGENT,
     })
+
+
+def fetch_profile(access_token):
+    status, profile = profile_request(access_token)
     return profile if status == 200 and profile else None
 
 
@@ -663,9 +699,13 @@ def works(creds_json):
 
 def check(creds_json):
     """Odpowiedź API dla tego tokenu: 200 działa, 401 martwy, reszta to brak wiedzy
-    (429, sieć), po której niczego nie wolno odświeżać ani oznaczać."""
+    (429, sieć), po której niczego nie wolno odświeżać ani oznaczać.
+
+    Pytamy API profilu, a nie endpoint limitów: ten drugi potrafi odpowiadać 429
+    przez godzinę i wtedy nie dało się nawet ręcznie przełączyć konta.
+    """
     token = oauth_of(creds_json).get("accessToken")
-    return fetch_usage(token)[0] if token else 401
+    return profile_request(token)[0] if token else 401
 
 
 def sync_back(account, cfg):
@@ -909,10 +949,17 @@ def snapshot(cfg):
     # aplikacja pyta co minutę, więc nie odświeża żadnych tokenów (to robią sesje
     # i automat), a świeże limity bierze tylko dla aktywnego konta; reszta z
     # pamięci do 10 minut, bo endpoint limitów dławi 429 i blokuje wtedy automat
-    if active:
+    orca = orca_selected(accounts)
+    if active and not orca:  # przy koncie wybranym w Orca niczego nie zapisujemy
         sync_back(active, cfg)
-        cached_usage(active, cfg, max_age=60, refresh=False)
-    rows = survey(accounts, cfg, max_age=600, refresh=False)
+    if active:
+        cached_usage(active, cfg, max_age=120, refresh=False)
+    rows = survey(accounts, cfg, max_age=1800, refresh=False)
+    if active and all(r["account"].id != active.id for r in rows):
+        # konto z listy "never" też bywa aktywne (np. wybrane ręcznie): pokazujemy je,
+        # tylko automat nigdy na nie nie przełącza
+        rows += survey([active], dict(cfg, never=[]), max_age=120, refresh=False)
+        rows[-1]["usable"] = False
     cache = load_json(USAGE_CACHE_PATH, {})
     order = {r["account"].id: i for i, r in enumerate(queue(rows), 1)}
     now = time.time()
@@ -959,6 +1006,7 @@ def snapshot(cfg):
         "api_backoff_until": state.get("api_backoff_until"),
         "last_tick": state.get("last_tick"),
         "switched_at": state.get("switched_at"),
+        "orca_selected": orca,
         "accounts": items,
     }
 
@@ -1059,6 +1107,10 @@ def cmd_switch(cfg, args):
     accounts = load_accounts()
     if not accounts:
         print("brak kont zarządzanych przez Orca")
+        return 1
+    orca = orca_selected(accounts)
+    if orca:
+        print(f"Orca ma wybrane konto {orca} i cofnie każde przełączenie. W Orca wybierz System default")
         return 1
     active = find_active(accounts, cfg)
     if active:
@@ -1216,6 +1268,17 @@ def cmd_tick(cfg, _args):
     accounts = load_accounts()
     if not accounts:
         return 1
+    orca = orca_selected(accounts)
+    if orca:
+        # Orca sama pilnuje wybranego konta i odświeża jego token: drugi gracz
+        # w tym samym miejscu to wyścig o refresh token i wylogowane konta
+        if load_state().get("orca_notified") != orca:
+            log(f"tick: Orca ma wybrane konto {orca}, automat stoi, dopóki w Orca nie będzie System default")
+            notify("Claude: automat wstrzymany", f"W Orca wybrane jest {orca}. Wybierz System default.")
+            update_state(orca_notified=orca)
+        return 0
+    if load_state().get("orca_notified"):
+        update_state(orca_notified=None)
     state = load_state()
     active = find_active(accounts, cfg)
 

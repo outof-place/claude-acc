@@ -80,6 +80,15 @@ class Env:
         for service in services or (scoped(self.config_dir), BASE):
             self.keychain[f"{service}|{USER}"] = json.dumps(blob)
 
+    def orca_selects(self, email):
+        """Orca w trybie kont zarządzanych: wybrane konto w jej ustawieniach, jak zapisuje je Orca."""
+        profile = os.path.join(self.home, "Library/Application Support/orca/profiles/local-default")
+        os.makedirs(profile, exist_ok=True)
+        selected = self.ids[email] if email else None
+        json.dump({"settings": {"activeClaudeManagedAccountId": selected,
+                                "activeClaudeManagedAccountIdsByRuntime": {"host": selected, "wsl": {}}}},
+                  open(os.path.join(profile, "orca-data.json"), "w"))
+
     def write(self):
         json.dump(self.server, open(os.path.join(self.fake, "server.json"), "w"))
         json.dump(self.keychain, open(os.path.join(self.fake, "keychain.json"), "w"))
@@ -215,23 +224,59 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(live["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
         self.assertEqual(live.get("mcpOAuth"), {"srv": "runtime-own"})
 
-    def test_switch_during_rate_limit_does_not_rotate_or_mark(self):
+    def test_switch_works_while_usage_endpoint_rate_limits(self):
+        # 429 z endpointu limitów blokował ręczne przełączanie na kwadrans, więc przełączało
+        # się w menu Orca; token sprawdza teraz API profilu, a limity nie są potrzebne
         w = Env()
         a = w.account("a@x")
         b = w.account("b@x")
         w.runtime(a)
+        w.server["rate_limited"] = True
         w.write()
         w.state(api_backoff_until=time.time() + 600)
 
         r = w.run("switch", "b@x")
 
-        self.assertNotEqual(r.returncode, 0)
-        self.assertEqual(w.managed("b@x")["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
         self.assertEqual(w.calls("/v1/oauth/token"), [])
         self.assertNotIn("b@x", w.saved_state().get("needs_login", {}))
 
+    def test_switch_refuses_while_orca_has_its_own_account_selected(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        w.orca_selects("a@x")
+
+        r = w.run("switch", "b@x")
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("System default", r.stdout)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], a["claudeAiOauth"])
+
 
 class StatusTest(unittest.TestCase):
+    def test_status_json_shows_active_account_even_when_excluded_from_rotation(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        cfg = os.path.join(w.state_dir, "config.json")
+        conf = json.load(open(cfg))
+        conf["never"] = ["a@x"]
+        json.dump(conf, open(cfg, "w"))
+        w.orca_selects("a@x")
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        active = [x for x in snap["accounts"] if x["active"]]
+        self.assertEqual([x["email"] for x in active], ["a@x"])
+        self.assertFalse(snap["foreign_runtime"])
+        self.assertEqual(snap["orca_selected"], "a@x")
+
     def test_status_json_never_refreshes_tokens(self):
         # panel pyta co minutę: odświeżanie tokenów zostaje przy automacie i sesjach
         w = Env()
@@ -291,6 +336,21 @@ class TickTest(unittest.TestCase):
         fresh = w.managed("a@x")["claudeAiOauth"]
         self.assertNotEqual(fresh["refreshToken"], a["claudeAiOauth"]["refreshToken"])
         self.assertEqual(w.entry(BASE)["claudeAiOauth"], fresh)
+
+    def test_tick_stands_down_while_orca_has_its_own_account_selected(self):
+        # Orca w trybie kont zarządzanych cofa przełączenia i sama odświeża tokeny:
+        # automat, który by się z nią przepychał, wylogowuje konta
+        w = Env()
+        a = w.account("a@x", session_used=99, expires_in=3 * 60)
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        w.orca_selects("a@x")
+
+        w.run("tick")
+
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], a["claudeAiOauth"])
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
 
     def test_tick_leaves_dead_active_account(self):
         # aktywne konto ma martwe tokeny w runtime i w kopii Orca: automat przechodzi na zdrowe

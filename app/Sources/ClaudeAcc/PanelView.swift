@@ -6,6 +6,10 @@ struct PanelView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if let snapshot = store.snapshot {
+                if let orca = snapshot.orcaSelected {
+                    OrcaWarning(email: orca)
+                        .padding([.horizontal, .top], 14)
+                }
                 ActiveSection(store: store, snapshot: snapshot)
                     .padding(14)
                 Divider()
@@ -97,7 +101,7 @@ private struct UsageBlock: View {
                 if let reset = window?.resetsAt {
                     Text("Reset \(Format.moment(reset)) · \(Format.until(reset))")
                 } else {
-                    Text("Okno jeszcze nie ruszyło")
+                    Text(window == nil ? "Brak danych" : "Okno jeszcze nie ruszyło")
                 }
             }
             .font(.caption)
@@ -130,7 +134,8 @@ private struct OthersSection: View {
                 .padding(.horizontal, 14)
                 .padding(.bottom, 4)
             ForEach(snapshot.others) { account in
-                AccountRow(store: store, account: account, isNext: account.id == snapshot.next?.id)
+                AccountRow(store: store, account: account, isNext: account.id == snapshot.next?.id,
+                           switchBlocked: snapshot.orcaSelected != nil)
             }
         }
     }
@@ -140,6 +145,7 @@ private struct AccountRow: View {
     let store: Store
     let account: Account
     let isNext: Bool
+    let switchBlocked: Bool
     @State private var hovering = false
 
     var body: some View {
@@ -162,7 +168,7 @@ private struct AccountRow: View {
         .onHover { hovering = $0 }
         .contextMenu {
             Button("Przełącz na to konto") { Task { await store.switchTo(account) } }
-                .disabled(store.busy != nil || account.status == .needsLogin)
+                .disabled(store.busy != nil || account.status == .needsLogin || switchBlocked)
             Button("Zaloguj ponownie") { Task { await store.login(account) } }
                 .disabled(store.busy != nil)
         }
@@ -216,7 +222,7 @@ private struct AccountRow: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(store.busy != nil)
-            } else if hovering {
+            } else if hovering && !switchBlocked {
                 Button("Przełącz") { Task { await store.switchTo(account) } }
                     .controlSize(.small)
                     .disabled(store.busy != nil)
@@ -347,9 +353,11 @@ private struct Footer: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(tickAge.map { $0 < 600 } == true ? Color.green : Color.orange)
+                    .fill(tickAge.map { $0 < 600 } == true && snapshot.orcaSelected == nil ? Color.green : Color.orange)
                     .frame(width: 7, height: 7)
-                if let tickAge, tickAge < 600 {
+                if snapshot.orcaSelected != nil {
+                    Text("Automat wstrzymany, konto wybrane w Orca")
+                } else if let tickAge, tickAge < 600 {
                     Text("Automat sprawdzał \(Format.ago(snapshot.lastTick, now: now))")
                 } else if snapshot.lastTick == nil {
                     Text("Automat jeszcze się nie odezwał")
@@ -369,6 +377,26 @@ private struct Footer: View {
 }
 
 // MARK: drobne elementy
+
+/// Orca w trybie kont zarządzanych: cofa przełączenia i sama odświeża tokeny,
+/// więc automat stoi, żeby nie ścigać się z nią o refresh token.
+private struct OrcaWarning: View {
+    let email: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("W Orca wybrane jest konto \(email)", systemImage: "exclamationmark.triangle.fill")
+                .font(.callout.weight(.semibold))
+            Text("Orca cofa przełączenia i sama odświeża tokeny, a dwóch odświeżających wylogowuje konta. Automat i przełączanie stoją. W Orca, w menu kont Claude, wybierz System default.")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(.orange)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
 
 private struct EmptyState: View {
     let store: Store

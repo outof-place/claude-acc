@@ -11,6 +11,8 @@ struct Snapshot: Decodable {
     let apiBackoffUntil: Double?
     let lastTick: Double?
     let switchedAt: Double?
+    /// Konto wybrane w menu Orca. Wtedy automat stoi, a przełączanie jest zablokowane.
+    let orcaSelected: String?
     let accounts: [Account]
 
     var active: Account? { accounts.first { $0.active } }
