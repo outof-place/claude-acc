@@ -10,7 +10,7 @@ The UI text and the code comments are in Polish.
 
 - **Menu bar ring** with the usage of the active account, for whichever window (5 hours or weekly) runs out first. It turns orange at 75% and red at 90%. An orange dot means some account needs to log in again.
 - **Panel** with every account: 5-hour and weekly bars, when each window resets ("za 2h 5min", "za 4d 4h"), which account goes next, and when the subscription renews. For the active account it also shows when, at the current pace, the watcher will switch away from it.
-- **Automatic switching** when the active account is down to 5% of the session or 3% of the week. It picks the account with the most weekly headroom and keeps accounts you mark as last resort (a company seat, say) for the end.
+- **Automatic switching** when the active account is down to 5% of the session or 3% of the week. It picks the account with the most weekly headroom and keeps accounts you mark as last resort (a company seat, say) for the end. An account whose subscription is canceled is skipped, and it comes back on its own once the subscription is renewed.
 - **One-click switch** to any account. Running sessions keep working because Claude Code reads its credentials from the Keychain on the fly.
 - **Log in again** for an account whose refresh token died. The button runs `claude auth login` in the background and opens the browser with the email pre-filled. Before saving anything, it asks the API which account you actually signed into, so a browser logged into the wrong account can't overwrite anything.
 
@@ -27,17 +27,17 @@ A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Cla
 Each of these rules comes from an account that actually lost its login while the tool was being built:
 
 - Refreshing a token rotates it, and presenting a refresh token that was already used got the whole account logged out. Claude Code sessions refresh the active account on their own, about 5 minutes before the token expires, so the watcher never refreshes the active account while a session could. It copies the pair the session wrote instead, from whichever Keychain entry the sessions use (`Claude Code-credentials` without `CLAUDE_CONFIG_DIR`, the hashed one with it). It refreshes the active account itself only once the token has been expired for 15 minutes, when no session is running.
-- Inactive accounts are refreshed only by the watcher and your clicks, one process at a time behind a file lock. The panel only reads.
+- An inactive account whose token no session holds is refreshed by whichever process reads it first (the watcher, a click, or the panel), one process at a time behind a file lock. The panel never refreshes a token that a session in any config directory may hold.
 - It never writes a token it hasn't checked against the API first. A future expiry date doesn't prove the token still works.
 - It replaces only `claudeAiOauth`. The same Keychain entry holds `mcpOAuth`, the tokens of your MCP servers, which belong to the config directory and survive every switch.
-- A 429 from the usage endpoint means "unknown", never "dead". It backs off for 15 minutes and doesn't refresh or flag anything in the meantime. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled.
+- A 429 from the usage endpoint means "unknown", never "dead". It backs off for 2 minutes, then 4, 8 and 15 while the endpoint keeps refusing, starts over after the first good answer, and doesn't refresh or flag anything in the meantime. Claude Code and Orca poll the same endpoint too, so it can throttle even while this tool is quiet. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled. Accounts with a canceled subscription get a 403 there, so they aren't asked at all.
 - Before overwriting the live entry it copies the token there back to its Orca copy, because the running session may have rotated it since the last switch.
 
 ## Requirements
 
 - macOS 14 or newer, with Swift 6 (Xcode or the command line tools) to build the app.
 - `/usr/bin/python3` (ships with the command line tools).
-- Claude Code. Tested with 2.1.282.
+- Claude Code. Tested with 2.1.284.
 - Orca with your Claude accounts added as managed accounts, and **System default** selected as the active Claude account in Orca. With a managed account selected, Orca puts its own account back whenever a terminal starts and every 15 minutes, undoing every switch, and it refreshes that account's token itself. claude-acc reads Orca's settings, and while an account is selected there the watcher stands down, switching is blocked and the panel tells you to pick System default.
 
 ## Install
