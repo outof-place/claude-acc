@@ -277,12 +277,14 @@ class StatusTest(unittest.TestCase):
         self.assertFalse(snap["foreign_runtime"])
         self.assertEqual(snap["orca_selected"], "a@x")
 
-    def test_status_json_never_refreshes_tokens(self):
-        # panel pyta co minutę: odświeżanie tokenów zostaje przy automacie i sesjach
+    def test_status_json_never_refreshes_tokens_a_session_may_hold(self):
+        # b@x żyje w sesjach innego katalogu konfiguracji: odświeżenie z panelu
+        # ścigałoby się z tymi sesjami o refresh token
         w = Env()
         a = w.account("a@x")
-        w.account("b@x", expired=True)
+        b = w.account("b@x", expired=True)
         w.runtime(a)
+        w.runtime(b, services=[scoped(w.other_dir)])
         w.write()
 
         r = w.run("status", "--json")
@@ -291,6 +293,49 @@ class StatusTest(unittest.TestCase):
         emails = [x["email"] for x in json.loads(r.stdout)["accounts"]]
         self.assertEqual(sorted(emails), ["a@x", "b@x"])
         self.assertEqual(w.calls("/v1/oauth/token"), [])
+
+
+class PanelFreshnessTest(unittest.TestCase):
+    def test_status_json_refreshes_idle_account_only_orca_holds(self):
+        # nieaktywne konto, którego tokenu nie trzyma żadna sesja: panel sam go
+        # odświeża, zamiast pokazywać dane sprzed kilkunastu godzin
+        w = Env()
+        a = w.account("a@x")
+        b = w.account("b@x", expired=True, weekly_used=42)
+        w.runtime(a)
+        w.write()
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(len(w.calls("/v1/oauth/token")), 1)
+        self.assertNotEqual(w.managed("b@x")["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["weekly"]["used"], 42)
+        self.assertEqual(row["status"], "ok")
+
+    def test_rate_limit_backoff_grows_and_resets(self):
+        # 15 minut po każdym 429 oślepiało automat, choć API wracało po paru minutach
+        w = Env()
+        a = w.account("a@x")
+        w.runtime(a)
+        w.server["rate_limited"] = True
+        w.write()
+
+        w.run("status", "--json")
+        first = w.saved_state()["api_backoff_until"] - time.time()
+        w.state(api_backoff_until=0)
+        w.run("status", "--json")
+        second = w.saved_state()["api_backoff_until"] - time.time()
+        server = json.load(open(os.path.join(w.fake, "server.json")))
+        server["rate_limited"] = False
+        json.dump(server, open(os.path.join(w.fake, "server.json"), "w"))
+        w.state(api_backoff_until=0)
+        w.run("status", "--json")
+
+        self.assertAlmostEqual(first, 120, delta=15)
+        self.assertAlmostEqual(second, 240, delta=15)
+        self.assertNotIn("api_backoff_until", w.saved_state())
+        self.assertNotIn("api_backoff_step", w.saved_state())
 
 
 class TickTest(unittest.TestCase):

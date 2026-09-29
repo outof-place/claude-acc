@@ -50,6 +50,8 @@ USAGE_CACHE_PATH = os.path.join(STATE_DIR, "usage-cache.json")
 # ile token aktywnego konta musi być przeterminowany, zanim automat sam go odświeży:
 # wcześniej robią to sesje Claude Code i drugi odświeżający zabija konto
 IDLE_REFRESH_AFTER = 15 * 60
+# kolejne przerwy po 429 z endpointu limitów; sukces zeruje licznik
+BACKOFF_STEPS = [120, 240, 480, 900]
 
 MANAGED_SERVICE = "Orca Claude Code Managed Credentials"
 ACTIVE_SERVICE = "Claude Code-credentials"
@@ -443,12 +445,16 @@ def fetch_usage(access_token):
         "User-Agent": USER_AGENT,
     })
     if status == 429:
-        update_state(api_backoff_until=time.time() + 900)
-        log("API limitów zwróciło 429, wstrzymuję odpytywanie na 15 minut")
-    elif until:
+        # narastające przerwy: stałe 15 minut oślepiało automat, a API wracało po paru
+        step = min(load_state().get("api_backoff_step", 0), len(BACKOFF_STEPS) - 1)
+        update_state(api_backoff_until=time.time() + BACKOFF_STEPS[step], api_backoff_step=step + 1)
+        log(f"API limitów zwróciło 429, wstrzymuję odpytywanie na {BACKOFF_STEPS[step] // 60} min")
+    elif status == 200:
         state = load_state()
-        state.pop("api_backoff_until", None)
-        save_state(state)
+        if "api_backoff_until" in state or "api_backoff_step" in state:
+            state.pop("api_backoff_until", None)
+            state.pop("api_backoff_step", None)
+            save_state(state)
     return status, data
 
 
@@ -880,7 +886,7 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
             rows.append({"account": a, "data": None, "why": "wymaga ponownego logowania",
                          "usable": False, "error": True})
             continue
-        data, note = cached_usage(a, cfg, max_age=max_age, refresh=refresh)
+        data, note = cached_usage(a, cfg, max_age=max_age, refresh=refresh(a) if callable(refresh) else refresh)
         if not data:
             rows.append({"account": a, "data": None, "why": note, "usable": False, "error": True})
             continue
@@ -959,7 +965,12 @@ def snapshot(cfg):
         sync_back(active, cfg)
     if active:
         cached_usage(active, cfg, max_age=120, refresh=False)
-    rows = survey(accounts, cfg, max_age=1800, refresh=False)
+    # Tokeny, które może trzymać jakaś sesja, zostają nietknięte. Konto, którego
+    # token leży tylko w kopii Orca, odświeżamy: nikt inny go nie używa, a bez
+    # tego panel pokazywał dane sprzed kilkunastu godzin.
+    held = {oauth_of(kc_read(s, KEYCHAIN_USER)).get("refreshToken") for s in runtime_services(cfg)}
+    idle = lambda a: not orca and a.oauth.get("refreshToken") not in held
+    rows = survey(accounts, cfg, max_age=1800, refresh=idle)
     if active and all(r["account"].id != active.id for r in rows):
         # konto z listy "never" też bywa aktywne (np. wybrane ręcznie): pokazujemy je,
         # tylko automat nigdy na nie nie przełącza
