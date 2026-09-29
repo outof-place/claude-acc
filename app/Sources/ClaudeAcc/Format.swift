@@ -58,9 +58,11 @@ enum Format {
         }
     }
 
-    /// Wiek danych bez słowa "temu": "12 min", "3h".
+    /// Wiek danych bez słowa "temu": "12 min", "3h", "1d 14h".
     static func age(_ seconds: Int) -> String {
-        seconds < 3600 ? "\(seconds / 60) min" : "\(seconds / 3600)h"
+        let hours = seconds / 3600
+        if hours >= 24 { return "\(hours / 24)d \(hours % 24)h" }
+        return seconds < 3600 ? "\(seconds / 60) min" : "\(hours)h"
     }
 
     static func ago(_ epoch: Double?, now: Date) -> String {

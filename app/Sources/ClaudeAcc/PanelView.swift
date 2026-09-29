@@ -196,7 +196,7 @@ private struct AccountRow: View {
 
     private var caption: String {
         if account.status == .error {
-            let age = account.dataAge.map { " (dane sprzed \($0 / 60) min)" } ?? ""
+            let age = account.dataAge.map { " (dane sprzed \(Format.age($0)))" } ?? ""
             return account.note + age
         }
         // okno 5h rusza dopiero przy pierwszym użyciu, więc nieużywane konto nie ma resetu
