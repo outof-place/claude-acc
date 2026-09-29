@@ -337,6 +337,45 @@ class PanelFreshnessTest(unittest.TestCase):
         self.assertNotIn("api_backoff_until", w.saved_state())
         self.assertNotIn("api_backoff_step", w.saved_state())
 
+    def test_status_json_stops_polling_usage_of_canceled_subscription(self):
+        # API limitów odpowiada anulowanemu kontu 403, a panel pytał o nie co minutę,
+        # przybliżając 429 dla wszystkich kont; w panelu wisiał przy tym błąd
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.server["subscription"] = {"b@x": "canceled"}
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()), "email": "b@x", "status": "canceled"}})
+
+        w.run("status", "--json")
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(len(w.calls("/api/oauth/usage")), 1)  # tylko aktywne konto, raz
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["note"], "subskrypcja: canceled, automat pomija")
+        self.assertIsNone(row["queue"])
+
+    def test_renewed_subscription_returns_to_rotation_by_itself(self):
+        # status subskrypcji sprawdzany w profilu raz na 12 h: po odnowieniu konto
+        # wraca do kolejki bez ręcznego grzebania w stanie
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 13 * 3600, "email": "b@x",
+                                         "status": "canceled"}})
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["subscription_status"], "active")
+        self.assertTrue(row["usable"])
+        self.assertIsNotNone(row["queue"])
+        self.assertEqual(row["weekly"]["used"], 20)
+
 
 class TickTest(unittest.TestCase):
     def test_tick_follows_session_refresh_instead_of_refreshing_itself(self):

@@ -886,18 +886,24 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
             rows.append({"account": a, "data": None, "why": "wymaga ponownego logowania",
                          "usable": False, "error": True})
             continue
-        data, note = cached_usage(a, cfg, max_age=max_age, refresh=refresh(a) if callable(refresh) else refresh)
+        may_refresh = refresh(a) if callable(refresh) else refresh
+        # Anulowane konto automat pomija. Limitów o nie nie pytamy: API odpowiada
+        # 403, a panel pytał co minutę i przybliżał 429 dla reszty kont. Status
+        # odświeża profil raz na 12 h, więc po odnowieniu konto samo wraca do rotacji.
+        status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
+        if status and status != "active":
+            status = (identity(a, cfg, refresh=may_refresh) or {}).get("status")
+        if status and status != "active":
+            rows.append({"account": a, "data": None, "why": f"subskrypcja: {status}, automat pomija",
+                         "usable": False, "error": True, "skipped": True})
+            continue
+        data, note = cached_usage(a, cfg, max_age=max_age, refresh=may_refresh)
         if not data:
             rows.append({"account": a, "data": None, "why": note, "usable": False, "error": True})
             continue
         session_left, weekly_left = headroom(data)
         usable = weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]
         why = f"zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji"
-        # status subskrypcji z pamięci profilu: anulowane konto automat pomija, a po
-        # odnowieniu samo wraca do rotacji, bez ręcznego dopisywania do "never"
-        status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
-        if status and status != "active":
-            usable, why = False, f"subskrypcja: {status}, automat pomija"
         remember_fingerprint(a.email, data)
         rows.append({
             "account": a, "data": data, "usable": usable, "error": False,
@@ -983,7 +989,8 @@ def snapshot(cfg):
     for r in rows:
         a = r["account"]
         who = identity(a, cfg, refresh=False) or {}
-        status = "needs_login" if needs_login(a) else ("error" if r["error"] else "ok")
+        # pominięte konto to nie błąd: ma ostatnie znane limity, a panel mówi dlaczego stoi
+        status = "needs_login" if needs_login(a) else ("error" if r["error"] and not r.get("skipped") else "ok")
         # przy błędzie odczytu pokazujemy ostatnie znane limity z ich wiekiem
         hit = cache.get(a.email)
         data = r["data"] or (settled(hit["data"]) if hit else None)
