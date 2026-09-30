@@ -20,6 +20,8 @@ Komendy:
   switch --auto     przełącz na następne z kolejki
   login <email>     zaloguj konto ponownie w przeglądarce, bez Orca i terminala
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
+  depot [--force]   token sandboxów `depot claude`: konto i ważność, --force wysyła od nowa
+  depot --fallback  zapisz długi token z `claude setup-token` na wypadek braku konta z zapasem
   watch [sekundy]   pętla ticków na pierwszym planie
 """
 
@@ -80,7 +82,17 @@ DEFAULT_CONFIG = {
     # konta całkiem wyłączone z rotacji
     "never": [],
     "history_keep_hours": 48,
+    # sandboxy Claude Code w Depot (`depot claude`) biorą CLAUDE_CODE_OAUTH_TOKEN z sekretu
+    # organizacji; tick trzyma tam konto z największym zapasem poza kontem lokalnym
+    "depot_sync": True,
+    # ile godzin ważności musi mieć token wysłany do Depot; krótszy wymieniamy
+    "depot_min_valid_hours": 4,
+    # ścieżka CLI Depot; pusta = szukaj na PATH i w Homebrew
+    "depot_bin": "",
 }
+
+DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
+DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
 
 
 # ---------- drobne narzędzia ----------
@@ -929,6 +941,101 @@ def queue(rows):
 
 
 
+# ---------- Depot: token sandboxów `depot claude` ----------
+
+def depot_bin(cfg):
+    """Ścieżka CLI Depot; launchd startuje z ubogim PATH, więc sprawdzamy też Homebrew."""
+    if cfg.get("depot_bin"):
+        return cfg["depot_bin"] if os.path.exists(cfg["depot_bin"]) else None
+    found = shutil.which("depot")
+    if found:
+        return found
+    return next((p for p in ("/opt/homebrew/bin/depot", "/usr/local/bin/depot") if os.path.exists(p)), None)
+
+
+def depot_push(depot, token):
+    r = subprocess.run([depot, "claude", "secrets", "add", DEPOT_SECRET, "--value", token],
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode == 0, (r.stderr or r.stdout or "").strip()[:200]
+
+
+def token_hash(token):
+    return hashlib.sha256((token or "").encode()).hexdigest()[:12]
+
+
+def depot_sync(accounts, cfg, active, force=False):
+    """Trzyma w sekrecie Depot token konta z największym zapasem POZA kontem lokalnym.
+
+    Sandbox `depot claude` czyta CLAUDE_CODE_OAUTH_TOKEN przy starcie sesji, więc token
+    musi mieć zapas ważności (depot_min_valid_hours). Wymiana następuje, gdy konto
+    sandboxów traci zapas, token dobiega końca albo konto stało się lokalnym: dwie
+    strony palące jedno konto wyczerpują je dwa razy szybciej. Odświeżamy wyłącznie
+    konta nieaktywne, bo token aktywnego rotują sesje Claude Code. Bez konta z zapasem
+    idzie długi token z `depot --fallback`, jeśli jest. Zwraca e-mail konta sandboxów.
+    """
+    if not cfg.get("depot_sync"):
+        return None
+    depot = depot_bin(cfg)
+    if not depot:
+        return None
+    state = load_state()
+    now = time.time()
+    min_valid = cfg["depot_min_valid_hours"] * 3600
+    current = next((a for a in accounts if a.email == state.get("depot_email")), None)
+    if current and not force and (not active or current.id != active.id) \
+            and state.get("depot_expires_at", 0) - now > min_valid:
+        data, _ = cached_usage(current, cfg, max_age=600, refresh=False)
+        if data:
+            session_left, weekly_left = headroom(data)
+            if weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]:
+                return current.email  # konto sandboxów niesie, token ważny: nic do roboty
+
+    rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
+    for row in rows:
+        target = row["account"]
+        expires = oauth_of(target.creds_json or "").get("expiresAt", 0) / 1000
+        creds_json, note = ensure_fresh(target, cfg, force=expires - now < min_valid)
+        if not creds_json:
+            log(f"depot: {target.email}: {note}")
+            continue
+        oauth = oauth_of(creds_json)
+        token, expires = oauth.get("accessToken"), oauth.get("expiresAt", 0) / 1000
+        if not token or expires - now < min_valid:
+            continue
+        if token_hash(token) == state.get("depot_token_mark") and not force:
+            return target.email
+        ok, err = depot_push(depot, token)
+        if not ok:
+            log(f"depot: wysyłka tokenu nieudana: {err}")
+            return None
+        update_state(depot_email=target.email, depot_expires_at=int(expires),
+                     depot_token_mark=token_hash(token), depot_synced_at=int(now))
+        log(f"depot: sandboxy na {target.email}, token ważny do {datetime.fromtimestamp(expires):%H:%M}")
+        return target.email
+
+    fallback = kc_read(DEPOT_FALLBACK_SERVICE, KEYCHAIN_USER)
+    if fallback and (force or state.get("depot_token_mark") != token_hash(fallback)):
+        ok, err = depot_push(depot, fallback)
+        if ok:
+            update_state(depot_email="fallback", depot_expires_at=0,
+                         depot_token_mark=token_hash(fallback), depot_synced_at=int(now))
+            log("depot: brak konta z zapasem poza lokalnym, sandboxy na tokenie zapasowym")
+            return "fallback"
+        log(f"depot: wysyłka tokenu zapasowego nieudana: {err}")
+    elif not rows:
+        log("depot: brak konta z zapasem poza lokalnym, token sandboxów bez zmian")
+    return None
+
+
+def depot_sync_safe(accounts, cfg, active, force=False):
+    """Depot to dodatek: jego błąd nie może zatrzymać pilnowania kont."""
+    try:
+        return depot_sync(accounts, cfg, active, force=force)
+    except Exception as err:
+        log(f"depot: błąd {err}")
+        return None
+
+
 # ---------- komendy ----------
 
 def window_view(window):
@@ -1146,6 +1253,7 @@ def cmd_switch(cfg, args):
             print(f"nie znam konta {args[0]}")
             return 1
         switch_to(target, cfg, "ręcznie")
+        depot_sync_safe(accounts, cfg, target)
         print(f"przełączono na {target.email}")
         return 0
     rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None))
@@ -1153,6 +1261,7 @@ def cmd_switch(cfg, args):
         print("żadne konto nie ma zapasu, sprawdź claude-acc status")
         return 1
     switch_to(rows[0]["account"], cfg, "ręcznie --auto")
+    depot_sync_safe(accounts, cfg, rows[0]["account"])
     print(f"przełączono na {rows[0]['account'].email}")
     return 0
 
@@ -1316,6 +1425,7 @@ def cmd_tick(cfg, _args):
         update_state(hands_off_notified=False)
 
     sync_back(active, cfg)
+    depot_sync_safe(accounts, cfg, active)
     dead = needs_login(active)
     data, note = (None, "token nie działa") if dead else active_usage(active, cfg)
     if not data and not dead:
@@ -1346,6 +1456,7 @@ def cmd_tick(cfg, _args):
 
     target = candidates[0]["account"]
     switch_to(target, cfg, reason)
+    depot_sync_safe(accounts, cfg, target)  # sandboxy nie mogą zostać na nowym koncie lokalnym
     left = headroom(candidates[0]["data"])[1]
     if target.email in cfg["last_resort"]:
         notify("Claude: wchodzę na konto firmowe",
@@ -1367,8 +1478,38 @@ def cmd_watch(cfg, args):
         time.sleep(interval)
 
 
+def cmd_depot(cfg, args):
+    """Stan i wymiana tokenu sandboxów `depot claude`."""
+    if "--fallback" in args:
+        import getpass
+        token = getpass.getpass("token z `claude setup-token` (nie pokazuje się): ").strip()
+        if not token.startswith("sk-ant-"):
+            print("to nie wygląda na token Claude Code")
+            return 1
+        kc_write(DEPOT_FALLBACK_SERVICE, KEYCHAIN_USER, token)
+        print("token zapasowy zapisany w Pęku kluczy")
+        return 0
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę")
+        return 1
+    if not depot_bin(cfg):
+        print("brak CLI depot (brew install depot/tap/depot)")
+        return 1
+    accounts = load_accounts()
+    email = depot_sync(accounts, cfg, find_active(accounts, cfg), force="--force" in args)
+    state = load_state()
+    if not email:
+        print("sandboxy Depot bez zmiany tokenu, szczegóły w switch.log")
+        return 1
+    until = state.get("depot_expires_at")
+    print(f"sandboxy Depot: {email}" + (f", token ważny do {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}" if until else ""))
+    return 0
+
+
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
-            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "watch": cmd_watch}
+            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "watch": cmd_watch,
+            "depot": cmd_depot}
 
 
 def main(argv):

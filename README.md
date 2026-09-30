@@ -61,6 +61,8 @@ The installer copies the script to `~/.local/share/claude-acc`, adds a `claude-a
 | `claude-acc login <email>` | Log the account in again in the browser |
 | `claude-acc heal [--deep]` | Recover accounts whose Orca copy died after a rotation elsewhere |
 | `claude-acc tick` | One watcher pass (what launchd runs) |
+| `claude-acc depot [--force]` | Which account the Depot sandboxes run on; `--force` sends its token again |
+| `claude-acc depot --fallback` | Store a long-lived `claude setup-token` token for when no account has headroom |
 
 ## Configuration
 
@@ -75,6 +77,13 @@ The installer copies the script to `~/.local/share/claude-acc`, adds a `claude-a
 | `never` | `[]` | Emails never switched to |
 | `config_dir` | `~/.claude` | The config directory whose sessions get switched |
 | `other_config_dirs` | `[]` | Other config directories whose entries get the new token when an account refreshes, but are never switched |
+| `depot_sync` | `true` | Keep the `CLAUDE_CODE_OAUTH_TOKEN` secret of `depot claude` sandboxes on an account with headroom |
+| `depot_min_valid_hours` | `4` | A token sent to Depot must stay valid at least this long; a shorter one is refreshed first |
+| `depot_bin` | `""` | Path of the Depot CLI; empty means `PATH`, then Homebrew |
+
+## Depot sandboxes
+
+[`depot claude`](https://depot.dev/docs/agents/claude-code/quickstart) starts Claude Code in a remote sandbox with the token stored in the organization secret `CLAUDE_CODE_OAUTH_TOKEN`. Every tick keeps that secret on the account first in the switching order **other than the local one**, so the laptop and the sandboxes never burn the same account. The token is sent again only when that account runs out of headroom, becomes the local account, or has less than `depot_min_valid_hours` of validity left; an idle account's token is refreshed before it is sent, the active account's never (its sessions own that refresh). With no other account left, the long-lived token from `claude-acc depot --fallback` goes out instead. A Depot failure is logged and never stops the switching. Requires the Depot CLI logged in to the organization (`depot login`).
 
 ## Tests
 
