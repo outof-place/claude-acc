@@ -22,6 +22,8 @@ final class Store {
     private(set) var panelOpen = false
     private(set) var problem: String?
     private(set) var busy: Busy?
+    /// `claude-acc resume` is running: the pause notice keeps its button disabled.
+    private(set) var resuming = false
     var notice: Notice?
     private(set) var launchAtLogin = false
     private(set) var janitor: JanitorState?
@@ -208,6 +210,19 @@ final class Store {
         guard let pid = loginPID else { return }
         loginCancelled = true
         kill(pid, SIGTERM)  // on SIGTERM the script also closes `claude auth login`
+    }
+
+    /// Lifts the limit pause until limits recover: paused sessions wake up right away.
+    func resumePaused() async {
+        guard !resuming else { return }
+        resuming = true
+        notice = nil
+        let result = await CLI.run(["resume"])
+        resuming = false
+        notice = result.status == 0
+            ? Notice(text: "Pause lifted, sessions are resuming")
+            : Notice(text: result.message.isEmpty ? "Couldn't lift the pause" : result.message, isError: true)
+        await refresh()
     }
 
     // MARK: Cleanup

@@ -8,6 +8,9 @@ struct ActiveAccountCard: View {
     var body: some View {
         Card("Claude Code", symbol: "terminal.fill") {
             if let snapshot = store.snapshot {
+                if let pause = snapshot.pause {
+                    PauseNotice(store: store, pause: pause)
+                }
                 if let active = snapshot.active {
                     ActiveAccount(store: store, snapshot: snapshot, account: active)
                 } else {
@@ -83,6 +86,54 @@ private struct ActiveAccount: View {
             }
         }
         .animation(.smooth(duration: 0.32), value: showDetails)
+    }
+}
+
+/// The limit pause: every account is out of headroom, so the hooks told the running sessions
+/// to finish their step, save their state and wait. They wake on their own when limits recover;
+/// the button lifts the pause sooner, until limits recover and run out again.
+private struct PauseNotice: View {
+    let store: Store
+    let pause: Pause
+    @Environment(\.now) private var now
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "pause.circle.fill")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Sessions paused at a checkpoint").font(.callout.weight(.semibold))
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack {
+                Text("Since \(Format.moment(pause.since, now: now))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Resume Now", systemImage: "play.fill") { Task { await store.resumePaused() } }
+                    .panelButton()
+                    .controlSize(.small)
+                    .disabled(store.resuming)
+                    .help("Wake the paused sessions now. The pause comes back only after limits recover and run out again.")
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: .rect(cornerRadius: 16, style: .continuous))
+    }
+
+    private var detail: String {
+        let wake = pause.resumeAt.map {
+            "They wake up on their own around \(Format.moment($0, now: now)) (\(Format.until($0, now: now)))."
+        } ?? "They wake up on their own once an account has headroom again."
+        return "No account has headroom. Sessions finish their current step, save their state to TASKS.md and wait, and new subagents are held. "
+            + wake
     }
 }
 
