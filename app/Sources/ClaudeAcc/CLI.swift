@@ -29,6 +29,7 @@ enum CLI {
     static let fanConfig = directory + "/fans.json"
     static let fanState = directory + "/fans-state.json"
     static let perfState = directory + "/perf-state.json"
+    static let schedState = directory + "/sched/state.json"
     static let switchLog = directory + "/switch.log"
     static let janitorLog = directory + "/janitor.log"
     static let guardLog = directory + "/devguard.log"

@@ -25,10 +25,11 @@ struct PanelView: View {
                     Column(width: 350) {
                         ActiveAccountCard(store: store).fixedSize(horizontal: false, vertical: true)
                         AccountsCard(store: store)
+                        DiskCard(store: store).fixedSize(horizontal: false, vertical: true)
                     }
                     Column(width: 360) {
                         DevServersCard(store: store)
-                        DiskCard(store: store).fixedSize(horizontal: false, vertical: true)
+                        BuildsCard(store: store)
                     }
                     Column(width: 310) {
                         AwakeCard(awake: store.awake).fixedSize(horizontal: false, vertical: true)
