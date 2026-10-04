@@ -27,6 +27,10 @@ struct PanelView: View {
                         DiskCard(store: store)
                     }
                     .frame(width: 360)
+                    VStack(spacing: 12) {
+                        AwakeCard(awake: store.awake)
+                    }
+                    .frame(width: 300)
                 }
                 if let notice = store.notice {
                     Banner(

@@ -14,6 +14,10 @@ struct MenuBarLabel: View {
                 badge: badge))
             Text(text(used: used))
                 .monospacedDigit()
+            if store.awake.isOn {
+                // Stay Awake is holding the Mac up, like Amphetamine's pill
+                Image(systemName: "cup.and.heat.waves.fill")
+            }
         }
     }
 

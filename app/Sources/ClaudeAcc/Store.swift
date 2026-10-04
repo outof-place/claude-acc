@@ -31,6 +31,8 @@ final class Store {
     private var guardModeOverride: String?
     /// Rendering only: the account whose details start open.
     @ObservationIgnored var previewOpenAccount: String?
+    /// Stay Awake lives as long as the app: power assertions and the hotspot watch.
+    let awake: Awake
 
     @ObservationIgnored private var loginPID: Int32?
     @ObservationIgnored private var loginCancelled = false
@@ -46,6 +48,7 @@ final class Store {
 
     /// Rendering the panel to a file: fixed data, no timers, no login item.
     init(preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil) {
+        awake = Awake(preview: true)
         snapshot = preview
         readLocal()
         if let guardState { self.guardState = guardState }
@@ -53,6 +56,7 @@ final class Store {
     }
 
     init() {
+        awake = Awake()
         // quitting during a sign-in must not leave the script with `claude` behind
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main

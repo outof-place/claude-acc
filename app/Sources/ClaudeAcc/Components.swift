@@ -120,11 +120,23 @@ struct PillToggleStyle: ToggleStyle {
     var tint: Color = .green
 
     func makeBody(configuration: Configuration) -> some View {
+        PillToggle(configuration: configuration, tint: tint)
+    }
+}
+
+private struct PillToggle: View {
+    let configuration: ToggleStyleConfiguration
+    let tint: Color
+    @Environment(\.labelsVisibility) private var labels
+
+    var body: some View {
         Button {
             configuration.isOn.toggle()
         } label: {
             HStack(spacing: 6) {
-                configuration.label
+                if labels != .hidden {
+                    configuration.label
+                }
                 Capsule()
                     .fill(configuration.isOn ? AnyShapeStyle(tint.gradient) : AnyShapeStyle(.quaternary))
                     .frame(width: 28, height: 16)
