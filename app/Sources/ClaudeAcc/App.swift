@@ -33,6 +33,7 @@ struct ClaudeAccApp: App {
         var fans: FanState?
         var ultra: Ultra?
         var load: LoadReading?
+        var sched: SchedState?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
             output = CLIResult(status: text.isEmpty ? 1 : 0, stdout: text, stderr: "no file \(snapshotFile)")
@@ -50,6 +51,9 @@ struct ClaudeAccApp: App {
                let demo = try? JSONSerialization.jsonObject(with: data) as? [String: Double] {
                 load = LoadReading(cpu: demo["cpu"] ?? 0, pCores: demo["p_cores"], eCores: demo["e_cores"], gpu: demo["gpu"])
             }
+            if let data = try? Data(contentsOf: folder.appending(path: "demo-sched.json")) {
+                sched = Store.decode(SchedState.self, from: data)
+            }
             if let data = try? Data(contentsOf: folder.appending(path: "demo-perf.json")) {
                 ultra = Store.decode(PerfFile.self, from: data)?.ultra
             }
@@ -60,7 +64,7 @@ struct ClaudeAccApp: App {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched)
         store.previewOpenAccount = open
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
         let panel = PanelView(store: store, frozenNow: frozen)
