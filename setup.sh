@@ -78,7 +78,8 @@ APP="$HOME/Applications/Claude Acc.app"
 pkill -x ClaudeAcc 2>/dev/null || true
 rm -rf "$APP"
 ditto "$APP_SRC" "$APP"
-open "$APP"
+# tuż po pkill LaunchServices potrafi odrzucić pierwsze open (-600)
+open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
 
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
