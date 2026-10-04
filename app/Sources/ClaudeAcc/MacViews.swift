@@ -162,7 +162,7 @@ private struct ServerRow: View {
                         .layoutPriority(-1)
                     viewers
                     if unit.agentWorking {
-                        Image(systemName: "sparkles")
+                        Image(systemName: "hammer.fill")
                             .foregroundStyle(Format.violet)
                             .help("An agent is working in this worktree")
                     }
@@ -329,7 +329,7 @@ struct DiskCard: View {
                     Text("Cleaning…").font(.caption).foregroundStyle(.secondary)
                 }
             } else {
-                Button("Clean Up", systemImage: "sparkles") { Task { await store.sweep() } }
+                Button("Clean Up", systemImage: "trash") { Task { await store.sweep() } }
                     .panelButton()
                     .controlSize(.small)
                     .help("Delete unused build caches, stale node_modules and tool leftovers")

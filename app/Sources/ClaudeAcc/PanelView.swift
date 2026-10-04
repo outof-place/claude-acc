@@ -118,7 +118,7 @@ private struct FooterBar: View {
                 .toggleStyle(.pill)
             Menu("Logs") {
                 Button("Switch History", systemImage: "arrow.triangle.swap") { open(CLI.switchLog) }
-                Button("Cleanup Log", systemImage: "sparkles") { open(CLI.janitorLog) }
+                Button("Cleanup Log", systemImage: "doc.text") { open(CLI.janitorLog) }
                 Button("Dev Server Guard Log", systemImage: "server.rack") { open(CLI.guardLog) }
             }
             .menuStyle(.button)

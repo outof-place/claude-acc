@@ -6,7 +6,7 @@ struct ActiveAccountCard: View {
     let store: Store
 
     var body: some View {
-        Card("Claude Code", symbol: "sparkle") {
+        Card("Claude Code", symbol: "terminal.fill") {
             if let snapshot = store.snapshot {
                 if let active = snapshot.active {
                     ActiveAccount(store: store, snapshot: snapshot, account: active)
