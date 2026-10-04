@@ -13,7 +13,7 @@ struct PanelView: View {
     static let columnHeight: CGFloat = 640
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 5)) { context in
+        TimelineView(PanelClock(running: store.panelOpen)) { context in
             VStack(spacing: 12) {
                 if let email = store.snapshot?.orcaSelected {
                     Banner(
@@ -52,11 +52,26 @@ struct PanelView: View {
             }
             .padding(14)
             .environment(\.now, frozenNow ?? context.date)
+            .environment(\.animating, store.panelOpen)
         }
         .fontDesign(.rounded)
         .animation(.smooth(duration: 0.35), value: store.notice)
         .onAppear { store.panelAppeared() }
         .onDisappear { store.panelDisappeared() }
+    }
+}
+
+/// Every 5 seconds while the panel is open; closed, one entry and no more updates.
+private struct PanelClock: TimelineSchedule {
+    let running: Bool
+
+    func entries(from start: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next: Date? = start
+        let running = running
+        return AnyIterator {
+            defer { next = running ? next?.addingTimeInterval(5) : nil }
+            return next
+        }
     }
 }
 
@@ -78,6 +93,7 @@ private struct Column<Content: View>: View {
 private struct FooterBar: View {
     let store: Store
     @Environment(\.now) private var now
+    @Environment(\.animating) private var animating
 
     var body: some View {
         HStack(spacing: 14) {
@@ -90,7 +106,7 @@ private struct FooterBar: View {
                     .labelStyle(.iconOnly)
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
-                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: store.refreshing)
+                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: store.refreshing && animating)
                     .disabled(store.refreshing)
                     .help("Refresh")
             }

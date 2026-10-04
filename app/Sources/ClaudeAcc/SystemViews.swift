@@ -278,12 +278,13 @@ private struct ThermalChart: View {
 /// The fan glyph turns, faster as the fans do.
 private struct SpinningFan: View {
     let rpm: Double
+    @Environment(\.animating) private var animating
 
     var body: some View {
         Image(systemName: "fanblades.fill")
             .font(.callout)
             .foregroundStyle(Format.violet)
-            .symbolEffect(.rotate.clockwise, options: .repeat(.continuous).speed(max(rpm / 2500, 0.2)), isActive: rpm > 0)
+            .symbolEffect(.rotate.clockwise, options: .repeat(.continuous).speed(max(rpm / 2500, 0.2)), isActive: animating && rpm > 0)
             .help("\(Int(rpm)) rpm")
     }
 }

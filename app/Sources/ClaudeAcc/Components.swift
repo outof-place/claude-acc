@@ -5,6 +5,8 @@ extension EnvironmentValues {
     @Entry var now: Date = .now
     /// Drawing into a PNG: ImageRenderer leaves ScrollView content out, so lists render flat.
     @Entry var renderingToFile = false
+    /// Continuous animations (spinning glyphs) run only while the panel is on screen.
+    @Entry var animating = true
 }
 
 /// A list that scrolls inside its card in the live panel and lies flat in a PNG render.

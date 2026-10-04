@@ -17,6 +17,9 @@ final class Store {
 
     private(set) var snapshot: Snapshot?
     private(set) var refreshing = false
+    /// The panel window is on screen. Closed, it stays alive offscreen and would keep rendering
+    /// every frame of a running animation, so animations and clocks follow this.
+    private(set) var panelOpen = false
     private(set) var problem: String?
     private(set) var busy: Busy?
     var notice: Notice?
@@ -129,6 +132,7 @@ final class Store {
 
     /// While the panel is open the guard's numbers move every few seconds.
     func panelAppeared() {
+        panelOpen = true
         let age = Date.now.timeIntervalSince1970 - (snapshot?.generatedAt ?? 0)
         if age > 30 { Task { await refresh() } }
         live?.cancel()
@@ -141,6 +145,7 @@ final class Store {
     }
 
     func panelDisappeared() {
+        panelOpen = false
         live?.cancel()
         live = nil
     }
