@@ -110,7 +110,10 @@ Tylko w `queue[]`:
 
 Trasa minimalizuje `czas do wyniku + λ × jednostki Depot`:
 
-1. Mieści się teraz (`mem_predicted_gb ≤ free_for_admission_gb`): lokalnie, bez czekania.
+1. Mieści się teraz (`mem_predicted_gb ≤ free_for_admission_gb`): lokalnie, bez czekania, chyba
+   że ciężki job (ponad `small_gb`) jest na Depot o więcej szybszy, niż kosztuje:
+   `predicted_wall_s - depot_eta_s > lambda × units` (cały `internal/handlers`: ~25 min lokalnie,
+   8 min na Depot za $0,19).
 2. Nie zmieści się nawet na pustym Macu (`mem_predicted_gb > idle_max_gb`): zawsze Depot.
 3. Musi czekać: lokalnie, chyba że `local_eta_s - depot_eta_s > lambda × units`.
    `local_eta_s` to czekanie (aż przewidywany koniec blokujących jobów zwolni pamięć) plus bieg
