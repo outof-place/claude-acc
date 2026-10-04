@@ -32,15 +32,15 @@ cd claude-acc
 ./install-fsguard.sh      # optional, root: restarts a bloated fseventsd
 ```
 
-Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads its launchd jobs (the account watcher, the janitor, the dev server guard, Ultra's keeper and the updater) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
+Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads its launchd jobs (the account watcher, the janitor, the dev server guard, Ultra's keeper and the updater) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. It also adds the [limit pause hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks, keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
 
-After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app and the command and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
+After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app, the command and the limit pause hooks and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
 
 ## What it does
 
 | | |
 | --- | --- |
-| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
+| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. When no account is left, it [pauses your sessions at a checkpoint](#how-the-pause-works) instead of letting agents run into the wall, and wakes them when limits come back. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
 | **Dev server guard** | Agents in [Orca](https://github.com/stablyai/orca) each run their own `next dev` with a preview tab, and Turbopack grows to 6-9 GB per server under their edits. The guard watches every dev server's real memory (the number macOS kills by), knows who is looking at it, restarts a bloated one in its own Orca terminal in seconds, stops duplicates, orphans and loops, and turns away an agent about to start a second server of the same app. |
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
@@ -68,6 +68,8 @@ flowchart LR
         fans["fanctl<br/>every 2 s"]
     end
     hook["Claude Code<br/>PreToolUse hook"]
+    pausehooks["Claude Code<br/>pause hooks"]
+    pause[("pause.json")]
     keychain[("Keychain<br/>Claude + Orca entries")]
     api[("Anthropic API<br/>usage, profile")]
     orca["Orca CLI<br/>tabs, terminals, agents"]
@@ -76,7 +78,8 @@ flowchart LR
     smc[("SMC<br/>fans, sensors")]
     pkgs[("Homebrew, npm,<br/>Go programs")]
     app -.-> tick & guard & janitor & perf & fans & updates
-    tick --> keychain & api
+    tick --> keychain & api & pause
+    pausehooks --> pause
     guard --> orca
     janitor --> disk
     perf --> tuned
@@ -138,6 +141,20 @@ Each of these rules comes from an account that actually lost its login while the
 - A 429 from the usage endpoint means "unknown", never "dead". It backs off for 2 minutes, then 4, 8 and 15 while the endpoint keeps refusing, starts over after the first good answer, and doesn't refresh or flag anything in the meantime. Claude Code and Orca poll the same endpoint too, so it can throttle even while this tool is quiet. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled. Accounts with a canceled subscription get a 403 there, so they aren't asked at all.
 - Before overwriting the live entry it copies the token there back to its Orca copy, because the running session may have rotated it since the last switch.
 
+## How the pause works
+
+Claude Code already waits at a usage limit and continues on its own after the reset (`Continue automatically at usage limit` in `/config`, on by default). What it lacks is a warning early enough for subagents to stop cleanly, any warning before the weekly limit, and a way to know that capacity came back on another account. Agents that hit the wall stop halfway through an edit and have to be started over. The pause fills those gaps with Claude Code hooks, which setup adds to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) next to your own hooks.
+
+- The watcher writes `~/.local/share/claude-acc/pause.json` when the active account is down to its switch threshold and no other account qualifies. It removes the file once the active account or another one is back at `min_session_left` and `min_weekly_left` (15% and 8%), not just above the switch threshold, so sessions don't wake up for one minute of work. A switch to an account with headroom ends it too. A throttled usage read leaves the pause as it is. With an account selected in Orca, or Claude Code signed in to an account outside Orca, there is no pause, because the watcher isn't in charge then.
+- `hook.py` only reads that file. Outside a pause each hook costs two file tests in the shell and never starts Python.
+- `PostToolUse` delivers the checkpoint once per session and once per subagent: finish the current small step, write the state to `TASKS.md`, start nothing new, end the turn. Subagents return with a report of where they stopped. `PreToolUse` on `Agent` refuses new subagents. A message you type in a paused session lifts the pause for that session; subagent reports and Claude Code's own resume messages don't count.
+- `Stop` starts a background alarm (`asyncRewake`) in sessions that were told to stop. It checks the file every 20 seconds, exits quietly if the session got going some other way, and wakes the session with an instruction to resume from `TASKS.md` and continue its subagents through `SendMessage` instead of starting them over. `StopFailure` with `rate_limit` starts the same alarm for a session that hit the wall: Claude Code resumes it by itself after that account's reset, and the alarm wakes it earlier if the watcher switches to an account with headroom.
+- `claude-acc resume`, or **Resume Now** in the panel, lifts the pause by hand. It stays lifted until limits recover and run out again.
+- Ultra's `claude-hooks-async` never makes these hooks async: in the background their instructions would never reach the session.
+- Setup keeps a copy of `settings.json` from before its first change in `settings.json.bak-claude-acc`. `CLAUDE_ACC_NO_HOOKS=1` leaves the hooks out (and removes the ones an earlier setup added), and `claude-acc uninstall` removes them.
+
+To try the pause in one real session without pausing the others, start that session with its own pause file, `CLAUDE_ACC_PAUSE_FILE=/tmp/pause.json claude`, then create the file with `echo '{"episode": "1"}' > /tmp/pause.json` and delete it to end the pause. `CLAUDE_ACC_HOOK_LOG=/tmp/hook.log` logs every hook call.
+
 ## Requirements
 
 - macOS 26 or newer on Apple silicon, with Swift 6.2 or newer (Xcode or the command line tools) to build the app. Homebrew builds it for you.
@@ -156,6 +173,7 @@ Each of these rules comes from an account that actually lost its login while the
 | `claude-acc login <email>` | Log the account in again in the browser |
 | `claude-acc heal [--deep]` | Recover accounts whose Orca copy died after a rotation elsewhere |
 | `claude-acc tick` | One watcher pass (what launchd runs) |
+| `claude-acc resume` | Lift the limit pause until limits recover (the panel's Resume Now) |
 | `claude-acc depot [--force]` | Which account the Depot sandboxes run on; `--force` sends its token again |
 | `claude-acc depot --fallback` | Store a long-lived `claude setup-token` token for when no account has headroom |
 | `claude-acc clean [--dry-run]` | Clean up now: every janitor task, whatever its schedule |
@@ -179,7 +197,7 @@ Each of these rules comes from an account that actually lost its login while the
 | `claude-acc perf-root spotlight apps-only\|undo` | Root: Spotlight indexes apps only; undo restores the previous privacy list |
 | `claude-acc perf-root devtools add\|undo\|status` | Opens Developer Tools in System Settings and waits until Orca is on the list, so fresh Go test binaries skip Gatekeeper |
 | `claude-acc perf bench gatekeeper` | How long the first run of a freshly built binary waits for Gatekeeper from this terminal |
-| `claude-acc uninstall` | Remove the launchd jobs, the app and this command; settings stay |
+| `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
 ## Configuration
 
@@ -189,7 +207,7 @@ Each of these rules comes from an account that actually lost its login while the
 | --- | --- | --- |
 | `hard_session_left` | `5` | Switch when the active account has this % of the 5-hour window left |
 | `hard_weekly_left` | `3` | Switch when it has this % of the week left |
-| `min_session_left` / `min_weekly_left` | `15` / `8` | An account needs at least this much to be switched to |
+| `min_session_left` / `min_weekly_left` | `15` / `8` | An account needs at least this much to be switched to, and the limit pause ends once an account has it again |
 | `last_resort` | `[]` | Emails used only when nothing else has headroom |
 | `never` | `[]` | Emails never switched to |
 | `config_dir` | `~/.claude` | The config directory whose sessions get switched |
@@ -377,11 +395,11 @@ What was measured and left alone, in [`docs/perf-research.md`](docs/perf-researc
 /usr/bin/python3 -m unittest discover -s tests
 ```
 
-The tests run the real script end to end against fake `security`, `curl` and `claude` binaries put first on `PATH`, so they never touch your Keychain or your accounts. They cover logging in, switching during a 429, keeping MCP tokens, cancelling a login halfway, and leaving an account whose token died.
+The tests run the real script end to end against fake `security`, `curl` and `claude` binaries put first on `PATH`, so they never touch your Keychain or your accounts. They cover logging in, switching during a 429, keeping MCP tokens, cancelling a login halfway, leaving an account whose token died, and when the limit pause starts and ends. `tests/test_hook.py` runs each pause hook through the same shell command `settings.json` gets, with JSON on stdin as Claude Code sends it, on a temporary `$HOME`, and installs and removes the hooks in a temporary `settings.json`.
 
 The janitor tests run the real script on a temporary `$HOME` with the real `lsof`: caches that go, caches kept because a file is open or a dev server works in the app, a shell prompt that doesn't block, protected paths, stale and active projects, an interrupted delete, and `caps` dropping the oldest snapshots.
 
-The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, and a value someone changed after Ultra survives `ultra off`.
+The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, a value someone changed after Ultra survives `ultra off`, and Ultra and the pause hooks come off in either order without taking each other's entries along.
 
 The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go` and `pip` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, the 3-day interval and the next-night retry, Python reported and never upgraded, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
 
@@ -393,7 +411,7 @@ To see the panel without clicking the menu bar, render it to a PNG, from live da
 "$HOME/Applications/Claude Acc.app/Contents/MacOS/ClaudeAcc" --render panel.png --snapshot docs/demo-snapshot.json
 ```
 
-With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json`, `demo-fans.json` and `demo-updates.json` next to it stand in for the guard, cleanup, fan and update state. `--open <account id>` renders that account opened. `--hover <account id>` renders that row as if the pointer were over it. Lists that scroll in the panel come out in full.
+With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json`, `demo-fans.json` and `demo-updates.json` next to it stand in for the guard, cleanup, fan and update state. `docs/demo-snapshot-pause.json` is the same panel during a limit pause. `--open <account id>` renders that account opened. `--hover <account id>` renders that row as if the pointer were over it. Lists that scroll in the panel come out in full.
 
 ## Caveats
 
