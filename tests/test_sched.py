@@ -363,6 +363,16 @@ class RouteTest(Paths):
         self.assertIsNone(target)
         self.assertIn("Depot would cost $", route["text"])
 
+    def test_small_job_stuck_behind_heavy_goes_to_depot(self):
+        st = self.state()
+        self.running(st, 18.0, wall=300)  # wolne 2,8 GB przez 5 minut
+        small = self.job("cd apps/charter-service && go test ./internal/moneyfmt/")
+        route, target = S.decide_route(st, small, 3.0, 40, self.cfg, {})
+        self.assertEqual(
+            (route["choice"], route["why"], target["cores"]), ("depot", "cost", 2)
+        )
+        self.assertLess(route["units"], 2)
+
     def test_lambda_moves_the_line(self):
         st = self.state()
         self.running(st, 18.0, wall=600)

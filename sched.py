@@ -1301,10 +1301,10 @@ def decide_route(state, job, gb, wall, cfg, cache):
         "cost_usd": None,
         "saves_s": None,
     }
-    target = depot_target(job, gb, wall, cfg, cache) if gb > cfg["small_gb"] else None
     if gb <= mem["free_for_admission_gb"]:
-        # mieści się teraz; Depot tylko wtedy, gdy jest tam dużo szybszy, niż kosztuje
-        # (cały internal/handlers: ~25 min lokalnie, 8 min na Depot za $0,19)
+        # mieści się teraz; ciężki job idzie na Depot tylko wtedy, gdy jest tam dużo szybszy,
+        # niż kosztuje (cały internal/handlers: ~25 min lokalnie, 8 min na Depot za $0,19)
+        target = depot_target(job, gb, wall, cfg, cache) if gb > cfg["small_gb"] else None
         if target and wall - target["eta_s"] > lam * target["units"]:
             saves = wall - target["eta_s"]
             route = dict(
@@ -1326,6 +1326,7 @@ def decide_route(state, job, gb, wall, cfg, cache):
             local_eta_s=round(wall),
             text="local, fits",
         ), None
+    target = depot_target(job, gb, wall, cfg, cache)  # musi czekać: Depot liczy się dla każdego
     if gb > mem["idle_max_gb"]:
         if target:
             route = dict(
