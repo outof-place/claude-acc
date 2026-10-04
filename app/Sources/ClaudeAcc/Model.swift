@@ -135,6 +135,7 @@ struct Ultra: Decodable {
         let title: String
         let detail: String
         let command: String?
+        var opensSpotlight = false
     }
 
     let on: Bool
@@ -176,7 +177,16 @@ struct Ultra: Decodable {
             title: "Docker VM", detail: "The VM gives back what containers don't use", unit: "GB", isSetting: true),
         "git-speed": Tweak(
             title: "Git", detail: "untrackedCache and fsmonitor in the repos you list", unit: "ms git status"),
+        "devguard-max-server": Tweak(
+            title: "Dev server size limit", detail: "The guard restarts a bloated server sooner", unit: "GB per server",
+            isSetting: true),
     ]
+
+    /// A tweak this app doesn't know yet: its name in words, numbers shown plainly.
+    static func tweak(_ name: String) -> Tweak {
+        catalog[name] ?? Tweak(
+            title: name.replacingOccurrences(of: "-", with: " ").capitalized, detail: "", unit: "", isSetting: true)
+    }
 
     static let steps: [String: Step] = [
         "vnodes": Step(
@@ -185,6 +195,10 @@ struct Ultra: Decodable {
         "shaper": Step(
             title: "Upload shaper", detail: "Uploads queue in the router. Keeping the queue on the Mac needs root.",
             command: "claude-acc perf-root trial"),
+        "spotlight-privacy": Step(
+            title: "Hide caches from Spotlight",
+            detail: "Spotlight indexes package caches (~/Library/pnpm, ~/go) for nothing. Add them under Search Privacy.",
+            command: nil, opensSpotlight: true),
         "docker-quit": Step(title: "Quit Docker once", detail: "The new memory cap is written while Docker is closed.", command: nil),
         "docker-restart": Step(title: "Restart Docker", detail: "The new memory cap applies on its next start.", command: nil),
     ]

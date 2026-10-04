@@ -59,8 +59,6 @@ struct PanelView: View {
         }
         .fontDesign(.rounded)
         .animation(.smooth(duration: 0.35), value: store.notice)
-        .onAppear { store.panelAppeared() }
-        .onDisappear { store.panelDisappeared() }
     }
 }
 

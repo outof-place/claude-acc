@@ -2,7 +2,7 @@ import SwiftUI
 
 @main
 struct ClaudeAccApp: App {
-    @State private var store = Store()
+    @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
     init() {
         // `ClaudeAcc --render panel.png [--snapshot accounts.json]`: the panel as a picture,
@@ -22,12 +22,8 @@ struct ClaudeAccApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra {
-            PanelView(store: store)
-        } label: {
-            MenuBarLabel(store: store)
-        }
-        .menuBarExtraStyle(.window)
+        // the ring and the panel are AppKit (MenuBarController); an App still needs a scene
+        Settings { EmptyView() }
     }
 
     private static func render(to path: String, from snapshotFile: String?, open: String?) -> Bool {
@@ -74,5 +70,13 @@ struct ClaudeAccApp: App {
             return false
         }
         return FileManager.default.createFile(atPath: path, contents: png)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var menuBar: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        menuBar = MenuBarController(store: Store())
     }
 }

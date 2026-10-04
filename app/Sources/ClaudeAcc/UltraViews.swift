@@ -34,7 +34,7 @@ struct UltraCard: View {
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
                             ForEach(needs, id: \.self) { name in
-                                UltraStep(name: name)
+                                UltraStep(name: name) { Task { await store.openSpotlightSettings() } }
                             }
                         }
                     }
@@ -97,7 +97,7 @@ private struct UltraRow: View {
     let active: Bool
     let waiting: String?
 
-    private var tweak: Ultra.Tweak { Ultra.catalog[name] ?? Ultra.Tweak(title: name, detail: "", unit: result?.unit ?? "") }
+    private var tweak: Ultra.Tweak { Ultra.tweak(name) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -170,9 +170,11 @@ private struct GainBar: View {
 /// Something Ultra can't do alone: a root command to copy, or a click in Docker.
 private struct UltraStep: View {
     let name: String
+    let openSpotlight: () -> Void
 
     var body: some View {
-        let step = Ultra.steps[name] ?? Ultra.Step(title: name, detail: "", command: nil)
+        let step = Ultra.steps[name] ?? Ultra.Step(
+            title: name.replacingOccurrences(of: "-", with: " ").capitalized, detail: "", command: nil)
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(step.title).font(.callout.weight(.medium))
@@ -190,6 +192,11 @@ private struct UltraStep: View {
                 .panelButton()
                 .controlSize(.small)
                 .help(command)
+            } else if step.opensSpotlight {
+                Button("Open", systemImage: "gearshape", action: openSpotlight)
+                    .panelButton()
+                    .controlSize(.small)
+                    .help("System Settings › Spotlight")
             }
         }
     }
