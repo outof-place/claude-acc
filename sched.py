@@ -761,9 +761,9 @@ def choose_p(job, free_gb, history):
     options = [(p,) + predict(job, p, history) for p in (2, 4, 6, 8)]
     fitting = [o for o in options if o[1] <= free_gb]
     if fitting:
-        p, gb, s, src = min(fitting, key=lambda o: (o[2], o[1]))
+        p, gb, s, src = min(fitting, key=lambda o: (o[2], o[1], abs(o[0] - 4)))
     else:
-        p, gb, s, src = min(options, key=lambda o: (o[1], o[2]))
+        p, gb, s, src = min(options, key=lambda o: (o[1], o[2], abs(o[0] - 4)))
     return p, "scheduler", gb, s, src
 
 
