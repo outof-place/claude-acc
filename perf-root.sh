@@ -21,6 +21,13 @@
 # zajęte vnode zostają do restartu, więc trial bez --keep nie jest pełnym cofnięciem.
 # Bez --persist wartość wraca do domyślnej po restarcie.
 #
+# devtools: aplikacja (domyślnie Orca) na liście Narzędzi deweloperskich. Za każdą nową
+# binarką testu Go, `go run` czy natywnym modułem node uruchomionym w terminalu agenta stoi
+# Orca; dopóki jej tam nie ma, macOS ocenia każdą taką binarkę przy pierwszym exec (skan
+# XProtect i zapytanie do Apple o notaryzację): 196 ms p50 na binarkę, w Terminalu 4 ms.
+# SIP nie pozwala dopisać jej skryptem nawet rootowi, więc devtools nie wymaga sudo: otwiera
+# panel w Ustawieniach, czeka na kliknięcie "+" i zapisuje zmianę (undo tak samo, "-").
+#
 # Uruchomienie:
 #   sudo ./perf-root.sh trial [--rate 27Mbps] [--if en0] [--keep]
 #        pomiar, ogranicznik, drugi pomiar, porównanie; bez --keep ogranicznik znika
@@ -34,6 +41,9 @@
 #        Spotlight indeksuje tylko aplikacje: katalogi domowe (poza Applications) i dane
 #        systemu idą na listę Prywatności; undo przywraca poprzednią listę
 #        --persist: LaunchDaemon ustawia wartość przy każdym starcie; undo go zdejmuje
+#   ./perf-root.sh devtools add|undo|status [--app /Applications/Orca.app]
+#        bez sudo, w Terminalu (czyta TCC.db): otwiera Ustawienia > Prywatność i ochrona >
+#        Narzędzia deweloperskie, czeka na "+" (undo: "-") i zapisuje zmianę w stanie
 # Bez --rate limit to `shaper_percent` (90%) uploadu z ostatniego `perf.py bench network`
 # przy tej samej bramie. --dry-run pokazuje polecenia bez wykonywania.
 set -euo pipefail
@@ -46,6 +56,7 @@ PERSIST=0
 RATE=""
 IFACE=""
 VNODES=786432
+DEVTOOLS_APP=/Applications/Orca.app
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,6 +66,7 @@ while [ $# -gt 0 ]; do
     --rate) RATE="$2"; shift ;;
     --if) IFACE="$2"; shift ;;
     --value) VNODES="$2"; shift ;;
+    --app) DEVTOOLS_APP="$2"; shift ;;
     -*) echo "nieznana opcja: $1" >&2; exit 2 ;;
     *) ARGS+=("$1") ;;
   esac
@@ -361,6 +373,113 @@ for label, key in (("drugi przebieg lstat s", "warm_s"), ("vnode z odzysku", "wa
   rm -rf "$tmp"
 }
 
+# devtools: Narzędzia deweloperskie (Prywatność i ochrona) to wpisy kTCCServiceDeveloperTool
+# w systemowym TCC.db. Gdy za procesem stoi taka aplikacja, świeżo zbudowana binarka (test
+# Go, `go run`, natywny moduł node) startuje bez oceny Gatekeepera: bez skanu XProtect i bez
+# zapytania o notaryzację do Apple (~150 ms sieci, limit 3 s). Terminal był na liście, Orca
+# nie, więc każda nowa binarka testu w terminalu agenta czekała 196 ms p50 (w Terminalu 4 ms).
+# Zapisu nie da się zrobić skryptem: SIP chroni TCC.db także przed rootem ("attempt to write
+# a readonly database"), a tccutil umie tylko kasować. Zostaje "+" w Ustawieniach (Touch ID);
+# skrypt otwiera właściwy panel, czeka, aż wpis się pojawi, i zapisuje go w stanie perf.py.
+# Czytanie bazy nie wymaga roota, tylko Pełnego dostępu do dysku (Terminal go ma).
+DEVTOOLS_DB="/Library/Application Support/com.apple.TCC/TCC.db"
+DEVTOOLS_PANE="x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools"
+DEVTOOLS_WAIT=300
+
+devtools_bundle() {
+  /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$DEVTOOLS_APP/Contents/Info.plist"
+}
+
+devtools_value() {
+  # auth_value wpisu aplikacji ($1): 2 dozwolone, 0 wyłączone, pusto gdy jej nie ma na liście
+  sqlite3 "$DEVTOOLS_DB" "select auth_value from access where service='kTCCServiceDeveloperTool' and client='$1' and client_type=0"
+}
+
+devtools_readable() {
+  sqlite3 "$DEVTOOLS_DB" "select 1" >/dev/null 2>&1 && return 0
+  echo "nie mogę czytać $DEVTOOLS_DB: ta aplikacja nie ma Pełnego dostępu do dysku," >&2
+  echo "uruchom to w Terminalu" >&2
+  exit 1
+}
+
+devtools_open() {
+  if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != root ]; then
+    do_it sudo -u "$USER_NAME" open "$DEVTOOLS_PANE"
+  else
+    do_it open "$DEVTOOLS_PANE"
+  fi
+}
+
+devtools_wait() {
+  # czeka, aż auth_value aplikacji $1 będzie równe $2 (pusto: brak wpisu)
+  local waited=0
+  while [ "$(devtools_value "$1")" != "$2" ]; do
+    if [ "$waited" -ge "$DEVTOOLS_WAIT" ]; then
+      echo "po ${DEVTOOLS_WAIT} s nic się nie zmieniło; uruchom ponownie, gdy skończysz" >&2
+      exit 1
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+}
+
+devtools_apply() {
+  local bundle prev
+  bundle="$(devtools_bundle)"
+  case "$bundle" in *[!A-Za-z0-9.-]*|"") echo "dziwny identyfikator aplikacji: $bundle" >&2; exit 1 ;; esac
+  devtools_readable
+  prev="$(devtools_value "$bundle")"
+  if [ "$prev" != 2 ]; then
+    echo "Narzędzia deweloperskie: dodaj $DEVTOOLS_APP"
+    echo "  Ustawienia systemowe > Prywatność i ochrona > Narzędzia deweloperskie >"
+    if [ -z "$prev" ]; then
+      echo "  \"+\" > $DEVTOOLS_APP > Otwórz (Touch ID)"
+    else
+      echo "  włącz przełącznik przy $(basename "$DEVTOOLS_APP" .app) (Touch ID)"
+    fi
+    devtools_open
+    [ "$DRY" -eq 1 ] && return 0
+    echo "czekam na zmianę (do ${DEVTOOLS_WAIT} s)..."
+    devtools_wait "$bundle" 2
+  fi
+  echo "Narzędzia deweloperskie: $bundle dozwolone (wcześniej: ${prev:-brak})"
+  [ "$DRY" -eq 1 ] || as_user record devtools "$bundle" "prev=${prev:-none}"
+}
+
+devtools_undo() {
+  local detail bundle prev name
+  detail="$(as_user status --json | /usr/bin/python3 -c 'import json,sys
+for t in json.load(sys.stdin)["tweaks"]:
+    if t["name"] == "devtools" and t["applied"]:
+        print(t["detail"])')"
+  bundle="${detail%% *}"
+  [ -n "$bundle" ] || bundle="$(devtools_bundle)"
+  prev="$(printf '%s' "$detail" | sed -n 's/.*prev=\([^ ]*\).*/\1/p')"
+  devtools_readable
+  name="$(basename "$DEVTOOLS_APP" .app)"
+  [ "$prev" = none ] && prev=""
+  if [ "$(devtools_value "$bundle")" != "$prev" ]; then
+    echo "Narzędzia deweloperskie: przywróć $bundle"
+    echo "  Ustawienia systemowe > Prywatność i ochrona > Narzędzia deweloperskie >"
+    if [ -z "$prev" ]; then
+      echo "  zaznacz $name > \"-\" (Touch ID)"
+    else
+      echo "  wyłącz przełącznik przy $name (Touch ID)"
+    fi
+    devtools_open
+    [ "$DRY" -eq 1 ] && return 0
+    echo "czekam na zmianę (do ${DEVTOOLS_WAIT} s)..."
+    devtools_wait "$bundle" "$prev"
+  fi
+  [ "$DRY" -eq 1 ] || as_user record devtools --forget
+}
+
+devtools_status() {
+  devtools_readable
+  sqlite3 "$DEVTOOLS_DB" "select client, auth_value from access where service='kTCCServiceDeveloperTool'" |
+    sed 's/|2$/ (dozwolone)/; s/|0$/ (wyłączone)/'
+}
+
 case "$CMD $SUB" in
   "shaper apply") shaper_apply ;;
   "shaper undo") shaper_undo ;;
@@ -371,6 +490,9 @@ case "$CMD $SUB" in
   "vnodes undo") vnodes_undo ;;
   "spotlight apps-only") spotlight_apply ;;
   "spotlight undo") spotlight_undo ;;
+  "devtools add") devtools_apply ;;
+  "devtools undo") devtools_undo ;;
+  "devtools status" | "devtools ") devtools_status ;;
   *)
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     exit 2

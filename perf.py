@@ -51,6 +51,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from xml.parsers.expat import ExpatError
 
@@ -1189,6 +1190,7 @@ class Deferred(Exception):
 
 
 ORCA_DATA = os.path.join(HOME, "Library/Application Support/orca/orca-data.json")
+ORCA_APP = "/Applications/Orca.app"
 
 
 def git_repos(cfg):
@@ -1529,6 +1531,14 @@ TWEAKS = [
         "claude-acc perf-root spotlight apps-only",
     ),
     RootTweak(
+        "devtools",
+        "Orca na liście Narzędzi deweloperskich: binarki zbudowane przez agentów (testy Go, "
+        "go run, natywne moduły node) startują bez oceny Gatekeepera",
+        "pierwsze uruchomienie nowej binarki Go w terminalu Orki 196 ms p50, w Terminalu "
+        "(narzędzie deweloperskie) 4 ms; ocena to skan XProtect i zapytanie do Apple o notaryzację",
+        "claude-acc perf-root devtools add (bez sudo, kliknięcie + w Ustawieniach)",
+    ),
+    RootTweak(
         "shaper",
         "ogranicznik wysyłania na interfejsie (ifconfig tbr): kolejka zostaje w fq_codel "
         "Maca zamiast w buforze routera",
@@ -1858,6 +1868,64 @@ def bench_agents(hours=24):
     }
 
 
+GO_PROBE = 'package main\n\nconst v = %d\n\nfunc main() { _ = v }\n'
+
+
+def responsible_app(pid=None):
+    """Aplikacja, którą macOS uważa za odpowiedzialną za proces (TCC, Gatekeeper)."""
+    try:
+        fn = _libc.responsibility_get_pid_responsible_for_pid
+    except AttributeError:
+        return None
+    fn.restype, fn.argtypes = ctypes.c_int, [ctypes.c_int]
+    owner = fn(pid or os.getpid())
+    out = janitor.run(["ps", "-o", "comm=", "-p", str(owner)]) or ""
+    path = out.strip()
+    app = re.search(r"/([^/]+)\.app/", path)
+    return app.group(1) if app else os.path.basename(path) or None
+
+
+def first_exec(count=8):
+    """Pierwsze i drugie uruchomienie świeżo zbudowanych binarek Go (ms, mediany).
+
+    Każda wersja ma inną stałą, więc inny hash: tak jak test Go po każdej zmianie. Różnica
+    między pierwszym a drugim uruchomieniem to ocena Gatekeepera przy pierwszym exec."""
+    go = janitor.which("go")
+    if not go:
+        return None
+    work = tempfile.mkdtemp(prefix="perf-gk-")
+    first, second = [], []
+    try:
+        with open(os.path.join(work, "go.mod"), "w") as f:
+            f.write("module gk\n\ngo 1.21\n")
+        for i in range(count):
+            with open(os.path.join(work, "main.go"), "w") as f:
+                f.write(GO_PROBE % time.time_ns())
+            binary = os.path.join(work, f"bin{i}")
+            if janitor.run([go, "build", "-C", work, "-o", binary, "."], timeout=120) is None:
+                return None
+            for runs in (first, second):
+                started = time.perf_counter()
+                subprocess.run([binary], capture_output=True, check=False)
+                runs.append((time.perf_counter() - started) * 1000)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return {"first_ms": rnd(median(first), 1), "second_ms": rnd(median(second), 1)}
+
+
+def bench_gatekeeper():
+    """Ile kosztuje pierwsze uruchomienie nowej binarki tam, gdzie działa ten proces.
+
+    Odpowiedzialna aplikacja decyduje: z Narzędzia deweloperskiego (Terminal) binarka startuje
+    od razu, z Orki spoza tej listy czeka na skan XProtect i zapytanie do Apple."""
+    result = {"responsible": responsible_app()}
+    probe = first_exec()
+    if probe:
+        result.update(probe)
+        result["penalty_ms"] = rnd(probe["first_ms"] - probe["second_ms"], 1)
+    return result
+
+
 def typescript_load(cache_dir=None, runs=5):
     """Mediana czasu `require('typescript')` w node (ms), z cache kompilacji albo bez."""
     node = janitor.which("node")
@@ -2017,6 +2085,9 @@ def spotlight_result(cfg, state, force=False):
 def pending_manual(state):
     """Rzeczy do kliknięcia przez człowieka: Ultra ich nie zrobi sama."""
     names = []
+    # SIP nie wpuszcza nawet roota do TCC.db, więc Orkę na listę dodaje "+" w Ustawieniach
+    if os.path.isdir(ORCA_APP) and "devtools" not in state["applied"]:
+        names.append("devtools")
     spotlight = ultra_state(state)["results"].get("spotlight-privacy")
     # krok ręczny znika, gdy perf-root.sh przełączył Spotlight na same aplikacje
     if (
@@ -2231,6 +2302,7 @@ def ultra_off(cfg, system, state):
 # jednostka zmierzonego efektu poprawki roota, jak "unit" w wynikach Ultra
 ROOT_UNITS = {
     "vnodes": "s drugi przebieg lstat node_modules",
+    "devtools": "ms pierwszego uruchomienia nowej binarki",
     "shaper": "ms kolejki wysyłania",
     "spotlight": "plików w indeksie poza aplikacjami",
 }
@@ -2326,6 +2398,8 @@ def cmd_ultra(cfg, args, system=None):
 
 
 MANUAL = {
+    "devtools": "Ustawienia > Prywatność i ochrona > Narzędzia deweloperskie > + > Orca "
+    "(`claude-acc perf-root devtools add` w Terminalu otwiera panel i zapisuje zmianę)",
     "spotlight-privacy": "Ustawienia > Spotlight > Prywatność wyszukiwania: dodaj katalogi "
     "z `spotlight_noise` (magazyn pnpm, moduły Go)",
     "docker-restart": "nowa pamięć maszyny Dockera zadziała po jego restarcie (Docker > Restart)",
@@ -2481,12 +2555,23 @@ def describe_agents(r):
     return lines
 
 
+def describe_gatekeeper(r):
+    if r.get("first_ms") is None:
+        return [f"brak pomiaru (go w PATH?), odpowiedzialna aplikacja: {r.get('responsible')}"]
+    return [
+        f"odpowiedzialna aplikacja: {r.get('responsible')}",
+        f"nowa binarka Go: pierwsze uruchomienie {fmt(r['first_ms'], ' ms')}, drugie "
+        f"{fmt(r['second_ms'], ' ms')}; ocena Gatekeepera {fmt(r['penalty_ms'], ' ms')} na binarkę",
+    ]
+
+
 DESCRIBE = {
     "network": describe_network,
     "cpu": describe_cpu,
     "gpu": describe_gpu,
     "fs": describe_fs,
     "agents": describe_agents,
+    "gatekeeper": describe_gatekeeper,
 }
 LABELS = {
     "network": "Sieć",
@@ -2494,6 +2579,7 @@ LABELS = {
     "gpu": "GPU",
     "fs": "System plików",
     "agents": "Agenci",
+    "gatekeeper": "Gatekeeper",
 }
 
 
@@ -2560,7 +2646,9 @@ def record_bench(state, kind, result, started, load=None):
 
 def cmd_bench(cfg, args, system=None):
     kinds = [
-        a for a in args if a in ("network", "cpu", "gpu", "fs", "agents", "all")
+        a
+        for a in args
+        if a in ("network", "cpu", "gpu", "fs", "agents", "gatekeeper", "all")
     ] or ["all"]
     if "all" in kinds:
         kinds = ["network", "cpu", "gpu"]
@@ -2580,6 +2668,8 @@ def cmd_bench(cfg, args, system=None):
             result = bench_fs(cfg)
         elif kind == "agents":
             result = bench_agents()
+        elif kind == "gatekeeper":
+            result = bench_gatekeeper()
         else:
             result = bench_gpu()
             result["latency"] = gpu_latency()
