@@ -34,9 +34,11 @@ now() { /usr/bin/python3 -c 'import time; print(time.time())'; }
 case "$1" in
   env) echo "${FAKE_GOENV_GOFLAGS:--p=4}"; exit 0 ;;
   list)
+    last="${@: -1}"
     case " $* " in
-      *" -deps "*) printf '%s\n' ${FAKE_GO_DEPS:-fmt testing} ;;
-      *) echo "${FAKE_GO_IMPORTS:-fmt testing}" ;;
+      *" -test "*) printf '%s\n' "fmt|/std/fmt|true" "testing|/std/testing|true" ${FAKE_GO_TESTDEPS:-} ;;
+      *" -deps "*) printf '%s\n' fmt testing ;;
+      *) d="$PWD/${last#./}"; echo "${d%/}" ;;
     esac
     exit 0 ;;
 esac
@@ -414,6 +416,13 @@ class RouteTest(Paths):
         self.assertEqual(
             S.depot_target(filtered, 5.3, 38, self.cfg, {})["target"], "depot-exec"
         )  # nie pełny job handlers
+        argv = S.depot_target(dict(filtered, uses_pg=True), 5.3, 38, self.cfg, {})[
+            "argv"
+        ]
+        self.assertEqual(
+            argv[:5], ["scripts/depot-exec.sh", "--cores", "2", "--with", "pg"]
+        )
+        self.assertNotIn("--with", S.depot_target(vet, 13.7, 41, self.cfg, {})["argv"])
 
 
 class PlanTest(Paths):
@@ -492,35 +501,88 @@ class Count1Test(Paths):
         self.assertIsNone(S.drop_count1("go test -count=10 ./x"))
         self.assertIsNone(S.drop_count1("go test -count=1 ./a && go test -count=1 ./b"))
 
-    def test_safe_only_without_db_and_exec(self):
+    def write_go(self, rel, text):
+        path = os.path.join(self.charter, rel)
+        write(path, text)
+        return path
+
+    def fake_list(self, helpers=()):
+        """go list dla moneyfmt: pakiet, a w testach dodatkowo pomocniki (ścieżka w module)."""
+        moneyfmt = os.path.join(self.charter, "internal/moneyfmt")
+
+        def fake(args, cwd, timeout=60):
+            if "-test" in args:
+                lines = [
+                    "fmt|/std/fmt|true",
+                    f"charter-service/internal/moneyfmt|{moneyfmt}|false",
+                ]
+                lines += [
+                    f"charter-service/{h}|{os.path.join(self.charter, h)}|false"
+                    for h in helpers
+                ]
+                return "\n".join(lines)
+            if "-deps" in args:
+                return "fmt\ncharter-service/internal/moneyfmt"
+            return moneyfmt
+
+        return fake
+
+    def test_exec_in_package_tests_or_helpers_keeps_count1(self):
         small = self.job(
             "cd apps/charter-service && go test -count=1 ./internal/moneyfmt/"
         )
-        answers = {
-            "deps": "fmt\ntesting\ncharter-service/internal/moneyfmt",
-            "own": "fmt testing",
-        }
-
-        def fake(args, cwd, timeout=60):
-            return answers["deps"] if "-deps" in args else answers["own"]
-
-        with mock.patch.object(S, "go_list", side_effect=fake):
-            self.assertTrue(S.count1_safe(small, {}))
-            answers["deps"] += "\ncharter-service/internal/testutil"
-            self.assertFalse(S.count1_safe(small, {}))
-            answers["deps"] = "fmt"
-            answers["own"] = "fmt os/exec testing"
-            self.assertFalse(S.count1_safe(small, {}))
-            answers["own"] = "fmt"
+        self.write_go("internal/moneyfmt/fmt.go", "package moneyfmt\n")
+        test = self.write_go(
+            "internal/moneyfmt/fmt_test.go", 'package moneyfmt\n\nimport "testing"\n'
+        )
+        with mock.patch.object(S, "go_list", side_effect=self.fake_list()):
             cache = {}
             self.assertTrue(S.count1_safe(small, cache))
-        self.assertTrue(S.count1_safe(small, cache))  # z cache, bez go list
+            write(
+                test,
+                'package moneyfmt\n\nimport "os/exec"\n\nfunc x() { exec.Command("git", "ls-files") }\n',
+            )
+            self.assertFalse(
+                S.count1_safe(small, cache)
+            )  # zmiana pliku: nowe skanowanie
+            write(
+                test,
+                'package moneyfmt\n\nimport sh "os/exec"\n\nfunc x() { sh.CommandContext(nil, "node") }\n',
+            )
+            self.assertFalse(S.count1_safe(small, cache))  # alias importu
+            write(test, "package moneyfmt\n")
+        helper = ["internal/testutil"]
+        self.write_go(
+            "internal/testutil/run.go",
+            'package testutil\n\nimport "os/exec"\n\nvar _ = exec.Command("atlas")\n',
+        )
+        with mock.patch.object(S, "go_list", side_effect=self.fake_list(helper)):
+            self.assertFalse(
+                S.count1_safe(small, {})
+            )  # pomocnik testu uruchamia program
+        trusted = ["internal/testhelpers"]
+        self.write_go(
+            "internal/testhelpers/testpg_docker.go",
+            'package testhelpers\n\nimport "os/exec"\n\nvar _ = exec.Command("docker")\n',
+        )
+        with mock.patch.object(S, "go_list", side_effect=self.fake_list(trusted)):
+            cache = {}
+            self.assertTrue(
+                S.count1_safe(small, cache)
+            )  # szablon testpg: wejścia śledzone w procesie
+            self.assertTrue(S.uses_pg(small, cache))  # depot-exec dostanie --with pg
+        with mock.patch.object(S, "go_list", side_effect=AssertionError("bez go list")):
+            self.assertTrue(S.count1_safe(small, cache))  # z cache po podpisie plików
+
+    def test_not_for_gates_flags_or_trees(self):
         race = self.job(
             "cd apps/charter-service && go test -race -count=1 ./internal/moneyfmt/"
         )
         self.assertFalse(S.count1_safe(race, {}))
         tree = self.job("cd apps/charter-service && go test -count=1 ./...")
         self.assertFalse(S.count1_safe(tree, {}))
+        gate = self.job("make -C apps/charter-service test-tenant-leakage")
+        self.assertFalse(S.count1_safe(gate, {}))
 
 
 class HookTest(Paths):
@@ -912,11 +974,16 @@ class RunTest(unittest.TestCase):
         args = [r[3] for r in self.go_log() if r[0] == "start"][0]
         self.assertNotIn("-count=1", args)
         self.assertTrue(self.history()[-1]["count1_dropped"])
+        write(
+            os.path.join(
+                self.repo, "apps/charter-service/internal/money/money_test.go"
+            ),
+            'package money\n\nimport "os/exec"\n\nvar _ = exec.Command("git", "ls-files")\n',
+        )
         rc, _, _ = self.done(
             self.start(
                 "cd apps/charter-service && go test -count=1 ./internal/money/",
                 via="hook",
-                FAKE_GO_DEPS="fmt charter-service/internal/testhelpers",
             )
         )
         args = [r[3] for r in self.go_log() if r[0] == "start"][-1]

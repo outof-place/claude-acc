@@ -84,7 +84,7 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `mem_predicted_gb` | przewidywany szczyt pamięci |
 | `predicted_wall_s` | przewidywany czas biegu lokalnie |
 | `small` | czy job jest mały (`mem_predicted_gb ≤ small_gb` i `predicted_wall_s ≤ small_wall_s`): może wyprzedzać |
-| `count1_dropped` | scheduler zdjął `-count=1`, bo pakiet nie sięga po bazę (wynik może przyjść z cache testów) |
+| `count1_dropped` | scheduler zdjął `-count=1` (wynik może przyjść z cache testów), patrz niżej |
 
 Tylko w `running[]`:
 
@@ -141,6 +141,20 @@ Trasa minimalizuje `czas do wyniku + λ × jednostki Depot`:
 | `today.local_kept_usd` | koszt Depot, którego uniknęły lokalne biegi klas, które stary hak `depot-heavy-go.sh` wysyłał na Depot |
 | `today.overtakes`, `today.pauses`, `today.peak_concurrency`, `today.max_reserved_gb` | liczniki dnia |
 
+## Kiedy scheduler zdejmuje `-count=1`
+
+Tylko w iteracji agenta (komenda owinięta przez hook), tylko dla `go test` jednego albo kilku
+pakietów bez `-race` i flag spoza zestawu cache'owalnego, nigdy dla celów make. Cache testów Go
+śledzi pliki i zmienne środowiska, które czyta sam proces testu; nie widzi tego, co czyta
+uruchomiony przez niego program (git, node, `atlas migrate lint`). Dlatego `-count=1` zostaje,
+gdy `exec.Command`, `exec.CommandContext` albo `os.StartProcess` (także przez alias importu
+`os/exec`) stoi w pakiecie, w jego testach albo w pakiecie modułu ściąganym tylko przez testy
+(pomocniki testów i ich zależności). Pakiety z bazą przechodzą: szablon testpg czyta migracje,
+Dockerfile Postgresa i atlasa w procesie testu, więc jego pliki (`count1_trusted_exec`) się nie
+liczą. Wynik jest w cache po podpisie plików; `go list` biegnie dopiero po zmianie `go.sum` albo
+plików pakietu. Ta sama analiza mówi, czy testy sięgają po Postgresa: wtedy `depot-exec` dostaje
+`--with pg`.
+
 ## `history.jsonl`
 
 Jeden wiersz JSON na skończony bieg, dopisywany na końcu pliku. Wiersze `where=depot` dopisuje też
@@ -168,4 +182,6 @@ small_wall_s         120    ...i tyle sekund lub mniej; mały może wyprzedzać
 starve_s             120    po tylu sekundach czekania job rezerwuje pamięć i nikt go nie wyprzedza
 drop_count1          true   zdejmuj -count=1 w iteracji agenta dla pakietów bez bazy
 pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ciężki job dostaje SIGSTOP
+depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)
+count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
 ```

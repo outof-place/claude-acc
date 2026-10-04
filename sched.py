@@ -22,6 +22,7 @@ Hook PreToolUse (devguard.py admit) owija komendy agentów przez hook_rewrite().
 import ctypes
 import ctypes.util
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -57,6 +58,10 @@ DEFAULTS = {
     "drop_count1": True,
     "pause_swap_gb": 0.5,
     "ldflags_w_for_build": True,
+    "depot_eta_since": "2026-10-05",
+    # pliki pomocników testów (ścieżka w module, prefiks), których exec nie psuje cache testów:
+    # szablon testpg czyta migracje, Dockerfile i atlasa w procesie testu (os.ReadFile, LookPath)
+    "count1_trusted_exec": ["internal/testhelpers/testpg"],
     "idle_floor_pct": 65,
 }
 PUBLIC_CONFIG = (
@@ -118,13 +123,8 @@ DEPOT_CI_JOBS = {
     ("charter-service", "make", "test-tenant-leakage", False): ("isolation", 16, 504),
     ("charter-service", "make", "test", False): ("full", 64, 510),
 }
-# zależności testu, przy których wynik zależy od stanu spoza procesu (baza w Dockerze, atlas)
-COUNT1_BLOCKERS = (
-    "/internal/testutil",
-    "/internal/testhelpers",
-    "testcontainers",
-    "dockertest",
-)
+# pakiety testów, które sięgają po Postgresa (szablon testpg): depot-exec dostaje --with pg
+PG_MARKERS = ("/internal/testhelpers", "/internal/testpg", "/internal/testutil", "testcontainers")
 
 
 def log(msg):
@@ -825,6 +825,7 @@ def depot_target(job, gb, wall, cfg, cache):
         "units": round(units, 1),
         "cost_usd": round(units * cfg["unit_usd"], 2),
         "argv": ["scripts/depot-exec.sh", "--cores", str(cores)]
+        + (["--with", "pg"] if job.get("uses_pg") else [])
         + (["--dir", module] if module else [])
         + ["--"]
         + list(job["argv"]),
@@ -841,8 +842,9 @@ def refresh_depot_eta(cache, repo_dir):
     jobs = {}
     if os.path.isfile(script):
         try:
+            since = load_config().get("depot_eta_since")
             out = subprocess.run(
-                ["/usr/bin/python3", script, "eta", "--json"],
+                ["/usr/bin/python3", script, "eta", "--json"] + (["--since", since] if since else []),
                 cwd=repo_dir,
                 capture_output=True,
                 text=True,
@@ -884,64 +886,150 @@ def go_list(args, cwd, timeout=60):
     return out.stdout if out.returncode == 0 else None
 
 
-def count1_safe(job, cache):
-    """Czy wynik testu zależy tylko od tego, co proces testu czyta sam (pliki modułu, env).
+EXEC_IMPORT = re.compile(r'^\s*(?:import\s+)?(?:([\w.]+)\s+)?"os/exec"', re.M)
 
-    Nie dla pakietów, których test sięga (także pośrednio) po testutil/testhelpers/testcontainers
-    (baza w Dockerze, atlas jako osobny proces) ani który sam importuje os/exec."""
-    if (
-        job["kind"] != "test"
-        or not job["count1"]
-        or job["scope"] not in ("pkg", "pkgs", "handlers")
-    ):
-        return False
-    allowed = {
-        "-count",
-        "-run",
-        "-v",
-        "-short",
-        "-timeout",
-        "-p",
-        "-failfast",
-        "-skip",
-        "-cpu",
-        "-parallel",
-    }
-    if any(k not in allowed for k in job["flags"]):
-        return False
-    pkgs = job["pkgs"] or ["."]
+
+def exec_calls(path):
+    """Czy plik Go uruchamia inny program (exec.Command, exec.CommandContext, os.StartProcess)."""
     try:
-        stamp = os.path.getmtime(os.path.join(job["module_dir"], "go.sum"))
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
     except OSError:
-        stamp = 0
+        return False
+    if "os.StartProcess(" in text or "syscall.Exec(" in text:
+        return True
+    m = EXEC_IMPORT.search(text)
+    if not m:
+        return False
+    alias = m.group(1) or "exec"
+    if alias == "_":
+        return False
+    if alias == ".":
+        return re.search(r"\bCommand(Context)?\s*\(", text) is not None
+    return re.search(rf"\b{re.escape(alias)}\.Command(Context)?\s*\(", text) is not None
+
+
+def go_files(directory, tests=True):
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    return [
+        os.path.join(directory, n)
+        for n in names
+        if n.endswith(".go") and (tests or not n.endswith("_test.go"))
+    ]
+
+
+def files_signature(paths):
+    sig = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        sig.append(f"{path}:{st.st_size}:{int(st.st_mtime_ns)}")
+    return hashlib.sha1("|".join(sig).encode()).hexdigest()
+
+
+def module_path(module_dir):
+    try:
+        with open(os.path.join(module_dir, "go.mod")) as f:
+            for line in f:
+                if line.startswith("module "):
+                    return line.split()[1]
+    except OSError:
+        pass
+    return None
+
+
+def test_inputs(job, cache):
+    """Co czytają testy pakietów joba: {"exec": bool, "pg": bool} albo None (go list padł).
+
+    exec: pakiet (testy i kod) albo pakiet ściągany tylko przez testy (pomocniki testów i ich
+    zależności z modułu) uruchamia inny program; tego, co czyta podproces (git, node, atlas
+    migrate lint), cache testów Go nie widzi. pg: testy sięgają po testpg/testhelpers/testcontainers.
+    Wynik w cache po podpisie plików (rozmiar, mtime); go list tylko po zmianie go.sum albo
+    zestawu plików pakietu."""
+    pkgs = job["pkgs"] or ["."]
     key = f"{job['go_dir']}|{' '.join(pkgs)}"
-    entry = (cache.get("count1") or {}).get(key)
-    if (
-        entry
-        and entry.get("stamp") == stamp
-        and time.time() - entry.get("at", 0) < 86400
-    ):
-        return entry["safe"]
-    deps = go_list(["-deps", "-test", "-f", "{{.ImportPath}}"] + pkgs, job["go_dir"])
-    own = go_list(
-        [
-            "-f",
-            '{{join .Imports " "}} {{join .TestImports " "}} {{join .XTestImports " "}}',
-        ]
-        + pkgs,
-        job["go_dir"],
-    )
-    safe = bool(deps) and own is not None
-    if safe and any(b in line for line in deps.splitlines() for b in COUNT1_BLOCKERS):
-        safe = False
-    if safe and "os/exec" in own.split():
-        safe = False
-    cache.setdefault("count1", {})[key] = {
-        "safe": safe,
-        "stamp": stamp,
+    entry = (cache.get("tests") or {}).get(key)
+    try:
+        gosum = os.path.getmtime(os.path.join(job["module_dir"], "go.sum"))
+    except OSError:
+        gosum = 0
+    if entry and entry.get("gosum") == gosum:
+        target_sig = files_signature([f for d in entry["targets"] for f in go_files(d)])
+        if target_sig == entry.get("target_sig"):
+            files = [f for d in entry["targets"] for f in go_files(d)]
+            files += [f for d in entry["helpers"] for f in go_files(d, tests=False)]
+            sig = files_signature(files)
+            if sig == entry.get("sig"):
+                return entry
+    listing = go_list(["-deps", "-test", "-f", "{{.ImportPath}}|{{.Dir}}|{{.Standard}}"] + pkgs, job["go_dir"])
+    plain = go_list(["-deps", "-f", "{{.ImportPath}}"] + pkgs, job["go_dir"])
+    targets = go_list(["-f", "{{.Dir}}"] + pkgs, job["go_dir"])
+    if listing is None or plain is None or targets is None:
+        return None
+    mod = module_path(job["module_dir"]) or "\x00"
+    target_dirs = sorted(set(targets.split()))
+    plain_set = set(plain.split())
+    helpers, pg = set(), False
+    for line in listing.splitlines():
+        parts = line.split("|")
+        if len(parts) != 3:
+            continue
+        imp, directory, standard = parts
+        base = imp.split(" ")[0]
+        if any(m in base for m in PG_MARKERS):
+            pg = True
+        if standard == "true" or base.endswith(".test"):
+            continue
+        if not (base == mod or base.startswith(mod + "/")):
+            continue
+        if directory in target_dirs or base in plain_set:
+            continue  # pakiet testowany albo używany też przez kod produkcyjny
+        helpers.add(directory)
+    files = [f for d in target_dirs for f in go_files(d)]
+    files += [f for d in sorted(helpers) for f in go_files(d, tests=False)]
+    trusted = tuple(os.path.join(job["module_dir"], t) for t in load_config().get("count1_trusted_exec") or ())
+    entry = {
+        "exec": any(exec_calls(f) for f in files if not (trusted and f.startswith(trusted))),
+        "pg": pg,
+        "targets": target_dirs,
+        "helpers": sorted(helpers),
+        "gosum": gosum,
+        "target_sig": files_signature([f for d in target_dirs for f in go_files(d)]),
+        "sig": files_signature(files),
         "at": time.time(),
     }
-    return safe
+    cache.setdefault("tests", {})[key] = entry
+    return entry
+
+
+def count1_safe(job, cache):
+    """Czy w iteracji agenta można zdjąć -count=1 (wynik może przyjść z cache testów Go).
+
+    Tak, gdy ani testy pakietu, ani pakiet, ani jego pomocniki testów nie uruchamiają innych
+    programów. Pakiety z bazą są w porządku: testpg czyta migracje, Dockerfile Postgresa i atlasa
+    w procesie testu (os.ReadFile, LookPath), a te wejścia cache testów Go śledzi."""
+    if job["kind"] != "test" or not job["count1"] or job["scope"] not in ("pkg", "pkgs", "handlers"):
+        return False
+    allowed = {"-count", "-run", "-v", "-short", "-timeout", "-p", "-failfast", "-skip", "-cpu", "-parallel"}
+    if any(k not in allowed for k in job["flags"]):
+        return False
+    inputs = test_inputs(job, cache)
+    return inputs is not None and not inputs["exec"]
+
+
+def uses_pg(job, cache):
+    """Czy testy joba sięgają po Postgresa (dla depot-exec --with pg)."""
+    if job["kind"] != "test":
+        return False
+    if job["scope"] == "tree":
+        return os.path.isdir(os.path.join(job["module_dir"], "internal/testhelpers"))
+    inputs = test_inputs(job, cache)
+    return bool(inputs and inputs["pg"])
 
 
 COUNT1 = re.compile(r"(?<![\w-])-count(?:=| )1(?![\w.])")
@@ -1484,6 +1572,8 @@ def cmd_run(args):
             log(
                 "bez -count=1: test nie sięga po bazę ani zewnętrzne programy, wynik może przyjść z cache testów"
             )
+    if job["kind"] == "test" and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
+        job["uses_pg"] = uses_pg(job, cache)
     if likely_heavy(job):
         refresh_depot_eta(cache, job["repo_dir"])
     save_cache(cache)
