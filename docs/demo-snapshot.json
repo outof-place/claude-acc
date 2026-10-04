@@ -43,7 +43,8 @@
    },
    "data_age": 40,
    "renews_at": 1792073697.435127,
-   "subscription_status": "active"
+   "subscription_status": "active",
+   "subscription_since": "2025-03-15"
   },
   {
    "id": "demo-2",
@@ -66,7 +67,8 @@
    },
    "data_age": 40,
    "renews_at": 1791382497.435127,
-   "subscription_status": "active"
+   "subscription_status": "active",
+   "subscription_since": "2025-06-07"
   },
   {
    "id": "demo-3",
@@ -89,7 +91,8 @@
    },
    "data_age": 40,
    "renews_at": 1790950497.435127,
-   "subscription_status": "active"
+   "subscription_status": "active",
+   "subscription_since": "2024-11-20"
   },
   {
    "id": "demo-4",
@@ -112,7 +115,8 @@
    },
    "data_age": 40,
    "renews_at": 1790604897.435127,
-   "subscription_status": "active"
+   "subscription_status": "active",
+   "subscription_since": "2025-08-01"
   },
   {
    "id": "demo-5",
@@ -129,7 +133,8 @@
    "weekly": null,
    "data_age": 40,
    "renews_at": 1792505697.435127,
-   "subscription_status": "active"
+   "subscription_status": "active",
+   "subscription_since": "2025-01-09"
   }
  ]
 }

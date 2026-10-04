@@ -71,6 +71,8 @@ struct Account: Decodable, Identifiable {
     /// Monthly anniversary of the subscription start: the API has no billing date.
     let renewsAt: Double?
     let subscriptionStatus: String?
+    /// "2025-03-28": the day the subscription started, as the profile API reports it.
+    let subscriptionSince: String?
 
     /// An Orca entry can hold a different account than its label says.
     var mislabeled: Bool { realEmail.map { $0.lowercased() != email.lowercased() } ?? false }

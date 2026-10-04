@@ -1119,6 +1119,7 @@ def snapshot(cfg):
             # API podaje tylko start subskrypcji, więc to miesięczna rocznica, nie data z rachunku
             "renews_at": renewal.timestamp() if renewal else None,
             "subscription_status": who.get("status"),
+            "subscription_since": who.get("subscription_since") or None,
         })
     # najpierw kolejka automatu, potem wypalone od najbliższego resetu tygodnia
     items.sort(key=lambda i: (not i["active"], i["queue"] or 99, i["status"] != "ok",

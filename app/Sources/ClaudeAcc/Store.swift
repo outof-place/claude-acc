@@ -29,6 +29,8 @@ final class Store {
     private(set) var guardBusy: String?
     /// The mode just picked in the panel, until the guard's next snapshot shows it.
     private var guardModeOverride: String?
+    /// Rendering only: the account whose details start open.
+    @ObservationIgnored var previewOpenAccount: String?
 
     @ObservationIgnored private var loginPID: Int32?
     @ObservationIgnored private var loginCancelled = false

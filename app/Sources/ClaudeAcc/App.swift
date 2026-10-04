@@ -11,7 +11,8 @@ struct ClaudeAccApp: App {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--render"), i + 1 < args.count {
             let data = args.firstIndex(of: "--snapshot").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
-            exit(Self.render(to: args[i + 1], from: data) ? 0 : 1)
+            let open = args.firstIndex(of: "--open").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+            exit(Self.render(to: args[i + 1], from: data, open: open) ? 0 : 1)
         }
         // a second copy would put a second ring in the menu bar
         let mine = Bundle.main.bundleIdentifier ?? ""
@@ -29,7 +30,7 @@ struct ClaudeAccApp: App {
         .menuBarExtraStyle(.window)
     }
 
-    private static func render(to path: String, from snapshotFile: String?) -> Bool {
+    private static func render(to path: String, from snapshotFile: String?, open: String?) -> Bool {
         let output: CLIResult
         var guardState: GuardState?
         var janitor: JanitorState?
@@ -51,6 +52,7 @@ struct ClaudeAccApp: App {
             return false
         }
         let store = Store(preview: snapshot, guardState: guardState, janitor: janitor)
+        store.previewOpenAccount = open
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
         let panel = PanelView(store: store, frozenNow: frozen)
             .fixedSize()
