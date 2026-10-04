@@ -20,8 +20,8 @@ Pomiary:
 
 Poprawki wymagające roota robi perf-root.sh; tu są tylko opisane.
 
-Ultra to jeden przełącznik dla pracy agentów (Orca, wiele sesji Claude Code, ich dev
-serwery i Docker): włącza wszystkie poprawki z listy ULTRA, zapisuje, co było przed
+Ultra to jeden przełącznik dla pracy agentów (Orca, wiele sesji Claude Code i ich dev
+serwery): włącza wszystkie poprawki z listy ULTRA, zapisuje, co było przed
 nimi, i mierzy przed i po. Stan dla panelu jest w perf-state.json pod "ultra".
 
 Komendy:
@@ -735,14 +735,19 @@ DEFAULT_CONFIG = {
         },
         {"event": "Stop", "match": "cavemem/dist/index.js hook run stop"},
     ],
-    # limit dev serwerów strażnika w Ultra (procent RAM; strażnik domyślnie ma 35)
+    # limity dev serwerów strażnika w Ultra: procent RAM na wszystkie (strażnik domyślnie
+    # ma 35) i GB, powyżej których jeden serwer jest spuchnięty (domyślnie 5)
     "devguard_budget_percent": 25,
-    # pamięć maszyny Dockera w Ultra; zapis tylko przy zamkniętym Dockerze, działa od
-    # jego następnego startu (kontenery używały 3,7 GB z 8)
+    "devguard_max_server_gb": 4,
+    # pamięć maszyny Dockera dla `perf.py apply docker-vm` (poza Ultra, tylko na życzenie);
+    # zapis tylko przy zamkniętym Dockerze, działa od jego następnego startu
     "docker_memory_mib": 6144,
-    # repozytoria, w których Ultra włącza core.untrackedCache i core.fsmonitor; puste,
-    # bo jedyne repo z worktree Orki (portivo) zmienia tylko jego właściciel
+    # repozytoria, w których Ultra włącza core.untrackedCache i core.fsmonitor: lista
+    # ścieżek albo "orca" (wszystkie repozytoria z worktree w Orce). Domyślnie pusta, bo
+    # jedyne takie repo (portivo) zmienia tylko jego właściciel
     "git_repos": [],
+    # katalogi, które Spotlight indeksuje bez potrzeby; wykluczenie jest tylko w Ustawieniach
+    "spotlight_noise": ["~/Library/pnpm", "~/go"],
     # drzewo do pomiaru `bench fs` (lstat wszystkiego, dwa przebiegi)
     "fs_bench_path": "~/Documents/portivo-app/Untitled/node_modules/.pnpm",
     # ogranicznik wysyłania z perf-root.sh dostaje tyle procent zmierzonego uploadu
@@ -1160,6 +1165,20 @@ class Deferred(Exception):
     """Cofnięcie musi poczekać (Docker działa); `keep` dokończy je później."""
 
 
+ORCA_DATA = os.path.join(HOME, "Library/Application Support/orca/orca-data.json")
+
+
+def git_repos(cfg):
+    """Ścieżki z `git_repos`; "orca" to wszystkie repozytoria, z których Orka robi worktree."""
+    wanted = cfg.get("git_repos") or []
+    if wanted == "orca":
+        data, _ = read_json_file(ORCA_DATA)
+        repos = data.get("repos") or []
+        items = repos.values() if isinstance(repos, dict) else repos
+        return [r["path"] for r in items if isinstance(r, dict) and r.get("path")]
+    return [os.path.expanduser(r) for r in wanted]
+
+
 class GitSpeed:
     """core.untrackedCache i core.fsmonitor w repozytoriach z listy `git_repos`."""
 
@@ -1169,14 +1188,14 @@ class GitSpeed:
     title = "git status bez skanowania drzewa: untrackedCache + fsmonitor (repozytoria z `git_repos`)"
     effect = (
         "klon portivo (14 tys. plików): git status 71 -> 31 ms z untrackedCache, 26 ms z "
-        "fsmonitor; feature.manyFiles (index v4) nic nie dodał"
+        "fsmonitor; feature.manyFiles (index v4, skipHash) i commit-graph nic nie dodały"
     )
     KEYS = (("core.untrackedCache", "true"), ("core.fsmonitor", "true"))
 
     def apply(self, cfg, system, record=None):
         repos = dict((record or {}).get("repos", {}))
         changed = []
-        for repo in [os.path.expanduser(r) for r in cfg.get("git_repos", [])]:
+        for repo in git_repos(cfg):
             if repo in repos or system.git(repo, "rev-parse", "--git-dir") is None:
                 continue
             prev = {}
@@ -1238,6 +1257,15 @@ TWEAKS = [
         "devguard_budget_percent",
         "ciaśniejszy limit dev serwerów w strażniku (devguard.json budget_percent)",
         "polityka, nie pomiar: 35% RAM (16,8 GB) -> 25% (12 GB); dev serwery zajmowały 3,2 GB",
+    ),
+    JsonSetting(
+        "devguard-max-server",
+        "dev",
+        DEVGUARD_CONFIG,
+        "max_server_gb",
+        "devguard_max_server_gb",
+        "wcześniejszy restart spuchniętego dev serwera (devguard.json max_server_gb)",
+        "polityka, nie pomiar: 5 -> 4 GB; Turbopack po godzinie pracy dobija do 7-9 GB",
     ),
     JsonSetting(
         "docker-vm",
@@ -1386,16 +1414,11 @@ def hook_records(path):
 
 
 def hook_latency(
-    since,
-    until=None,
-    events=("PreToolUse", "PostToolUse", "Stop"),
-    skip=(),
-    born_after=None,
+    since, until=None, events=("PreToolUse", "PostToolUse", "Stop"), skip=()
 ):
     """Ile sesja Claude Code czeka na hooki przy jednym zdarzeniu (ms): najdłuższy z
     równoległych hooków, z transkryptów. Hooki, których komenda zawiera coś z `skip`
-    (puszczone w tle), nie wstrzymują sesji, więc się nie liczą. `born_after` bierze
-    tylko sesje otwarte po tej chwili: Claude Code czyta hooki raz, przy starcie sesji.
+    (puszczone w tle), nie wstrzymują sesji, więc się nie liczą.
 
     {"PostToolUse": {"n": ..., "p50": ..., "p90": ...}, ...}
     """
@@ -1404,8 +1427,6 @@ def hook_latency(
     for path in glob.glob(os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")):
         try:
             if os.path.getmtime(path) < since:
-                continue
-            if born_after and janitor.born(path) < born_after:
                 continue
             records = list(hook_records(path))
         except OSError:
@@ -1494,9 +1515,11 @@ ULTRA = [
     "claude-hooks-async",
     "node-compile-cache",
     "devguard-budget",
-    "docker-vm",
+    "devguard-max-server",
     "git-speed",
 ]
+# co sprawdzić co najwyżej raz na tyle sekund (mdfind trwa około sekundy)
+SPOTLIGHT_CHECK_SECONDS = 600
 # poprawka hooków liczy się dopiero po tylu zdarzeniach od włączenia
 HOOK_SAMPLES = 30
 SETTLE_SECONDS = 2
@@ -1525,9 +1548,59 @@ def pending_root(cfg, state):
     return names
 
 
+def spotlight_indexed(cfg):
+    """Ile plików Spotlight trzyma w indeksie pod katalogami z `spotlight_noise`."""
+    total = 0
+    for path in cfg.get("spotlight_noise", []):
+        path = os.path.expanduser(path)
+        if not os.path.isdir(path):
+            continue
+        out = janitor.run(
+            ["mdfind", "-onlyin", path, "-count", 'kMDItemDisplayName == "*"c'],
+            timeout=60,
+        )
+        try:
+            total += int(out.strip())
+        except (AttributeError, ValueError):
+            continue
+    return total
+
+
+def spotlight_result(cfg, state, force=False):
+    """Wynik do kliknięcia w Ustawieniach: pliki pakietów i modułów w indeksie Spotlight.
+
+    mdfind trwa około sekundy, więc liczymy najwyżej raz na SPOTLIGHT_CHECK_SECONDS.
+    Gdy użytkownik wykluczy katalogi, liczba spada i wynik dostaje "after".
+    """
+    ultra = ultra_state(state)
+    result = ultra["results"].get("spotlight-privacy")
+    if result and result.get("after") is not None:
+        return
+    checked = state.get("spotlight_checked", 0)
+    if not force and time.time() - checked < SPOTLIGHT_CHECK_SECONDS:
+        return
+    state["spotlight_checked"] = time.time()
+    count = spotlight_indexed(cfg)
+    if result is None:
+        if count > 0:
+            paths = ", ".join(cfg.get("spotlight_noise", []))
+            ultra["results"]["spotlight-privacy"] = {
+                "before": count,
+                "after": None,
+                "unit": "plików w indeksie Spotlight",
+                "note": f"dodaj w Ustawienia > Spotlight > Prywatność: {paths}",
+            }
+    elif count < result["before"] * 0.1:
+        result["after"] = count
+        result.pop("note", None)
+
+
 def pending_manual(state):
     """Rzeczy do kliknięcia przez człowieka: Ultra ich nie zrobi sama."""
     names = []
+    spotlight = ultra_state(state)["results"].get("spotlight-privacy")
+    if spotlight and spotlight.get("after") is None:
+        names.append("spotlight-privacy")
     record = state["applied"].get("docker-vm")
     if record and record.get("written") and not record.get("active"):
         names.append("docker-restart")
@@ -1555,6 +1628,14 @@ def measure_before_after(item, cfg, system, record):
             "after": record.get("value"),
             "unit": "% RAM na dev serwery",
         }
+    if name == "devguard-max-server":
+        prev = record.get("prev")
+        before = 5 if prev == MISSING or prev is None else prev
+        return {
+            "before": before,
+            "after": record.get("value"),
+            "unit": "GB na jeden dev serwer",
+        }
     if name == "docker-vm":
         prev = record.get("prev")
         before = 8192 if prev == MISSING or prev is None else prev
@@ -1580,6 +1661,18 @@ def ultra_on(cfg, system, state):
         ultra["results"] = {}
     ultra["on"] = True
     report = []
+    for name in [n for n in ultra["applied"] if n not in ULTRA]:
+        record = state["applied"].pop(name, None)
+        ultra["applied"].remove(name)
+        ultra["results"].pop(name, None)
+        if record is None:
+            continue
+        try:
+            restored = tweak(name).undo(record, system)
+        except Deferred:
+            state.setdefault("deferred", {})[name] = record
+            restored = ["cofnę po zamknięciu Dockera"]
+        report += [f"{name} (już nie w Ultra): {what}" for what in restored]
     for name in ULTRA:
         item = tweak(name)
         old = state["applied"].get(name)
@@ -1588,10 +1681,8 @@ def ultra_on(cfg, system, state):
         before = None
         if name == "bg-helpers" and old is None:
             before = item.measure(cfg, system)
-        if name == "git-speed" and old is None and cfg.get("git_repos"):
-            before = git_status_ms(
-                system, [os.path.expanduser(r) for r in cfg["git_repos"]]
-            )
+        if name == "git-speed" and old is None and git_repos(cfg):
+            before = git_status_ms(system, git_repos(cfg))
         try:
             record, changed = item.apply(cfg, system, old)
         except (OSError, ValueError, RuntimeError) as err:
@@ -1614,9 +1705,7 @@ def ultra_on(cfg, system, state):
             after = item.measure(cfg, system)
             result = {"before": before, "after": after, "unit": "% rdzenia P"}
         elif name == "git-speed" and before is not None:
-            after = git_status_ms(
-                system, [os.path.expanduser(r) for r in cfg["git_repos"]]
-            )
+            after = git_status_ms(system, git_repos(cfg))
             result = {"before": before, "after": after, "unit": "ms git status"}
         elif name == "claude-hooks-async" and name not in ultra["results"]:
             since = ultra["since"]
@@ -1632,6 +1721,7 @@ def ultra_on(cfg, system, state):
             result = measure_before_after(item, cfg, system, record)
         if result:
             ultra["results"][name] = result
+    spotlight_result(cfg, state, force=True)
     ultra["pending_root"] = pending_root(cfg, state)
     ultra["pending_manual"] = pending_manual(state)
     return report
@@ -1664,9 +1754,11 @@ def refresh_ultra(cfg, state, system):
         return
     hooks = ultra["results"].get("claude-hooks-async")
     if hooks and hooks.get("after") is None and ultra["since"]:
-        # hooki puszczone w tle mogą dalej trafiać do transkryptu, ale sesja na nie nie czeka
+        # działające sesje Claude Code łapią zmianę hooków w locie (zmierzone: po włączeniu
+        # wpisy cavemem znikają z transkryptów także starych sesji); wpisy, które jeszcze
+        # przyszły, nie wstrzymują już sesji
         skip = [spec["match"] for spec in cfg.get("async_hooks", [])]
-        stats = hook_latency(ultra["since"], skip=skip, born_after=ultra["since"])
+        stats = hook_latency(ultra["since"], skip=skip)
         stats = stats.get("PostToolUse")
         if stats and stats["n"] >= HOOK_SAMPLES:
             hooks["after"] = stats["p50"]
@@ -1676,6 +1768,7 @@ def refresh_ultra(cfg, state, system):
         total = system.docker_memory()
         if total and abs(total / 2**20 - docker["value"]) < 512:
             docker["active"] = True
+    spotlight_result(cfg, state)
     if docker and "docker-vm" in ultra["applied"]:
         # notatka idzie za stanem: czeka na zamknięcie, czeka na restart, działa
         result = measure_before_after(tweak("docker-vm"), cfg, system, docker)
@@ -1727,6 +1820,8 @@ def cmd_ultra(cfg, args, system=None):
 
 
 MANUAL = {
+    "spotlight-privacy": "Ustawienia > Spotlight > Prywatność wyszukiwania: dodaj katalogi "
+    "z `spotlight_noise` (magazyn pnpm, moduły Go)",
     "docker-restart": "nowa pamięć maszyny Dockera zadziała po jego restarcie (Docker > Restart)",
     "docker-quit": "zapis limitu pamięci Dockera czeka, aż Docker będzie zamknięty",
 }

@@ -197,7 +197,8 @@ Orca prowadzi worktree jednego repozytorium: portivo (`~/Documents/portivo-app/U
 
 - **Ultra** ma do tego poprawkę `git-speed` (untrackedCache + fsmonitor, z dokładnym
   cofnięciem), ale działa tylko na repozytoriach wpisanych do `git_repos` w
-  `~/.local/share/claude-acc/perf.json`. Domyślnie ta lista jest pusta.
+  `~/.local/share/claude-acc/perf.json`. Lista jest domyślnie pusta; `"git_repos": "orca"`
+  bierze wszystkie repozytoria z worktree Orki.
 - **Dla portivo** można to włączyć wpisem albo ręcznie:
   `git -C ~/Documents/portivo-app/Untitled config core.untrackedCache true && git -C
   ~/Documents/portivo-app/Untitled config core.fsmonitor true && git -C
@@ -260,10 +261,10 @@ Orca prowadzi worktree jednego repozytorium: portivo (`~/Documents/portivo-app/U
   tu nie płacisz za to nic.
 - **Odpytywanie z dashboardu:** Docker Desktop z otwartym oknem odpala `docker stats --all
   --no-stream` 18 razy na minutę. Zamknięcie okna (nie aplikacji) to wyłącza.
-- **Limit pamięci VM:**
-  - Ultra zapisuje `MemoryMiB` = 6144 do `settings-store.json`, ale tylko wtedy, gdy
-    Docker nie działa, bo działający Docker trzyma ustawienia w pamięci i nadpisuje plik.
-  - Nowa wartość działa od następnego startu Dockera. Ultra go nie restartuje.
+- **Limit pamięci VM:** tylko zalecenie, poza Ultrą. `perf.py apply docker-vm` zapisuje
+  `MemoryMiB` = 6144 do `settings-store.json`, ale wyłącznie wtedy, gdy Docker nie działa,
+  bo działający Docker trzyma ustawienia w pamięci i nadpisuje plik. Nowa wartość działa
+  od następnego startu Dockera. Nikt go nie restartuje.
 - **Docker VMM** (od 4.86) według dokumentacji oddaje wolną pamięć hostowi. Przejście
   wymaga restartu i nie obsługuje Rosetty; nie mierzyłem, zostawiam to do decyzji.
 
@@ -272,58 +273,123 @@ Orca prowadzi worktree jednego repozytorium: portivo (`~/Documents/portivo-app/U
 `perf.py ultra on|off|status [--json]` włącza naraz poprawki dla pracy agentów i zapisuje
 w `perf-state.json`, co było przed nimi. `off` przywraca dokładnie poprzednie wartości.
 
-- Sprawdzone na żywym systemie: po `ultra off` `~/.claude/settings.json` i `devguard.json`
-  były bajt w bajt takie jak przed `on`.
-- Zmiana wartości przez kogoś innego po włączeniu Ultra zostaje nietknięta.
-- Poprawki włączone ręcznie przed Ultra Ultra zostawia w spokoju.
-- `ultra on` drugi raz niczego nie psuje i nie mierzy „przed” od nowa, więc może iść
-  przy logowaniu.
+- **Sprawdzone na żywym systemie:** po `ultra off` pliki `~/.claude/settings.json` i
+  `devguard.json` były bajt w bajt takie jak przed `on`. Testy w osobnym `$HOME` sprawdzają
+  to samo: `on`, drugi raz `on` bez żadnej zmiany w plikach, `off`.
+- **Cudze zmiany zostają:** gdy ktoś zmieni wartość po włączeniu Ultry, `off` jej nie
+  rusza.
+- **Ręcznie włączone poprawki zostają:** to, co włączono przed Ultrą przez `perf.py apply`,
+  Ultra omija i `off` tego nie cofa.
+- **Drugie `on` niczego nie psuje** i nie mierzy „przed” od nowa, więc może iść przy
+  logowaniu.
+- **Pilnowanie:** po restarcie wystarczy `perf.py keep` (RunAtLoad i co 5 minut). Nakłada
+  QoS tła na nowy pid workera, przywraca wpisy, gdy ktoś nadpisze settings.json, i
+  uzupełnia wyniki, które przychodzą później.
+- **Zmiany składu:** składnik usunięty z Ultry, jak `docker-vm` z pierwszej wersji, następne
+  `ultra on` cofa sam.
+
+### Co Ultra włącza i co dało
 
 | poprawka | grupa | co zmienia | zmierzone przed -> po |
 |---|---|---|---|
-| `bg-helpers` | cpu | `PRIO_DARWIN_BG` dla cavemem worker | rdzeń P 32,1% -> 0,1%, ~1 W -> 0,1 W |
-| `claude-hooks-async` | claude | `"async": true` dla cavemem `post-tool-use` i `stop` | PostToolUse p50 53 ms przed. Wynik „po” wypełnia się sam, bo Claude Code czyta hooki przy starcie sesji: liczone są tylko sesje otwarte po włączeniu, bez hooków działających w tle, od 30 wywołań. Spodziewane około 26 ms (hook Orki) |
-| `node-compile-cache` | claude | `env.NODE_COMPILE_CACHE` w `~/.claude/settings.json` | `require('typescript')` 96 -> 49 ms (nowe sesje) |
-| `devguard-budget` | dev | `budget_percent` 25 w `devguard.json` (strażnik czyta co 5 s) | 35% RAM (16,8 GB) -> 25% (12 GB); polityka, nie pomiar |
-| `docker-vm` | docker | `MemoryMiB` 6144, zapis przy zamkniętym Dockerze | 8,0 -> 6,0 GB od następnego startu Dockera |
-| `git-speed` | dev | untrackedCache + fsmonitor w repozytoriach z `git_repos` | klon portivo 71 -> 26 ms; lista domyślnie pusta |
-| `vnodes` | root (pending_root) | `kern.maxvnodes` 786432 przez perf-root.sh | do zmierzenia `perf-root.sh vnodes trial` |
-| `shaper` | root (pending_root, tylko gdy sieć puchnie) | `ifconfig tbr` | przy BE230 niepotrzebny |
+| `bg-helpers` | cpu | `PRIO_DARWIN_BG` dla cavemem worker | rdzeń P 32,1% -> 0,1%, energia ~1 W -> 0,1 W |
+| `claude-hooks-async` | claude | `"async": true` dla cavemem `post-tool-use` i `stop` w `~/.claude/settings.json` | sesja czeka na hooki PostToolUse: **53 -> 24 ms p50, 73 -> 30 ms p90** na każde narzędzie (107 wywołań po włączeniu kontra 3304 w dobie przed); Stop 70 -> 16 ms p50 (tylko 2 tury po) |
+| `node-compile-cache` | claude | `env.NODE_COMPILE_CACHE` w `~/.claude/settings.json` | `require('typescript')` 96 -> 49 ms |
+| `devguard-budget` | dev | `budget_percent` 25 w `devguard.json` | 35% RAM (16,8 GB) -> 25% (12 GB); polityka |
+| `devguard-max-server` | dev | `max_server_gb` 4 w `devguard.json` | 5 -> 4 GB na serwer; polityka (Turbopack dobija do 7-9 GB) |
+| `git-speed` | dev | `core.untrackedCache` + `core.fsmonitor` w repozytoriach z `git_repos` | klon portivo 71 -> 26 ms; domyślnie pusta lista |
 
-Kształt `perf-state.json` pod kluczem `ultra` (panel czyta też `perf.py ultra status --json`):
+Hooki zmieniają się na żywo, bez restartu sesji. Po włączeniu wpisy cavemem PostToolUse
+zniknęły z transkryptów także sesji otwartych wcześniej (było 2389 na godzinę, przyszło 6).
+Z kolei PreToolUse, którego zmiana nie dotyczy, przesunęło się w tym samym oknie o 4 ms
+(29 -> 25 ms p50), więc tyle spadku to luźniejsza pora, a reszta (~25 ms na każde
+narzędzie) to hook cavemem.
+
+**Czeka na roota** (`pending_root`, robi to perf-root.sh):
+
+- `vnodes`: `kern.maxvnodes` 786432, przez `sudo ./perf-root.sh vnodes trial`.
+- `shaper`: ogranicznik wysyłania. Pojawia się tylko wtedy, gdy ostatni pomiar sieci
+  pokazał, że łącze puchnie przy wysyłaniu (więcej niż 50 ms ponad opóźnienie bez
+  obciążenia).
+
+**Czeka na człowieka** (`pending_manual`): `spotlight-privacy`. Spotlight trzyma 509 825
+plików z `~/Library/pnpm` i `~/go`, a wykluczyć je można tylko w Ustawieniach. Gdy liczba
+spadnie, wynik sam dostanie „po”; sprawdzanie najwyżej raz na 10 minut, bo mdfind trwa
+około sekundy.
+
+**Tylko na życzenie, poza Ultrą** (`perf.py apply ...`):
+
+- `docker-vm`: `MemoryMiB` 6144, zapis tylko przy zamkniętym Dockerze, działa od jego
+  następnego startu. Dockera nikt nie restartuje.
+- `git-speed` dla portivo: `"git_repos": "orca"` albo `["~/Documents/portivo-app/Untitled"]`
+  w `perf.json`. Lista jest domyślnie pusta, bo konfigurację portivo zmienia tylko jego
+  właściciel.
+
+### Kształt JSON dla panelu
+
+`perf-state.json` pod kluczem `ultra`, także `perf.py ultra status --json`. Na żywo, 2026-10-04:
 
 ```json
 {
   "on": true,
   "since": 1791137059.26,
-  "applied": ["bg-helpers", "claude-hooks-async", "node-compile-cache", "devguard-budget", "docker-vm", "git-speed"],
+  "applied": ["bg-helpers", "claude-hooks-async", "node-compile-cache", "devguard-budget", "git-speed", "devguard-max-server"],
   "pending_root": ["vnodes"],
-  "pending_manual": ["docker-quit"],
+  "pending_manual": ["spotlight-privacy"],
   "results": {
     "bg-helpers": {"before": 32.1, "after": 0.1, "unit": "% rdzenia P"},
-    "claude-hooks-async": {"before": 53.0, "after": null, "unit": "ms hooków na narzędzie (p50)", "note": "po 30 wywołaniach od włączenia"},
+    "claude-hooks-async": {"before": 53.0, "after": 24.0, "unit": "ms hooków na narzędzie (p50)"},
     "node-compile-cache": {"before": 96.0, "after": 49.0, "unit": "ms require('typescript')"},
     "devguard-budget": {"before": 35, "after": 25, "unit": "% RAM na dev serwery"},
-    "docker-vm": {"before": 8.0, "after": 6.0, "unit": "GB RAM maszyny Dockera", "note": "zapisze się po zamknięciu Dockera"}
+    "devguard-max-server": {"before": 5, "after": 4, "unit": "GB na jeden dev serwer"},
+    "spotlight-privacy": {"before": 509825, "after": null, "unit": "plików w indeksie Spotlight", "note": "dodaj w Ustawienia > Spotlight > Prywatność: ~/Library/pnpm, ~/go"}
   }
 }
 ```
 
-Klucze `on`, `since`, `applied`, `pending_root` i `results` są takie, jak ustaliliśmy.
-Doszły dwie rzeczy:
+- **Klucze:** `on`, `since`, `applied`, `pending_root` i `results` (z `before`, `after`,
+  `unit` i opcjonalnym `note`) są takie, jak ustaliliśmy. Doszła lista `pending_manual`:
+  `spotlight-privacy`, a przy ręcznie włączonym `docker-vm` także `docker-quit` i
+  `docker-restart`.
+- **`after: null`:** pomiar „po” jeszcze nie przyszedł.
+- **Wynik bez wpisu w `applied`:** `spotlight-privacy` dotyczy kroku do kliknięcia, nie
+  poprawki.
 
-- **Opcjonalne pole `note`** przy wyniku: liczba jeszcze nie dojrzała albo zmiana działa od
-  restartu. `after: null` znaczy, że pomiar „po” jeszcze nie przyszedł.
-- **Lista `pending_manual`**, czyli rzeczy, które musi kliknąć człowiek:
-  - `docker-quit`: zapis limitu czeka na zamknięcie Dockera;
-  - `docker-restart`: limit jest zapisany i zadziała po restarcie.
+### Sprawdzone i niewłączone
 
-`perf.py keep` (szablon launchd co 5 minut) robi trzy rzeczy:
+| kandydat | pomiar | decyzja |
+|---|---|---|
+| inne pomocniki systemu w bg-helpers | 60 s: photoanalysisd, mediaanalysisd, cloudd, fileproviderd 0,00-0,04% CPU; corespotlightd 0,17%; mdworker, bird, suggestd, siriknowledged, duetexpertd już z priorytetem 4; mds_stores należy do `_mds_stores` (bez roota setpriority odmawia) | nie: nie ma czego zabrać |
+| Passwords w menu bar (`com.apple.Passwords.MenuBarExtra`) | 3,7% CPU, 1,4% rdzenia P, 50 mW bez przerwy | nie w tło (to UI, menu otwierałoby się wolniej); lepiej wyłączyć ikonę w ustawieniach aplikacji Hasła |
+| limity (`maxfiles`, `maxproc`, `ptmx_max`) | 5-8% zużycia; agenci mają `ulimit -n` 1048576 | nie: zapas jest |
+| `feature.manyFiles`, `index.skipHash` | klon portivo: 34 ms kontra 31 ms z samym untrackedCache | nie: bez zysku, skipHash myli narzędzia na libgit2 |
+| `git maintenance register` | portivo ma już łańcuch commit-graph z automatycznego gc; na klonie commit-graph z filtrami ścieżek dał `git log -- plik` 31 -> 15 ms, `git status` i całą historię bez zmian | nie domyślnie; opcja dla portivo: `git -C <repo> maintenance register` (cofnięcie: `maintenance unregister`) |
+| wykluczenia Time Machine (`tmutil addexclusion`) | `tmutil destinationinfo`: brak dysku | nie: nic nie da, dopóki nie ma kopii |
+| Spotlight na worktree, node_modules, .next | worktree portivo i projekty: 0 plików w indeksie (prywatność już ustawiona, `.next` to katalog z kropką) | zostają tylko pnpm i go (patrz wyżej) |
+| App Nap i timery Orki | priorytet 46 i 24-31 wybudzeń/s także pod spodem | nie: nie ma czego wyłączać |
+| `NODE_COMPILE_CACHE` dla samego `claude` | `claude --version` 10 ms; to binarka Buna | nie dotyczy; cache włączony dla tego, co sesje uruchamiają |
+| Docker VM w Ultra | 8 GB VM, 3,7 GB kontenerów | tylko zalecenie (`perf.py apply docker-vm`) |
 
-- pilnuje włączonych poprawek: nowy pid workera, nadpisany settings.json;
-- zapisuje limit Dockera, gdy Docker zostanie zamknięty;
-- dokańcza cofnięcia, które czekały na Dockera, i uzupełnia wyniki, które przychodzą
-  później.
+Gdzie ustawić `NODE_COMPILE_CACHE` dla terminali Orki:
+
+- **`launchctl setenv`:** działa tylko dla aplikacji uruchomionych później. Działająca Orca
+  i jej terminale nie dostaną zmiennej do restartu Orki, a ustawienie znika przy restarcie
+  Maca.
+- **Plik startowy powłoki (`~/.zshrc`):** zmienia twój dotfile, działa w każdej powłoce,
+  także poza agentami, a cofnięcie to edycja pliku.
+- **`env` w `~/.claude/settings.json` (wybrane):** jeden klucz z zapisaną poprzednią
+  wartością. Obejmuje dokładnie to, co uruchamiają sesje Claude: Bash, serwery MCP i hooki.
+
+### Zmienne Claude Code (sprawdzone w dokumentacji, Context7 `/websites/code_claude`)
+
+| zmienna | co robi według dokumentacji | decyzja |
+|---|---|---|
+| `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING` | wyłączają metryki i raporty błędów; `DISABLE_TELEMETRY` wyłącza też pobieranie flag funkcji, przez co Remote Control może być niedostępny | już ustawione we wszystkich 9 sesjach (`~/.zshrc`); jeśli używasz Remote Control, to jest jego możliwa przyczyna |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | wyłącza autoaktualizacje, telemetrię, raporty, `/feedback`, informacje o wydaniach, odznaki statusu PR, sprawdzanie dostępności, pobieranie flag funkcji (Remote Control) i działanie wtyczek `command` w tle; `0` też wyłącza | opt-in, nie w Ultra: wyłącza autoaktualizacje i funkcje |
+| `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY` | wyłącza ankiety jakości sesji | opt-in; narzutu nie da się zmierzyć |
+| `skipWebFetchPreflight` (ustawienie) | pomija sprawdzanie bezpieczeństwa domeny przy WebFetch | nie: to zabezpieczenie |
+| `USE_BUILTIN_RIPGREP=0` | używa systemowego rg zamiast dołączonego | nie: dokumentacja podaje to jako obejście zgodności |
+| `async: true` w hooku | „hook runs in background without blocking” (schemat w binarce 2.1.289) | tak, dla cavemem PostToolUse i Stop |
 
 ## Wyniki ogólne: sieć, CPU, GPU
 
@@ -516,14 +582,14 @@ Najpierw praca agentów, potem ogólne.
 
 1. **`perf.py ultra on`** (włączone 2026-10-04 wieczorem). Robi jednocześnie:
    - **cavemem worker w tle:** rdzeń P 32% -> 0,1%;
-   - **hooki cavemem w tle:** około 28 ms mniej na każde narzędzie, w nowych sesjach;
-   - **`NODE_COMPILE_CACHE`:** wczytanie TypeScriptu o połowę szybsze, w nowych sesjach;
-   - **ciaśniejszy budżet strażnika:** 25% RAM;
-   - **limit pamięci Dockera:** 6 GB, czeka na zamknięcie Dockera.
+   - **hooki cavemem w tle:** PostToolUse 53 -> 24 ms p50 na każde narzędzie, działa od
+     razu także w otwartych sesjach;
+   - **`NODE_COMPILE_CACHE`:** `require('typescript')` 96 -> 49 ms;
+   - **ciaśniejsze limity strażnika:** 25% RAM na wszystkie dev serwery, 4 GB na jeden.
 
    Szczegóły i kształt JSON są w sekcji Ultra.
-   - Żeby Ultra działała po logowaniu i pilnowała nowych pidów, trzeba zainstalować
-     szablon `launchd/com.filip.claude-acc.perf.plist.template` (`perf.py keep` co 5
+   - Żeby Ultra pilnowała nowych pidów po restarcie, trzeba zainstalować szablon
+     `launchd/com.filip.claude-acc.perf.plist.template` (`perf.py keep` przy starcie i co 5
      minut). Tego jeszcze nie zrobiłem.
    - Lepsza poprawka cavemem jest u źródła: worker nie powinien skanować 1,9 GB bazy bez
      końca (cavemem 0.3.0, `idleShutdownMs` nie działa, gdy sesje bez przerwy zapisują).
@@ -533,19 +599,21 @@ Najpierw praca agentów, potem ogólne.
    - trial mierzy lstat przed i po zmianie i wszystko cofa; jeśli drugi przebieg spadnie
      wyraźnie poniżej 3,6 s, warto zostawić (`--keep`, do restartu).
 3. **`git-speed` dla portivo:**
-   - dopisz `"git_repos": ["~/Documents/portivo-app/Untitled"]` do
+   - dopisz `"git_repos": "orca"` (albo `["~/Documents/portivo-app/Untitled"]`) do
      `~/.local/share/claude-acc/perf.json` i puść `perf.py ultra on` jeszcze raz;
    - `git status` spadnie z ~76 do ~26-31 ms we wszystkich worktree.
 4. **Spotlight:** Ustawienia > Spotlight > Prywatność wyszukiwania, dodaj `~/Library/pnpm`
-   (468 tys. plików w indeksie) i `~/go`. Każda instalacja pnpm z nowymi pakietami
-   przestanie dokładać pracy mds.
+   i `~/go` (razem 509 825 plików w indeksie). Opcjonalnie też
+   `~/Documents/test-router/lms` (23 902 pliki, katalog `vendor` PHP). Każda instalacja
+   pnpm z nowymi pakietami przestanie dokładać pracy mds; Ultra pokazuje to jako
+   `spotlight-privacy` i sama zauważy, gdy liczba spadnie.
 5. **devguard** (dla głównej sesji): szybka ścieżka w `admit` przed importami oszczędzi
    około 20 ms na każdym Bashu (44 ms teraz). Polling Orki przez CLI (19 razy na minutę,
    70-130 ms każde) warto zrzadzić albo przenieść na jedno wywołanie.
 6. **Docker:**
    - zamykaj okno Docker Desktop, gdy go nie oglądasz: z otwartym oknem Docker odpala
      `docker stats` 18 razy na minutę;
-   - restart Dockera po zapisie limitu przez Ultra da 2 GB RAM na stałe;
+   - `perf.py apply docker-vm` i restart Dockera, kiedy Ci pasuje, dadzą 2 GB RAM na stałe;
    - Docker VMM to osobna decyzja.
 7. **Ogranicznik wysyłania przy Zyxelu** (`sudo ./perf-root.sh trial`).
    - Przy Orange najpierw `perf.py bench network`. Jeśli w linii „z tego sieć” opóźnienie

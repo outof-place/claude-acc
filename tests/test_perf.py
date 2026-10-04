@@ -86,16 +86,25 @@ class Isolated(unittest.TestCase):
         # żaden test nie może dotknąć prawdziwych plików Claude, strażnika ani Dockera
         self.claude = os.path.join(self.dir, "claude-settings.json")
         self.files = {}
+        fake = {
+            perf.DEVGUARD_CONFIG: os.path.join(self.dir, "devguard.json"),
+            perf.DOCKER_SETTINGS: os.path.join(self.dir, "docker-settings.json"),
+        }
         for item in perf.TWEAKS:
             if isinstance(item, (perf.AsyncHooks, perf.ClaudeEnv)):
                 patcher = mock.patch.object(item, "path", self.claude)
             elif isinstance(item, perf.JsonSetting):
-                self.files[item.name] = os.path.join(self.dir, f"{item.name}.json")
+                self.files[item.name] = fake[item.path]
                 patcher = mock.patch.object(item, "path", self.files[item.name])
             else:
                 continue
             patcher.start()
             self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(
+            perf, "ORCA_DATA", os.path.join(self.dir, "orca-data.json")
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfg = dict(perf.DEFAULT_CONFIG)
 
     def write(self, path, data):
@@ -575,8 +584,6 @@ class HookLatencyTest(Isolated):
             stats["PostToolUse"]["p50"], 100
         )  # max z równoległych: 110 i 90
         self.assertEqual(stats["Stop"], {"n": 1, "p50": 70, "p90": 70})
-        later = perf.hook_latency(since, since + 7200, born_after=time.time() + 60)
-        self.assertEqual(later, {})  # transkrypt powstał przed tą chwilą: stare hooki
         skipped = perf.hook_latency(
             since, since + 7200, skip=["cavemem/dist/index.js hook run"]
         )
@@ -603,21 +610,17 @@ class UltraTest(Isolated):
     def setUp(self):
         super().setUp()
         self.write(self.claude, claude_settings())
-        self.write(self.files["devguard-budget"], {"protect": ["~/x"]})
-        self.write(self.files["docker-vm"], {"AutoStart": True})
-        self.originals = {
-            p: self.read(p)
-            for p in (
-                self.claude,
-                self.files["devguard-budget"],
-                self.files["docker-vm"],
-            )
-        }
+        self.devguard = self.files["devguard-budget"]
+        self.write(self.devguard, {"protect": ["~/x"]})
+        self.originals = {p: self.text(p) for p in (self.claude, self.devguard)}
+        self.spotlight = [468066]
         for name, value in {
             "typescript_load": lambda cache_dir=None, runs=5: 40 if cache_dir else 87,
-            "hook_latency": lambda since, until=None, events=(), skip=(), born_after=None: {
+            "hook_latency": lambda since, until=None, events=(), skip=(): {
                 "PostToolUse": {"n": 500, "p50": 54, "p90": 99}
             },
+            "spotlight_indexed": lambda cfg: self.spotlight[0],
+            "SETTLE_SECONDS": 0,
         }.items():
             patcher = mock.patch.object(perf, name, value)
             patcher.start()
@@ -627,9 +630,6 @@ class UltraTest(Isolated):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(perf, "SETTLE_SECONDS", 0)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.system = FakeSystem({10: [100, WORKER, False]})
 
     def ultra(self, *args):
@@ -637,80 +637,213 @@ class UltraTest(Isolated):
         self.assertEqual(code, 0)
         return out
 
+    def status(self):
+        return json.loads(self.ultra("status", "--json"))
+
     def test_on_status_off_roundtrip(self):
         self.ultra("on")
-        data = json.loads(self.ultra("status", "--json"))
+        data = self.status()
         self.assertEqual(
             set(data),
             {"on", "since", "applied", "pending_root", "pending_manual", "results"},
         )
         self.assertTrue(data["on"])
         self.assertEqual(data["applied"], perf.ULTRA)
+        self.assertNotIn("docker-vm", data["applied"])  # Docker tylko jako zalecenie
         self.assertIn("vnodes", data["pending_root"])
         self.assertNotIn(
             "shaper", data["pending_root"]
         )  # sieć nie puchnie (brak pomiaru)
+        self.assertEqual(data["pending_manual"], ["spotlight-privacy"])
         results = data["results"]
         self.assertEqual(
             results["bg-helpers"], {"before": 25.0, "after": 0.2, "unit": "% rdzenia P"}
         )
-        self.assertEqual(results["node-compile-cache"]["before"], 87)
-        self.assertEqual(results["node-compile-cache"]["after"], 40)
-        self.assertEqual(results["devguard-budget"]["before"], 35)
-        self.assertEqual(results["devguard-budget"]["after"], 25)
-        self.assertEqual(results["docker-vm"]["after"], 6.0)
+        self.assertEqual(
+            (
+                results["node-compile-cache"]["before"],
+                results["node-compile-cache"]["after"],
+            ),
+            (87, 40),
+        )
+        self.assertEqual(
+            (results["devguard-budget"]["before"], results["devguard-budget"]["after"]),
+            (35, 25),
+        )
+        self.assertEqual(
+            (
+                results["devguard-max-server"]["before"],
+                results["devguard-max-server"]["after"],
+            ),
+            (5, 4),
+        )
         self.assertEqual(results["claude-hooks-async"]["before"], 54)
-        # hooki: po włączeniu jest już 500 zdarzeń (atrapa), więc status uzupełnia "after"
+        # atrapa ma już 500 zdarzeń z nowych sesji, więc status uzupełnia "after"
         self.assertEqual(results["claude-hooks-async"]["after"], 54)
-        self.assertEqual(self.system.procs[10][2], True)
-        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
-        self.assertEqual(self.read(self.files["docker-vm"])["MemoryMiB"], 6144)
-        self.assertIn("docker-restart", data["pending_manual"])
+        self.assertEqual(results["spotlight-privacy"]["before"], 468066)
+        self.assertIsNone(results["spotlight-privacy"]["after"])
+        self.assertTrue(self.system.procs[10][2])
+        self.assertEqual(
+            self.read(self.devguard),
+            {"protect": ["~/x"], "budget_percent": 25, "max_server_gb": 4},
+        )
 
-        since = data["since"]
-        self.ultra("on")  # drugi raz: nic nowego, ten sam początek
-        again = json.loads(self.ultra("status", "--json"))
-        self.assertEqual(again["since"], since)
+        # drugi raz: pliki bez zmian co do bajtu, ten sam początek, "przed" nie mierzone od nowa
+        files = {p: self.text(p) for p in self.originals}
+        self.ultra("on")
+        again = self.status()
+        self.assertEqual(again["since"], data["since"])
         self.assertEqual(again["results"]["bg-helpers"]["before"], 25.0)
+        self.assertEqual({p: self.text(p) for p in self.originals}, files)
+
+        # użytkownik wyklucza katalogi w Spotlight: wynik dostaje "after", zadanie znika
+        self.spotlight[0] = 0
+        with mock.patch.object(perf, "SPOTLIGHT_CHECK_SECONDS", 0):
+            after = self.status()
+        self.assertEqual(after["results"]["spotlight-privacy"]["after"], 0)
+        self.assertEqual(after["pending_manual"], [])
 
         self.ultra("off")
-        off = json.loads(self.ultra("status", "--json"))
+        off = self.status()
         self.assertFalse(off["on"])
-        self.assertEqual(off["applied"], [])
-        self.assertEqual(off["pending_root"], [])
+        self.assertEqual((off["applied"], off["pending_root"]), ([], []))
         for path, original in self.originals.items():
-            self.assertEqual(self.read(path), original)
-        self.assertEqual(self.system.procs[10][2], False)
+            self.assertEqual(self.text(path), original)
+        self.assertFalse(self.system.procs[10][2])
         self.assertEqual(perf.load_state()["applied"], {})
+
+    def test_keep_puts_new_worker_pid_in_background(self):
+        self.ultra("on")
+        del self.system.procs[10]
+        self.system.procs[11] = [110, WORKER, False]
+        self.run_cmd(perf.cmd_keep, system=self.system)
+        self.assertTrue(self.system.procs[11][2])
+        self.ultra("off")
+        self.assertFalse(self.system.procs[11][2])
 
     def test_manual_tweak_survives_ultra_off(self):
         self.run_cmd(perf.cmd_apply, "devguard-budget", system=self.system)
         self.ultra("on")
-        self.assertNotIn(
-            "devguard-budget", json.loads(self.ultra("status", "--json"))["applied"]
-        )
+        self.assertNotIn("devguard-budget", self.status()["applied"])
         self.ultra("off")
         self.assertIn("devguard-budget", perf.load_state()["applied"])
-        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
+        self.assertEqual(
+            self.read(self.devguard), {"protect": ["~/x"], "budget_percent": 25}
+        )
 
-    def test_docker_running_waits_and_off_defers(self):
-        self.system.docker = True
+    def test_component_dropped_from_ultra_is_undone(self):
+        """Pierwsza wersja Ultry miała docker-vm; nowe `ultra on` je cofa."""
+        docker = self.files["docker-vm"]
+        self.write(docker, {"AutoStart": True})
+        before = self.text(docker)
+        self.run_cmd(perf.cmd_apply, "docker-vm", system=self.system)
+        state = perf.load_state()
+        state["applied"]["docker-vm"]["ultra"] = True
+        perf.ultra_state(state).update(on=True, since=1.0, applied=["docker-vm"])
+        perf.save_state(state)
         self.ultra("on")
-        data = json.loads(self.ultra("status", "--json"))
-        self.assertIn("docker-quit", data["pending_manual"])
-        self.assertEqual(self.read(self.files["docker-vm"]), {"AutoStart": True})
-        self.ultra("off")
-        self.assertEqual(self.read(self.files["docker-vm"]), {"AutoStart": True})
-        self.assertEqual(perf.load_state().get("deferred", {}), {})
+        self.assertEqual(self.text(docker), before)
+        data = self.status()
+        self.assertNotIn("docker-vm", data["applied"])
+        self.assertNotIn("docker-vm", perf.load_state()["applied"])
 
     def test_shaper_pending_only_when_network_bloats(self):
         state = perf.load_state()
         perf.record_bench(state, "network", {"idle_ms": 30, "up_net_p90_ms": 900}, 1)
         perf.save_state(state)
         self.ultra("on")
-        self.assertIn(
-            "shaper", json.loads(self.ultra("status", "--json"))["pending_root"]
+        self.assertIn("shaper", self.status()["pending_root"])
+
+    def test_git_repos_from_orca(self):
+        self.write(
+            perf.ORCA_DATA, {"repos": [{"path": "/w/portivo"}, {"name": "bez ścieżki"}]}
         )
+        self.assertEqual(perf.git_repos({"git_repos": "orca"}), ["/w/portivo"])
+        self.assertEqual(
+            perf.git_repos({"git_repos": ["~/x"]}), [os.path.expanduser("~/x")]
+        )
+        self.assertEqual(perf.git_repos({}), [])
+
+
+class UltraFakeHomeTest(unittest.TestCase):
+    """Skrypt w osobnym $HOME: prawdziwe ścieżki pod HOME, prawdziwy proces-wydmuszka."""
+
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="perf-ultra-home-"))
+        self.marker = f"perf-ultra-dummy-{uuid.uuid4().hex}"
+        self.state_dir = os.path.join(self.home, ".local/share/claude-acc")
+        os.makedirs(self.state_dir)
+        os.makedirs(os.path.join(self.home, ".claude"))
+        self.claude = os.path.join(self.home, ".claude/settings.json")
+        with open(self.claude, "w") as f:
+            json.dump(claude_settings(), f, indent=2)
+            f.write("\n")
+        self.devguard = os.path.join(self.state_dir, "devguard.json")
+        with open(self.devguard, "w") as f:
+            f.write('{\n  "protect": [\n    "~/x"\n  ]\n}')
+        with open(os.path.join(self.state_dir, "perf.json"), "w") as f:
+            json.dump({"background": [self.marker], "spotlight_noise": []}, f)
+        self.originals = {}
+        self.originals = self.files()
+        self.dummy = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)", self.marker]
+        )
+
+    def tearDown(self):
+        self.dummy.kill()
+        self.dummy.wait()
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def perf(self, *args):
+        done = subprocess.run(
+            ["/usr/bin/python3", SCRIPT, *args],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, HOME=self.home),
+            timeout=120,
+            check=False,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout
+
+    def files(self):
+        out = {}
+        for path in (self.claude, self.devguard):
+            with open(path) as f:
+                out[path] = f.read()
+        return out
+
+    def priority(self):
+        out = subprocess.run(
+            ["ps", "-o", "pri=", "-p", str(self.dummy.pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        return int(out.strip())
+
+    def test_on_twice_then_off_restores_bytes(self):
+        time.sleep(0.2)
+        normal = self.priority()
+        self.perf("ultra", "on")
+        settings = json.loads(self.files()[self.claude])
+        self.assertEqual(
+            settings["env"]["NODE_COMPILE_CACHE"],
+            os.path.join(self.home, "Library/Caches/node-compile-cache"),
+        )
+        self.assertIs(settings["hooks"]["Stop"][0]["hooks"][0]["async"], True)
+        self.assertEqual(json.loads(self.files()[self.devguard])["max_server_gb"], 4)
+        self.assertEqual(self.priority(), perf.BACKGROUND_PRI)
+        first = self.files()
+        self.perf("ultra", "on")
+        self.assertEqual(self.files(), first)
+        data = json.loads(self.perf("ultra", "status", "--json"))
+        self.assertEqual(data["applied"], perf.ULTRA)
+        self.perf("ultra", "off")
+        self.assertEqual(self.files(), self.originals)
+        self.assertEqual(self.priority(), normal)
+        data = json.loads(self.perf("ultra", "status", "--json"))
+        self.assertFalse(data["on"])
 
 
 class RealProcessTest(unittest.TestCase):
