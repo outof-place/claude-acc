@@ -112,6 +112,39 @@ struct DiskSpace {
     var used: Double { 1 - free / total }
 }
 
+// MARK: - Fans (`fans-state.json`, written by the root fanctl daemon)
+
+struct FanState: Decodable {
+    struct Fan: Decodable, Identifiable {
+        let index: Int
+        let rpm: Double
+        let min: Double
+        let max: Double
+        let target: Double
+        let manual: Bool
+
+        var id: Int { index }
+        var share: Double { max > 0 ? rpm / max : 0 }
+    }
+
+    let at: Double
+    let fans: [Fan]
+    let cpu: Double?
+    let gpu: Double?
+    /// nil until a mode is picked in the panel: the daemon keeps its hands off.
+    let mode: String?
+    let percent: Int?
+    let boosting: Bool?
+    let conflict: Bool?
+    /// Hottest sensor per part: pcores, ecores, gpu, ssd, battery.
+    let sensors: [String: Double]?
+    /// `[time, cpu, gpu, rpm]` every 5 seconds, 20 minutes back.
+    let history: [[Double]]?
+    let error: String?
+
+    var anyManual: Bool { fans.contains(where: \.manual) }
+}
+
 // MARK: - Dev server guard (`devguard-state.json`)
 
 struct GuardState: Decodable {

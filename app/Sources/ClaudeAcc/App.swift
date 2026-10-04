@@ -34,6 +34,7 @@ struct ClaudeAccApp: App {
         let output: CLIResult
         var guardState: GuardState?
         var janitor: JanitorState?
+        var fans: FanState?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
             output = CLIResult(status: text.isEmpty ? 1 : 0, stdout: text, stderr: "no file \(snapshotFile)")
@@ -44,6 +45,9 @@ struct ClaudeAccApp: App {
             if let data = try? Data(contentsOf: folder.appending(path: "demo-janitor.json")) {
                 janitor = Store.decode(JanitorState.self, from: data)
             }
+            if let data = try? Data(contentsOf: folder.appending(path: "demo-fans.json")) {
+                fans = Store.decode(FanState.self, from: data)
+            }
         } else {
             output = CLI.runBlocking(CLI.process(["status", "--json"]))
         }
@@ -51,7 +55,7 @@ struct ClaudeAccApp: App {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans)
         store.previewOpenAccount = open
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
         let panel = PanelView(store: store, frozenNow: frozen)

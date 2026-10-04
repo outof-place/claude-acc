@@ -124,6 +124,11 @@ enum Format {
         return "\(number) \(unit.name)"
     }
 
+    /// "3,480".
+    static func rpm(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0)).locale(english))
+    }
+
     static let violet = Color(red: 0.58, green: 0.49, blue: 1.0)
     static let nsViolet = NSColor(srgbRed: 0.58, green: 0.49, blue: 1.0, alpha: 1)
 

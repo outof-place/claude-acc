@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.filip.claude-acc.fans</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/libexec/claude-acc-fanctl</string>
+    <string>daemon</string>
+    <string>--config</string>
+    <string>__HOME__/.local/share/claude-acc/fans.json</string>
+    <string>--state</string>
+    <string>__HOME__/.local/share/claude-acc/fans-state.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardErrorPath</key><string>/var/log/claude-acc-fans.log</string>
+</dict>
+</plist>

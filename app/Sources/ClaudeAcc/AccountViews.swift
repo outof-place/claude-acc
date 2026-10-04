@@ -64,7 +64,7 @@ private struct ActiveAccount: View {
             .help(showDetails ? "Hide details" : "Show details")
             if showDetails {
                 AccountDetails(store: store, snapshot: snapshot, account: account)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(.blurReplace.combined(with: .move(edge: .top)))
             }
             if account.status == .needsLogin {
                 LoginPrompt(store: store, account: account)
@@ -82,7 +82,7 @@ private struct ActiveAccount: View {
                 }
             }
         }
-        .animation(.snappy(duration: 0.25), value: showDetails)
+        .animation(.smooth(duration: 0.32), value: showDetails)
     }
 }
 
@@ -137,10 +137,10 @@ struct AccountDetails: View {
             if !account.active {
                 HStack(spacing: 8) {
                     Button("Switch Here", systemImage: "arrow.triangle.swap") { Task { await store.switchTo(account) } }
-                        .glassButton()
+                        .panelButton()
                         .disabled(store.busy != nil || account.status == .needsLogin || snapshot.orcaSelected != nil)
                     Button("Sign In Again", systemImage: "person.badge.key") { Task { await store.login(account) } }
-                        .glassButton()
+                        .panelButton()
                         .disabled(store.busy != nil)
                 }
                 .controlSize(.small)
@@ -266,13 +266,13 @@ private struct LoginPrompt: View {
                     .foregroundStyle(.orange)
                 Spacer()
                 Button("Cancel") { store.cancelLogin() }
-                    .glassButton()
+                    .panelButton()
             } else {
                 Label("Session expired", systemImage: "person.crop.circle.badge.exclamationmark")
                     .foregroundStyle(.orange)
                 Spacer()
                 Button("Sign In") { Task { await store.login(account) } }
-                    .glassButton(prominent: true)
+                    .panelButton(prominent: true)
                     .disabled(store.busy != nil)
             }
         }
@@ -309,6 +309,7 @@ struct AccountsCard: View {
     var body: some View {
         if let snapshot = store.snapshot, !snapshot.others.isEmpty {
             Card("Accounts", symbol: "person.2") {
+                CardScroll {
                 VStack(spacing: 2) {
                     ForEach(snapshot.others) { account in
                         VStack(spacing: 6) {
@@ -324,13 +325,14 @@ struct AccountsCard: View {
                                 AccountDetails(store: store, snapshot: snapshot, account: account)
                                     .padding(.horizontal, 6)
                                     .padding(.bottom, 6)
-                                    .transition(.opacity.combined(with: .move(edge: .top)))
+                                    .transition(.blurReplace.combined(with: .move(edge: .top)))
                             }
                         }
                     }
                 }
+                }
                 .padding(.horizontal, -6)
-                .animation(.snappy(duration: 0.25), value: expanded)
+                .animation(.smooth(duration: 0.32), value: expanded)
             } accessory: {
                 Text("\(snapshot.others.count)")
                     .font(.caption.weight(.semibold))
@@ -410,7 +412,7 @@ private struct AccountRow: View {
             HStack(spacing: 6) {
                 Text("In browser…").font(.caption).foregroundStyle(.orange)
                 Button("Cancel") { store.cancelLogin() }
-                    .glassButton()
+                    .panelButton()
                     .controlSize(.small)
             }
         case .switching(let email) where email == account.email:
@@ -418,12 +420,12 @@ private struct AccountRow: View {
         default:
             if account.status == .needsLogin {
                 Button("Sign In") { Task { await store.login(account) } }
-                    .glassButton(prominent: true)
+                    .panelButton(prominent: true)
                     .controlSize(.small)
                     .disabled(store.busy != nil)
             } else if hovering && !switchBlocked {
                 Button("Switch", systemImage: "arrow.triangle.swap") { Task { await store.switchTo(account) } }
-                    .glassButton()
+                    .panelButton()
                     .controlSize(.small)
                     .disabled(store.busy != nil)
                     .transition(.opacity.combined(with: .scale(scale: 0.92)))
