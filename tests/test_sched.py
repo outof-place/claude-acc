@@ -680,7 +680,7 @@ class StateTest(Paths):
 
     def test_idle_max_learns_only_from_idle_readings(self):
         self.set_memory(80)  # 38,4 GB, ale biegnie job: nie uczy
-        st = self.state()
+        st = S.load_state(self.cfg)  # bez odczytu przed dodaniem joba
         st["running"].append(
             {"id": "r", "where": "local", "mem_now_gb": 20.0, "mem_predicted_gb": 20.0}
         )
