@@ -678,6 +678,21 @@ class StateTest(Paths):
         self.assertNotIn("_internal", S.public_state(saved))
         self.assertEqual(saved["config"]["lambda_s_per_unit"], 6.0)
 
+    def test_idle_max_learns_only_from_idle_readings(self):
+        self.set_memory(80)  # 38,4 GB, ale biegnie job: nie uczy
+        st = self.state()
+        st["running"].append(
+            {"id": "r", "where": "local", "mem_now_gb": 20.0, "mem_predicted_gb": 20.0}
+        )
+        S.refresh_memory(st, self.cfg)
+        self.assertEqual(
+            st["memory"]["idle_max_gb"], round(0.65 * 48 - 4, 1)
+        )  # podłoga
+        st["running"] = []
+        self.set_memory(70)  # 33,6 GB bez jobów: uczy
+        S.refresh_memory(st, self.cfg)
+        self.assertEqual(st["memory"]["idle_max_gb"], round(0.70 * 48 - 4, 1))
+
     def test_devserver_reserve_from_devguard(self):
         with open(S.DEVGUARD_STATE, "w") as f:
             json.dump(
