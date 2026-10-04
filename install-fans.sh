@@ -2,6 +2,7 @@
 # Sterowanie wiatrakami: fanctl jako root LaunchDaemon (zapis do SMC wymaga roota).
 #
 #   ./install-fans.sh              buduje fanctl i instaluje demona (sudo, Touch ID)
+#   ./install-fans.sh --binary F   instaluje gotowy fanctl (Homebrew)
 #   ./install-fans.sh --uninstall  oddaje wiatraki macOS i usuwa demona
 #
 # Binarka trafia do /usr/local/libexec jako root:wheel, więc nikt bez roota jej nie podmieni.
@@ -21,8 +22,12 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
-(cd app && swift build -c release --product fanctl)
-BUILT="$(cd app && swift build -c release --show-bin-path)/fanctl"
+if [ "${1:-}" = "--binary" ]; then
+  BUILT="$2"  # gotowy fanctl, np. z Homebrew
+else
+  (cd app && swift build -c release --product fanctl)
+  BUILT="$(cd app && swift build -c release --show-bin-path)/fanctl"
+fi
 mkdir -p "$HOME/.local/share/claude-acc"
 
 sudo install -d -o root -g wheel -m 755 /usr/local/libexec
