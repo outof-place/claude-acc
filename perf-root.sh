@@ -443,6 +443,8 @@ devtools_apply() {
     devtools_wait "$bundle" 2
   fi
   echo "Narzędzia deweloperskie: $bundle dozwolone (wcześniej: ${prev:-brak})"
+  # zwolnienie dostaje proces uruchomiony po zmianie (log syspolicyd: dalej GK performScan)
+  echo "zrestartuj $(basename "$DEVTOOLS_APP" .app), żeby zadziałało (zamknie sesje w jej terminalach)"
   [ "$DRY" -eq 1 ] || as_user record devtools "$bundle" "prev=${prev:-none}"
 }
 

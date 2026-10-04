@@ -118,6 +118,12 @@ class Isolated(unittest.TestCase):
         patcher = mock.patch.object(perf, "ORCA_APP", self.orca_app)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.orca_started = None
+        patcher = mock.patch.object(
+            perf, "orca_started", side_effect=lambda: self.orca_started
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfg = dict(perf.DEFAULT_CONFIG)
 
     def write(self, path, data):
@@ -295,6 +301,33 @@ class RootRecordTest(Isolated):
         )
         perf.cmd_record(self.cfg, ["devtools", "--forget"])
         self.assertIn("devtools", perf.pending_manual(perf.load_state()))
+
+    def test_devtools_wants_orca_started_after_it(self):
+        os.makedirs(self.orca_app)
+        perf.cmd_record(self.cfg, ["devtools", "com.stablyai.orca", "prev=none"])
+        state = perf.load_state()
+        at = state["applied"]["devtools"]["at"]
+        self.orca_started = at - 600
+        self.assertEqual(perf.pending_manual(state), ["devtools-restart"])
+        self.orca_started = at + 5
+        self.assertEqual(perf.pending_manual(state), [])
+        self.orca_started = None  # Orca nie działa
+        self.assertEqual(perf.pending_manual(state), [])
+
+
+class OrcaStartedTest(unittest.TestCase):
+    def test_parses_etime(self):
+        main = "/Applications/Orca.app/Contents/MacOS/Orca"
+        procs = {7: "/usr/bin/other", 9: main + " --flag"}
+        for etime, seconds in (("05:10", 310), ("01:00:00", 3600), ("2-00:00:01", 172801)):
+            with mock.patch.object(perf, "own_processes", return_value=procs), mock.patch.object(
+                perf.janitor, "run", return_value=f"   {etime}\n"
+            ) as run:
+                started = perf.orca_started()
+            self.assertEqual(run.call_args[0][0][-1], "9")
+            self.assertAlmostEqual(time.time() - started, seconds, delta=2)
+        with mock.patch.object(perf, "own_processes", return_value={7: "/usr/bin/other"}):
+            self.assertIsNone(perf.orca_started())
 
 
 class GatekeeperTest(unittest.TestCase):

@@ -2082,12 +2082,37 @@ def spotlight_result(cfg, state, force=False):
         result.pop("note", None)
 
 
+def orca_started():
+    """Kiedy (epoch) wystartował główny proces Orki; None, gdy nie działa."""
+    main = os.path.join(ORCA_APP, "Contents/MacOS/Orca")
+    for pid, command in own_processes().items():
+        if command != main and not command.startswith(main + " "):
+            continue
+        # etime: [[dd-]hh:]mm:ss
+        out = janitor.run(["ps", "-o", "etime=", "-p", str(pid)]) or ""
+        days, _, clock = out.strip().rpartition("-")
+        parts = clock.split(":")
+        if not all(part.isdigit() for part in parts):
+            return None
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + int(part)
+        return time.time() - seconds - int(days or 0) * 86400
+    return None
+
+
 def pending_manual(state):
     """Rzeczy do kliknięcia przez człowieka: Ultra ich nie zrobi sama."""
     names = []
     # SIP nie wpuszcza nawet roota do TCC.db, więc Orkę na listę dodaje "+" w Ustawieniach
-    if os.path.isdir(ORCA_APP) and "devtools" not in state["applied"]:
+    devtools = state["applied"].get("devtools")
+    if os.path.isdir(ORCA_APP) and not devtools:
         names.append("devtools")
+    elif devtools:
+        # zwolnienie z oceny Gatekeepera dostaje dopiero Orca uruchomiona po zmianie
+        started = orca_started()
+        if started and started < devtools["at"]:
+            names.append("devtools-restart")
     spotlight = ultra_state(state)["results"].get("spotlight-privacy")
     # krok ręczny znika, gdy perf-root.sh przełączył Spotlight na same aplikacje
     if (
@@ -2400,6 +2425,8 @@ def cmd_ultra(cfg, args, system=None):
 MANUAL = {
     "devtools": "Ustawienia > Prywatność i ochrona > Narzędzia deweloperskie > + > Orca "
     "(`claude-acc perf-root devtools add` w Terminalu otwiera panel i zapisuje zmianę)",
+    "devtools-restart": "zrestartuj Orkę: Narzędzia deweloperskie działają dopiero dla Orki "
+    "uruchomionej po zmianie (restart zamyka sesje w jej terminalach)",
     "spotlight-privacy": "Ustawienia > Spotlight > Prywatność wyszukiwania: dodaj katalogi "
     "z `spotlight_noise` (magazyn pnpm, moduły Go)",
     "docker-restart": "nowa pamięć maszyny Dockera zadziała po jego restarcie (Docker > Restart)",
