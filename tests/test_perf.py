@@ -91,7 +91,8 @@ class Isolated(unittest.TestCase):
             perf.DOCKER_SETTINGS: os.path.join(self.dir, "docker-settings.json"),
         }
         for item in perf.TWEAKS:
-            if isinstance(item, (perf.AsyncHooks, perf.ClaudeEnv)):
+            # każda poprawka, która pisze do settings.json Claude, dostaje kopię
+            if hasattr(item, "settings_path"):
                 patcher = mock.patch.object(item, "path", self.claude)
             elif isinstance(item, perf.JsonSetting):
                 self.files[item.name] = fake[item.path]
@@ -100,6 +101,12 @@ class Isolated(unittest.TestCase):
                 continue
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.hooks_dir = os.path.join(self.dir, "hooks")
+        patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # siatka bezpieczeństwa: prawdziwe ustawienia Claude nie mogą się zmienić w teście
+        self.real_settings = self.stamp(os.path.expanduser("~/.claude/settings.json"))
         patcher = mock.patch.object(
             perf, "ORCA_DATA", os.path.join(self.dir, "orca-data.json")
         )
@@ -121,6 +128,18 @@ class Isolated(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+        self.assertEqual(
+            self.stamp(os.path.expanduser("~/.claude/settings.json")),
+            self.real_settings,
+            "test zmienił prawdziwy ~/.claude/settings.json",
+        )
+
+    @staticmethod
+    def stamp(path):
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return None
 
     def run_cmd(self, func, *args, system=None):
         out = io.StringIO()
@@ -222,7 +241,13 @@ class RootRecordTest(Isolated):
         self.assertNotIn("shaper", perf.load_state()["applied"])
 
     def test_record_result_shows_next_to_ultra(self):
-        self.assertEqual(perf.cmd_record(self.cfg, ["vnodes", "786432", "prev=263168", "--result", "5.68", "3.42"]), 0)
+        self.assertEqual(
+            perf.cmd_record(
+                self.cfg,
+                ["vnodes", "786432", "prev=263168", "--result", "5.68", "3.42"],
+            ),
+            0,
+        )
         state = perf.load_state()
         self.assertEqual(state["applied"]["vnodes"]["detail"], "786432 prev=263168")
         ultra = state["ultra"]
@@ -231,7 +256,9 @@ class RootRecordTest(Isolated):
         self.assertNotIn("vnodes", ultra["pending_root"])
         # re-recording without numbers keeps the measured ones; forgetting drops them
         perf.cmd_record(self.cfg, ["vnodes", "786432", "prev=263168"])
-        self.assertEqual(perf.load_state()["applied"]["vnodes"]["result"]["before"], 5.68)
+        self.assertEqual(
+            perf.load_state()["applied"]["vnodes"]["result"]["before"], 5.68
+        )
         perf.cmd_record(self.cfg, ["vnodes", "--forget"])
         ultra = perf.load_state()["ultra"]
         self.assertEqual(ultra["root_applied"], [])
@@ -342,6 +369,10 @@ ORCA = 'if [ -z "${HOME-}" ]; then printf "{}"; fi  # ORCA_AGENT_HOOK_PORT'
 CAVE = "/x/node /x/lib/node_modules/cavemem/dist/index.js hook run"
 
 
+FORMAT = "/Users/x/.claude/hooks/auto-format.sh"
+TYPECHECK = "/Users/x/.claude/hooks/ts-typecheck.sh"
+
+
 def claude_settings():
     """Wycinek prawdziwego ~/.claude/settings.json: hooki cavemem obok hooka Orki."""
     return {
@@ -351,7 +382,11 @@ def claude_settings():
             "PostToolUse": [
                 {
                     "matcher": "Write|Edit",
-                    "hooks": [{"type": "command", "command": "fmt.sh"}],
+                    "hooks": [
+                        {"type": "command", "command": FORMAT},
+                        {"type": "command", "command": TYPECHECK, "timeout": 30},
+                        {"type": "command", "command": "fmt.sh | tee log"},
+                    ],
                 },
                 {
                     "matcher": "*",
@@ -622,6 +657,252 @@ class FsBenchTest(Isolated):
         )
 
 
+class ClaudeEnvSetTest(Isolated):
+    def test_limits_added_and_removed_exactly(self):
+        self.write(self.claude, claude_settings())
+        before = self.text(self.claude)
+        item = perf.tweak("claude-limits")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(changed, ["BASH_MAX_TIMEOUT_MS=3600000"])
+        self.assertEqual(
+            self.read(self.claude)["env"]["BASH_MAX_TIMEOUT_MS"], "3600000"
+        )
+        again, changed = item.apply(self.cfg, FakeSystem({}), record)
+        self.assertEqual((again, changed), (record, []))
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), before)
+
+    def test_existing_value_kept_and_user_change_survives(self):
+        data = claude_settings()
+        data["env"]["BASH_MAX_TIMEOUT_MS"] = "1200000"
+        self.write(self.claude, data)
+        item = perf.tweak("claude-limits")
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(record["vars"]["BASH_MAX_TIMEOUT_MS"]["prev"], "1200000")
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(
+            self.read(self.claude)["env"]["BASH_MAX_TIMEOUT_MS"], "1200000"
+        )
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        changed = self.read(self.claude)
+        changed["env"]["BASH_MAX_TIMEOUT_MS"] = "900000"  # użytkownik zmienia po nas
+        self.write(self.claude, changed)
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.read(self.claude)["env"]["BASH_MAX_TIMEOUT_MS"], "900000")
+
+
+class HookWrapTest(Isolated):
+    def test_wraps_only_listed_plain_commands_and_undoes_exactly(self):
+        self.write(self.claude, claude_settings())
+        before = self.text(self.claude)
+        cfg = dict(
+            self.cfg,
+            npx_fast_hooks=[
+                "/.claude/hooks/auto-format.sh",
+                "/.claude/hooks/ts-typecheck.sh",
+                "fmt.sh",
+            ],
+        )
+        item = perf.tweak("fast-npx-hooks")
+        record, changed = item.apply(cfg, FakeSystem({}))
+        self.assertEqual(
+            len(changed), 2
+        )  # "fmt.sh | tee log" to składnia powłoki: zostaje
+        wrap = os.path.join(self.hooks_dir, "npx-fast-wrap.sh")
+        hooks = self.read(self.claude)["hooks"]["PostToolUse"][0]["hooks"]
+        self.assertEqual(hooks[0]["command"], f"{wrap} {FORMAT}")
+        self.assertEqual(hooks[1]["command"], f"{wrap} {TYPECHECK}")
+        self.assertEqual(hooks[1]["timeout"], 30)
+        self.assertEqual(hooks[2]["command"], "fmt.sh | tee log")
+        self.assertTrue(
+            os.access(os.path.join(self.hooks_dir, "npx-fast/npx"), os.X_OK)
+        )
+        again, changed = item.apply(cfg, FakeSystem({}), record)
+        self.assertEqual(changed, [])
+        self.assertEqual(again["hooks"], record["hooks"])
+        item.undo(again, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), before)
+        self.assertFalse(os.path.exists(self.hooks_dir))
+
+    def test_installed_hooks_are_not_deleted_on_undo(self):
+        """Gdy perf.py działa z katalogu instalacji, hooks/ to pliki instalacji, nie kopie."""
+        self.write(self.claude, claude_settings())
+        os.makedirs(os.path.join(self.hooks_dir, "npx-fast"))
+        for rel in perf.HookWrap.FILES:
+            shutil.copyfile(
+                os.path.join(perf.REPO_HOOKS, rel), os.path.join(self.hooks_dir, rel)
+            )
+        item = perf.tweak("fast-npx-hooks")
+        with mock.patch.object(perf, "REPO_HOOKS", self.hooks_dir):
+            record, _ = item.apply(self.cfg, FakeSystem({}))
+            self.assertEqual(record["created"], [])
+            item.undo(record, FakeSystem({}))
+        self.assertTrue(
+            os.path.exists(os.path.join(self.hooks_dir, "npx-fast-wrap.sh"))
+        )
+
+
+class NpxShimTest(unittest.TestCase):
+    """Atrapa npx na prawdziwych plikach: narzędzie z node_modules/.bin wyżej w drzewie,
+    brak narzędzia, inne wywołania przekazane prawdziwemu npx."""
+
+    def setUp(self):
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix="perf-npx-"))
+        self.shim = os.path.join(ROOT, "hooks/npx-fast/npx")
+        self.wrap = os.path.join(ROOT, "hooks/npx-fast-wrap.sh")
+        bin_dir = os.path.join(self.dir, "proj/node_modules/.bin")
+        os.makedirs(bin_dir)
+        self.nested = os.path.join(self.dir, "proj/apps/web/src")
+        os.makedirs(self.nested)
+        self.script(os.path.join(bin_dir, "fakefmt"), 'echo "fakefmt $*"')
+        # "prawdziwy" npx, do którego atrapa oddaje resztę wywołań
+        self.real = os.path.join(self.dir, "real")
+        os.makedirs(self.real)
+        self.script(os.path.join(self.real, "npx"), 'echo "real npx $*"')
+        self.env = dict(os.environ, PATH=f"{self.real}:/usr/bin:/bin")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def script(self, path, body):
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\n{body}\n")
+        os.chmod(path, 0o755)
+
+    def run_in(self, cwd, *cmd):
+        return subprocess.run(
+            list(cmd),
+            cwd=cwd,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def test_tool_found_up_the_tree(self):
+        r = self.run_in(
+            self.nested,
+            self.shim,
+            "--no-install",
+            "--quiet",
+            "fakefmt",
+            "--write",
+            "a b.ts",
+        )
+        self.assertEqual(
+            (r.returncode, r.stdout.strip()), (0, "fakefmt --write a b.ts")
+        )
+
+    def test_missing_tool_fails_like_npx(self):
+        r = self.run_in(self.dir, self.shim, "--no-install", "prettier", "--version")
+        self.assertEqual(r.returncode, 127)
+
+    def test_other_calls_go_to_real_npx(self):
+        r = self.run_in(self.nested, self.shim, "--yes", "cowsay", "hi")
+        self.assertEqual(r.stdout.strip(), "real npx --yes cowsay hi")
+        r = self.run_in(self.nested, self.shim, "fakefmt")
+        self.assertEqual(r.stdout.strip(), "real npx fakefmt")
+
+    def test_wrapper_puts_shim_first_for_the_hook(self):
+        hook = os.path.join(self.dir, "hook.sh")
+        self.script(hook, "npx --no-install --quiet fakefmt ok")
+        r = self.run_in(self.nested, self.wrap, hook)
+        self.assertEqual(r.stdout.strip(), "fakefmt ok")
+
+
+def tool_transcript():
+    """Wywołania narzędzi jak w transkrypcie: go test, edycje .ts i .go, Bash ścięty do 10 min."""
+    rows = []
+
+    def call(i, name, args, start, end, result="ok"):
+        rows.append(
+            {
+                "timestamp": start,
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": f"t{i}", "name": name, "input": args}
+                    ]
+                },
+            }
+        )
+        rows.append(
+            {
+                "timestamp": end,
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": f"t{i}",
+                            "content": result,
+                        }
+                    ]
+                },
+            }
+        )
+
+    call(
+        1,
+        "Bash",
+        {"command": "rtk proxy go test ./internal/x -run TestA"},
+        "2026-10-04T10:00:00.000Z",
+        "2026-10-04T10:00:10.500Z",
+    )
+    call(
+        2,
+        "Edit",
+        {"file_path": "/w/app/page.ts"},
+        "2026-10-04T10:01:00.000Z",
+        "2026-10-04T10:01:05.400Z",
+    )
+    call(
+        3,
+        "Edit",
+        {"file_path": "/w/app/main.go"},
+        "2026-10-04T10:02:00.000Z",
+        "2026-10-04T10:02:00.100Z",
+    )
+    call(
+        4,
+        "Bash",
+        {"command": "go test ./...", "timeout": 1800000},
+        "2026-10-04T10:03:00.000Z",
+        "2026-10-04T10:13:01.000Z",
+        "Command did not complete within its 600s timeout and was moved to the background",
+    )
+    call(
+        5,
+        "Bash",
+        {"command": "sleep 700", "timeout": 600000},
+        "2026-10-04T10:20:00.000Z",
+        "2026-10-04T10:30:00.000Z",
+        "Command did not complete within its 600s timeout",
+    )
+    return rows
+
+
+class AgentTurnaroundTest(Isolated):
+    def test_families_formatted_edits_and_capped(self):
+        folder = os.path.join(perf.CLAUDE_PROJECTS, "proj", "sesja", "subagents")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "agent.jsonl"), "w") as f:
+            f.writelines(json.dumps(r) + "\n" for r in tool_transcript())
+        since = perf.iso_epoch("2026-10-04T09:00:00")
+        data = perf.agent_turnaround(since, since + 7200)
+        fam = data["families"]
+        self.assertEqual(fam["Bash: go test"]["n"], 2)
+        self.assertEqual(fam["Edit formatowane"], {"n": 1, "p50": 5400, "p90": 5400})
+        self.assertEqual(fam["Edit inne"]["p50"], 100)
+        self.assertEqual(data["formatted_edits"]["n"], 1)
+        # sleep 700 z timeoutem 600000 nie prosił o więcej niż sufit, więc się nie liczy
+        self.assertEqual(data["capped"], 1)
+        now = perf.iso_epoch("2026-10-04T12:00:00")
+        with mock.patch.object(perf.time, "time", return_value=now):
+            bench = perf.bench_agents(hours=12)
+        self.assertEqual(bench["capped_per_day"], 2.0)
+        self.assertEqual(bench["tools"]["Bash: go test"]["n"], 2)
+        self.assertEqual(bench["formatted_edits"]["p50"], 5400)
+
+
 class UltraTest(Isolated):
     def setUp(self):
         super().setUp()
@@ -661,7 +942,15 @@ class UltraTest(Isolated):
         data = self.status()
         self.assertEqual(
             set(data),
-            {"on", "since", "applied", "root_applied", "pending_root", "pending_manual", "results"},
+            {
+                "on",
+                "since",
+                "applied",
+                "root_applied",
+                "pending_root",
+                "pending_manual",
+                "results",
+            },
         )
         self.assertTrue(data["on"])
         self.assertEqual(data["applied"], perf.ULTRA)

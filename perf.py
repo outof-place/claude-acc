@@ -17,6 +17,8 @@ Pomiary:
   Electron), ile CPU pali WindowServer i ile czeka malutkie zlecenie Metalu;
 - system plików: lstat dużego drzewa node_modules dwa razy pod rząd i ile vnode
   jądro przy tym odzyskuje (czy drzewo mieści się w cache vnode).
+- agenci: obrót narzędzi z transkryptów Claude Code (Bash według rodzin poleceń,
+  edycje plików, które formatują hooki), czekanie na hooki i polecenia ścięte do 10 min.
 
 Poprawki wymagające roota robi perf-root.sh; tu są tylko opisane.
 
@@ -26,7 +28,7 @@ nimi, i mierzy przed i po. Stan dla panelu jest w perf-state.json pod "ultra".
 
 Komendy:
   status [--json]                     poprawki i ostatnie pomiary
-  bench [network|cpu|gpu|fs|all]      pomiar; wynik ląduje w perf-state.json
+  bench [network|cpu|gpu|fs|agents|all]  pomiar; wynik ląduje w perf-state.json
         [--runs N] [--json]
   apply <nazwa>|--all [--dry-run]     włącz poprawkę (tylko te bez roota)
   undo <nazwa>|--all                  cofnij
@@ -44,6 +46,8 @@ import json
 import os
 import plistlib
 import re
+import shlex
+import shutil
 import statistics
 import subprocess
 import sys
@@ -715,6 +719,12 @@ DOCKER_SETTINGS = os.path.join(
 )
 COMPILE_CACHE_DIR = os.path.join(HOME, "Library/Caches/node-compile-cache")
 DOCKER_CLI = "/Applications/Docker.app/Contents/Resources/bin/docker"
+# skrypty hooków dostarczane z perf.py (hooks/ obok niego) i ich kopie w katalogu stanu,
+# na które wskazuje settings.json, żeby nie zależał od miejsca, z którego uruchomiono perf.py
+REPO_HOOKS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hooks")
+HOOKS_DIR = os.path.join(STATE_DIR, "hooks")
+# komenda hooka, którą wolno owinąć: ścieżka i proste argumenty, bez składni powłoki
+PLAIN_COMMAND = re.compile(r"[\w./~$@%+=:,-]+(\s+[\w./~$@%+=:,-]+)*")
 # w zapisie poprzedniej wartości: klucza wcześniej nie było
 MISSING = {"__missing__": True}
 # `change` w edit_json_file: plik ma zniknąć (powstał przez nas i znowu jest pusty)
@@ -746,6 +756,16 @@ DEFAULT_CONFIG = {
     # ścieżek albo "orca" (wszystkie repozytoria z worktree w Orce). Domyślnie pusta, bo
     # jedyne takie repo (portivo) zmienia tylko jego właściciel
     "git_repos": [],
+    # hooki Claude Code (fragment komendy), które Ultra uruchamia z szybkim npx: w monorepo
+    # pnpm `npx --no-install` szukał formattera 3,5-8,8 s przy każdej edycji
+    "npx_fast_hooks": [
+        "/.claude/hooks/auto-format.sh",
+        "/.claude/hooks/ts-typecheck.sh",
+    ],
+    # limity Claude Code podnoszone w Ultra (env w ~/.claude/settings.json). Tylko sufity,
+    # nie zachowanie: 10-minutowy sufit Bash ściął w 2 doby ~40 poleceń, którym agent sam
+    # dał dłuższy timeout (testy Go pod zamkiem, czekanie na buildy na Depot)
+    "claude_limits": {"BASH_MAX_TIMEOUT_MS": 3600000},
     # katalogi, które Spotlight indeksuje bez potrzeby; wykluczenie jest tylko w Ustawieniach
     "spotlight_noise": ["~/Library/pnpm", "~/go"],
     # drzewo do pomiaru `bench fs` (lstat wszystkiego, dwa przebiegi)
@@ -1229,6 +1249,198 @@ class GitSpeed:
         )
 
 
+class ClaudeEnvSet:
+    """Kilka zmiennych w env ~/.claude/settings.json naraz, każda z własnym cofnięciem."""
+
+    root = False
+    group = "claude"
+    path = None
+
+    def __init__(self, name, config_key, title, effect):
+        self.name, self.config_key, self.title, self.effect = (
+            name,
+            config_key,
+            title,
+            effect,
+        )
+
+    def settings_path(self):
+        return self.path or CLAUDE_SETTINGS
+
+    def apply(self, cfg, system, record=None):
+        wanted = {k: str(v) for k, v in cfg.get(self.config_key, {}).items()}
+        known = dict((record or {}).get("vars", {}))
+        changed = []
+        if not os.path.exists(self.settings_path()):
+            return {"vars": known}, []
+
+        def change(data):
+            del changed[:]
+            env = data.get("env") or {}
+            for var, value in wanted.items():
+                current = env.get(var, MISSING)
+                if current == value:
+                    known.setdefault(var, {"value": value, "prev": value})
+                    continue
+                if var not in known or known[var]["value"] != value:
+                    prev = known[var]["prev"] if var in known else current
+                    known[var] = {"value": value, "prev": prev}
+                env[var] = value
+                changed.append(f"{var}={value}")
+            if changed:
+                data["env"] = env
+            return bool(changed)
+
+        edit_json_file(self.settings_path(), change)
+        return {"vars": known}, changed
+
+    def undo(self, record, system):
+        restored = []
+        todo = {
+            var: entry
+            for var, entry in record.get("vars", {}).items()
+            if entry["prev"] != entry["value"]
+        }
+
+        def change(data):
+            del restored[:]
+            env = data.get("env") or {}
+            for var, entry in todo.items():
+                if restore_key(env, var, entry["prev"], entry["value"]):
+                    restored.append(var)
+            if env:
+                data["env"] = env
+            else:
+                data.pop("env", None)
+            return bool(restored)
+
+        if todo and os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        return restored
+
+    def describe(self, record, system):
+        found = (record or {}).get("vars", {})
+        return ", ".join(f"{k}={v['value']}" for k, v in found.items()) or "nic"
+
+
+class HookWrap:
+    """Hooki formatowania uruchamiane przez hooks/npx-fast-wrap.sh: ten sam skrypt hooka,
+    tylko `npx --no-install <narzędzie>` bierze narzędzie wprost z node_modules/.bin.
+
+    Komenda hooka w settings.json dostaje przed sobą ścieżkę do wrappera; oryginał jest
+    zapisany i wraca przy cofnięciu. Skrypty hooków użytkownika zostają nietknięte.
+    """
+
+    name = "fast-npx-hooks"
+    group = "claude"
+    root = False
+    title = (
+        "hooki formatowania (auto-format, ts-typecheck) z szybkim npx: narzędzie wprost z "
+        "node_modules/.bin, bez czytania całego drzewa modułów przez npm"
+    )
+    effect = (
+        "auto-format na plikach portivo, gdzie formatterów nie ma: .json 3,3 s -> 39 ms, "
+        ".ts 6,6 s -> 82 ms; npx tsc 236 -> 54 ms; edycja .ts czekała 5,4 s p50"
+    )
+    path = None
+    FILES = ("npx-fast-wrap.sh", "npx-fast/npx")
+
+    def settings_path(self):
+        return self.path or CLAUDE_SETTINGS
+
+    def install(self):
+        """Wrapper i atrapa npx w HOOKS_DIR; zwraca ścieżkę wrappera i to, co utworzył."""
+        created = []
+        for rel in self.FILES:
+            source, target = os.path.join(REPO_HOOKS, rel), os.path.join(HOOKS_DIR, rel)
+            if os.path.realpath(source) == os.path.realpath(target):
+                continue  # perf.py działa z katalogu instalacji, pliki już tam są
+            if not os.path.exists(target):
+                created.append(target)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copyfile(source, target)
+            os.chmod(target, 0o755)
+        return os.path.join(HOOKS_DIR, self.FILES[0]), created
+
+    def apply(self, cfg, system, record=None):
+        entries = list((record or {}).get("hooks", []))
+        created = list((record or {}).get("created", []))
+        if not os.path.exists(self.settings_path()):
+            return {"hooks": entries, "created": created}, []
+        wrap, new_files = self.install()
+        created += [f for f in new_files if f not in created]
+        prefix = shlex.quote(wrap) + " "
+        targets = cfg.get("npx_fast_hooks", [])
+        changed = []
+
+        def change(data):
+            del changed[:]
+            known = {e["wrapped"] for e in entries}
+            for event, groups in (data.get("hooks") or {}).items():
+                for group in groups or []:
+                    for hook in group.get("hooks", []) or []:
+                        command = hook.get("command", "")
+                        if command.startswith(prefix) or not PLAIN_COMMAND.fullmatch(
+                            command
+                        ):
+                            continue
+                        if not any(t in command for t in targets):
+                            continue
+                        hook["command"] = prefix + command
+                        if hook["command"] not in known:
+                            entries.append(
+                                {
+                                    "event": event,
+                                    "original": command,
+                                    "wrapped": hook["command"],
+                                }
+                            )
+                        changed.append(
+                            f"{event}: {os.path.basename(command.split()[0])}"
+                        )
+            return bool(changed)
+
+        edit_json_file(self.settings_path(), change)
+        return {"hooks": entries, "created": created}, changed
+
+    def undo(self, record, system):
+        restored = []
+        wanted = {e["wrapped"]: e["original"] for e in record.get("hooks", [])}
+
+        def change(data):
+            del restored[:]
+            for groups in (data.get("hooks") or {}).values():
+                for group in groups or []:
+                    for hook in group.get("hooks", []) or []:
+                        if hook.get("command") in wanted:
+                            hook["command"] = wanted[hook["command"]]
+                            restored.append(
+                                os.path.basename(hook["command"].split()[0])
+                            )
+            return bool(restored)
+
+        if wanted and os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        if os.path.realpath(REPO_HOOKS) == os.path.realpath(HOOKS_DIR):
+            return restored  # pliki z instalacji claude-acc, nie nasze kopie
+        for path in record.get("created", []):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        for folder in (os.path.join(HOOKS_DIR, "npx-fast"), HOOKS_DIR):
+            try:
+                os.rmdir(folder)  # tylko gdy pusty
+            except OSError:
+                pass
+        return restored
+
+    def describe(self, record, system):
+        hooks = (record or {}).get("hooks", [])
+        names = sorted({os.path.basename(e["original"].split()[0]) for e in hooks})
+        return ", ".join(names) or "brak hooków z listy `npx_fast_hooks`"
+
+
 class RootTweak:
     """Poprawka, która wymaga roota: perf.py tylko ją opisuje, robi ją perf-root.sh."""
 
@@ -1278,6 +1490,15 @@ TWEAKS = [
         defer=True,
     ),
     GitSpeed(),
+    HookWrap(),
+    ClaudeEnvSet(
+        "claude-limits",
+        "claude_limits",
+        "wyższe sufity Claude Code z `claude_limits` (env w ~/.claude/settings.json); "
+        "domyślne zachowanie bez zmian",
+        "BASH_MAX_TIMEOUT_MS 600000 -> 3600000: w 2 doby ~40 poleceń z timeoutem 15-60 min "
+        "ściętych do 10 min i przeniesionych w tło",
+    ),
     RootTweak(
         "vnodes",
         "większy cache vnode (kern.maxvnodes 263168 -> 786432): metadane drzew node_modules "
@@ -1460,6 +1681,171 @@ def hook_latency(
     return result
 
 
+def tool_calls(since, until=None):
+    """Wywołania narzędzi z transkryptów Claude Code (także subagentów) w oknie czasu:
+    (narzędzie, wejście, ms od tool_use do tool_result, początek tekstu wyniku).
+
+    Czas to obrót z punktu widzenia sesji: wykonanie razem z hookami Pre i Post.
+    Czytane są tylko transkrypty zmienione w oknie.
+    """
+    until = until or time.time()
+    for path in glob.glob(
+        os.path.join(CLAUDE_PROJECTS, "**", "*.jsonl"), recursive=True
+    ):
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+            yield from transcript_tools(path, since, until)
+        except OSError:
+            continue
+
+
+def transcript_tools(path, since, until):
+    """tool_calls dla jednego transkryptu; setki MB, więc linia po linii."""
+    pending = {}
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            if '"tool_use"' not in line and '"tool_result"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            stamp = iso_epoch(entry.get("timestamp"))
+            content = (entry.get("message") or {}).get("content")
+            if stamp is None or not isinstance(content, list):
+                continue
+            stamp += iso_fraction(entry.get("timestamp"))
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    pending[block.get("id")] = (
+                        block.get("name"),
+                        block.get("input") or {},
+                        stamp,
+                    )
+                elif block.get("type") == "tool_result":
+                    start = pending.pop(block.get("tool_use_id"), None)
+                    if start and since <= start[2] <= until:
+                        text = json.dumps(block.get("content"), ensure_ascii=False)
+                        yield start[0], start[1], (stamp - start[2]) * 1000, text[:600]
+
+
+def iso_fraction(stamp):
+    """Milisekundy znacznika ISO jako ułamek sekundy ("...:05.432Z" -> 0.432)."""
+    try:
+        return float("0" + stamp[19:23]) if stamp[19] == "." else 0.0
+    except (TypeError, IndexError, ValueError):
+        return 0.0
+
+
+BASH_FAMILIES = [
+    ("go test", r"\bgo\s+test\b"),
+    ("go build/vet/run", r"\bgo\s+(build|vet|run|install|generate|mod)\b"),
+    ("golangci-lint", r"golangci-lint"),
+    ("make", r"(^|[;&|(]\s*)make\b"),
+    ("pnpm/npm/npx", r"\b(pnpm|npm|npx|yarn|bun)\b"),
+    ("tsc/eslint/vitest/next", r"\b(tsc|eslint|vitest|jest|next|turbo|playwright)\b"),
+    ("node", r"\bnode\b"),
+    ("git", r"\bgit\b"),
+    ("rg/grep/find", r"\b(rg|grep|find|fd)\b"),
+    ("docker", r"\bdocker\b"),
+    ("python", r"\bpython3?\b"),
+    ("sleep/czekanie", r"\b(sleep|until|wait)\b"),
+    (
+        "pliki (ls/cat/sed)",
+        r"\b(ls|cat|sed|head|tail|wc|mkdir|cp|mv|rm|awk|cut|sort)\b",
+    ),
+]
+# rozszerzenia, które formatują hooki (prettier, eslint, tsc)
+FORMATTED = (
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".md",
+    ".mdx",
+    ".css",
+    ".yml",
+    ".yaml",
+    ".html",
+)
+
+
+def tool_family(name, args):
+    if name == "Bash":
+        command = re.sub(r"\brtk\s+(proxy\s+)?", "", str(args.get("command", "")))
+        for family, pattern in BASH_FAMILIES:
+            if re.search(pattern, command):
+                return f"Bash: {family}"
+        return "Bash: inne"
+    if name in ("Edit", "Write", "MultiEdit"):
+        ext = os.path.splitext(str(args.get("file_path", "")))[1].lower()
+        return f"{name} {'formatowane' if ext in FORMATTED else 'inne'}"
+    if name and name.startswith("mcp__"):
+        return "MCP " + name.split("__")[1]
+    return name or "?"
+
+
+def ms_stats(values):
+    return {
+        "n": len(values),
+        "p50": rnd(percentile(values, 0.5), 0),
+        "p90": rnd(percentile(values, 0.9), 0),
+    }
+
+
+def capped_bash(text, args):
+    """Polecenie, któremu agent dał więcej niż 10 min, a Claude Code ściął je do 600 s."""
+    asked = args.get("timeout") or 0
+    try:
+        asked = int(asked)
+    except (TypeError, ValueError):
+        asked = 0
+    return asked > 600000 and (
+        "within its 600s timeout" in text or "timed out after 10m" in text
+    )
+
+
+def agent_turnaround(since, until=None):
+    """Czasy narzędzi agentów w oknie: rodziny Bash, edycje plików formatowanych i nie,
+    polecenia ścięte do 10 min wbrew prośbie agenta."""
+    families = {}
+    formatted = []
+    capped = 0
+    for name, args, ms, text in tool_calls(since, until):
+        family = tool_family(name, args)
+        families.setdefault(family, []).append(ms)
+        if family.endswith(" formatowane"):
+            formatted.append(ms)
+        if name == "Bash" and capped_bash(text, args):
+            capped += 1
+    return {
+        "families": {k: ms_stats(v) for k, v in families.items()},
+        "formatted_edits": ms_stats(formatted),
+        "capped": capped,
+    }
+
+
+def bench_agents(hours=24):
+    """Obrót narzędzi agentów z ostatnich `hours` godzin i czekanie na hooki."""
+    since = time.time() - hours * 3600
+    data = agent_turnaround(since)
+    families = data["families"]
+    top = sorted(families.items(), key=lambda kv: -kv[1]["n"] * (kv[1]["p50"] or 0))
+    return {
+        "hours": hours,
+        "tools": dict(top[:16]),
+        "formatted_edits": data["formatted_edits"],
+        "capped_per_day": rnd(data["capped"] * 24 / hours, 1),
+        "hooks": hook_latency(since),
+    }
+
+
 def typescript_load(cache_dir=None, runs=5):
     """Mediana czasu `require('typescript')` w node (ms), z cache kompilacji albo bez."""
     node = janitor.which("node")
@@ -1512,7 +1898,9 @@ def git_status_ms(system, repos, runs=5, write_index=False):
             subprocess.run(
                 ["git", "-C", repo, "status", "--porcelain"],
                 capture_output=True,
-                env=janitor.ENV if write_index else dict(janitor.ENV, GIT_OPTIONAL_LOCKS="0"),
+                env=janitor.ENV
+                if write_index
+                else dict(janitor.ENV, GIT_OPTIONAL_LOCKS="0"),
                 check=False,
             )
             times.append((time.perf_counter() - started) * 1000)
@@ -1529,7 +1917,13 @@ ULTRA = [
     "devguard-budget",
     "devguard-max-server",
     "git-speed",
+    "fast-npx-hooks",
+    "claude-limits",
 ]
+# wyniki z transkryptów liczone najwyżej raz na tyle sekund (doba transkryptów to ~10 s)
+AGENTS_CHECK_SECONDS = 1800
+# "po" dla limitu Bash dopiero po tylu godzinach od włączenia: ścięć jest kilka na dobę
+CAPPED_AFTER_HOURS = 6
 # co sprawdzić co najwyżej raz na tyle sekund (mdfind trwa około sekundy)
 SPOTLIGHT_CHECK_SECONDS = 600
 # poprawka hooków liczy się dopiero po tylu zdarzeniach od włączenia
@@ -1612,7 +2006,11 @@ def pending_manual(state):
     names = []
     spotlight = ultra_state(state)["results"].get("spotlight-privacy")
     # krok ręczny znika, gdy perf-root.sh przełączył Spotlight na same aplikacje
-    if spotlight and spotlight.get("after") is None and "spotlight" not in state["applied"]:
+    if (
+        spotlight
+        and spotlight.get("after") is None
+        and "spotlight" not in state["applied"]
+    ):
         names.append("spotlight-privacy")
     record = state["applied"].get("docker-vm")
     if record and record.get("written") and not record.get("active"):
@@ -1725,6 +2123,10 @@ def ultra_on(cfg, system, state):
             time.sleep(SETTLE_SECONDS)
             after = git_status_ms(system, git_repos(cfg))
             result = {"before": before, "after": after, "unit": "ms git status"}
+        elif (
+            name in ("fast-npx-hooks", "claude-limits") and name not in ultra["results"]
+        ):
+            result = transcript_before(name, ultra["since"])
         elif name == "claude-hooks-async" and name not in ultra["results"]:
             since = ultra["since"]
             stats = hook_latency(since - 86400, since).get("PostToolUse")
@@ -1743,6 +2145,54 @@ def ultra_on(cfg, system, state):
     sync_root(cfg, state)
     ultra["pending_manual"] = pending_manual(state)
     return report
+
+
+def transcript_before(name, since):
+    """Wynik "przed" z transkryptów sprzed włączenia; "po" dokłada refresh_ultra."""
+    if name == "fast-npx-hooks":
+        stats = agent_turnaround(since - 86400, since)["formatted_edits"]
+        if not stats["n"]:
+            return None
+        return {
+            "before": stats["p50"],
+            "after": None,
+            "unit": "ms edycji pliku formatowanego (p50)",
+            "note": "po 20 edycjach .ts/.md/.json od włączenia",
+        }
+    capped = agent_turnaround(since - 2 * 86400, since)["capped"]
+    return {
+        "before": rnd(capped / 2, 1),
+        "after": None,
+        "unit": "poleceń ściętych do 10 min na dobę",
+        "note": f"po {CAPPED_AFTER_HOURS} h od włączenia",
+    }
+
+
+def transcript_after(ultra, state, force=False):
+    """Wyniki "po" z transkryptów od włączenia Ultry, najwyżej raz na AGENTS_CHECK_SECONDS."""
+    waiting = [
+        n
+        for n in ("fast-npx-hooks", "claude-limits")
+        if n in ultra["results"] and ultra["results"][n].get("after") is None
+    ]
+    if not waiting or not ultra["since"]:
+        return
+    if (
+        not force
+        and time.time() - state.get("agents_checked", 0) < AGENTS_CHECK_SECONDS
+    ):
+        return
+    state["agents_checked"] = time.time()
+    data = agent_turnaround(ultra["since"])
+    elapsed = time.time() - ultra["since"]
+    fast = ultra["results"].get("fast-npx-hooks")
+    if fast and fast.get("after") is None and data["formatted_edits"]["n"] >= 20:
+        fast["after"] = data["formatted_edits"]["p50"]
+        fast.pop("note", None)
+    limits = ultra["results"].get("claude-limits")
+    if limits and limits.get("after") is None and elapsed >= CAPPED_AFTER_HOURS * 3600:
+        limits["after"] = rnd(data["capped"] * 86400 / elapsed, 1)
+        limits.pop("note", None)
 
 
 def ultra_off(cfg, system, state):
@@ -1810,6 +2260,7 @@ def refresh_ultra(cfg, state, system):
         if total and abs(total / 2**20 - docker["value"]) < 512:
             docker["active"] = True
     spotlight_result(cfg, state)
+    transcript_after(ultra, state)
     if docker and "docker-vm" in ultra["applied"]:
         # notatka idzie za stanem: czeka na zamknięcie, czeka na restart, działa
         result = measure_before_after(tweak("docker-vm"), cfg, system, docker)
@@ -1993,13 +2444,44 @@ def describe_fs(r):
     return [walk, cache]
 
 
+def describe_agents(r):
+    lines = [
+        f"obrót narzędzi agentów z ostatnich {r.get('hours')} h (ms p50 / p90, liczba):"
+    ]
+    for name, st in (r.get("tools") or {}).items():
+        lines.append(f"  {name}: {fmt(st['p50'])} / {fmt(st['p90'])} ({st['n']})")
+    edits = r.get("formatted_edits") or {}
+    if edits.get("n"):
+        lines.append(
+            f"edycja pliku formatowanego (.ts/.md/.json...): {fmt(edits['p50'])} / "
+            f"{fmt(edits['p90'])} ms ({edits['n']})"
+        )
+    hooks = r.get("hooks") or {}
+    if hooks:
+        parts = ", ".join(
+            f"{k} {fmt(v['p50'])}/{fmt(v['p90'])} ms" for k, v in hooks.items()
+        )
+        lines.append(f"czekanie na hooki (p50/p90): {parts}")
+    lines.append(
+        f"polecenia ścięte do 10 min wbrew timeoutowi agenta: {fmt(r.get('capped_per_day'))} na dobę"
+    )
+    return lines
+
+
 DESCRIBE = {
     "network": describe_network,
     "cpu": describe_cpu,
     "gpu": describe_gpu,
     "fs": describe_fs,
+    "agents": describe_agents,
 }
-LABELS = {"network": "Sieć", "cpu": "CPU", "gpu": "GPU", "fs": "System plików"}
+LABELS = {
+    "network": "Sieć",
+    "cpu": "CPU",
+    "gpu": "GPU",
+    "fs": "System plików",
+    "agents": "Agenci",
+}
 
 
 def cmd_status(cfg, args, system=None):
@@ -2039,7 +2521,7 @@ def cmd_status(cfg, args, system=None):
             print(f"        {entry['detail']}")
     for name in state.get("deferred", {}):
         print(f"  ! {name}: cofnięcie czeka na zamknięcie Dockera")
-    for kind in ("network", "cpu", "gpu", "fs"):
+    for kind in ("network", "cpu", "gpu", "fs", "agents"):
         last = state["bench"].get(kind)
         if not last:
             print(f"{LABELS[kind]}: jeszcze bez pomiaru (perf.py bench {kind})")
@@ -2064,7 +2546,9 @@ def record_bench(state, kind, result, started, load=None):
 
 
 def cmd_bench(cfg, args, system=None):
-    kinds = [a for a in args if a in ("network", "cpu", "gpu", "fs", "all")] or ["all"]
+    kinds = [
+        a for a in args if a in ("network", "cpu", "gpu", "fs", "agents", "all")
+    ] or ["all"]
     if "all" in kinds:
         kinds = ["network", "cpu", "gpu"]
     runs = 1
@@ -2081,6 +2565,8 @@ def cmd_bench(cfg, args, system=None):
             result = bench_cpu(max(runs, 3))
         elif kind == "fs":
             result = bench_fs(cfg)
+        elif kind == "agents":
+            result = bench_agents()
         else:
             result = bench_gpu()
             result["latency"] = gpu_latency()
