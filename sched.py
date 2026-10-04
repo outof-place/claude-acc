@@ -1198,7 +1198,8 @@ def refresh_memory(state, cfg, mem=None):
         else:
             avail.append([day, available, now])
     internal["avail"] = avail[-8:]
-    idle_top = max([a[1] for a in avail] + [cfg["idle_floor_pct"] / 100 * ram])
+    # nigdy ponad 85% RAM: tyle macOS realnie oddaje, a stare wpisy (sprzed 3ed7edf) bywały za duże
+    idle_top = min(max([a[1] for a in avail] + [cfg["idle_floor_pct"] / 100 * ram]), 0.85 * ram)
     state["host"]["ram_gb"] = round(ram, 1)
     state["memory"] = {
         "level_pct": round(mem["level"]),
@@ -1339,7 +1340,7 @@ def decide_route(state, job, gb, wall, cfg, cache):
                 depot_eta_s=target["eta_s"],
                 units=target["units"],
                 cost_usd=target["cost_usd"],
-                text=f"Depot: needs {gb:.0f} GB, Mac max ~{mem['idle_max_gb']:.0f}",
+                text=f"Depot: needs {gb:.0f} GB, Mac max ~{max(0, mem['idle_max_gb']):.0f}",
             )
             return route, target
         text = f"local: needs {gb:.0f} GB, no Depot route, runs when the Mac is free"
@@ -1574,7 +1575,7 @@ def cmd_run(args):
             entry["cmd"] = command
             entry["count1_dropped"] = True
             log(
-                "bez -count=1: test nie sięga po bazę ani zewnętrzne programy, wynik może przyjść z cache testów"
+                "bez -count=1: testy nie uruchamiają innych programów, wynik może przyjść z cache testów"
             )
     if job["kind"] == "test" and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
         job["uses_pg"] = uses_pg(job, cache)
