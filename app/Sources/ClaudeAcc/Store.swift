@@ -31,6 +31,11 @@ final class Store {
     /// Unit the panel is restarting or stopping right now.
     private(set) var guardBusy: String?
     private(set) var fanState: FanState?
+    private(set) var ultra: Ultra?
+    /// Turning Ultra on or off measures as it goes, which takes a while.
+    private(set) var ultraBusy = false
+    /// The state just asked for, until perf.py is done.
+    private(set) var ultraPick: Bool?
     /// The fan mode just picked, until the daemon's state file shows it.
     private(set) var fanPick: String?
     /// The mode just picked in the panel, until the guard's next snapshot shows it.
@@ -53,13 +58,17 @@ final class Store {
     }()
 
     /// Rendering the panel to a file: fixed data, no timers, no login item.
-    init(preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil) {
+    init(
+        preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
+        ultra: Ultra? = nil
+    ) {
         awake = Awake(preview: true)
         snapshot = preview
         readLocal()
         if let guardState { self.guardState = guardState }
         if let janitor { self.janitor = janitor }
         if let fans { fanState = fans }
+        if let ultra { self.ultra = ultra }
     }
 
     init() {
@@ -118,6 +127,9 @@ final class Store {
         if let data = FileManager.default.contents(atPath: CLI.fanState) {
             fanState = Self.decode(FanState.self, from: data)
             if let pick = fanPick, pick == fanMode { fanPick = nil }
+        }
+        if let data = FileManager.default.contents(atPath: CLI.perfState) {
+            ultra = Self.decode(PerfFile.self, from: data)?.ultra
         }
         if let data = FileManager.default.contents(atPath: CLI.guardState) {
             guardState = Self.decode(GuardState.self, from: data)
@@ -292,6 +304,22 @@ final class Store {
         } catch {
             notice = Notice(text: "Couldn't save the fan mode: \(error.localizedDescription)", isError: true)
         }
+    }
+
+    // MARK: Ultra
+
+    func setUltra(_ on: Bool) async {
+        guard !ultraBusy else { return }
+        ultraBusy = true
+        ultraPick = on
+        notice = nil
+        let result = await CLI.run(["ultra", on ? "on" : "off"], script: CLI.perf)
+        readLocal()
+        ultraBusy = false
+        ultraPick = nil
+        notice = result.status == 0
+            ? Notice(text: on ? "Ultra is on" : "Ultra is off, and everything it changed is back")
+            : Notice(text: result.message, isError: true)
     }
 
     // MARK: Login item

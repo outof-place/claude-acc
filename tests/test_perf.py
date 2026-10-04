@@ -188,7 +188,7 @@ class BackgroundBookkeepingTest(Isolated):
         system = FakeSystem({})
         code, out = self.run_cmd(perf.cmd_apply, "shaper", system=system)
         self.assertEqual(code, 2)
-        self.assertIn("perf-root.sh", out)
+        self.assertIn("claude-acc perf-root", out)
         self.assertEqual(perf.load_state()["applied"], {})
 
     def test_unknown_tweak(self):

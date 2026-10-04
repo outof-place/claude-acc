@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/panel.png" width="900" alt="Claude Acc panel in three columns: the active Claude account with session and weekly usage and the other accounts; dev servers with a memory chart against the budget and what the guard will do, plus free disk space; Stay Awake and fans with temperatures and a 20-minute chart">
+<img src="docs/panel.png" width="900" alt="Claude Acc panel in four columns: the active Claude account with session and weekly usage and the other accounts; dev servers with a memory chart against the budget and what the guard will do, plus free disk space; Stay Awake and fans with temperatures and a 20-minute chart; Ultra with each tweak measured before and after">
 
 # claude-acc
 
@@ -44,6 +44,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
 | **Fans & heat** | P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
+| **Ultra** | One switch that tunes the Mac for agent work. Helpers no agent waits on move to the efficiency cores, memory hooks stop holding up every tool call, Node starts warm for everything sessions spawn, and the dev server budget and Docker's VM get tighter. Each change is measured before and after, and Off puts back exactly what was there. |
 
 <img src="docs/panel-details.png" width="900" alt="The same panel with one account opened: plan, subscription status and start, renewal date with a countdown, the 5-hour and weekly windows with their exact resets, place in the switching order, and buttons to switch or sign in again">
 
@@ -58,6 +59,7 @@ flowchart LR
         tick["accswitch.py<br/>every 2 min"]
         guard["devguard.py<br/>every 5 s"]
         janitor["janitor.py<br/>login + every 3 h"]
+        perf["perf.py keep<br/>every 5 min"]
     end
     subgraph root["launchd, root"]
         fans["fanctl<br/>every 2 s"]
@@ -67,11 +69,13 @@ flowchart LR
     api[("Anthropic API<br/>usage, profile")]
     orca["Orca CLI<br/>tabs, terminals, agents"]
     disk[("build caches<br/>node_modules")]
+    tuned[("helpers, settings.json<br/>Docker, devguard.json")]
     smc[("SMC<br/>fans, sensors")]
-    app -.-> tick & guard & janitor & fans
+    app -.-> tick & guard & janitor & perf & fans
     tick --> keychain & api
     guard --> orca
     janitor --> disk
+    perf --> tuned
     fans --> smc
     hook --> guard
 ```
@@ -108,6 +112,15 @@ With agents compiling, macOS on Auto kept the fans at about 2,000 rpm and let th
 | Max | 5,777 rpm |
 
 On any fixed setting the daemon goes to full speed when a sensor passes 95 °C and comes back below 85 °C.
+
+Ultra, measured on the same Mac with Orca and nine Claude Code sessions running:
+
+| Tweak | Before | After |
+| --- | --- | --- |
+| A memory helper that scanned its 1.9 GB database all day, moved to the efficiency cores | 32% of a P-core, ~1 W | 0.1%, ~0.1 W |
+| Node compile cache for what sessions spawn: `require('typescript')` | 96 ms | 49 ms |
+| `git status` in an agent worktree repo, with `untrackedCache` and `fsmonitor` (opt-in) | 71 ms | 26 ms |
+| Synchronous memory hook on every tool call, made async | 54 ms p50, 99 ms p90 | measured after 30 calls |
 
 ## How it avoids logging you out
 
@@ -152,6 +165,10 @@ Each of these rules comes from an account that actually lost its login while the
 | `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
 | `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
 | `claude-acc fans install\|uninstall` | Install the fan daemon, or remove it and give the fans back to macOS |
+| `claude-acc perf ultra on\|off\|status` | Turn Ultra on or off, or show what it changed and the numbers |
+| `claude-acc perf bench network\|cpu\|gpu\|fs` | Measure: queueing in the network vs inside the connection, P-core share and wake-up latency, GPU time per app, the file cache |
+| `claude-acc perf list` / `apply` / `undo <name>` | Every tweak on its own, with what it changes and how it was measured |
+| `claude-acc perf-root vnodes trial [--keep]` | Root: a bigger vnode cache, measured before and after and undone unless `--keep` |
 | `claude-acc uninstall` | Remove the launchd jobs, the app and this command; settings stay |
 
 ## Configuration
@@ -294,6 +311,23 @@ Setting the fans needs root, so `claude-acc fans install` puts `fanctl` in `/usr
 - Another fan app (Mole, Macs Fan Control, TG Pro) wins: when the fans move to a speed the daemon didn't set, the panel says so and the daemon leaves them alone. It only takes the fans back after sleep, when macOS reset them to auto under a fixed setting.
 - When the daemon stops, it gives the fans back to macOS, unless another app had them.
 
+## Ultra
+
+A Mac running a dozen agents spends a surprising amount of its time on work nobody waits for. `perf.py` measured where it went on an M4 Max with Orca and nine Claude Code sessions, and Ultra turns on the fixes that paid off. Every tweak records what was there before, measures before and after, and `ultra off` restores it byte for byte, leaving alone anything you changed by hand in the meantime. Running `ultra on` twice is safe. launchd runs `perf.py keep` every 5 minutes, which reapplies tweaks to processes that restarted with a new pid and fills in numbers that arrive later.
+
+| Tweak | What it changes |
+| --- | --- |
+| `bg-helpers` | Background QoS (`PRIO_DARWIN_BG`: efficiency cores, throttled disk) for always-on helpers matched by `background` in `perf.json` |
+| `claude-hooks-async` | `"async": true` on the hooks listed in `async_hooks`, in `~/.claude/settings.json`. Every tool call of every session waited for them |
+| `node-compile-cache` | `NODE_COMPILE_CACHE` in the `env` of `~/.claude/settings.json`, so tsc, eslint, MCP servers and hooks start from a warm V8 cache. The `claude` binary itself runs on Bun and doesn't need it |
+| `devguard-budget` | The guard's `budget_percent` from 35 to 25 |
+| `docker-vm` | Docker's `MemoryMiB` to 6144, written only while Docker is closed. Ultra never restarts Docker |
+| `git-speed` | `core.untrackedCache` and `core.fsmonitor` in the repos listed in `git_repos` (empty by default) |
+
+What needs root is prepared, not applied: `claude-acc perf-root vnodes trial` raises `kern.maxvnodes` (the file cache was full, recycling 28 million vnodes in 5 hours, so every scan of a large `node_modules` started cold) and undoes it unless you add `--keep`. The panel lists it under Needs you with the command to copy.
+
+What was measured and left alone, in [`docs/perf-research.md`](docs/perf-research.md) (Polish): open-file and process limits (5% used), App Nap for Orca (it never naps), forced L4S (halved the upload here), an upload shaper (the router adds only 1-4 ms under load), MCP servers duplicated per session (2.3 GB across nine sessions, with no shared mode to switch to), and the Claude API connections (already reused).
+
 ## Tests
 
 ```sh
@@ -303,6 +337,8 @@ Setting the fans needs root, so `claude-acc fans install` puts `fanctl` in `/usr
 The tests run the real script end to end against fake `security`, `curl` and `claude` binaries put first on `PATH`, so they never touch your Keychain or your accounts. They cover logging in, switching during a 429, keeping MCP tokens, cancelling a login halfway, and leaving an account whose token died.
 
 The janitor tests run the real script on a temporary `$HOME` with the real `lsof`: caches that go, caches kept because a file is open or a dev server works in the app, a shell prompt that doesn't block, protected paths, stale and active projects, an interrupted delete, and `caps` dropping the oldest snapshots.
+
+The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, and a value someone changed after Ultra survives `ultra off`.
 
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, and that the hook sends a second start to the running one.
 

@@ -112,6 +112,94 @@ struct DiskSpace {
     var used: Double { 1 - free / total }
 }
 
+// MARK: - Ultra (`perf-state.json`, written by perf.py)
+
+/// The Ultra part of perf-state.json. Numbers come from perf.py; the words for them live
+/// here, so the panel reads in English whatever the script's own messages say.
+struct Ultra: Decodable {
+    struct Result: Decodable {
+        let before: Double?
+        let after: Double?
+        let unit: String?
+    }
+
+    struct Tweak {
+        let title: String
+        let detail: String
+        let unit: String
+        /// A setting rather than a measurement: before → after, never shown as a gain.
+        var isSetting = false
+    }
+
+    struct Step {
+        let title: String
+        let detail: String
+        let command: String?
+    }
+
+    let on: Bool
+    let since: Double?
+    let applied: [String]
+    let pendingRoot: [String]
+    let pendingManual: [String]
+    let results: [String: Result]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        on = try c.decodeIfPresent(Bool.self, forKey: .on) ?? false
+        since = try c.decodeIfPresent(Double.self, forKey: .since)
+        applied = try c.decodeIfPresent([String].self, forKey: .applied) ?? []
+        pendingRoot = try c.decodeIfPresent([String].self, forKey: .pendingRoot) ?? []
+        pendingManual = try c.decodeIfPresent([String].self, forKey: .pendingManual) ?? []
+        results = try c.decodeIfPresent([String: Result].self, forKey: .results) ?? [:]
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case on, since, applied, pendingRoot, pendingManual, results
+    }
+
+    /// perf.py's ULTRA list, in the order it applies them.
+    static let order = ["bg-helpers", "claude-hooks-async", "node-compile-cache", "devguard-budget", "docker-vm", "git-speed"]
+
+    static let catalog: [String: Tweak] = [
+        "bg-helpers": Tweak(
+            title: "Background helpers", detail: "Helpers no agent waits on move to the efficiency cores",
+            unit: "% of a P-core"),
+        "claude-hooks-async": Tweak(
+            title: "Async hooks", detail: "Memory hooks stop holding up every tool call", unit: "ms per tool call"),
+        "node-compile-cache": Tweak(
+            title: "Node compile cache", detail: "What sessions spawn (tsc, eslint, MCP servers) starts warm",
+            unit: "ms to load TypeScript"),
+        "devguard-budget": Tweak(
+            title: "Dev server budget", detail: "The guard frees memory sooner", unit: "% of RAM", isSetting: true),
+        "docker-vm": Tweak(
+            title: "Docker VM", detail: "The VM gives back what containers don't use", unit: "GB", isSetting: true),
+        "git-speed": Tweak(
+            title: "Git", detail: "untrackedCache and fsmonitor in the repos you list", unit: "ms git status"),
+    ]
+
+    static let steps: [String: Step] = [
+        "vnodes": Step(
+            title: "Bigger file cache", detail: "The vnode cache is full, so every scan of node_modules starts cold. Needs root.",
+            command: "claude-acc perf-root vnodes trial"),
+        "shaper": Step(
+            title: "Upload shaper", detail: "Uploads queue in the router. Keeping the queue on the Mac needs root.",
+            command: "claude-acc perf-root trial"),
+        "docker-quit": Step(title: "Quit Docker once", detail: "The new memory cap is written while Docker is closed.", command: nil),
+        "docker-restart": Step(title: "Restart Docker", detail: "The new memory cap applies on its next start.", command: nil),
+    ]
+
+    static func number(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(value < 10 && value != value.rounded() ? 1 : 0))
+            .locale(Locale(identifier: "en_US")))
+    }
+}
+
+/// perf-state.json holds more (applied tweaks, benchmarks); the panel needs only Ultra.
+struct PerfFile: Decodable {
+    let ultra: Ultra?
+}
+
 // MARK: - Fans (`fans-state.json`, written by the root fanctl daemon)
 
 struct FanState: Decodable {

@@ -34,6 +34,9 @@ struct PanelView: View {
                         AwakeCard(awake: store.awake).fixedSize(horizontal: false, vertical: true)
                         FansCard(store: store)
                     }
+                    Column(width: 300) {
+                        UltraCard(store: store)
+                    }
                 }
                 // live: fixed height, lists scroll inside their cards; PNG: as tall as the content
                 .frame(height: renderingToFile ? nil : Self.columnHeight)

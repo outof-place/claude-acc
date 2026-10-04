@@ -12,7 +12,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
-JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard"
+JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf"
 
 APP_SRC=""
 FANCTL=""
@@ -36,12 +36,13 @@ done
 [ -d "$APP_SRC" ] || { echo "brak aplikacji: --app \"<Claude Acc.app>\"" >&2; exit 2; }
 
 mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
-cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$STATE/"
+cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$STATE/"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
 
-# jedna komenda na wszystko: konta, porządki (mac, clean), strażnik (guard), wiatraki (fans),
+# jedna komenda na wszystko: konta, porządki (mac, clean), strażnik (guard), wydajność (perf,
+# perf-root), wiatraki (fans),
 # a `claude-acc uninstall` zdejmuje to, co postawił ten skrypt
 cat > "$HOME/.local/bin/claude-acc" <<'EOF'
 #!/bin/sh
@@ -50,6 +51,8 @@ case "$1" in
   mac) shift; exec /usr/bin/python3 "$STATE/janitor.py" "$@" ;;
   clean) shift; exec /usr/bin/python3 "$STATE/janitor.py" sweep --force "$@" ;;
   guard) shift; exec /usr/bin/python3 "$STATE/devguard.py" "$@" ;;
+  perf) shift; exec /usr/bin/python3 "$STATE/perf.py" "$@" ;;
+  perf-root) shift; exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
   fans)
     shift
     case "${1:-read}" in
@@ -65,7 +68,8 @@ exec /usr/bin/python3 "$STATE/accswitch.py" "$@"
 EOF
 chmod +x "$HOME/.local/bin/claude-acc"
 
-# automaty: tick kont co 2 minuty, porządki przy logowaniu i co 3 godziny, strażnik dev serwerów cały czas
+# automaty: tick kont co 2 minuty, porządki przy logowaniu i co 3 godziny, strażnik dev serwerów cały czas,
+# perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie)
 for job in $JOBS; do
   plist="$AGENTS/$job.plist"
   sed "s|__HOME__|$HOME|g" "$SRC/launchd/$job.plist.template" > "$plist"

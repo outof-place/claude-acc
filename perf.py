@@ -1255,7 +1255,7 @@ TWEAKS = [
         "większy cache vnode (kern.maxvnodes 263168 -> 786432): drzewa node_modules mieszczą się w nim",
         "lstat 358 tys. wpisów portivo/.pnpm: 3,6 s w każdym przebiegu i 250 tys. vnode z odzysku, "
         "bo cache ma 263 tys.; 28 mln odzysków w 5 h pracy",
-        "sudo ./perf-root.sh vnodes trial",
+        "claude-acc perf-root vnodes trial",
     ),
     RootTweak(
         "shaper",
@@ -1263,7 +1263,7 @@ TWEAKS = [
         "Maca zamiast w buforze routera",
         "przy BE230 sieć pod obciążeniem dokłada 1-4 ms, więc nie ma czego ratować; "
         "przy Zyxelu jeszcze niezmierzone (sprawdź linię „z tego sieć” w bench network)",
-        "sudo ./perf-root.sh trial",
+        "claude-acc perf-root trial",
     ),
 ]
 
