@@ -20,6 +20,8 @@ Komendy:
   switch --auto     przełącz na następne z kolejki
   login <email>     zaloguj konto ponownie w przeglądarce, bez Orca i terminala
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
+  depot [--force]   token sandboxów `depot claude`: konto i ważność, --force wysyła od nowa
+  depot --fallback  zapisz długi token z `claude setup-token` na wypadek braku konta z zapasem
   watch [sekundy]   pętla ticków na pierwszym planie
 """
 
@@ -50,6 +52,8 @@ USAGE_CACHE_PATH = os.path.join(STATE_DIR, "usage-cache.json")
 # ile token aktywnego konta musi być przeterminowany, zanim automat sam go odświeży:
 # wcześniej robią to sesje Claude Code i drugi odświeżający zabija konto
 IDLE_REFRESH_AFTER = 15 * 60
+# kolejne przerwy po 429 z endpointu limitów; sukces zeruje licznik
+BACKOFF_STEPS = [120, 240, 480, 900]
 
 MANAGED_SERVICE = "Orca Claude Code Managed Credentials"
 ACTIVE_SERVICE = "Claude Code-credentials"
@@ -78,7 +82,17 @@ DEFAULT_CONFIG = {
     # konta całkiem wyłączone z rotacji
     "never": [],
     "history_keep_hours": 48,
+    # sandboxy Claude Code w Depot (`depot claude`) biorą CLAUDE_CODE_OAUTH_TOKEN z sekretu
+    # organizacji; tick trzyma tam konto z największym zapasem poza kontem lokalnym
+    "depot_sync": True,
+    # ile godzin ważności musi mieć token wysłany do Depot; krótszy wymieniamy
+    "depot_min_valid_hours": 4,
+    # ścieżka CLI Depot; pusta = szukaj na PATH i w Homebrew
+    "depot_bin": "",
 }
+
+DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
+DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
 
 
 # ---------- drobne narzędzia ----------
@@ -443,12 +457,16 @@ def fetch_usage(access_token):
         "User-Agent": USER_AGENT,
     })
     if status == 429:
-        update_state(api_backoff_until=time.time() + 900)
-        log("API limitów zwróciło 429, wstrzymuję odpytywanie na 15 minut")
-    elif until:
+        # narastające przerwy: stałe 15 minut oślepiało automat, a API wracało po paru
+        step = min(load_state().get("api_backoff_step", 0), len(BACKOFF_STEPS) - 1)
+        update_state(api_backoff_until=time.time() + BACKOFF_STEPS[step], api_backoff_step=step + 1)
+        log(f"API limitów zwróciło 429, wstrzymuję odpytywanie na {BACKOFF_STEPS[step] // 60} min")
+    elif status == 200:
         state = load_state()
-        state.pop("api_backoff_until", None)
-        save_state(state)
+        if "api_backoff_until" in state or "api_backoff_step" in state:
+            state.pop("api_backoff_until", None)
+            state.pop("api_backoff_step", None)
+            save_state(state)
     return status, data
 
 
@@ -880,18 +898,24 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
             rows.append({"account": a, "data": None, "why": "wymaga ponownego logowania",
                          "usable": False, "error": True})
             continue
-        data, note = cached_usage(a, cfg, max_age=max_age, refresh=refresh)
+        may_refresh = refresh(a) if callable(refresh) else refresh
+        # Anulowane konto automat pomija. Limitów o nie nie pytamy: API odpowiada
+        # 403, a panel pytał co minutę i przybliżał 429 dla reszty kont. Status
+        # odświeża profil raz na 12 h, więc po odnowieniu konto samo wraca do rotacji.
+        status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
+        if status and status != "active":
+            status = (identity(a, cfg, refresh=may_refresh) or {}).get("status")
+        if status and status != "active":
+            rows.append({"account": a, "data": None, "why": f"subskrypcja: {status}, automat pomija",
+                         "usable": False, "error": True, "skipped": True})
+            continue
+        data, note = cached_usage(a, cfg, max_age=max_age, refresh=may_refresh)
         if not data:
             rows.append({"account": a, "data": None, "why": note, "usable": False, "error": True})
             continue
         session_left, weekly_left = headroom(data)
         usable = weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]
         why = f"zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji"
-        # status subskrypcji z pamięci profilu: anulowane konto automat pomija, a po
-        # odnowieniu samo wraca do rotacji, bez ręcznego dopisywania do "never"
-        status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
-        if status and status != "active":
-            usable, why = False, f"subskrypcja: {status}, automat pomija"
         remember_fingerprint(a.email, data)
         rows.append({
             "account": a, "data": data, "usable": usable, "error": False,
@@ -915,6 +939,101 @@ def queue(rows):
     return sorted([r for r in rows if r["usable"]], key=lambda r: r["rank"])
 
 
+
+
+# ---------- Depot: token sandboxów `depot claude` ----------
+
+def depot_bin(cfg):
+    """Ścieżka CLI Depot; launchd startuje z ubogim PATH, więc sprawdzamy też Homebrew."""
+    if cfg.get("depot_bin"):
+        return cfg["depot_bin"] if os.path.exists(cfg["depot_bin"]) else None
+    found = shutil.which("depot")
+    if found:
+        return found
+    return next((p for p in ("/opt/homebrew/bin/depot", "/usr/local/bin/depot") if os.path.exists(p)), None)
+
+
+def depot_push(depot, token):
+    r = subprocess.run([depot, "claude", "secrets", "add", DEPOT_SECRET, "--value", token],
+                       capture_output=True, text=True, timeout=60)
+    return r.returncode == 0, (r.stderr or r.stdout or "").strip()[:200]
+
+
+def token_hash(token):
+    return hashlib.sha256((token or "").encode()).hexdigest()[:12]
+
+
+def depot_sync(accounts, cfg, active, force=False):
+    """Trzyma w sekrecie Depot token konta z największym zapasem POZA kontem lokalnym.
+
+    Sandbox `depot claude` czyta CLAUDE_CODE_OAUTH_TOKEN przy starcie sesji, więc token
+    musi mieć zapas ważności (depot_min_valid_hours). Wymiana następuje, gdy konto
+    sandboxów traci zapas, token dobiega końca albo konto stało się lokalnym: dwie
+    strony palące jedno konto wyczerpują je dwa razy szybciej. Odświeżamy wyłącznie
+    konta nieaktywne, bo token aktywnego rotują sesje Claude Code. Bez konta z zapasem
+    idzie długi token z `depot --fallback`, jeśli jest. Zwraca e-mail konta sandboxów.
+    """
+    if not cfg.get("depot_sync"):
+        return None
+    depot = depot_bin(cfg)
+    if not depot:
+        return None
+    state = load_state()
+    now = time.time()
+    min_valid = cfg["depot_min_valid_hours"] * 3600
+    current = next((a for a in accounts if a.email == state.get("depot_email")), None)
+    if current and not force and (not active or current.id != active.id) \
+            and state.get("depot_expires_at", 0) - now > min_valid:
+        data, _ = cached_usage(current, cfg, max_age=600, refresh=False)
+        if data:
+            session_left, weekly_left = headroom(data)
+            if weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]:
+                return current.email  # konto sandboxów niesie, token ważny: nic do roboty
+
+    rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
+    for row in rows:
+        target = row["account"]
+        expires = oauth_of(target.creds_json or "").get("expiresAt", 0) / 1000
+        creds_json, note = ensure_fresh(target, cfg, force=expires - now < min_valid)
+        if not creds_json:
+            log(f"depot: {target.email}: {note}")
+            continue
+        oauth = oauth_of(creds_json)
+        token, expires = oauth.get("accessToken"), oauth.get("expiresAt", 0) / 1000
+        if not token or expires - now < min_valid:
+            continue
+        if token_hash(token) == state.get("depot_token_mark") and not force:
+            return target.email
+        ok, err = depot_push(depot, token)
+        if not ok:
+            log(f"depot: wysyłka tokenu nieudana: {err}")
+            return None
+        update_state(depot_email=target.email, depot_expires_at=int(expires),
+                     depot_token_mark=token_hash(token), depot_synced_at=int(now))
+        log(f"depot: sandboxy na {target.email}, token ważny do {datetime.fromtimestamp(expires):%H:%M}")
+        return target.email
+
+    fallback = kc_read(DEPOT_FALLBACK_SERVICE, KEYCHAIN_USER)
+    if fallback and (force or state.get("depot_token_mark") != token_hash(fallback)):
+        ok, err = depot_push(depot, fallback)
+        if ok:
+            update_state(depot_email="fallback", depot_expires_at=0,
+                         depot_token_mark=token_hash(fallback), depot_synced_at=int(now))
+            log("depot: brak konta z zapasem poza lokalnym, sandboxy na tokenie zapasowym")
+            return "fallback"
+        log(f"depot: wysyłka tokenu zapasowego nieudana: {err}")
+    elif not rows:
+        log("depot: brak konta z zapasem poza lokalnym, token sandboxów bez zmian")
+    return None
+
+
+def depot_sync_safe(accounts, cfg, active, force=False):
+    """Depot to dodatek: jego błąd nie może zatrzymać pilnowania kont."""
+    try:
+        return depot_sync(accounts, cfg, active, force=force)
+    except Exception as err:
+        log(f"depot: błąd {err}")
+        return None
 
 
 # ---------- komendy ----------
@@ -959,7 +1078,12 @@ def snapshot(cfg):
         sync_back(active, cfg)
     if active:
         cached_usage(active, cfg, max_age=120, refresh=False)
-    rows = survey(accounts, cfg, max_age=1800, refresh=False)
+    # Tokeny, które może trzymać jakaś sesja, zostają nietknięte. Konto, którego
+    # token leży tylko w kopii Orca, odświeżamy: nikt inny go nie używa, a bez
+    # tego panel pokazywał dane sprzed kilkunastu godzin.
+    held = {oauth_of(kc_read(s, KEYCHAIN_USER)).get("refreshToken") for s in runtime_services(cfg)}
+    idle = lambda a: not orca and a.oauth.get("refreshToken") not in held
+    rows = survey(accounts, cfg, max_age=1800, refresh=idle)
     if active and all(r["account"].id != active.id for r in rows):
         # konto z listy "never" też bywa aktywne (np. wybrane ręcznie): pokazujemy je,
         # tylko automat nigdy na nie nie przełącza
@@ -972,7 +1096,8 @@ def snapshot(cfg):
     for r in rows:
         a = r["account"]
         who = identity(a, cfg, refresh=False) or {}
-        status = "needs_login" if needs_login(a) else ("error" if r["error"] else "ok")
+        # pominięte konto to nie błąd: ma ostatnie znane limity, a panel mówi dlaczego stoi
+        status = "needs_login" if needs_login(a) else ("error" if r["error"] and not r.get("skipped") else "ok")
         # przy błędzie odczytu pokazujemy ostatnie znane limity z ich wiekiem
         hit = cache.get(a.email)
         data = r["data"] or (settled(hit["data"]) if hit else None)
@@ -1128,6 +1253,7 @@ def cmd_switch(cfg, args):
             print(f"nie znam konta {args[0]}")
             return 1
         switch_to(target, cfg, "ręcznie")
+        depot_sync_safe(accounts, cfg, target)
         print(f"przełączono na {target.email}")
         return 0
     rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None))
@@ -1135,6 +1261,7 @@ def cmd_switch(cfg, args):
         print("żadne konto nie ma zapasu, sprawdź claude-acc status")
         return 1
     switch_to(rows[0]["account"], cfg, "ręcznie --auto")
+    depot_sync_safe(accounts, cfg, rows[0]["account"])
     print(f"przełączono na {rows[0]['account'].email}")
     return 0
 
@@ -1298,6 +1425,7 @@ def cmd_tick(cfg, _args):
         update_state(hands_off_notified=False)
 
     sync_back(active, cfg)
+    depot_sync_safe(accounts, cfg, active)
     dead = needs_login(active)
     data, note = (None, "token nie działa") if dead else active_usage(active, cfg)
     if not data and not dead:
@@ -1328,6 +1456,7 @@ def cmd_tick(cfg, _args):
 
     target = candidates[0]["account"]
     switch_to(target, cfg, reason)
+    depot_sync_safe(accounts, cfg, target)  # sandboxy nie mogą zostać na nowym koncie lokalnym
     left = headroom(candidates[0]["data"])[1]
     if target.email in cfg["last_resort"]:
         notify("Claude: wchodzę na konto firmowe",
@@ -1349,8 +1478,38 @@ def cmd_watch(cfg, args):
         time.sleep(interval)
 
 
+def cmd_depot(cfg, args):
+    """Stan i wymiana tokenu sandboxów `depot claude`."""
+    if "--fallback" in args:
+        import getpass
+        token = getpass.getpass("token z `claude setup-token` (nie pokazuje się): ").strip()
+        if not token.startswith("sk-ant-"):
+            print("to nie wygląda na token Claude Code")
+            return 1
+        kc_write(DEPOT_FALLBACK_SERVICE, KEYCHAIN_USER, token)
+        print("token zapasowy zapisany w Pęku kluczy")
+        return 0
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę")
+        return 1
+    if not depot_bin(cfg):
+        print("brak CLI depot (brew install depot/tap/depot)")
+        return 1
+    accounts = load_accounts()
+    email = depot_sync(accounts, cfg, find_active(accounts, cfg), force="--force" in args)
+    state = load_state()
+    if not email:
+        print("sandboxy Depot bez zmiany tokenu, szczegóły w switch.log")
+        return 1
+    until = state.get("depot_expires_at")
+    print(f"sandboxy Depot: {email}" + (f", token ważny do {datetime.fromtimestamp(until):%Y-%m-%d %H:%M}" if until else ""))
+    return 0
+
+
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
-            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "watch": cmd_watch}
+            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "watch": cmd_watch,
+            "depot": cmd_depot}
 
 
 def main(argv):

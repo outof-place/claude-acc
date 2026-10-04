@@ -277,20 +277,25 @@ class StatusTest(unittest.TestCase):
         self.assertFalse(snap["foreign_runtime"])
         self.assertEqual(snap["orca_selected"], "a@x")
 
-    def test_status_json_never_refreshes_tokens(self):
-        # panel pyta co minutę: odświeżanie tokenów zostaje przy automacie i sesjach
+    def test_status_json_leaves_tokens_sessions_hold(self):
+        # panel pyta co minutę: token, który trzyma sesja, odświeża tylko ona (druga
+        # wymiana tej samej pary to dla serwera kradzież). Konto, którego token leży
+        # tylko w kopii Orca, panel odświeża, bo nikt inny go nie używa, a bez tego
+        # pokazywał dane sprzed kilkunastu godzin.
         w = Env()
-        a = w.account("a@x")
+        a = w.account("a@x", expires_in=3 * 60)
         w.account("b@x", expired=True)
         w.runtime(a)
         w.write()
+        held = w.entry(BASE)
 
         r = w.run("status", "--json")
 
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         emails = [x["email"] for x in json.loads(r.stdout)["accounts"]]
         self.assertEqual(sorted(emails), ["a@x", "b@x"])
-        self.assertEqual(w.calls("/v1/oauth/token"), [])
+        self.assertEqual(w.entry(BASE), held)
+        self.assertEqual(len(w.calls("/v1/oauth/token")), 1)
 
 
 class TickTest(unittest.TestCase):
