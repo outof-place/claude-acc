@@ -10,12 +10,22 @@
 # (Zyxel przy Orange); przy BE230 sieć pod obciążeniem dokłada 4 ms i nie ma czego ratować.
 # Działa na ruch z tego Maca i do restartu albo ponownego podłączenia adaptera.
 #
+# vnodes: większy cache vnode (kern.maxvnodes). Jądro trzyma 263168 vnode i przy pracy
+# agentów odzyskuje ich ponad 1000 na sekundę: jedno drzewo node_modules/.pnpm portivo
+# (358 tys. wpisów) nie mieści się w cache, więc każde kolejne skanowanie modułów (tsc,
+# eslint, Turbopack, git status -uall) zaczyna od zera. Koszt: około 1,1 KB pamięci
+# jądra na vnode (vnode, inode APFS, namecache), czyli ~0,6 GB przy 786432. Wartość
+# wraca do domyślnej po restarcie.
+#
 # Uruchomienie:
 #   sudo ./perf-root.sh trial [--rate 27Mbps] [--if en0] [--keep]
 #        pomiar, ogranicznik, drugi pomiar, porównanie; bez --keep ogranicznik znika
 #   sudo ./perf-root.sh shaper apply [--rate 27Mbps] [--if en0]
 #   sudo ./perf-root.sh shaper undo
 #   ./perf-root.sh shaper status
+#   sudo ./perf-root.sh vnodes trial [--value 786432] [--keep]
+#        lstat drzewa modułów przed i po, bez --keep wraca stara wartość
+#   sudo ./perf-root.sh vnodes apply|undo [--value 786432]
 # Bez --rate limit to `shaper_percent` (90%) uploadu z ostatniego `perf.py bench network`
 # przy tej samej bramie. --dry-run pokazuje polecenia bez wykonywania.
 set -euo pipefail
@@ -26,6 +36,7 @@ DRY=0
 KEEP=0
 RATE=""
 IFACE=""
+VNODES=786432
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -33,6 +44,7 @@ while [ $# -gt 0 ]; do
     --keep) KEEP=1 ;;
     --rate) RATE="$2"; shift ;;
     --if) IFACE="$2"; shift ;;
+    --value) VNODES="$2"; shift ;;
     -*) echo "nieznana opcja: $1" >&2; exit 2 ;;
     *) ARGS+=("$1") ;;
   esac
@@ -170,11 +182,67 @@ trial() {
   rm -rf "$tmp"
 }
 
+vnodes_apply() {
+  need_root vnodes apply
+  local before
+  before="$(sysctl -n kern.maxvnodes)"
+  echo "kern.maxvnodes: $before -> $VNODES"
+  do_it sysctl -w kern.maxvnodes="$VNODES"
+  if [ "$DRY" -eq 0 ]; then
+    if [ "$(sysctl -n kern.maxvnodes)" != "$VNODES" ]; then
+      echo "jądro nie przyjęło nowej wartości; nic nie zapisuję" >&2
+      exit 1
+    fi
+    as_user record vnodes "$VNODES" "prev=$before"
+  fi
+}
+
+vnodes_undo() {
+  need_root vnodes undo
+  local prev
+  prev="$(as_user status --json | /usr/bin/python3 -c 'import json,sys
+for t in json.load(sys.stdin)["tweaks"]:
+    if t["name"] == "vnodes" and t["applied"]:
+        print(t["detail"].split("prev=")[-1])')"
+  prev="${prev:-263168}"
+  echo "kern.maxvnodes: $(sysctl -n kern.maxvnodes) -> $prev"
+  do_it sysctl -w kern.maxvnodes="$prev"
+  [ "$DRY" -eq 1 ] || as_user record vnodes --forget
+}
+
+vnodes_trial() {
+  need_root vnodes trial
+  local tmp
+  tmp="$(mktemp -d)"
+  echo "1/3 lstat drzewa modułów przy obecnym cache"
+  [ "$DRY" -eq 1 ] || as_user bench fs --json > "$tmp/before.json"
+  echo "2/3 większy cache vnode"
+  vnodes_apply
+  [ "$KEEP" -eq 1 ] || [ "$DRY" -eq 1 ] || trap 'vnodes_undo; rm -rf "$tmp"; exit 130' INT TERM
+  echo "3/3 lstat drzewa modułów z większym cache"
+  [ "$DRY" -eq 1 ] || as_user bench fs --json > "$tmp/after.json"
+  if [ "$KEEP" -eq 0 ]; then
+    trap - INT TERM
+    vnodes_undo
+  else
+    echo "nowa wartość zostaje do restartu; cofnięcie: sudo $0 vnodes undo"
+  fi
+  [ "$DRY" -eq 1 ] || /usr/bin/python3 -c 'import json,sys
+a, b = (json.load(open(p))["fs"] for p in sys.argv[1:3])
+print("%-34s %10s %10s" % ("", "przed", "po"))
+for label, key in (("drugi przebieg lstat s", "warm_s"), ("vnode z odzysku", "warm_recycled"), ("kern.maxvnodes", "maxvnodes")):
+    print("%-34s %10s %10s" % (label, a.get(key), b.get(key)))' "$tmp/before.json" "$tmp/after.json"
+  rm -rf "$tmp"
+}
+
 case "$CMD $SUB" in
   "shaper apply") shaper_apply ;;
   "shaper undo") shaper_undo ;;
   "shaper status" | "shaper ") shaper_status ;;
   "trial ") trial ;;
+  "vnodes trial") vnodes_trial ;;
+  "vnodes apply") vnodes_apply ;;
+  "vnodes undo") vnodes_undo ;;
   *)
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     exit 2

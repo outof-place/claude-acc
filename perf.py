@@ -14,22 +14,31 @@ Pomiary:
   jaka część poszła na rdzenie wydajnościowe i ile czasu proces czekał w kolejce,
   do tego opóźnienie wybudzenia wątku (to, co czujesz jako lag);
 - GPU: ile procent czasu GPU zajmuje każdy klient (WindowServer, przeglądarki,
-  Electron), ile CPU pali WindowServer i ile czeka malutkie zlecenie Metalu.
+  Electron), ile CPU pali WindowServer i ile czeka malutkie zlecenie Metalu;
+- system plików: lstat dużego drzewa node_modules dwa razy pod rząd i ile vnode
+  jądro przy tym odzyskuje (czy drzewo mieści się w cache vnode).
 
 Poprawki wymagające roota robi perf-root.sh; tu są tylko opisane.
 
+Ultra to jeden przełącznik dla pracy agentów (Orca, wiele sesji Claude Code, ich dev
+serwery i Docker): włącza wszystkie poprawki z listy ULTRA, zapisuje, co było przed
+nimi, i mierzy przed i po. Stan dla panelu jest w perf-state.json pod "ultra".
+
 Komendy:
   status [--json]                     poprawki i ostatnie pomiary
-  bench [network|cpu|gpu|all]         pomiar; wynik ląduje w perf-state.json
+  bench [network|cpu|gpu|fs|all]      pomiar; wynik ląduje w perf-state.json
         [--runs N] [--json]
   apply <nazwa>|--all [--dry-run]     włącz poprawkę (tylko te bez roota)
   undo <nazwa>|--all                  cofnij
-  keep                                nałóż włączone poprawki na nowe procesy (dla launchd)
+  ultra on|off|status [--json]        wszystkie poprawki dla agentów naraz i ich wyniki
+  keep                                pilnuj włączonych poprawek (dla launchd co 5 min)
   list                                poprawki z opisem i zmierzonym efektem
 """
 
+import calendar
 import ctypes
 import ctypes.util
+import glob
 import hashlib
 import json
 import os
@@ -697,12 +706,45 @@ def bench_network(runs=1, flags=()):
 
 # ---------- poprawki ----------
 
+HOME = janitor.HOME
+CLAUDE_SETTINGS = os.path.join(HOME, ".claude/settings.json")
+CLAUDE_PROJECTS = os.path.join(HOME, ".claude/projects")
+DEVGUARD_CONFIG = os.path.join(STATE_DIR, "devguard.json")
+DOCKER_SETTINGS = os.path.join(
+    HOME, "Library/Group Containers/group.com.docker/settings-store.json"
+)
+COMPILE_CACHE_DIR = os.path.join(HOME, "Library/Caches/node-compile-cache")
+DOCKER_CLI = "/Applications/Docker.app/Contents/Resources/bin/docker"
+# w zapisie poprzedniej wartości: klucza wcześniej nie było
+MISSING = {"__missing__": True}
+# `change` w edit_json_file: plik ma zniknąć (powstał przez nas i znowu jest pusty)
+DELETE = "delete"
+
 DEFAULT_CONFIG = {
     # procesy pomocnicze, które bez przerwy palą CPU, a nikt na nie nie czeka, dostają
     # QoS tła Darwina: tylko rdzenie energooszczędne i dławione IO. Wzorce to wyrażenia
     # regularne na pełnej linii poleceń. cavemem worker skanuje swoją 2 GB bazę SQLite
     # bez końca (zmierzone 2026-10-04: 24-32% rdzenia P, około 1 W)
     "background": [r"/cavemem/dist/index\.js worker"],
+    # hooki Claude Code puszczane w tle ("async": true): nie zwracają nic, na co sesja
+    # czeka, a każde wywołanie narzędzia czekało na start node (54 ms p50)
+    "async_hooks": [
+        {
+            "event": "PostToolUse",
+            "match": "cavemem/dist/index.js hook run post-tool-use",
+        },
+        {"event": "Stop", "match": "cavemem/dist/index.js hook run stop"},
+    ],
+    # limit dev serwerów strażnika w Ultra (procent RAM; strażnik domyślnie ma 35)
+    "devguard_budget_percent": 25,
+    # pamięć maszyny Dockera w Ultra; zapis tylko przy zamkniętym Dockerze, działa od
+    # jego następnego startu (kontenery używały 3,7 GB z 8)
+    "docker_memory_mib": 6144,
+    # repozytoria, w których Ultra włącza core.untrackedCache i core.fsmonitor; puste,
+    # bo jedyne repo z worktree Orki (portivo) zmienia tylko jego właściciel
+    "git_repos": [],
+    # drzewo do pomiaru `bench fs` (lstat wszystkiego, dwa przebiegi)
+    "fs_bench_path": "~/Documents/portivo-app/Untitled/node_modules/.pnpm",
     # ogranicznik wysyłania z perf-root.sh dostaje tyle procent zmierzonego uploadu
     "shaper_percent": 90,
 }
@@ -740,9 +782,92 @@ class System:
             return False
         return True
 
+    def docker_running(self):
+        """Docker Desktop trzyma ustawienia w pamięci i nadpisuje plik; piszemy tylko bez niego."""
+        out = janitor.run(["pgrep", "-x", "com.docker.backend"])
+        return bool(out and out.strip())
+
+    def git(self, repo, *args):
+        """Wyjście gita albo None (brak klucza w configu to też None)."""
+        return janitor.run(["git", "-C", repo, *args], timeout=120)
+
+    def docker_memory(self):
+        """Pamięć maszyny Dockera w bajtach z `docker info`, gdy Docker działa."""
+        cli = janitor.which("docker") or DOCKER_CLI
+        out = janitor.run([cli, "info", "--format", "{{.MemTotal}}"], timeout=20)
+        try:
+            return int(out.strip())
+        except (AttributeError, ValueError):
+            return None
+
+
+# ---------- pliki JSON cudzych narzędzi ----------
+
+
+def read_json_file(path):
+    """(dane, mtime); brak pliku to ({}, None)."""
+    try:
+        with open(path) as f:
+            return json.load(f), os.stat(path).st_mtime_ns
+    except FileNotFoundError:
+        return {}, None
+
+
+def edit_json_file(path, change, indent=2):
+    """Czyta, zmienia i zapisuje atomowo, tylko gdy `change(data)` zwróci True (DELETE
+    usuwa plik). Gdy ktoś zapisał plik w międzyczasie (Claude Code potrafi), zaczyna od
+    nowa, więc `change` musi dać się powtórzyć."""
+    for _ in range(5):
+        data, stamp = read_json_file(path)
+        result = change(data)
+        if not result:
+            return result
+        _, now = read_json_file(path)
+        if now != stamp:
+            continue
+        if result == DELETE:
+            os.remove(path)
+            return result
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.perf-tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=indent, ensure_ascii=False)
+            if trailing_newline(path):
+                f.write("\n")
+        if stamp is not None:
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        os.replace(tmp, path)
+        return result
+    raise RuntimeError(f"{path} zmienia się bez przerwy, spróbuj później")
+
+
+def trailing_newline(path):
+    """Czy plik kończy się nową linią (nowy plik: tak), żeby zapis nie zmieniał nic poza kluczem."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) == b"\n"
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False  # pusty plik
+
+
+def restore_key(data, key, previous, ours):
+    """Przywraca klucz, ale tylko gdy dalej ma naszą wartość; inaczej ktoś go zmienił
+    po nas i to jego decyzja zostaje."""
+    if data.get(key, MISSING) != ours:
+        return False
+    if previous == MISSING:
+        data.pop(key, None)
+    else:
+        data[key] = previous
+    return True
+
 
 class BackgroundHelpers:
     name = "bg-helpers"
+    group = "cpu"
     root = False
     title = "procesy pomocnicze z listy `background` w tle (rdzenie E, dławione IO)"
     effect = (
@@ -780,7 +905,7 @@ class BackgroundHelpers:
             if system.set_background(pid, True):
                 kept.append({"pid": pid, "start": start, "command": command[:200]})
                 changed.append(command)
-        return {"procs": kept}, changed
+        return {"procs": kept}, [short_command(c) for c in changed]
 
     def undo(self, record, system):
         restored = []
@@ -788,7 +913,7 @@ class BackgroundHelpers:
             if system.start(entry["pid"]) != entry["start"]:
                 continue
             if system.set_background(entry["pid"], False):
-                restored.append(entry["command"])
+                restored.append(short_command(entry["command"]))
         return restored
 
     def describe(self, record, system):
@@ -801,11 +926,295 @@ class BackgroundHelpers:
             return "brak działających procesów z listy"
         return ", ".join(f"{short_command(e['command'])} ({e['pid']})" for e in alive)
 
+    def measure(self, cfg, system, seconds=3):
+        """Ile rdzenia P (%) zjadają teraz procesy z listy; None, gdy żadnego nie ma."""
+        targets = self.targets(cfg, system)
+        first = {pid: rusage(pid) for pid, _, _ in targets}
+        if not any(first.values()):
+            return None
+        time.sleep(seconds)
+        total = 0.0
+        for pid, info in first.items():
+            last = rusage(pid)
+            if info and last and last["start"] == info["start"]:
+                total += last["pcpu"] - info["pcpu"]
+        return rnd(total / seconds * 100)
+
+
+class AsyncHooks:
+    """Hooki Claude Code w tle: sesja nie czeka na ich koniec przy każdym narzędziu."""
+
+    name = "claude-hooks-async"
+    group = "claude"
+    root = False
+    title = (
+        "hooki z listy `async_hooks` w ~/.claude/settings.json puszczone w tle (async)"
+    )
+    effect = (
+        "PostToolUse czekał na start node w hooku cavemem: 54 ms p50, 99 ms p90 na każde "
+        "narzędzie; równoległy hook Orki trwa 26/71 ms (transkrypty z 24 h, 12 tys. wywołań)"
+    )
+    path = None  # testy podstawiają plik; None to CLAUDE_SETTINGS
+
+    def settings_path(self):
+        return self.path or CLAUDE_SETTINGS
+
+    def matching(self, data, cfg):
+        """[(zdarzenie, hook)] pasujące do listy, wprost ze struktury settings.json."""
+        found = []
+        for spec in cfg.get("async_hooks", []):
+            for group in (data.get("hooks") or {}).get(spec["event"], []) or []:
+                for hook in group.get("hooks", []) or []:
+                    if spec["match"] in hook.get("command", ""):
+                        found.append((spec["event"], hook))
+        return found
+
+    def apply(self, cfg, system, record=None):
+        entries = list((record or {}).get("hooks", []))
+        changed = []
+
+        def change(data):
+            del changed[:]
+            known = {(e["event"], e["command"]) for e in entries}
+            for event, hook in self.matching(data, cfg):
+                if hook.get("async") is True:
+                    continue
+                if (event, hook["command"]) not in known:
+                    entries.append(
+                        {
+                            "event": event,
+                            "command": hook["command"],
+                            "prev": hook.get("async", MISSING),
+                        }
+                    )
+                hook["async"] = True
+                changed.append(f"{event}: {hook_label(hook['command'])}")
+            return bool(changed)
+
+        if os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        return {"hooks": entries}, changed
+
+    def undo(self, record, system):
+        restored = []
+        wanted = {
+            (e["event"], e["command"]): e["prev"] for e in record.get("hooks", [])
+        }
+
+        def change(data):
+            del restored[:]
+            for event, groups in (data.get("hooks") or {}).items():
+                for group in groups or []:
+                    for hook in group.get("hooks", []) or []:
+                        key = (event, hook.get("command"))
+                        if key not in wanted:
+                            continue
+                        if restore_key(hook, "async", wanted[key], True):
+                            restored.append(f"{event}: {hook_label(hook['command'])}")
+            return bool(restored)
+
+        if wanted and os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        return restored
+
+    def describe(self, record, system):
+        hooks = (record or {}).get("hooks", [])
+        if not hooks:
+            return "brak pasujących hooków"
+        return ", ".join(f"{e['event']}: {hook_label(e['command'])}" for e in hooks)
+
+
+def hook_label(command):
+    if "cavemem" in command and "hook run " in command:
+        return "cavemem " + command.split("hook run ")[-1].split()[0]
+    return short_command(command)
+
+
+class ClaudeEnv:
+    """Zmienna środowiskowa dla sesji Claude Code i wszystkiego, co uruchamiają (env w
+    ~/.claude/settings.json). Działa w sesjach otwartych po zmianie."""
+
+    root = False
+    group = "claude"
+    path = None
+
+    def __init__(self, name, var, value, title, effect):
+        self.name, self.var, self.value = name, var, value
+        self.title, self.effect = title, effect
+
+    def settings_path(self):
+        return self.path or CLAUDE_SETTINGS
+
+    def apply(self, cfg, system, record=None):
+        if not os.path.exists(self.settings_path()):
+            return dict(record or {}), []
+        seen = {}
+
+        def change(data):
+            env = data.get("env") or {}
+            seen["prev"] = env.get(self.var, MISSING)
+            if seen["prev"] == self.value:
+                return False
+            env[self.var] = self.value
+            data["env"] = env
+            return True
+
+        edit_json_file(self.settings_path(), change)
+        changed = [] if seen["prev"] == self.value else [f"{self.var}={self.value}"]
+        if record and "prev" in record:
+            return dict(
+                record
+            ), changed  # poprzednia wartość zapisana przy pierwszym razie
+        return {"value": self.value, "prev": seen["prev"]}, changed
+
+    def undo(self, record, system):
+        restored = []
+        if record.get("prev") == record.get("value"):
+            return restored  # wartość była taka sama przed nami
+
+        def change(data):
+            env = data.get("env") or {}
+            if not restore_key(env, self.var, record["prev"], record["value"]):
+                return False
+            restored.append(self.var)
+            if env:
+                data["env"] = env
+            else:
+                data.pop("env", None)
+            return True
+
+        if os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        return restored
+
+    def describe(self, record, system):
+        return f"{self.var}={self.value}"
+
+
+class JsonSetting:
+    """Jeden klucz w pliku JSON innego narzędzia, z dokładnym cofnięciem."""
+
+    root = False
+
+    def __init__(self, name, group, path, key, config_key, title, effect, defer=False):
+        self.name, self.group, self.path, self.key = name, group, path, key
+        self.config_key, self.defer = config_key, defer
+        self.title, self.effect = title, effect
+
+    def blocked(self, system):
+        """Docker nadpisuje swój plik ustawień; dopóki działa, zapis czeka."""
+        return self.defer and system.docker_running()
+
+    def apply(self, cfg, system, record=None):
+        value = cfg[self.config_key]
+        if self.blocked(system):
+            if record and record.get("written"):
+                return dict(record), []  # już zapisane; zmiana wartości poczeka
+            return dict(record or {}, value=value, written=False), []
+        seen = {}
+
+        def change(data):
+            seen["prev"] = data.get(self.key, MISSING)
+            seen["created"] = not os.path.exists(self.path)
+            if seen["prev"] == value:
+                return False
+            data[self.key] = value
+            return True
+
+        edit_json_file(self.path, change)
+        if record and record.get("written"):
+            prev, created = record["prev"], record.get("created", False)
+        else:
+            prev, created = seen["prev"], seen["created"]
+        changed = [] if seen["prev"] == value else [f"{self.key}={value}"]
+        result = {"value": value, "prev": prev, "created": created, "written": True}
+        if record and "active" in record:
+            result["active"] = record["active"]
+        return result, changed
+
+    def undo(self, record, system):
+        if not record.get("written") or record.get("prev") == record.get("value"):
+            return []
+        if self.blocked(system):
+            raise Deferred(self.name)
+        restored = []
+
+        def change(data):
+            if not restore_key(data, self.key, record["prev"], record["value"]):
+                return False
+            restored.append(self.key)
+            return DELETE if record.get("created") and not data else True
+
+        if os.path.exists(self.path):
+            edit_json_file(self.path, change)
+        return restored
+
+    def describe(self, record, system):
+        record = record or {}
+        if not record.get("written"):
+            return f"{self.key}={record.get('value')} czeka na zamknięcie Dockera"
+        return f"{self.key}={record.get('value')}"
+
+
+class Deferred(Exception):
+    """Cofnięcie musi poczekać (Docker działa); `keep` dokończy je później."""
+
+
+class GitSpeed:
+    """core.untrackedCache i core.fsmonitor w repozytoriach z listy `git_repos`."""
+
+    name = "git-speed"
+    group = "dev"
+    root = False
+    title = "git status bez skanowania drzewa: untrackedCache + fsmonitor (repozytoria z `git_repos`)"
+    effect = (
+        "klon portivo (14 tys. plików): git status 71 -> 31 ms z untrackedCache, 26 ms z "
+        "fsmonitor; feature.manyFiles (index v4) nic nie dodał"
+    )
+    KEYS = (("core.untrackedCache", "true"), ("core.fsmonitor", "true"))
+
+    def apply(self, cfg, system, record=None):
+        repos = dict((record or {}).get("repos", {}))
+        changed = []
+        for repo in [os.path.expanduser(r) for r in cfg.get("git_repos", [])]:
+            if repo in repos or system.git(repo, "rev-parse", "--git-dir") is None:
+                continue
+            prev = {}
+            for key, value in self.KEYS:
+                current = system.git(repo, "config", "--local", "--get", key)
+                prev[key] = current.strip() if current is not None else None
+                system.git(repo, "config", "--local", key, value)
+            system.git(repo, "update-index", "--untracked-cache")
+            repos[repo] = prev
+            changed.append(repo)
+        return {"repos": repos}, changed
+
+    def undo(self, record, system):
+        restored = []
+        for repo, prev in record.get("repos", {}).items():
+            system.git(repo, "fsmonitor--daemon", "stop")
+            for key, _ in self.KEYS:
+                if prev.get(key) is None:
+                    system.git(repo, "config", "--local", "--unset", key)
+                else:
+                    system.git(repo, "config", "--local", key, prev[key])
+            if prev.get("core.untrackedCache") is None:
+                system.git(repo, "update-index", "--no-untracked-cache")
+            restored.append(repo)
+        return restored
+
+    def describe(self, record, system):
+        repos = (record or {}).get("repos", {})
+        return (
+            ", ".join(short_path(r) for r in repos) or "brak repozytoriów w `git_repos`"
+        )
+
 
 class RootTweak:
     """Poprawka, która wymaga roota: perf.py tylko ją opisuje, robi ją perf-root.sh."""
 
     root = True
+    group = "root"
 
     def __init__(self, name, title, effect, command):
         self.name, self.title, self.effect, self.command = name, title, effect, command
@@ -813,6 +1222,41 @@ class RootTweak:
 
 TWEAKS = [
     BackgroundHelpers(),
+    AsyncHooks(),
+    ClaudeEnv(
+        "node-compile-cache",
+        "NODE_COMPILE_CACHE",
+        COMPILE_CACHE_DIR,
+        "cache kompilacji V8 dla node uruchamianego przez sesje Claude (tsc, eslint, serwery MCP, hooki)",
+        "require('typescript') 87 -> 40 ms, eslint 77 -> 67 ms; next i cavemem bez zmian",
+    ),
+    JsonSetting(
+        "devguard-budget",
+        "dev",
+        DEVGUARD_CONFIG,
+        "budget_percent",
+        "devguard_budget_percent",
+        "ciaśniejszy limit dev serwerów w strażniku (devguard.json budget_percent)",
+        "polityka, nie pomiar: 35% RAM (16,8 GB) -> 25% (12 GB); dev serwery zajmowały 3,2 GB",
+    ),
+    JsonSetting(
+        "docker-vm",
+        "docker",
+        DOCKER_SETTINGS,
+        "MemoryMiB",
+        "docker_memory_mib",
+        "mniejsza maszyna Dockera (settings-store.json MemoryMiB), od następnego startu Dockera",
+        "VM trzymała 8,0 GB, 21 kontenerów używało 3,7 GB; Virtualization.framework nie oddaje pamięci",
+        defer=True,
+    ),
+    GitSpeed(),
+    RootTweak(
+        "vnodes",
+        "większy cache vnode (kern.maxvnodes 263168 -> 786432): drzewa node_modules mieszczą się w nim",
+        "lstat 358 tys. wpisów portivo/.pnpm: 3,6 s w każdym przebiegu i 250 tys. vnode z odzysku, "
+        "bo cache ma 263 tys.; 28 mln odzysków w 5 h pracy",
+        "sudo ./perf-root.sh vnodes trial",
+    ),
     RootTweak(
         "shaper",
         "ogranicznik wysyłania na interfejsie (ifconfig tbr): kolejka zostaje w fq_codel "
@@ -838,6 +1282,454 @@ def short_command(command):
         if part.endswith((".js", ".py", ".mjs", ".ts")):
             return os.path.basename(os.path.dirname(os.path.dirname(part))) or part
     return os.path.basename(parts[0]) if parts else command
+
+
+def short_path(path):
+    return path.replace(HOME, "~", 1) if path.startswith(HOME) else path
+
+
+# ---------- pomiary pracy agentów ----------
+
+
+def stat_walk(root):
+    """lstat każdego wpisu w drzewie (jak rozwiązywanie modułów albo git status -uall)."""
+    count = 0
+    stack = [root]
+    while stack:
+        try:
+            entries = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    entry.stat(follow_symlinks=False)
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                count += 1
+                if is_dir:
+                    stack.append(entry.path)
+    return count
+
+
+def bench_fs(cfg, passes=2):
+    """Dwa przebiegi lstat po dużym drzewie node_modules. Gdy drugi jest tak samo wolny jak
+    pierwszy, a jądro odzyskuje vnode tyle, ile było wpisów, drzewo nie mieści się w cache
+    vnode (kern.maxvnodes) i każde narzędzie skanujące moduły płaci za to od nowa."""
+    root = os.path.expanduser(cfg["fs_bench_path"])
+    if not os.path.isdir(root):
+        return {"error": f"brak {root}"}
+    runs = []
+    for _ in range(passes):
+        recycled = sysctl_int("kern.num_recycledvnodes") or 0
+        started = time.monotonic()
+        entries = stat_walk(root)
+        runs.append(
+            {
+                "seconds": round(time.monotonic() - started, 2),
+                "recycled": (sysctl_int("kern.num_recycledvnodes") or 0) - recycled,
+            }
+        )
+    return {
+        "path": short_path(root),
+        "entries": entries,
+        "first_s": runs[0]["seconds"],
+        "warm_s": runs[-1]["seconds"],
+        "warm_recycled": runs[-1]["recycled"],
+        "maxvnodes": sysctl_int("kern.maxvnodes"),
+    }
+
+
+def iso_epoch(stamp):
+    try:
+        return calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def hook_records(path):
+    """(zdarzenie, klucz wywołania, ms, chwila, komenda) z jednego transkryptu Claude Code.
+
+    Każdy hook ma osobny wpis hook_success z durationMs. Przy narzędziu kluczem jest
+    toolUseID; Stop go nie ma, więc hooki jednej tury łączy to, że kończą się w tej
+    samej sekundzie. Transkrypty mają setki MB: czytane linia po linii.
+    """
+    last_stop = (None, 0)
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            if '"hook_success"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+                attachment = entry["attachment"]
+                ms = float(attachment["durationMs"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            stamp = iso_epoch(entry.get("timestamp"))
+            if stamp is None:
+                continue
+            key = attachment.get("toolUseID")
+            if not key:
+                if last_stop[0] and stamp - last_stop[1] < 2:
+                    key = last_stop[0]
+                else:
+                    key = f"{path}:{entry.get('uuid')}"
+                last_stop = (key, stamp)
+            yield (
+                attachment.get("hookEvent"),
+                key,
+                ms,
+                stamp,
+                attachment.get("command", ""),
+            )
+
+
+def hook_latency(
+    since,
+    until=None,
+    events=("PreToolUse", "PostToolUse", "Stop"),
+    skip=(),
+    born_after=None,
+):
+    """Ile sesja Claude Code czeka na hooki przy jednym zdarzeniu (ms): najdłuższy z
+    równoległych hooków, z transkryptów. Hooki, których komenda zawiera coś z `skip`
+    (puszczone w tle), nie wstrzymują sesji, więc się nie liczą. `born_after` bierze
+    tylko sesje otwarte po tej chwili: Claude Code czyta hooki raz, przy starcie sesji.
+
+    {"PostToolUse": {"n": ..., "p50": ..., "p90": ...}, ...}
+    """
+    until = until or time.time()
+    calls = {event: {} for event in events}
+    for path in glob.glob(os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+            if born_after and janitor.born(path) < born_after:
+                continue
+            records = list(hook_records(path))
+        except OSError:
+            continue
+        for event, key, ms, stamp, command in records:
+            if event not in calls or not since <= stamp <= until:
+                continue
+            if any(s in command for s in skip):
+                calls[event].setdefault(key, 0)
+                continue
+            calls[event][key] = max(calls[event].get(key, 0), ms)
+    result = {}
+    for event, per_call in calls.items():
+        values = list(per_call.values())
+        if values:
+            result[event] = {
+                "n": len(values),
+                "p50": rnd(percentile(values, 0.5), 0),
+                "p90": rnd(percentile(values, 0.9), 0),
+            }
+    return result
+
+
+def typescript_load(cache_dir=None, runs=5):
+    """Mediana czasu `require('typescript')` w node (ms), z cache kompilacji albo bez."""
+    node = janitor.which("node")
+    candidates = sorted(
+        glob.glob(
+            os.path.join(
+                HOME,
+                "Documents/*/node_modules/.pnpm/typescript@[1-6]*/node_modules/typescript",
+            )
+        )
+        + glob.glob(
+            os.path.join(
+                HOME,
+                "Documents/*/*/node_modules/.pnpm/typescript@[1-6]*/node_modules/typescript",
+            )
+        )
+        + glob.glob(
+            os.path.join(HOME, ".nvm/versions/node/*/lib/node_modules/typescript")
+        )
+    )
+    if not node or not candidates:
+        return None
+    env = dict(janitor.ENV)
+    env.pop("NODE_COMPILE_CACHE", None)
+    if cache_dir:
+        env["NODE_COMPILE_CACHE"] = cache_dir
+    code = f"require({json.dumps(os.path.realpath(candidates[-1]))})"
+    times = []
+    for i in range(runs + (1 if cache_dir else 0)):
+        started = time.perf_counter()
+        done = subprocess.run(
+            [node, "-e", code], env=env, capture_output=True, check=False
+        )
+        if done.returncode != 0:
+            return None
+        if cache_dir and i == 0:
+            continue  # pierwszy przebieg zapisuje cache
+        times.append((time.perf_counter() - started) * 1000)
+    return rnd(median(times), 0)
+
+
+def git_status_ms(system, repos, runs=5):
+    """Mediana `git status --porcelain` (ms) po repozytoriach z listy; bez blokad indeksu."""
+    times = []
+    for repo in repos:
+        for _ in range(runs):
+            started = time.perf_counter()
+            subprocess.run(
+                ["git", "-C", repo, "status", "--porcelain"],
+                capture_output=True,
+                env=dict(janitor.ENV, GIT_OPTIONAL_LOCKS="0"),
+                check=False,
+            )
+            times.append((time.perf_counter() - started) * 1000)
+    return rnd(median(times), 0) if times else None
+
+
+# ---------- Ultra: jeden przełącznik dla pracy agentów ----------
+
+# kolejność ma znaczenie: najpierw to, co działa od razu
+ULTRA = [
+    "bg-helpers",
+    "claude-hooks-async",
+    "node-compile-cache",
+    "devguard-budget",
+    "docker-vm",
+    "git-speed",
+]
+# poprawka hooków liczy się dopiero po tylu zdarzeniach od włączenia
+HOOK_SAMPLES = 30
+SETTLE_SECONDS = 2
+
+
+def ultra_state(state):
+    ultra = state.setdefault("ultra", {})
+    ultra.setdefault("on", False)
+    ultra.setdefault("since", None)
+    ultra.setdefault("applied", [])
+    ultra.setdefault("pending_root", [])
+    ultra.setdefault("pending_manual", [])
+    ultra.setdefault("results", {})
+    return ultra
+
+
+def pending_root(cfg, state):
+    """Poprawki roota, które w tej chwili mają sens; robi je perf-root.sh."""
+    names = []
+    if "vnodes" not in state["applied"]:
+        names.append("vnodes")
+    last = state["bench"].get("network", {}).get("result", {})
+    bloat = (last.get("up_net_p90_ms") or 0) - (last.get("idle_ms") or 0)
+    if bloat > 50 and "shaper" not in state["applied"]:
+        names.append("shaper")  # sieć puchnie przy wysyłaniu: router bez SQM
+    return names
+
+
+def pending_manual(state):
+    """Rzeczy do kliknięcia przez człowieka: Ultra ich nie zrobi sama."""
+    names = []
+    record = state["applied"].get("docker-vm")
+    if record and record.get("written") and not record.get("active"):
+        names.append("docker-restart")
+    elif record and not record.get("written"):
+        names.append("docker-quit")
+    return names
+
+
+def measure_before_after(item, cfg, system, record):
+    """Wynik do panelu: {"before", "after", "unit"} albo None, gdy nie ma czego mierzyć."""
+    name = item.name
+    if name == "bg-helpers":
+        return None  # mierzone przy włączaniu, patrz ultra_on
+    if name == "node-compile-cache":
+        before = typescript_load()
+        after = typescript_load(COMPILE_CACHE_DIR)
+        if before is None or after is None:
+            return None
+        return {"before": before, "after": after, "unit": "ms require('typescript')"}
+    if name == "devguard-budget":
+        prev = record.get("prev")
+        before = 35 if prev == MISSING or prev is None else prev
+        return {
+            "before": before,
+            "after": record.get("value"),
+            "unit": "% RAM na dev serwery",
+        }
+    if name == "docker-vm":
+        prev = record.get("prev")
+        before = 8192 if prev == MISSING or prev is None else prev
+        result = {
+            "before": round(before / 1024, 1),
+            "after": round(record.get("value", before) / 1024, 1),
+            "unit": "GB RAM maszyny Dockera",
+        }
+        if not record.get("written"):
+            result["note"] = "zapisze się po zamknięciu Dockera"
+        elif not record.get("active"):
+            result["note"] = "zadziała po restarcie Dockera"
+        return result
+    return None
+
+
+def ultra_on(cfg, system, state):
+    """Włącza wszystko z ULTRA, co jeszcze nie działa; drugi raz niczego nie psuje."""
+    ultra = ultra_state(state)
+    if not ultra["on"]:
+        ultra["since"] = time.time()
+        ultra["applied"] = []
+        ultra["results"] = {}
+    ultra["on"] = True
+    report = []
+    for name in ULTRA:
+        item = tweak(name)
+        old = state["applied"].get(name)
+        if old is not None and name not in ultra["applied"]:
+            continue  # włączone ręcznie przed Ultra: nie nasze, nie ruszamy
+        before = None
+        if name == "bg-helpers" and old is None:
+            before = item.measure(cfg, system)
+        if name == "git-speed" and old is None and cfg.get("git_repos"):
+            before = git_status_ms(
+                system, [os.path.expanduser(r) for r in cfg["git_repos"]]
+            )
+        try:
+            record, changed = item.apply(cfg, system, old)
+        except (OSError, ValueError, RuntimeError) as err:
+            report.append(f"{name}: błąd {err}")
+            continue
+        record["at"] = old["at"] if old else time.time()
+        record["ultra"] = True
+        if name == "docker-vm" and record.get("written"):
+            # Docker wczyta nową wartość dopiero przy następnym starcie
+            record.setdefault("active", bool((old or {}).get("active")))
+        state["applied"][name] = record
+        if name not in ultra["applied"]:
+            ultra["applied"].append(name)
+        for what in changed:
+            report.append(f"{name}: {what}")
+        result = None
+        if name == "bg-helpers" and before is not None:
+            # planista przenosi wątki na rdzenie E nie od razu
+            time.sleep(SETTLE_SECONDS)
+            after = item.measure(cfg, system)
+            result = {"before": before, "after": after, "unit": "% rdzenia P"}
+        elif name == "git-speed" and before is not None:
+            after = git_status_ms(
+                system, [os.path.expanduser(r) for r in cfg["git_repos"]]
+            )
+            result = {"before": before, "after": after, "unit": "ms git status"}
+        elif name == "claude-hooks-async" and name not in ultra["results"]:
+            since = ultra["since"]
+            stats = hook_latency(since - 86400, since).get("PostToolUse")
+            if stats:
+                result = {
+                    "before": stats["p50"],
+                    "after": None,
+                    "unit": "ms hooków na narzędzie (p50)",
+                    "note": f"po {HOOK_SAMPLES} wywołaniach od włączenia",
+                }
+        elif name not in ultra["results"]:
+            result = measure_before_after(item, cfg, system, record)
+        if result:
+            ultra["results"][name] = result
+    ultra["pending_root"] = pending_root(cfg, state)
+    ultra["pending_manual"] = pending_manual(state)
+    return report
+
+
+def ultra_off(cfg, system, state):
+    """Cofa dokładnie to, co włączyła Ultra; ręcznie włączone poprawki zostają."""
+    ultra = ultra_state(state)
+    report = []
+    for name in reversed(ultra["applied"]):
+        record = state["applied"].get(name)
+        if record is None:
+            continue
+        try:
+            restored = tweak(name).undo(record, system)
+        except Deferred:
+            state.setdefault("deferred", {})[name] = record
+            report.append(f"{name}: cofnę po zamknięciu Dockera")
+        else:
+            report += [f"{name}: {what}" for what in restored]
+        del state["applied"][name]
+    ultra.update(on=False, applied=[], pending_root=[], pending_manual=[])
+    return report
+
+
+def refresh_ultra(cfg, state, system):
+    """Wyniki, które przychodzą później: hooki z nowych transkryptów, Docker po restarcie."""
+    ultra = ultra_state(state)
+    if not ultra["on"]:
+        return
+    hooks = ultra["results"].get("claude-hooks-async")
+    if hooks and hooks.get("after") is None and ultra["since"]:
+        # hooki puszczone w tle mogą dalej trafiać do transkryptu, ale sesja na nie nie czeka
+        skip = [spec["match"] for spec in cfg.get("async_hooks", [])]
+        stats = hook_latency(ultra["since"], skip=skip, born_after=ultra["since"])
+        stats = stats.get("PostToolUse")
+        if stats and stats["n"] >= HOOK_SAMPLES:
+            hooks["after"] = stats["p50"]
+            hooks.pop("note", None)
+    docker = state["applied"].get("docker-vm")
+    if docker and docker.get("written") and not docker.get("active"):
+        total = system.docker_memory()
+        if total and abs(total / 2**20 - docker["value"]) < 512:
+            docker["active"] = True
+    if docker and "docker-vm" in ultra["applied"]:
+        # notatka idzie za stanem: czeka na zamknięcie, czeka na restart, działa
+        result = measure_before_after(tweak("docker-vm"), cfg, system, docker)
+        ultra["results"]["docker-vm"] = result
+    ultra["pending_manual"] = pending_manual(state)
+
+
+def cmd_ultra(cfg, args, system=None):
+    system = system or System()
+    action = args[0] if args else "status"
+    state = load_state()
+    if action == "on":
+        report = ultra_on(cfg, system, state)
+        save_state(state)
+        log(f"ultra on: {len(report)} zmian")
+    elif action == "off":
+        report = ultra_off(cfg, system, state)
+        save_state(state)
+        log(f"ultra off: {len(report)} cofnięć")
+    elif action == "status":
+        report = []
+        refresh_ultra(cfg, state, system)
+        save_state(state)
+    else:
+        print("użycie: perf.py ultra on|off|status [--json]", file=sys.stderr)
+        return 2
+    ultra = ultra_state(state)
+    if "--json" in args:
+        print(json.dumps(ultra, ensure_ascii=False))
+        return 0
+    for line in report:
+        print(line)
+    print(f"Ultra: {'włączona' if ultra['on'] else 'wyłączona'}")
+    if ultra["on"] and ultra["since"]:
+        print(f"  od {ago(ultra['since'])}")
+    for name in ultra["applied"]:
+        item, record = tweak(name), state["applied"].get(name, {})
+        print(f"  [x] {name}: {item.describe(record, system)}")
+        result = ultra["results"].get(name)
+        if result:
+            after = "?" if result.get("after") is None else fmt(result["after"])
+            note = f" ({result['note']})" if result.get("note") else ""
+            print(f"        {fmt(result['before'])} -> {after} {result['unit']}{note}")
+    for name in ultra["pending_root"]:
+        print(f"  [ ] {name} (root): {tweak(name).command}")
+    for name in ultra["pending_manual"]:
+        print(f"  [ ] {name}: {MANUAL[name]}")
+    return 0
+
+
+MANUAL = {
+    "docker-restart": "nowa pamięć maszyny Dockera zadziała po jego restarcie (Docker > Restart)",
+    "docker-quit": "zapis limitu pamięci Dockera czeka, aż Docker będzie zamknięty",
+}
 
 
 # ---------- komendy ----------
@@ -950,8 +1842,27 @@ def describe_gpu(r):
     return lines
 
 
-DESCRIBE = {"network": describe_network, "cpu": describe_cpu, "gpu": describe_gpu}
-LABELS = {"network": "Sieć", "cpu": "CPU", "gpu": "GPU"}
+def describe_fs(r):
+    if r.get("error"):
+        return [r["error"]]
+    walk = (
+        f"lstat {r.get('entries')} wpisów w {r.get('path')}: pierwszy przebieg "
+        f"{fmt(r.get('first_s'), ' s')}, drugi {fmt(r.get('warm_s'), ' s')}"
+    )
+    cache = (
+        f"vnode z odzysku w drugim przebiegu: {r.get('warm_recycled')} "
+        f"(kern.maxvnodes {r.get('maxvnodes')})"
+    )
+    return [walk, cache]
+
+
+DESCRIBE = {
+    "network": describe_network,
+    "cpu": describe_cpu,
+    "gpu": describe_gpu,
+    "fs": describe_fs,
+}
+LABELS = {"network": "Sieć", "cpu": "CPU", "gpu": "GPU", "fs": "System plików"}
 
 
 def cmd_status(cfg, args, system=None):
@@ -962,10 +1873,12 @@ def cmd_status(cfg, args, system=None):
         record = state["applied"].get(item.name)
         entry = {
             "name": item.name,
+            "group": item.group,
             "title": item.title,
             "effect": item.effect,
             "root": item.root,
             "applied": record is not None,
+            "ultra": bool(record and record.get("ultra")),
         }
         if record:
             entry["at"] = record.get("at")
@@ -975,16 +1888,21 @@ def cmd_status(cfg, args, system=None):
                 entry["detail"] = record.get("detail", "")
         tweaks.append(entry)
     if "--json" in args:
-        print(json.dumps({"tweaks": tweaks, "bench": state["bench"]}))
+        out = {"tweaks": tweaks, "bench": state["bench"], "ultra": ultra_state(state)}
+        print(json.dumps(out, ensure_ascii=False))
         return 0
+    ultra = ultra_state(state)
+    print(f"Ultra: {'włączona' if ultra['on'] else 'wyłączona'} (perf.py ultra status)")
     print("Poprawki:")
     for entry in tweaks:
         mark = "x" if entry["applied"] else " "
-        root = " (root)" if entry["root"] else ""
-        print(f"  [{mark}] {entry['name']}{root}: {entry['title']}")
+        kind = "root" if entry["root"] else entry["group"]
+        print(f"  [{mark}] {entry['name']} [{kind}]: {entry['title']}")
         if entry.get("detail"):
             print(f"        {entry['detail']}")
-    for kind in ("network", "cpu", "gpu"):
+    for name in state.get("deferred", {}):
+        print(f"  ! {name}: cofnięcie czeka na zamknięcie Dockera")
+    for kind in ("network", "cpu", "gpu", "fs"):
         last = state["bench"].get(kind)
         if not last:
             print(f"{LABELS[kind]}: jeszcze bez pomiaru (perf.py bench {kind})")
@@ -1009,7 +1927,7 @@ def record_bench(state, kind, result, started, load=None):
 
 
 def cmd_bench(cfg, args, system=None):
-    kinds = [a for a in args if a in ("network", "cpu", "gpu", "all")] or ["all"]
+    kinds = [a for a in args if a in ("network", "cpu", "gpu", "fs", "all")] or ["all"]
     if "all" in kinds:
         kinds = ["network", "cpu", "gpu"]
     runs = 1
@@ -1024,6 +1942,8 @@ def cmd_bench(cfg, args, system=None):
             result = bench_network(runs)
         elif kind == "cpu":
             result = bench_cpu(max(runs, 3))
+        elif kind == "fs":
+            result = bench_fs(cfg)
         else:
             result = bench_gpu()
             result["latency"] = gpu_latency()
@@ -1069,16 +1989,20 @@ def cmd_apply(cfg, args, system=None):
             code = 2
             continue
         if dry_run:
-            targets = item.targets(cfg, system)
-            names = ", ".join(f"{short_command(c)} ({p})" for p, _, c in targets)
-            print(f"{item.name}: zmieniłbym {names or 'nic (brak procesów z listy)'}")
+            print(f"{item.name}: {item.title}")
+            if isinstance(item, BackgroundHelpers):
+                targets = item.targets(cfg, system)
+                names = ", ".join(f"{short_command(c)} ({p})" for p, _, c in targets)
+                print(f"  w tle: {names or 'nic (brak procesów z listy)'}")
             continue
         old = state["applied"].get(item.name)
         record, changed = item.apply(cfg, system, old)
         record["at"] = old["at"] if old else time.time()
+        if old and old.get("ultra"):
+            record["ultra"] = True
         state["applied"][item.name] = record
-        for command in changed:
-            print(f"{item.name}: w tle {short_command(command)}")
+        for what in changed:
+            print(f"{item.name}: {what}")
         if not changed:
             print(f"{item.name}: bez zmian ({item.describe(record, system)})")
         log(f"apply {item.name}: {len(changed)} zmian")
@@ -1100,29 +2024,60 @@ def cmd_undo(cfg, args, system=None):
             print(f"{item.name}: nie jest włączona")
             continue
         if item.root:
-            print(f"{item.name} cofa root: sudo ./perf-root.sh shaper undo")
+            print(f"{item.name} cofa root: {item.command.replace('trial', 'undo')}")
             continue
-        restored = item.undo(record, system)
+        try:
+            restored = item.undo(record, system)
+        except Deferred:
+            state.setdefault("deferred", {})[item.name] = record
+            print(f"{item.name}: cofnę, gdy Docker będzie zamknięty (perf.py keep)")
+            restored = []
+        else:
+            print(f"{item.name}: cofnięte ({', '.join(restored) or 'nic do zmiany'})")
         del state["applied"][item.name]
-        print(f"{item.name}: cofnięte ({len(restored)} procesów)")
+        if item.name in ultra_state(state)["applied"]:
+            ultra_state(state)["applied"].remove(item.name)
         log(f"undo {item.name}")
     save_state(state)
     return 0
 
 
 def cmd_keep(cfg, args, system=None):
-    """Ponownie nakłada włączone poprawki: procesy z listy wstają z nowym pid."""
+    """Pilnuje włączonych poprawek (dla launchd co kilka minut): procesy z listy wstają
+    z nowym pid, ktoś nadpisał settings.json, zapis do Dockera czekał na jego zamknięcie;
+    kończy też cofnięcia, które musiały poczekać."""
     system = system or System()
     state = load_state()
+    for name, record in list(state.get("deferred", {}).items()):
+        try:
+            tweak(name).undo(record, system)
+        except Deferred:
+            continue
+        del state["deferred"][name]
+        log(f"keep {name}: dokończone cofnięcie")
     for item in TWEAKS:
         old = state["applied"].get(item.name)
         if old is None or item.root:
             continue
-        record, changed = item.apply(cfg, system, old)
+        try:
+            record, changed = item.apply(cfg, system, old)
+        except (OSError, ValueError, RuntimeError) as err:
+            log(f"keep {item.name}: błąd {err!r}")
+            continue
         record["at"] = old["at"]
+        if old.get("ultra"):
+            record["ultra"] = True
+        if (
+            item.name == "docker-vm"
+            and record.get("written")
+            and not old.get("written")
+        ):
+            record["active"] = False
         state["applied"][item.name] = record
         if changed:
-            log(f"keep {item.name}: {len(changed)} nowych procesów w tle")
+            log(f"keep {item.name}: {', '.join(changed)}")
+    if ultra_state(state)["on"]:
+        refresh_ultra(cfg, state, system)
     save_state(state)
     return 0
 
@@ -1130,7 +2085,8 @@ def cmd_keep(cfg, args, system=None):
 def cmd_list(cfg, args, system=None):
     for item in TWEAKS:
         root = " (root: " + item.command + ")" if item.root else ""
-        print(f"{item.name}{root}")
+        ultra = " [Ultra]" if item.name in ULTRA else ""
+        print(f"{item.name} [{item.group}]{ultra}{root}")
         print(f"  {item.title}")
         print(f"  zmierzone: {item.effect}")
     return 0
@@ -1185,6 +2141,7 @@ COMMANDS = {
     "undo": cmd_undo,
     "keep": cmd_keep,
     "list": cmd_list,
+    "ultra": cmd_ultra,
     "shaper-rate": cmd_shaper_rate,
     "record": cmd_record,
 }

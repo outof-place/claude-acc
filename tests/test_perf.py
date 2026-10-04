@@ -1,7 +1,8 @@
-"""Testy perf.py: księgowanie poprawek (apply, keep, undo) i odczyty pomiarów.
+"""Testy perf.py: księgowanie poprawek (apply, keep, undo, Ultra) i odczyty pomiarów.
 
-Księgowanie sprawdzamy na atrapie systemu (procesy, priorytety), stan i log idą do
-katalogu tymczasowego. Jeden test robi to naprawdę: stawia własny proces-wydmuszkę,
+Księgowanie sprawdzamy na atrapie systemu (procesy, priorytety, Docker), a stan, log
+i wszystkie cudze pliki, które poprawki zmieniają (~/.claude/settings.json,
+devguard.json, ustawienia Dockera), są kopiami w katalogu tymczasowym. Jeden test robi to naprawdę: stawia własny proces-wydmuszkę,
 skrypt w osobnym $HOME daje go do tła, a ps ma pokazać priorytet 4 i powrót po undo.
 Prawdziwe procesy na tym Macu są dla testów niewidoczne: lista `background` w ich
 konfiguracji pasuje tylko do wydmuszki.
@@ -33,9 +34,19 @@ import perf
 class FakeSystem:
     """Procesy jako {pid: [start, linia poleceń, w tle?]}; zapisuje każdą zmianę priorytetu."""
 
-    def __init__(self, procs):
+    def __init__(self, procs, docker=False):
         self.procs = {pid: list(v) for pid, v in procs.items()}
         self.calls = []
+        self.docker = docker
+
+    def docker_running(self):
+        return self.docker
+
+    def git(self, repo, *args):
+        return None
+
+    def docker_memory(self):
+        return 8318709760 if self.docker else None
 
     def processes(self):
         return [(pid, p[0], p[1]) for pid, p in sorted(self.procs.items())]
@@ -67,11 +78,37 @@ class Isolated(unittest.TestCase):
             "CONFIG_PATH": os.path.join(self.dir, "perf.json"),
             "LOG_PATH": os.path.join(self.dir, "perf.log"),
         }
+        patches["CLAUDE_PROJECTS"] = os.path.join(self.dir, "projects")
         for name, value in patches.items():
             patcher = mock.patch.object(perf, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # żaden test nie może dotknąć prawdziwych plików Claude, strażnika ani Dockera
+        self.claude = os.path.join(self.dir, "claude-settings.json")
+        self.files = {}
+        for item in perf.TWEAKS:
+            if isinstance(item, (perf.AsyncHooks, perf.ClaudeEnv)):
+                patcher = mock.patch.object(item, "path", self.claude)
+            elif isinstance(item, perf.JsonSetting):
+                self.files[item.name] = os.path.join(self.dir, f"{item.name}.json")
+                patcher = mock.patch.object(item, "path", self.files[item.name])
+            else:
+                continue
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.cfg = dict(perf.DEFAULT_CONFIG)
+
+    def write(self, path, data):
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def read(self, path):
+        with open(path) as f:
+            return json.load(f)
+
+    def text(self, path):
+        with open(path) as f:
+            return f.read()
 
     def tearDown(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -274,6 +311,406 @@ class ParseTest(unittest.TestCase):
     def test_short_command(self):
         self.assertEqual(perf.short_command(WORKER), "cavemem")
         self.assertEqual(perf.short_command("/usr/bin/vim a.txt"), "vim")
+
+
+ORCA = 'if [ -z "${HOME-}" ]; then printf "{}"; fi  # ORCA_AGENT_HOOK_PORT'
+CAVE = "/x/node /x/lib/node_modules/cavemem/dist/index.js hook run"
+
+
+def claude_settings():
+    """Wycinek prawdziwego ~/.claude/settings.json: hooki cavemem obok hooka Orki."""
+    return {
+        "cleanupPeriodDays": 90,
+        "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"},
+        "hooks": {
+            "PostToolUse": [
+                {
+                    "matcher": "Write|Edit",
+                    "hooks": [{"type": "command", "command": "fmt.sh"}],
+                },
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{CAVE} post-tool-use --ide claude-code",
+                            "timeout": 10,
+                        },
+                        {"type": "command", "command": ORCA, "timeout": 10},
+                    ],
+                },
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{CAVE} stop --ide claude-code",
+                            "timeout": 10,
+                        }
+                    ]
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": f"{CAVE} user-prompt-submit"}
+                    ]
+                }
+            ],
+        },
+    }
+
+
+class AsyncHooksTest(Isolated):
+    def test_apply_and_exact_undo(self):
+        original = claude_settings()
+        self.write(self.claude, original)
+        item = perf.tweak("claude-hooks-async")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(len(changed), 2)
+        data = self.read(self.claude)
+        post = data["hooks"]["PostToolUse"][1]["hooks"]
+        self.assertIs(post[0]["async"], True)
+        self.assertNotIn("async", post[1])  # hook Orki zostaje synchroniczny
+        self.assertIs(data["hooks"]["Stop"][0]["hooks"][0]["async"], True)
+        self.assertNotIn("async", data["hooks"]["UserPromptSubmit"][0]["hooks"][0])
+        # drugi raz nic nie zmienia
+        record2, changed2 = item.apply(self.cfg, FakeSystem({}), record)
+        self.assertEqual(changed2, [])
+        self.assertEqual(record2, record)
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.read(self.claude), original)
+
+    def test_undo_keeps_later_user_change_and_restores_false(self):
+        original = claude_settings()
+        original["hooks"]["Stop"][0]["hooks"][0]["async"] = False
+        self.write(self.claude, original)
+        item = perf.tweak("claude-hooks-async")
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        data = self.read(self.claude)
+        # użytkownik sam zmienia hook PostToolUse po nas
+        data["hooks"]["PostToolUse"][1]["hooks"][0]["async"] = "custom"
+        self.write(self.claude, data)
+        item.undo(record, FakeSystem({}))
+        after = self.read(self.claude)
+        self.assertEqual(
+            after["hooks"]["PostToolUse"][1]["hooks"][0]["async"], "custom"
+        )
+        self.assertIs(after["hooks"]["Stop"][0]["hooks"][0]["async"], False)
+
+    def test_no_settings_file(self):
+        record, changed = perf.tweak("claude-hooks-async").apply(
+            self.cfg, FakeSystem({})
+        )
+        self.assertEqual((record, changed), ({"hooks": []}, []))
+        self.assertFalse(os.path.exists(self.claude))
+
+
+class ClaudeEnvTest(Isolated):
+    def test_env_added_and_removed(self):
+        original = {"cleanupPeriodDays": 90}
+        self.write(self.claude, original)
+        item = perf.tweak("node-compile-cache")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(
+            self.read(self.claude)["env"],
+            {"NODE_COMPILE_CACHE": perf.COMPILE_CACHE_DIR},
+        )
+        self.assertEqual(changed, [f"NODE_COMPILE_CACHE={perf.COMPILE_CACHE_DIR}"])
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.read(self.claude), original)
+
+    def test_other_env_untouched_and_previous_value_restored(self):
+        original = claude_settings()
+        original["env"]["NODE_COMPILE_CACHE"] = "/old/cache"
+        self.write(self.claude, original)
+        item = perf.tweak("node-compile-cache")
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(record["prev"], "/old/cache")
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.read(self.claude), original)
+
+    def test_same_value_already_there_means_nothing_to_undo(self):
+        original = {"env": {"NODE_COMPILE_CACHE": perf.COMPILE_CACHE_DIR}}
+        self.write(self.claude, original)
+        item = perf.tweak("node-compile-cache")
+        stamp = os.stat(self.claude).st_mtime_ns
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(changed, [])
+        self.assertEqual(os.stat(self.claude).st_mtime_ns, stamp)  # bez zbędnego zapisu
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.read(self.claude), original)
+
+
+class JsonSettingTest(Isolated):
+    def test_budget_in_missing_file_is_removed_with_the_file(self):
+        item = perf.tweak("devguard-budget")
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(
+            self.read(self.files["devguard-budget"]), {"budget_percent": 25}
+        )
+        item.undo(record, FakeSystem({}))
+        self.assertFalse(os.path.exists(self.files["devguard-budget"]))
+
+    def test_file_bytes_restored_without_trailing_newline(self):
+        path = self.files["devguard-budget"]
+        with open(path, "w") as f:
+            f.write('{\n  "protect": [\n    "~/x"\n  ]\n}')
+        before = self.text(path)
+        item = perf.tweak("devguard-budget")
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(path), before)
+
+    def test_budget_keeps_other_keys_and_restores_old_value(self):
+        original = {"protect": ["~/x"], "budget_percent": 30}
+        self.write(self.files["devguard-budget"], original)
+        item = perf.tweak("devguard-budget")
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.read(self.files["devguard-budget"]), original)
+
+    def test_docker_waits_until_docker_is_closed(self):
+        path = self.files["docker-vm"]
+        original = {"AutoStart": True, "UseContainerdSnapshotter": True}
+        self.write(path, original)
+        system = FakeSystem({}, docker=True)
+        self.run_cmd(perf.cmd_apply, "docker-vm", system=system)
+        self.assertEqual(self.read(path), original)  # Docker działa: nic nie piszemy
+        self.assertFalse(perf.load_state()["applied"]["docker-vm"]["written"])
+        system.docker = False
+        self.run_cmd(perf.cmd_keep, system=system)
+        self.assertEqual(self.read(path)["MemoryMiB"], 6144)
+        record = perf.load_state()["applied"]["docker-vm"]
+        self.assertTrue(record["written"])
+        self.assertFalse(record["active"])
+        # cofnięcie przy działającym Dockerze czeka na keep
+        system.docker = True
+        self.run_cmd(perf.cmd_undo, "docker-vm", system=system)
+        self.assertEqual(self.read(path)["MemoryMiB"], 6144)
+        self.assertIn("docker-vm", perf.load_state()["deferred"])
+        system.docker = False
+        self.run_cmd(perf.cmd_keep, system=system)
+        self.assertEqual(self.read(path), original)
+        self.assertEqual(perf.load_state()["deferred"], {})
+
+
+class GitSpeedTest(Isolated):
+    def test_real_repo_config_restored(self):
+        repo = os.path.join(self.dir, "repo")
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        subprocess.run(
+            ["git", "-C", repo, "config", "core.untrackedCache", "false"], check=True
+        )
+
+        class GitSystem(FakeSystem):
+            def git(self, repo, *args):
+                return perf.System().git(repo, *args)
+
+        system = GitSystem({})
+        cfg = dict(self.cfg, git_repos=[repo])
+        record, changed = perf.tweak("git-speed").apply(cfg, system)
+        self.assertEqual(changed, [repo])
+
+        def get(key):
+            return subprocess.run(
+                ["git", "-C", repo, "config", "--local", "--get", key],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+
+        self.assertEqual(get("core.untrackedCache"), "true")
+        self.assertEqual(get("core.fsmonitor"), "true")
+        perf.tweak("git-speed").undo(record, system)
+        self.assertEqual(get("core.untrackedCache"), "false")
+        self.assertEqual(get("core.fsmonitor"), "")
+
+
+def transcript_lines():
+    """Dwa wywołania narzędzia i jedna tura Stop, jak w transkrypcie Claude Code."""
+
+    def rec(event, tool, ms, stamp, command):
+        attachment = {
+            "type": "hook_success",
+            "hookEvent": event,
+            "durationMs": str(ms),
+            "command": command,
+        }
+        if tool:
+            attachment["toolUseID"] = tool
+        return {"uuid": f"u{stamp}{ms}", "timestamp": stamp, "attachment": attachment}
+
+    return [
+        rec("PostToolUse", "t1", 30, "2026-10-04T10:00:00.100Z", ORCA),
+        rec(
+            "PostToolUse",
+            "t1",
+            110,
+            "2026-10-04T10:00:00.200Z",
+            f"{CAVE} post-tool-use",
+        ),
+        rec("PostToolUse", "t2", 25, "2026-10-04T10:00:05.100Z", ORCA),
+        rec(
+            "PostToolUse", "t2", 90, "2026-10-04T10:00:05.200Z", f"{CAVE} post-tool-use"
+        ),
+        rec("Stop", None, 40, "2026-10-04T10:00:09.100Z", ORCA),
+        rec("Stop", None, 70, "2026-10-04T10:00:09.300Z", f"{CAVE} stop"),
+    ]
+
+
+class HookLatencyTest(Isolated):
+    def test_per_call_max_and_async_skip(self):
+        folder = os.path.join(perf.CLAUDE_PROJECTS, "proj")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "s.jsonl"), "w") as f:
+            f.writelines(json.dumps(line) + "\n" for line in transcript_lines())
+            f.write("{zepsuta linia hook_success\n")
+        since = perf.iso_epoch("2026-10-04T09:00:00")
+        stats = perf.hook_latency(since, since + 7200)
+        self.assertEqual(stats["PostToolUse"]["n"], 2)
+        self.assertEqual(
+            stats["PostToolUse"]["p50"], 100
+        )  # max z równoległych: 110 i 90
+        self.assertEqual(stats["Stop"], {"n": 1, "p50": 70, "p90": 70})
+        later = perf.hook_latency(since, since + 7200, born_after=time.time() + 60)
+        self.assertEqual(later, {})  # transkrypt powstał przed tą chwilą: stare hooki
+        skipped = perf.hook_latency(
+            since, since + 7200, skip=["cavemem/dist/index.js hook run"]
+        )
+        self.assertEqual(skipped["PostToolUse"]["p50"], 28)
+        self.assertEqual(skipped["Stop"]["p50"], 40)
+
+
+class FsBenchTest(Isolated):
+    def test_walk_counts_entries(self):
+        root = os.path.join(self.dir, "tree")
+        for i in range(3):
+            os.makedirs(os.path.join(root, f"d{i}"))
+            for j in range(4):
+                open(os.path.join(root, f"d{i}", f"f{j}"), "w").close()
+        result = perf.bench_fs(dict(self.cfg, fs_bench_path=root))
+        self.assertEqual(result["entries"], 15)
+        self.assertIn("warm_s", result)
+        self.assertIn(
+            "error", perf.bench_fs(dict(self.cfg, fs_bench_path="/nonexistent"))
+        )
+
+
+class UltraTest(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.write(self.claude, claude_settings())
+        self.write(self.files["devguard-budget"], {"protect": ["~/x"]})
+        self.write(self.files["docker-vm"], {"AutoStart": True})
+        self.originals = {
+            p: self.read(p)
+            for p in (
+                self.claude,
+                self.files["devguard-budget"],
+                self.files["docker-vm"],
+            )
+        }
+        for name, value in {
+            "typescript_load": lambda cache_dir=None, runs=5: 40 if cache_dir else 87,
+            "hook_latency": lambda since, until=None, events=(), skip=(), born_after=None: {
+                "PostToolUse": {"n": 500, "p50": 54, "p90": 99}
+            },
+        }.items():
+            patcher = mock.patch.object(perf, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(
+            perf.BackgroundHelpers, "measure", side_effect=[25.0, 0.2, 25.0, 0.2]
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(perf, "SETTLE_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.system = FakeSystem({10: [100, WORKER, False]})
+
+    def ultra(self, *args):
+        code, out = self.run_cmd(perf.cmd_ultra, *args, system=self.system)
+        self.assertEqual(code, 0)
+        return out
+
+    def test_on_status_off_roundtrip(self):
+        self.ultra("on")
+        data = json.loads(self.ultra("status", "--json"))
+        self.assertEqual(
+            set(data),
+            {"on", "since", "applied", "pending_root", "pending_manual", "results"},
+        )
+        self.assertTrue(data["on"])
+        self.assertEqual(data["applied"], perf.ULTRA)
+        self.assertIn("vnodes", data["pending_root"])
+        self.assertNotIn(
+            "shaper", data["pending_root"]
+        )  # sieć nie puchnie (brak pomiaru)
+        results = data["results"]
+        self.assertEqual(
+            results["bg-helpers"], {"before": 25.0, "after": 0.2, "unit": "% rdzenia P"}
+        )
+        self.assertEqual(results["node-compile-cache"]["before"], 87)
+        self.assertEqual(results["node-compile-cache"]["after"], 40)
+        self.assertEqual(results["devguard-budget"]["before"], 35)
+        self.assertEqual(results["devguard-budget"]["after"], 25)
+        self.assertEqual(results["docker-vm"]["after"], 6.0)
+        self.assertEqual(results["claude-hooks-async"]["before"], 54)
+        # hooki: po włączeniu jest już 500 zdarzeń (atrapa), więc status uzupełnia "after"
+        self.assertEqual(results["claude-hooks-async"]["after"], 54)
+        self.assertEqual(self.system.procs[10][2], True)
+        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
+        self.assertEqual(self.read(self.files["docker-vm"])["MemoryMiB"], 6144)
+        self.assertIn("docker-restart", data["pending_manual"])
+
+        since = data["since"]
+        self.ultra("on")  # drugi raz: nic nowego, ten sam początek
+        again = json.loads(self.ultra("status", "--json"))
+        self.assertEqual(again["since"], since)
+        self.assertEqual(again["results"]["bg-helpers"]["before"], 25.0)
+
+        self.ultra("off")
+        off = json.loads(self.ultra("status", "--json"))
+        self.assertFalse(off["on"])
+        self.assertEqual(off["applied"], [])
+        self.assertEqual(off["pending_root"], [])
+        for path, original in self.originals.items():
+            self.assertEqual(self.read(path), original)
+        self.assertEqual(self.system.procs[10][2], False)
+        self.assertEqual(perf.load_state()["applied"], {})
+
+    def test_manual_tweak_survives_ultra_off(self):
+        self.run_cmd(perf.cmd_apply, "devguard-budget", system=self.system)
+        self.ultra("on")
+        self.assertNotIn(
+            "devguard-budget", json.loads(self.ultra("status", "--json"))["applied"]
+        )
+        self.ultra("off")
+        self.assertIn("devguard-budget", perf.load_state()["applied"])
+        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
+
+    def test_docker_running_waits_and_off_defers(self):
+        self.system.docker = True
+        self.ultra("on")
+        data = json.loads(self.ultra("status", "--json"))
+        self.assertIn("docker-quit", data["pending_manual"])
+        self.assertEqual(self.read(self.files["docker-vm"]), {"AutoStart": True})
+        self.ultra("off")
+        self.assertEqual(self.read(self.files["docker-vm"]), {"AutoStart": True})
+        self.assertEqual(perf.load_state().get("deferred", {}), {})
+
+    def test_shaper_pending_only_when_network_bloats(self):
+        state = perf.load_state()
+        perf.record_bench(state, "network", {"idle_ms": 30, "up_net_p90_ms": 900}, 1)
+        perf.save_state(state)
+        self.ultra("on")
+        self.assertIn(
+            "shaper", json.loads(self.ultra("status", "--json"))["pending_root"]
+        )
 
 
 class RealProcessTest(unittest.TestCase):
