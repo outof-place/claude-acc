@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     "npx_idle_days": 30,
     # cache kompilacji Go czyszczony dopiero powyżej tylu GB
     "go_cache_max_gb": 20,
+    "go_cache_keep_percent": 60,
     # Xcode DerivedData bez zmian od tylu dni
     "derived_data_idle_days": 14,
     # logi aplikacji starsze niż tyle dni
@@ -640,6 +641,38 @@ def task_tmp(sw, _scan):
             sw.remove("tmp", path, lambda n: n.startswith("go-build"))
 
 
+def trim_oldest(root, keep_bytes, dry_run=False):
+    """Usuwa najdawniej używane wpisy cache Go (podkatalogi 00..ff), aż zostanie keep_bytes.
+
+    Go odświeża mtime wpisu przy użyciu (najwyżej raz na godzinę), więc mtime to czas
+    ostatniego użycia. Brak pliku wyjścia przy zachowanym wpisie akcji Go traktuje jak
+    chybienie i buduje ponownie, więc kolejność kasowania niczego nie psuje."""
+    entries, total = [], 0
+    for sub in os.listdir(root):
+        path = os.path.join(root, sub)
+        if len(sub) != 2 or not os.path.isdir(path):
+            continue  # README, trim.txt, testexpire.txt zostają
+        for name in os.listdir(path):
+            full = os.path.join(path, name)
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_blocks * 512, full))
+            total += st.st_blocks * 512
+    freed = 0
+    for _mtime, size, full in sorted(entries):
+        if total - freed <= keep_bytes:
+            break
+        if not dry_run:
+            try:
+                os.unlink(full)
+            except OSError:
+                continue
+        freed += size
+    return freed
+
+
 def task_go_cache(sw, _scan):
     go = which("go")
     if not go:
@@ -656,10 +689,11 @@ def task_go_cache(sw, _scan):
     ):
         sw.skip("go", cache, "kompilacja w toku")
         return
-    if not sw.dry_run:
-        run([go, "clean", "-cache"], timeout=900)
-        size -= du_bytes(cache)
-    sw.record("go", "cache kompilacji Go", size)
+    # nie całość: `go clean -cache` zmuszał każdego agenta do budowania wszystkiego od zera
+    # (10-03 poleciało 87,5 GB naraz); zostaje świeża część, najstarsze wpisy idą
+    keep = sw.cfg["go_cache_max_gb"] * GB * sw.cfg["go_cache_keep_percent"] / 100
+    freed = trim_oldest(cache, keep, dry_run=sw.dry_run)
+    sw.record("go", "najstarsze wpisy cache kompilacji Go", freed)
 
 
 def task_npm(sw, _scan):

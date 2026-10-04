@@ -37,6 +37,8 @@ done
 
 mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
 cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$STATE/"
+# hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
+rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"

@@ -121,6 +121,16 @@ struct Ultra: Decodable {
         let before: Double?
         let after: Double?
         let unit: String?
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            // a setting may record text ("medium" -> "large"): shown without numbers
+            before = try? c.decodeIfPresent(Double.self, forKey: .before)
+            after = try? c.decodeIfPresent(Double.self, forKey: .after)
+            unit = try? c.decodeIfPresent(String.self, forKey: .unit)
+        }
+
+        private enum CodingKeys: String, CodingKey { case before, after, unit }
     }
 
     struct Tweak {
@@ -165,6 +175,7 @@ struct Ultra: Decodable {
     /// perf.py's ULTRA list, in the order it applies them.
     static let order = [
         "bg-helpers", "claude-hooks-async", "node-compile-cache", "devguard-budget", "devguard-max-server", "git-speed",
+        "fast-npx-hooks", "claude-limits", "workflow-size",
     ]
 
     static let catalog: [String: Tweak] = [
@@ -182,6 +193,15 @@ struct Ultra: Decodable {
             title: "Docker VM", detail: "The VM gives back what containers don't use", unit: "GB", isSetting: true),
         "git-speed": Tweak(
             title: "Git", detail: "untrackedCache and fsmonitor in the repos you list", unit: "ms git status"),
+        "fast-npx-hooks": Tweak(
+            title: "Fast format hooks", detail: "Formatting hooks find eslint and prettier in milliseconds, not seconds",
+            unit: "ms per formatted edit"),
+        "claude-limits": Tweak(
+            title: "Claude Code limits", detail: "Bash commands may run an hour, MCP output doubled",
+            unit: "commands cut at 10 min a day"),
+        "workflow-size": Tweak(
+            title: "Large workflows", detail: "Workflows plan for up to 50 agents instead of 10", unit: "",
+            isSetting: true),
         "vnodes": Tweak(
             title: "Bigger file cache", detail: "Three times the vnodes, set again at every boot (root)",
             unit: "s to rescan node_modules"),

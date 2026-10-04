@@ -75,6 +75,37 @@ class Env:
         shutil.rmtree(self.home, ignore_errors=True)
 
 
+class GoCacheTrimTest(unittest.TestCase):
+    def test_oldest_entries_go_first_and_root_files_stay(self):
+        import sys
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+        root = tempfile.mkdtemp(prefix="gocache-test-")
+        self.addCleanup(shutil.rmtree, root, True)
+        now = time.time()
+        paths = []
+        for i, sub in enumerate(("00", "0a", "ff")):
+            os.makedirs(os.path.join(root, sub))
+            for j in range(3):
+                path = os.path.join(root, sub, f"{i}{j}-a")
+                with open(path, "wb") as f:
+                    f.write(b"x" * 8192)
+                age = (i * 3 + j) * 3600  # 0 = newest
+                os.utime(path, (now - age, now - age))
+                paths.append((age, path))
+        with open(os.path.join(root, "trim.txt"), "w") as f:
+            f.write("1")
+        block = os.lstat(paths[0][1]).st_blocks * 512
+        freed = janitor.trim_oldest(root, keep_bytes=4 * block)
+        self.assertEqual(freed, 5 * block)
+        left = sorted(age for age, path in paths if os.path.exists(path))
+        self.assertEqual(left, [0, 3600, 7200, 10800])  # the four most recently used
+        self.assertTrue(os.path.exists(os.path.join(root, "trim.txt")))
+        # dry run counts without deleting
+        self.assertEqual(janitor.trim_oldest(root, keep_bytes=0, dry_run=True), 4 * block)
+        self.assertEqual(len([a for a, p in paths if os.path.exists(p)]), 4)
+
+
 class JanitorTest(unittest.TestCase):
     def setUp(self):
         self.env = Env()

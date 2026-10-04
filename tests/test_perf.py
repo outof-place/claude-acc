@@ -89,6 +89,7 @@ class Isolated(unittest.TestCase):
         fake = {
             perf.DEVGUARD_CONFIG: os.path.join(self.dir, "devguard.json"),
             perf.DOCKER_SETTINGS: os.path.join(self.dir, "docker-settings.json"),
+            perf.CLAUDE_SETTINGS: self.claude,
         }
         for item in perf.TWEAKS:
             # każda poprawka, która pisze do settings.json Claude, dostaje kopię
@@ -663,7 +664,7 @@ class ClaudeEnvSetTest(Isolated):
         before = self.text(self.claude)
         item = perf.tweak("claude-limits")
         record, changed = item.apply(self.cfg, FakeSystem({}))
-        self.assertEqual(changed, ["BASH_MAX_TIMEOUT_MS=3600000"])
+        self.assertEqual(changed, ["BASH_MAX_TIMEOUT_MS=3600000", "MAX_MCP_OUTPUT_TOKENS=50000"])
         self.assertEqual(
             self.read(self.claude)["env"]["BASH_MAX_TIMEOUT_MS"], "3600000"
         )

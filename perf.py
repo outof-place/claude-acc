@@ -765,7 +765,10 @@ DEFAULT_CONFIG = {
     # limity Claude Code podnoszone w Ultra (env w ~/.claude/settings.json). Tylko sufity,
     # nie zachowanie: 10-minutowy sufit Bash ściął w 2 doby ~40 poleceń, którym agent sam
     # dał dłuższy timeout (testy Go pod zamkiem, czekanie na buildy na Depot)
-    "claude_limits": {"BASH_MAX_TIMEOUT_MS": 3600000},
+    "claude_limits": {"BASH_MAX_TIMEOUT_MS": 3600000, "MAX_MCP_OUTPUT_TOKENS": 50000},
+    # rozmiar workflow, na jaki model planuje (small <5, medium <10, large <50 agentów);
+    # domyślne medium; twarde limity runtime zostają (docs: code.claude.com/docs/en/workflows)
+    "workflow_size_guideline": "large",
     # katalogi, które Spotlight indeksuje bez potrzeby; wykluczenie jest tylko w Ustawieniach
     "spotlight_noise": ["~/Library/pnpm", "~/go"],
     # drzewo do pomiaru `bench fs` (lstat wszystkiego, dwa przebiegi)
@@ -1499,6 +1502,15 @@ TWEAKS = [
         "BASH_MAX_TIMEOUT_MS 600000 -> 3600000: w 2 doby ~40 poleceń z timeoutem 15-60 min "
         "ściętych do 10 min i przeniesionych w tło",
     ),
+    JsonSetting(
+        "workflow-size",
+        "claude",
+        CLAUDE_SETTINGS,
+        "workflowSizeGuideline",
+        "workflow_size_guideline",
+        "workflowSizeGuideline w ~/.claude/settings.json: workflowy planowane na duży rozmiar",
+        "medium (<10 agentów) -> large (<50); limit runtime na agentów i ostrzeżenia zostają",
+    ),
     RootTweak(
         "vnodes",
         "większy cache vnode (kern.maxvnodes 263168 -> 786432): metadane drzew node_modules "
@@ -1919,6 +1931,7 @@ ULTRA = [
     "git-speed",
     "fast-npx-hooks",
     "claude-limits",
+    "workflow-size",
 ]
 # wyniki z transkryptów liczone najwyżej raz na tyle sekund (doba transkryptów to ~10 s)
 AGENTS_CHECK_SECONDS = 1800
