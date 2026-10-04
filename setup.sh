@@ -3,15 +3,18 @@
 # automaty w launchd i aplikacja w pasku menu.
 #
 #   setup.sh --app "<ścieżka do Claude Acc.app>" [--fanctl <ścieżka do fanctl>]
-#   setup.sh --uninstall   zdejmuje automaty, aplikację i komendę; stan i konfiguracja zostają
+#   setup.sh --uninstall   zdejmuje automaty, aplikację, komendę i hooki pauzy limitów;
+#                          stan i konfiguracja zostają
 #
 # Woła go install.sh po zbudowaniu ze źródeł i `claude-acc-setup` z Homebrew, które podaje
 # swoją zbudowaną aplikację. Wiatraki (root) to osobny krok: install-fans.sh.
+# CLAUDE_ACC_NO_HOOKS=1 pomija hooki pauzy limitów w settings.json Claude Code.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
+CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates"
 
 APP_SRC=""
@@ -27,7 +30,16 @@ while [ $# -gt 0 ]; do
       done
       pkill -x ClaudeAcc 2>/dev/null || true
       rm -rf "$HOME/Applications/Claude Acc.app" "$HOME/.local/bin/claude-acc"
-      echo "usunięte: automaty, aplikacja i komenda claude-acc. Stan i konfiguracja zostają w $STATE"
+      # hooki pauzy limitów; bez automatu nikt by już pauzy nie zdjął, więc wstrzymane
+      # sesje budzimy, kasując jej plik
+      for hook in "$STATE/hook.py" "$SRC/hook.py"; do
+        if [ -f "$hook" ]; then
+          /usr/bin/python3 "$hook" uninstall "$CLAUDE_SETTINGS" || true
+          break
+        fi
+      done
+      rm -rf "$STATE/pause.json" "$STATE/pause-marks"
+      echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
     *) echo "nieznana opcja: $1" >&2; exit 2 ;;
@@ -40,6 +52,20 @@ cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$SRC
 # hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
+
+# pauza limitów: hooki w sesjach Claude Code dopisane do settings.json obok Twoich
+# (kopia sprzed pierwszej zmiany: settings.json.bak-claude-acc). Paczka bez hook.py
+# (starsza formuła Homebrew) albo zepsuty settings.json nie zatrzymują reszty instalacji.
+if [ -f "$SRC/hook.py" ]; then
+  cp "$SRC/hook.py" "$STATE/hook.py"
+  # z CLAUDE_ACC_NO_HOOKS=1 zdejmujemy też hooki dopisane przez wcześniejszą instalację
+  action=install
+  [ -n "${CLAUDE_ACC_NO_HOOKS:-}" ] && action=uninstall
+  /usr/bin/python3 "$STATE/hook.py" "$action" "$CLAUDE_SETTINGS" \
+    || echo "hooki pauzy limitów: $action nieudany, szczegóły wyżej" >&2
+else
+  echo "brak hook.py w $SRC: pauza limitów bez hooków w sesjach Claude Code" >&2
+fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
 
