@@ -40,20 +40,48 @@ Komendy:
 
 import sys
 
+DEV_WORDS = ("dev", "vite", "expo", "serve")
+GO_WORDS = ("go ", "golangci-lint", "make", "govulncheck")
+
+
+def sched_rewrite(event):
+    """Komenda Go agenta owinięta w scheduler (sched.py obok tego pliku): wyjście hooka z
+    updatedInput albo None. Jedyny hook, który przepisuje komendy Bash; nigdy nie blokuje."""
+    try:
+        import importlib.util
+        import os as _os
+
+        path = _os.path.join(_os.path.dirname(_os.path.realpath(__file__)), "sched.py")
+        if not _os.path.exists(path):
+            return None
+        spec = importlib.util.spec_from_file_location("acc_sched", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.hook_rewrite(event)
+    except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
+        return None
+
+
 # Hook idzie przy każdym poleceniu Bash każdego agenta, więc komenda bez śladu dev serwera
-# kończy się tutaj, zanim załadują się ctypes, janitor i wyrażenia regularne. Słowa to
+# ani Go kończy się tutaj, zanim załadują się ctypes, janitor i wyrażenia regularne. Słowa to
 # minimum, które ma każda komenda pasująca do START (dev, vite, expo, webpack serve);
-# fałszywy alarm (np. "dev" w nazwie pliku) idzie po prostu pełną ścieżką.
+# fałszywy alarm (np. "dev" w nazwie pliku) idzie po prostu pełną ścieżką. Komenda z Go,
+# a bez dev serwera, idzie od razu do schedulera, bez reszty tego pliku.
 if __name__ == "__main__" and sys.argv[1:2] == ["admit"]:
     import io
     import json
 
     _event = sys.stdin.read()
     try:
-        _command = (json.loads(_event).get("tool_input") or {}).get("command") or ""
+        _parsed = json.loads(_event)
+        _command = (_parsed.get("tool_input") or {}).get("command") or ""
     except (ValueError, AttributeError):
         sys.exit(0)
-    if not any(word in _command for word in ("dev", "vite", "expo", "serve")):
+    if not any(word in _command for word in DEV_WORDS):
+        if any(word in _command for word in GO_WORDS):
+            _out = sched_rewrite(_parsed)
+            if _out:
+                print(json.dumps(_out))
         sys.exit(0)
     sys.stdin = io.StringIO(_event)
 
@@ -1628,13 +1656,24 @@ def cmd_admit(cfg, _args):
         return 0
     if event.get("tool_name") != "Bash":
         return 0
+    reason = devserver_refusal(cfg, event)
+    if reason:
+        return deny(reason)
+    out = sched_rewrite(event)
+    if out:
+        print(json.dumps(out))
+    return 0
+
+
+def devserver_refusal(cfg, event):
+    """Powód odmowy startu dev serwera albo None."""
     command = (event.get("tool_input") or {}).get("command") or ""
     if "DEVGUARD_ALLOW=1" in command:
-        return 0
+        return None
     cwd = event.get("cwd") or os.getcwd()
     starts = dev_starts(command, cwd)
     if not starts:
-        return 0
+        return None
     state = janitor.load_json(STATE_PATH, {})
     world = World(cfg, state, Orca(), time.time(), use_orca=False)
     for target, package, stack in starts:
@@ -1647,7 +1686,7 @@ def cmd_admit(cfg, _args):
             or (stack and os.path.realpath(u.launch_cwd) == app)
         ]
         if same:
-            return deny(
+            return (
                 f"Strażnik dev serwerów: dla {short(app)} już działa {describe(same[0])}. "
                 "Użyj tego adresu, nie stawiaj drugiego serwera tej samej aplikacji: "
                 "drugi zjada kolejne gigabajty i dubluje rekompilacje przy każdej edycji."
@@ -1663,12 +1702,12 @@ def cmd_admit(cfg, _args):
             if world.pressure.level == 2
             else f"dev serwery zajmują już {janitor.human(total)} z budżetu {janitor.human(budget)}"
         )
-        return deny(
+        return (
             f"Strażnik dev serwerów: {why}. Działają: {listing}. Użyj któregoś z nich albo poproś "
             "użytkownika o zgodę; do zrzutów ekranu i pomiarów wystarczy `next build && next start`. "
             "Tylko na wyraźne polecenie użytkownika poprzedź komendę DEVGUARD_ALLOW=1."
         )
-    return 0
+    return None
 
 
 COMMANDS = {
