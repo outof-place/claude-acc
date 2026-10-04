@@ -146,6 +146,8 @@ struct Ultra: Decodable {
         let detail: String
         let command: String?
         var opensSpotlight = false
+        /// System Settings pane to open instead of a command to copy.
+        var pane: String?
     }
 
     let on: Bool
@@ -202,6 +204,9 @@ struct Ultra: Decodable {
         "workflow-size": Tweak(
             title: "Large workflows", detail: "Workflows plan for up to 50 agents instead of 10", unit: "",
             isSetting: true),
+        "devtools": Tweak(
+            title: "Go tests skip Gatekeeper", detail: "Orca is a developer tool, so fresh test binaries start without a check",
+            unit: "ms first run of a new binary"),
         "vnodes": Tweak(
             title: "Bigger file cache", detail: "Three times the vnodes, set again at every boot (root)",
             unit: "s to rescan node_modules"),
@@ -232,6 +237,11 @@ struct Ultra: Decodable {
             title: "Hide caches from Spotlight",
             detail: "Spotlight indexes package caches (~/Library/pnpm, ~/go) for nothing. Add them under Search Privacy.",
             command: nil, opensSpotlight: true),
+        "devtools": Step(
+            title: "Make Orca a developer tool",
+            detail: "Every new Go test binary waits ~0.2 s for Gatekeeper. Click +, pick Orca, confirm with Touch ID.",
+            command: nil,
+            pane: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools"),
         "docker-quit": Step(title: "Quit Docker once", detail: "The new memory cap is written while Docker is closed.", command: nil),
         "docker-restart": Step(title: "Restart Docker", detail: "The new memory cap applies on its next start.", command: nil),
     ]

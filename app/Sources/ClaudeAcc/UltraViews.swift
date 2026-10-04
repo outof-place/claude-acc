@@ -192,6 +192,11 @@ private struct UltraStep: View {
                 .panelButton()
                 .controlSize(.small)
                 .help(command)
+            } else if let pane = step.pane, let url = URL(string: pane) {
+                Button("Open", systemImage: "gearshape") { NSWorkspace.shared.open(url) }
+                    .panelButton()
+                    .controlSize(.small)
+                    .help("Opens the right System Settings pane")
             } else if step.opensSpotlight {
                 Button("Open", systemImage: "gearshape", action: openSpotlight)
                     .panelButton()

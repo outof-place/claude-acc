@@ -54,7 +54,11 @@ case "$1" in
   clean) shift; exec /usr/bin/python3 "$STATE/janitor.py" sweep --force "$@" ;;
   guard) shift; exec /usr/bin/python3 "$STATE/devguard.py" "$@" ;;
   perf) shift; exec /usr/bin/python3 "$STATE/perf.py" "$@" ;;
-  perf-root) shift; exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
+  perf-root)
+    shift
+    # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
+    [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
+    exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
   fans)
     shift
     case "${1:-read}" in
