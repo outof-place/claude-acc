@@ -1,0 +1,52 @@
+{
+  "ultra": {
+    "on": true,
+    "since": 1790420577.435127,
+    "applied": [
+      "bg-helpers",
+      "claude-hooks-async",
+      "node-compile-cache",
+      "devguard-budget",
+      "docker-vm",
+      "git-speed"
+    ],
+    "pending_root": [
+      "vnodes"
+    ],
+    "pending_manual": [
+      "docker-quit"
+    ],
+    "results": {
+      "bg-helpers": {
+        "before": 32.1,
+        "after": 0.1,
+        "unit": "% P-core"
+      },
+      "claude-hooks-async": {
+        "before": 53.0,
+        "after": null,
+        "unit": "ms per tool call"
+      },
+      "node-compile-cache": {
+        "before": 96.0,
+        "after": 49.0,
+        "unit": "ms require typescript"
+      },
+      "devguard-budget": {
+        "before": 35,
+        "after": 25,
+        "unit": "% RAM"
+      },
+      "docker-vm": {
+        "before": 8.0,
+        "after": 6.0,
+        "unit": "GB"
+      },
+      "git-speed": {
+        "before": 71.0,
+        "after": 26.0,
+        "unit": "ms git status"
+      }
+    }
+  }
+}

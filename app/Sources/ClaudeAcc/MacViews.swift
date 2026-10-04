@@ -65,9 +65,12 @@ private struct GuardContent: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             } else {
-                VStack(spacing: 2) {
-                    ForEach(snapshot.units.sorted { $0.footprint > $1.footprint }) { unit in
-                        ServerRow(store: store, unit: unit, plan: snapshot.plan(for: unit))
+                CardScroll {
+                    VStack(spacing: 2) {
+                        ForEach(snapshot.units.sorted { $0.footprint > $1.footprint }) { unit in
+                            ServerRow(store: store, unit: unit, plan: snapshot.plan(for: unit))
+                                .transition(.blurReplace)
+                        }
                     }
                 }
                 .padding(.horizontal, -6)
@@ -327,7 +330,7 @@ struct DiskCard: View {
                 }
             } else {
                 Button("Clean Up", systemImage: "sparkles") { Task { await store.sweep() } }
-                    .glassButton()
+                    .panelButton()
                     .controlSize(.small)
                     .help("Delete unused build caches, stale node_modules and tool leftovers")
             }
@@ -363,7 +366,7 @@ private struct AlertRow: View {
             Spacer(minLength: 0)
             if alert.kind == "spotlight" {
                 Button("Fix") { Task { await store.openSpotlightSettings() } }
-                    .glassButton()
+                    .panelButton()
                     .controlSize(.mini)
             }
         }

@@ -1,55 +1,144 @@
+<div align="center">
+
+<img src="docs/panel.png" width="900" alt="Claude Acc panel in four columns: the active Claude account with session and weekly usage and the other accounts; dev servers with a memory chart against the budget and what the guard will do, plus free disk space; Stay Awake and fans with temperatures and a 20-minute chart; Ultra with each tweak measured before and after">
+
 # claude-acc
 
-Keeps Claude Code working when you have more than one Claude subscription. A menu bar app shows the 5-hour and weekly usage of every account, and a background job moves your running Claude Code sessions to the account with the most headroom once the current one runs out. No restart, no `/login`, no terminal.
+**A menu bar control room for a Mac that runs Claude Code agents all day.**
 
-<img src="docs/panel.png" width="750" alt="Claude Acc panel: on the left the active account with 5-hour and weekly usage and the other accounts in one line each; on the right the dev servers with a memory chart against the budget, who watches each one and what the guard will do, then free disk space and the last cleanup">
+It rotates your Claude subscriptions before one hits the wall, keeps the agents' dev servers from eating your RAM, cleans up what they leave on disk, holds the Mac awake on a hotspot, and spins the fans up before the chip cooks.
 
-The UI text and the code comments are in Polish.
+[Install](#install) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Numbers](#numbers) · [Command line](#command-line)
+
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-111?logo=apple) ![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white) ![Python](https://img.shields.io/badge/Python-stdlib%20only-3776AB?logo=python&logoColor=white) ![License MIT](https://img.shields.io/badge/license-MIT-2ea44f)
+
+</div>
+
+## Install
+
+```sh
+brew install outof-place/tap/claude-acc
+claude-acc-setup          # scripts, launchd jobs and the menu bar app, into your account
+claude-acc fans install   # optional: fan control, a small root helper (asks for Touch ID)
+```
+
+Or from source:
+
+```sh
+git clone https://github.com/outof-place/claude-acc.git
+cd claude-acc
+./install.sh              # builds the app and fanctl, then runs setup.sh
+./install-fans.sh         # optional, root
+```
+
+Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads three launchd jobs (the account watcher, the janitor and the dev server guard) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
+
+After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app and the command and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
 
 ## What it does
 
-- **Menu bar ring** with the usage of the active account, for whichever window (5 hours or weekly) runs out first. It turns orange at 75% and red at 90%. An orange dot means some account needs to log in again, a red one that the Mac is running out of memory.
-- **Panel**, wide rather than tall so it fits under the menu bar of a laptop. On the left every account: 5-hour and weekly usage, which account goes next, and (in the tooltip) when each window resets ("in 2h 5m", "in 4d 4h") and when the subscription renews. For the active account it also shows when, at the current pace, the watcher will switch away from it. On the right the Mac: dev servers with a two-hour memory chart against the budget, who watches each one, what the guard is about to do, buttons to restart or stop one and to turn the guard off; free disk space and the last cleanup.
-- **Automatic switching** when the active account is down to 5% of the session or 3% of the week. It picks the account with the most weekly headroom and keeps accounts you mark as last resort (a company seat, say) for the end.
-- **One-click switch** to any account. Running sessions keep working because Claude Code reads its credentials from the Keychain on the fly.
-- **Log in again** for an account whose refresh token died. The button runs `claude auth login` in the background and opens the browser with the email pre-filled. Before saving anything, it asks the API which account you actually signed into, so a browser logged into the wrong account can't overwrite anything.
-- **Mac janitor** that keeps the disk free of build caches and tool junk that agents leave behind, at login and every 3 hours. The panel shows free space, the last cleanup and a button to clean up now. See [Mac janitor](#mac-janitor).
+| | |
+| --- | --- |
+| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
+| **Dev server guard** | Agents in [Orca](https://github.com/stablyai/orca) each run their own `next dev` with a preview tab, and Turbopack grows to 6-9 GB per server under their edits. The guard watches every dev server's real memory (the number macOS kills by), knows who is looking at it, restarts a bloated one in its own Orca terminal in seconds, stops duplicates, orphans and loops, and turns away an agent about to start a second server of the same app. |
+| **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
+| **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
+| **Fans & heat** | P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
+| **Ultra** | One switch that tunes the Mac for agent work. Helpers no agent waits on move to the efficiency cores, memory hooks stop holding up every tool call, Node starts warm for everything sessions spawn, and the dev server budget and Docker's VM get tighter. Each change is measured before and after, and Off puts back exactly what was there. |
+
+<img src="docs/panel-details.png" width="900" alt="The same panel with one account opened: plan, subscription status and start, renewal date with a countdown, the 5-hour and weekly windows with their exact resets, place in the switching order, and buttons to switch or sign in again">
+
+The UI is in English; the scripts' messages and the code comments are in Polish.
 
 ## How it works
+
+```mermaid
+flowchart LR
+    app["Claude Acc.app<br/>menu bar"]
+    subgraph user["launchd, your account"]
+        tick["accswitch.py<br/>every 2 min"]
+        guard["devguard.py<br/>every 5 s"]
+        janitor["janitor.py<br/>login + every 3 h"]
+        perf["perf.py keep<br/>every 5 min"]
+    end
+    subgraph root["launchd, root"]
+        fans["fanctl<br/>every 2 s"]
+    end
+    hook["Claude Code<br/>PreToolUse hook"]
+    keychain[("Keychain<br/>Claude + Orca entries")]
+    api[("Anthropic API<br/>usage, profile")]
+    orca["Orca CLI<br/>tabs, terminals, agents"]
+    disk[("build caches<br/>node_modules")]
+    tuned[("helpers, settings.json<br/>Docker, devguard.json")]
+    smc[("SMC<br/>fans, sensors")]
+    app -.-> tick & guard & janitor & perf & fans
+    tick --> keychain & api
+    guard --> orca
+    janitor --> disk
+    perf --> tuned
+    fans --> smc
+    hook --> guard
+```
+
+- Every piece runs without the app. Each job writes its state to `~/.local/share/claude-acc`, and the app (dotted lines) only reads those files, calls the scripts and writes the fan mode. Close it and the switching, cleanup, guard and fans keep working.
+- The scripts are Python 3.9 standard library only (the `/usr/bin/python3` that ships with the command line tools). Kernel numbers come through `ctypes`: `proc_pid_rusage` for memory, `sysctl` for swap and pressure, `KERN_PROCARGS2` for exact command lines.
+- The app is Swift 6 with main-actor default isolation (SE-0466) and `@concurrent` for process work, Swift Charts for the charts, and SF Rounded throughout.
+- `fanctl` talks to the SMC through IOKit's `AppleSMC` user client. Reading needs no root; the daemon that writes runs as root, reads only a mode from your folder, and writes its readings back atomically.
+
+### Accounts under the hood
 
 A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Claude Code reads `Claude Code-credentials`, plus `Claude Code-credentials-<first 8 hex chars of sha256(config dir)>` when `CLAUDE_CONFIG_DIR` is set. [Orca](https://github.com/stablyai/orca) keeps a copy of every account you add to it under `Orca Claude Code Managed Credentials`. Switching accounts means copying one account's `claudeAiOauth` into the entries the live sessions read.
 
 - `accswitch.py` holds all the logic. launchd runs `accswitch.py tick` every 2 minutes, with or without the app.
-- The menu bar app (SwiftUI, Swift 6 with main-actor default isolation, Liquid Glass controls, Swift Charts) is a thin UI. It runs `accswitch.py status --json` every minute and `switch` or `login` when you click, and reads `janitor-state.json` and `devguard-state.json`, every 3 seconds while the panel is open.
 - Usage comes from `GET https://api.anthropic.com/api/oauth/usage`, and the account behind a token from `/api/oauth/profile`.
+
+## Numbers
+
+Measured on a MacBook Pro 16" M4 Max with 48 GB, on 2026-10-04, with several agents working in Orca.
+
+<img src="docs/turbopack-ab.svg" width="760" alt="Line chart: memory of a Turbopack next dev server over 30 cycles of an agent editing a CSS file and a component and requesting two pages, then a minute idle. Both arms start at 1.2 GB, reach about 6 GB by the 30th edit and settle at about 4.6 GB idle; the auto and full memory eviction settings give the same curve">
+
+A Turbopack dev server grows fivefold under an agent's edits, and `turbopackMemoryEviction: "full"` changes nothing: 6.01 GB against 5.97 GB after 30 edits. Next.js restarts a dev server only when its V8 heap fills, and Turbopack's memory lives outside it. What does work is a restart: the server comes back from its disk cache in seconds at a third of the size, which is what the guard does once a server passes 5 GB and goes quiet.
+
+<img src="docs/guard-timeline.svg" width="760" alt="Area chart of the memory of all dev servers over about an hour, peaking near 15 GB below a 16.8 GB budget line, with dots where the guard restarted or stopped a server and the total dropped right after">
+
+With agents compiling, macOS on Auto kept the fans at about 2,000 rpm and let the hottest CPU sensor reach **115&nbsp;°C**. The fixed settings, as the SMC reports them on the same Mac:
+
+| Setting | Fan speed |
+| --- | --- |
+| macOS Auto, idle | ~1,400 rpm |
+| 50% | ~3,560 rpm |
+| 75% | ~4,670 rpm |
+| Max | 5,777 rpm |
+
+On any fixed setting the daemon goes to full speed when a sensor passes 95 °C and comes back below 85 °C.
+
+Ultra, measured on the same Mac with Orca and nine Claude Code sessions running:
+
+| Tweak | Before | After |
+| --- | --- | --- |
+| A memory helper that scanned its 1.9 GB database all day, moved to the efficiency cores | 32% of a P-core, ~1 W | 0.1%, ~0.1 W |
+| Node compile cache for what sessions spawn: `require('typescript')` | 96 ms | 49 ms |
+| `git status` in an agent worktree repo, with `untrackedCache` and `fsmonitor` (opt-in) | 71 ms | 26 ms |
+| Synchronous memory hook on every tool call, made async | 54 ms p50, 99 ms p90 | measured after 30 calls |
 
 ## How it avoids logging you out
 
 Each of these rules comes from an account that actually lost its login while the tool was being built:
 
 - Refreshing a token rotates it, and presenting a refresh token that was already used got the whole account logged out. Claude Code sessions refresh the active account on their own, about 5 minutes before the token expires, so the watcher never refreshes the active account while a session could. It copies the pair the session wrote instead, from whichever Keychain entry the sessions use (`Claude Code-credentials` without `CLAUDE_CONFIG_DIR`, the hashed one with it). It refreshes the active account itself only once the token has been expired for 15 minutes, when no session is running.
-- Inactive accounts are refreshed only by the watcher and your clicks, one process at a time behind a file lock. The panel only reads.
+- An inactive account whose token no session holds is refreshed by whichever process reads it first (the watcher, a click, or the panel), one process at a time behind a file lock. The panel never refreshes a token that a session in any config directory may hold.
 - It never writes a token it hasn't checked against the API first. A future expiry date doesn't prove the token still works.
 - It replaces only `claudeAiOauth`. The same Keychain entry holds `mcpOAuth`, the tokens of your MCP servers, which belong to the config directory and survive every switch.
-- A 429 from the usage endpoint means "unknown", never "dead". It backs off for 15 minutes and doesn't refresh or flag anything in the meantime. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled.
+- A 429 from the usage endpoint means "unknown", never "dead". It backs off for 2 minutes, then 4, 8 and 15 while the endpoint keeps refusing, starts over after the first good answer, and doesn't refresh or flag anything in the meantime. Claude Code and Orca poll the same endpoint too, so it can throttle even while this tool is quiet. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled. Accounts with a canceled subscription get a 403 there, so they aren't asked at all.
 - Before overwriting the live entry it copies the token there back to its Orca copy, because the running session may have rotated it since the last switch.
 
 ## Requirements
 
-- macOS 26 or newer, with Swift 6.2 or newer (Xcode or the command line tools) to build the app.
+- macOS 26 or newer on Apple silicon, with Swift 6.2 or newer (Xcode or the command line tools) to build the app. Homebrew builds it for you.
 - `/usr/bin/python3` (ships with the command line tools).
-- Claude Code. Tested with 2.1.282.
+- Claude Code. Tested with 2.1.284.
 - Orca with your Claude accounts added as managed accounts, and **System default** selected as the active Claude account in Orca. With a managed account selected, Orca puts its own account back whenever a terminal starts and every 15 minutes, undoing every switch, and it refreshes that account's token itself. claude-acc reads Orca's settings, and while an account is selected there the watcher stands down, switching is blocked and the panel tells you to pick System default.
-
-## Install
-
-```sh
-git clone https://github.com/outofplace-space/claude-acc.git
-cd claude-acc
-./install.sh
-```
-
-The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads the three launchd jobs (the account watcher, the janitor and the dev server guard), then builds and opens `~/Applications/Claude Acc.app`. The app adds itself to your login items on first run. You can turn that off in the panel.
 
 ## Command line
 
@@ -62,6 +151,8 @@ The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-
 | `claude-acc login <email>` | Log the account in again in the browser |
 | `claude-acc heal [--deep]` | Recover accounts whose Orca copy died after a rotation elsewhere |
 | `claude-acc tick` | One watcher pass (what launchd runs) |
+| `claude-acc depot [--force]` | Which account the Depot sandboxes run on; `--force` sends its token again |
+| `claude-acc depot --fallback` | Store a long-lived `claude setup-token` token for when no account has headroom |
 | `claude-acc clean [--dry-run]` | Clean up now: every janitor task, whatever its schedule |
 | `claude-acc mac status` | Free space, the last cleanup and warnings |
 | `claude-acc mac report` | What slows the Mac down: top processes, Spotlight, orphaned dev servers, data of uninstalled apps, broken launchd entries |
@@ -71,6 +162,14 @@ The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-
 | `claude-acc guard once [--dry-run]` | One guard pass, at most one action |
 | `claude-acc guard stop <pid\|:port>` | Stop a dev server the way the guard does |
 | `claude-acc guard recycle <pid\|:port>` | Restart a dev server in its own Orca terminal |
+| `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
+| `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
+| `claude-acc fans install\|uninstall` | Install the fan daemon, or remove it and give the fans back to macOS |
+| `claude-acc perf ultra on\|off\|status` | Turn Ultra on or off, or show what it changed and the numbers |
+| `claude-acc perf bench network\|cpu\|gpu\|fs` | Measure: queueing in the network vs inside the connection, P-core share and wake-up latency, GPU time per app, the file cache |
+| `claude-acc perf list` / `apply` / `undo <name>` | Every tweak on its own, with what it changes and how it was measured |
+| `claude-acc perf-root vnodes trial [--keep]` | Root: a bigger vnode cache, measured before and after and undone unless `--keep` |
+| `claude-acc uninstall` | Remove the launchd jobs, the app and this command; settings stay |
 
 ## Configuration
 
@@ -85,6 +184,13 @@ The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-
 | `never` | `[]` | Emails never switched to |
 | `config_dir` | `~/.claude` | The config directory whose sessions get switched |
 | `other_config_dirs` | `[]` | Other config directories whose entries get the new token when an account refreshes, but are never switched |
+| `depot_sync` | `true` | Keep the `CLAUDE_CODE_OAUTH_TOKEN` secret of `depot claude` sandboxes on an account with headroom |
+| `depot_min_valid_hours` | `4` | A token sent to Depot must stay valid at least this long; a shorter one is refreshed first |
+| `depot_bin` | `""` | Path of the Depot CLI; empty means `PATH`, then Homebrew |
+
+## Depot sandboxes
+
+[`depot claude`](https://depot.dev/docs/agents/claude-code/quickstart) starts Claude Code in a remote sandbox with the token stored in the organization secret `CLAUDE_CODE_OAUTH_TOKEN`. Every tick keeps that secret on the account first in the switching order **other than the local one**, so the laptop and the sandboxes never burn the same account. The token is sent again only when that account runs out of headroom, becomes the local account, or has less than `depot_min_valid_hours` of validity left; an idle account's token is refreshed before it is sent, the active account's never (its sessions own that refresh). With no other account left, the long-lived token from `claude-acc depot --fallback` goes out instead. A Depot failure is logged and never stops the switching. Requires the Depot CLI logged in to the organization (`depot login`).
 
 ## Mac janitor
 
@@ -188,6 +294,40 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
 | `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |
 
+## Stay Awake
+
+The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
+
+With **Auto on any hotspot** it switches itself on whenever the Mac joins a network that macOS marks as expensive: an iPhone or Android hotspot over Wi-Fi or USB, or a cellular modem. It turns off again when you leave that network, unless you turned it on yourself. **Keep the hotspot alive** sends one small request every 25 seconds, so a phone doesn't drop a hotspot it thinks nobody uses. The settings live in the app's preferences.
+
+## Fans & heat
+
+`fanctl` reads the SMC: every fan's speed, minimum, maximum and target, and the temperature sensors grouped by what they measure: P-cores (`Tp*`), E-cores (`Te*`), GPU (`Tg*`), SSD (`TH*`) and battery (`TB*`). The panel shows the hottest of each group, the fan speeds and a 20-minute chart of CPU and GPU temperature. Reading needs no root, so the card works without the daemon.
+
+Setting the fans needs root, so `claude-acc fans install` puts `fanctl` in `/usr/local/libexec` (owned by root) and loads it as a LaunchDaemon. Every 2 seconds it follows the mode the panel writes to `~/.local/share/claude-acc/fans.json`:
+
+- `{"mode": "auto"}` gives the fans back to macOS, `{"mode": "fixed", "percent": 50}` holds them at that share of the range between their minimum and maximum. Until you pick a mode, the daemon only reads.
+- Above 95 °C on any CPU or GPU sensor it goes to full speed, and back to your setting below 85 °C.
+- Another fan app (Mole, Macs Fan Control, TG Pro) wins: when the fans move to a speed the daemon didn't set, the panel says so and the daemon leaves them alone. It only takes the fans back after sleep, when macOS reset them to auto under a fixed setting.
+- When the daemon stops, it gives the fans back to macOS, unless another app had them.
+
+## Ultra
+
+A Mac running a dozen agents spends a surprising amount of its time on work nobody waits for. `perf.py` measured where it went on an M4 Max with Orca and nine Claude Code sessions, and Ultra turns on the fixes that paid off. Every tweak records what was there before, measures before and after, and `ultra off` restores it byte for byte, leaving alone anything you changed by hand in the meantime. Running `ultra on` twice is safe. launchd runs `perf.py keep` every 5 minutes, which reapplies tweaks to processes that restarted with a new pid and fills in numbers that arrive later.
+
+| Tweak | What it changes |
+| --- | --- |
+| `bg-helpers` | Background QoS (`PRIO_DARWIN_BG`: efficiency cores, throttled disk) for always-on helpers matched by `background` in `perf.json` |
+| `claude-hooks-async` | `"async": true` on the hooks listed in `async_hooks`, in `~/.claude/settings.json`. Every tool call of every session waited for them |
+| `node-compile-cache` | `NODE_COMPILE_CACHE` in the `env` of `~/.claude/settings.json`, so tsc, eslint, MCP servers and hooks start from a warm V8 cache. The `claude` binary itself runs on Bun and doesn't need it |
+| `devguard-budget` | The guard's `budget_percent` from 35 to 25 |
+| `docker-vm` | Docker's `MemoryMiB` to 6144, written only while Docker is closed. Ultra never restarts Docker |
+| `git-speed` | `core.untrackedCache` and `core.fsmonitor` in the repos listed in `git_repos` (empty by default) |
+
+What needs root is prepared, not applied: `claude-acc perf-root vnodes trial` raises `kern.maxvnodes` (the file cache was full, recycling 28 million vnodes in 5 hours, so every scan of a large `node_modules` started cold) and undoes it unless you add `--keep`. The panel lists it under Needs you with the command to copy.
+
+What was measured and left alone, in [`docs/perf-research.md`](docs/perf-research.md) (Polish): open-file and process limits (5% used), App Nap for Orca (it never naps), forced L4S (halved the upload here), an upload shaper (the router adds only 1-4 ms under load), MCP servers duplicated per session (2.3 GB across nine sessions, with no shared mode to switch to), and the Claude API connections (already reused).
+
 ## Tests
 
 ```sh
@@ -198,6 +338,8 @@ The tests run the real script end to end against fake `security`, `curl` and `cl
 
 The janitor tests run the real script on a temporary `$HOME` with the real `lsof`: caches that go, caches kept because a file is open or a dev server works in the app, a shell prompt that doesn't block, protected paths, stale and active projects, an interrupted delete, and `caps` dropping the oldest snapshots.
 
+The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, and a value someone changed after Ultra survives `ultra off`.
+
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, and that the hook sends a second start to the running one.
 
 To see the panel without clicking the menu bar, render it to a PNG, from live data or from a JSON file:
@@ -206,7 +348,7 @@ To see the panel without clicking the menu bar, render it to a PNG, from live da
 "$HOME/Applications/Claude Acc.app/Contents/MacOS/ClaudeAcc" --render panel.png --snapshot docs/demo-snapshot.json
 ```
 
-With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json` and `demo-janitor.json` next to it stand in for the guard and cleanup state. The renderer can't draw Liquid Glass, so buttons come out bordered.
+With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json` and `demo-fans.json` next to it stand in for the guard, cleanup and fan state. `--open <account id>` renders that account opened. Lists that scroll in the panel come out in full.
 
 ## Caveats
 

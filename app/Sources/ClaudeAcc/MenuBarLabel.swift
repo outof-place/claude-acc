@@ -14,7 +14,24 @@ struct MenuBarLabel: View {
                 badge: badge))
             Text(text(used: used))
                 .monospacedDigit()
+            if store.awake.isOn {
+                // Stay Awake is holding the Mac up, like Amphetamine's pill
+                Image(systemName: "cup.and.heat.waves.fill")
+            }
+            if let hot {
+                // only when it matters: the bar stays clean below 90 °C
+                Text("\(Int(hot.rounded()))°")
+                    .monospacedDigit()
+                    .foregroundStyle(hot >= 95 ? .red : .orange)
+            }
         }
+    }
+
+    /// Hottest CPU/GPU sensor from the fan daemon, when it's fresh and at 90 °C or more.
+    private var hot: Double? {
+        guard let state = store.fanState, Date.now.timeIntervalSince1970 - state.at < 15 else { return nil }
+        let value = [state.cpu, state.gpu].compactMap(\.self).max() ?? 0
+        return value >= 90 ? value : nil
     }
 
     private var badge: NSColor? {

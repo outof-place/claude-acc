@@ -2,7 +2,7 @@ import SwiftUI
 
 @main
 struct ClaudeAccApp: App {
-    @State private var store = Store()
+    @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
     init() {
         // `ClaudeAcc --render panel.png [--snapshot accounts.json]`: the panel as a picture,
@@ -11,7 +11,8 @@ struct ClaudeAccApp: App {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--render"), i + 1 < args.count {
             let data = args.firstIndex(of: "--snapshot").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
-            exit(Self.render(to: args[i + 1], from: data) ? 0 : 1)
+            let open = args.firstIndex(of: "--open").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+            exit(Self.render(to: args[i + 1], from: data, open: open) ? 0 : 1)
         }
         // a second copy would put a second ring in the menu bar
         let mine = Bundle.main.bundleIdentifier ?? ""
@@ -21,18 +22,16 @@ struct ClaudeAccApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra {
-            PanelView(store: store)
-        } label: {
-            MenuBarLabel(store: store)
-        }
-        .menuBarExtraStyle(.window)
+        // the ring and the panel are AppKit (MenuBarController); an App still needs a scene
+        Settings { EmptyView() }
     }
 
-    private static func render(to path: String, from snapshotFile: String?) -> Bool {
+    private static func render(to path: String, from snapshotFile: String?, open: String?) -> Bool {
         let output: CLIResult
         var guardState: GuardState?
         var janitor: JanitorState?
+        var fans: FanState?
+        var ultra: Ultra?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
             output = CLIResult(status: text.isEmpty ? 1 : 0, stdout: text, stderr: "no file \(snapshotFile)")
@@ -43,6 +42,12 @@ struct ClaudeAccApp: App {
             if let data = try? Data(contentsOf: folder.appending(path: "demo-janitor.json")) {
                 janitor = Store.decode(JanitorState.self, from: data)
             }
+            if let data = try? Data(contentsOf: folder.appending(path: "demo-fans.json")) {
+                fans = Store.decode(FanState.self, from: data)
+            }
+            if let data = try? Data(contentsOf: folder.appending(path: "demo-perf.json")) {
+                ultra = Store.decode(PerfFile.self, from: data)?.ultra
+            }
         } else {
             output = CLI.runBlocking(CLI.process(["status", "--json"]))
         }
@@ -50,7 +55,8 @@ struct ClaudeAccApp: App {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra)
+        store.previewOpenAccount = open
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
         let panel = PanelView(store: store, frozenNow: frozen)
             .fixedSize()
@@ -64,5 +70,13 @@ struct ClaudeAccApp: App {
             return false
         }
         return FileManager.default.createFile(atPath: path, contents: png)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var menuBar: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        menuBar = MenuBarController(store: Store())
     }
 }

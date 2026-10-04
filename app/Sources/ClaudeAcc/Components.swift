@@ -3,28 +3,80 @@ import SwiftUI
 extension EnvironmentValues {
     /// One clock for the whole panel, so every "5 min ago" moves together.
     @Entry var now: Date = .now
-    /// Drawing into a PNG: ImageRenderer can't draw Liquid Glass, so buttons fall back to bordered.
+    /// Drawing into a PNG: ImageRenderer leaves ScrollView content out, so lists render flat.
     @Entry var renderingToFile = false
+    /// Continuous animations (spinning glyphs) run only while the panel is on screen.
+    @Entry var animating = true
 }
 
-private struct GlassButton: ViewModifier {
-    let prominent: Bool
+/// A list that scrolls inside its card in the live panel and lies flat in a PNG render.
+struct CardScroll<Content: View>: View {
+    @ViewBuilder let content: Content
     @Environment(\.renderingToFile) private var renderingToFile
 
-    func body(content: Content) -> some View {
-        switch (renderingToFile, prominent) {
-        case (true, true): content.buttonStyle(.borderedProminent)
-        case (true, false): content.buttonStyle(.bordered)
-        case (false, true): content.buttonStyle(.glassProminent)
-        case (false, false): content.buttonStyle(.glass)
+    var body: some View {
+        if renderingToFile {
+            content
+        } else {
+            ScrollView {
+                content.padding(.horizontal, 6)
+            }
+            .padding(.horizontal, -6)
+            .scrollIndicators(.never)
+            .scrollBounceBehavior(.basedOnSize)
         }
     }
 }
 
+/// The panel's own button: a soft rounded fill that lights up on hover and gives a little
+/// on press; `prominent` is the violet one for the action you most likely want.
+struct PanelButtonStyle: ButtonStyle {
+    var prominent = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        PanelButton(configuration: configuration, prominent: prominent)
+    }
+}
+
+private struct PanelButton: View {
+    let configuration: ButtonStyleConfiguration
+    let prominent: Bool
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.controlSize) private var controlSize
+    @State private var hovering = false
+
+    var body: some View {
+        let small = controlSize == .small || controlSize == .mini
+        configuration.label
+            .font(small ? .caption.weight(.semibold) : .callout.weight(.semibold))
+            .labelStyle(.titleAndIcon)
+            .lineLimit(1)
+            .foregroundStyle(prominent ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+            .padding(.horizontal, small ? 10 : 13)
+            .padding(.vertical, small ? 5 : 7)
+            .background(fill, in: .capsule)
+            .overlay {
+                Capsule().strokeBorder(.white.opacity(prominent ? 0.18 : 0.07), lineWidth: 0.5)
+            }
+            .contentShape(.capsule)
+            .scaleEffect(configuration.isPressed ? 0.96 : 1)
+            .opacity(isEnabled ? 1 : 0.45)
+            .onHover { hovering = $0 }
+            .animation(.snappy(duration: 0.16), value: configuration.isPressed)
+            .animation(.snappy(duration: 0.16), value: hovering)
+    }
+
+    private var fill: AnyShapeStyle {
+        if prominent {
+            return AnyShapeStyle(Format.violet.gradient.opacity(hovering ? 1 : 0.88))
+        }
+        return AnyShapeStyle(.white.opacity(hovering ? 0.14 : 0.08))
+    }
+}
+
 extension View {
-    /// Liquid Glass button, bordered when the panel is rendered to a file.
-    func glassButton(prominent: Bool = false) -> some View {
-        modifier(GlassButton(prominent: prominent))
+    func panelButton(prominent: Bool = false) -> some View {
+        buttonStyle(PanelButtonStyle(prominent: prominent))
     }
 }
 
@@ -59,7 +111,7 @@ struct Card<Content: View, Accessory: View>: View {
             content
         }
         .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(.quinary, in: .rect(cornerRadius: 20, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -120,11 +172,23 @@ struct PillToggleStyle: ToggleStyle {
     var tint: Color = .green
 
     func makeBody(configuration: Configuration) -> some View {
+        PillToggle(configuration: configuration, tint: tint)
+    }
+}
+
+private struct PillToggle: View {
+    let configuration: ToggleStyleConfiguration
+    let tint: Color
+    @Environment(\.labelsVisibility) private var labels
+
+    var body: some View {
         Button {
             configuration.isOn.toggle()
         } label: {
             HStack(spacing: 6) {
-                configuration.label
+                if labels != .hidden {
+                    configuration.label
+                }
                 Capsule()
                     .fill(configuration.isOn ? AnyShapeStyle(tint.gradient) : AnyShapeStyle(.quaternary))
                     .frame(width: 28, height: 16)

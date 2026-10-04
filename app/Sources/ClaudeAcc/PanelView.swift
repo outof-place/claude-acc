@@ -1,14 +1,19 @@
 import SwiftUI
 
-/// The menu bar panel: Claude accounts on the left, the Mac on the right, one footer bar.
-/// Wide rather than tall, so it fits under the menu bar on a laptop screen.
+/// The menu bar panel: Claude accounts, dev servers and disk, then the Mac itself, and one footer bar.
+/// Wide rather than tall so it fits under the menu bar of a laptop, and a fixed height:
+/// what grows (account details, long server lists) scrolls inside its card, so the window
+/// never jumps in size while you click around.
 struct PanelView: View {
     let store: Store
     /// A fixed clock for rendering a snapshot file: times read as they did when it was taken.
     var frozenNow: Date?
+    @Environment(\.renderingToFile) private var renderingToFile
+
+    static let columnHeight: CGFloat = 640
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 5)) { context in
+        TimelineView(PanelClock(running: store.panelOpen)) { context in
             VStack(spacing: 12) {
                 if let email = store.snapshot?.orcaSelected {
                     Banner(
@@ -17,17 +22,26 @@ struct PanelView: View {
                         text: "Orca reverts switches and refreshes tokens itself, and two refreshers sign accounts out. Auto-switch and switching are paused until you pick System default in Orca's Claude account menu.")
                 }
                 HStack(alignment: .top, spacing: 12) {
-                    VStack(spacing: 12) {
-                        ActiveAccountCard(store: store)
+                    Column(width: 350) {
+                        ActiveAccountCard(store: store).fixedSize(horizontal: false, vertical: true)
                         AccountsCard(store: store)
                     }
-                    .frame(width: 350)
-                    VStack(spacing: 12) {
+                    Column(width: 360) {
                         DevServersCard(store: store)
-                        DiskCard(store: store)
+                        DiskCard(store: store).fixedSize(horizontal: false, vertical: true)
                     }
-                    .frame(width: 360)
+                    Column(width: 310) {
+                        AwakeCard(awake: store.awake).fixedSize(horizontal: false, vertical: true)
+                        FansCard(store: store)
+                    }
+                    Column(width: 300) {
+                        UltraCard(store: store)
+                    }
                 }
+                // live: fixed height, lists scroll inside their cards; PNG: as tall as the content
+                .frame(height: renderingToFile ? nil : Self.columnHeight)
+                .frame(minHeight: renderingToFile ? Self.columnHeight : nil)
+                .fixedSize(horizontal: false, vertical: renderingToFile)
                 if let notice = store.notice {
                     Banner(
                         symbol: notice.isError ? "xmark.octagon.fill" : "checkmark.circle.fill",
@@ -41,17 +55,46 @@ struct PanelView: View {
             }
             .padding(14)
             .environment(\.now, frozenNow ?? context.date)
+            .environment(\.animating, store.panelOpen)
         }
         .fontDesign(.rounded)
-        .animation(.smooth, value: store.notice)
-        .onAppear { store.panelAppeared() }
-        .onDisappear { store.panelDisappeared() }
+        .animation(.smooth(duration: 0.35), value: store.notice)
+    }
+}
+
+/// Every 5 seconds while the panel is open; closed, one entry and no more updates.
+private struct PanelClock: TimelineSchedule {
+    let running: Bool
+
+    func entries(from start: Date, mode: TimelineScheduleMode) -> AnyIterator<Date> {
+        var next: Date? = start
+        let running = running
+        return AnyIterator {
+            defer { next = running ? next?.addingTimeInterval(5) : nil }
+            return next
+        }
+    }
+}
+
+/// A column of cards filling the panel's height: the last card stretches, so every column
+/// ends on the same line.
+private struct Column<Content: View>: View {
+    let width: CGFloat
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(spacing: 12) {
+            content
+        }
+        .frame(width: width)
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 }
 
 private struct FooterBar: View {
     let store: Store
     @Environment(\.now) private var now
+    @Environment(\.animating) private var animating
 
     var body: some View {
         HStack(spacing: 14) {
@@ -64,7 +107,7 @@ private struct FooterBar: View {
                     .labelStyle(.iconOnly)
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
-                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: store.refreshing)
+                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: store.refreshing && animating)
                     .disabled(store.refreshing)
                     .help("Refresh")
             }

@@ -17,6 +17,9 @@ final class Store {
 
     private(set) var snapshot: Snapshot?
     private(set) var refreshing = false
+    /// The panel window is on screen. Closed, it stays alive offscreen and would keep rendering
+    /// every frame of a running animation, so animations and clocks follow this.
+    private(set) var panelOpen = false
     private(set) var problem: String?
     private(set) var busy: Busy?
     var notice: Notice?
@@ -27,8 +30,20 @@ final class Store {
     private(set) var guardState: GuardState?
     /// Unit the panel is restarting or stopping right now.
     private(set) var guardBusy: String?
+    private(set) var fanState: FanState?
+    private(set) var ultra: Ultra?
+    /// Turning Ultra on or off measures as it goes, which takes a while.
+    private(set) var ultraBusy = false
+    /// The state just asked for, until perf.py is done.
+    private(set) var ultraPick: Bool?
+    /// The fan mode just picked, until the daemon's state file shows it.
+    private(set) var fanPick: String?
     /// The mode just picked in the panel, until the guard's next snapshot shows it.
     private var guardModeOverride: String?
+    /// Rendering only: the account whose details start open.
+    @ObservationIgnored var previewOpenAccount: String?
+    /// Stay Awake lives as long as the app: power assertions and the hotspot watch.
+    let awake: Awake
 
     @ObservationIgnored private var loginPID: Int32?
     @ObservationIgnored private var loginCancelled = false
@@ -43,14 +58,21 @@ final class Store {
     }()
 
     /// Rendering the panel to a file: fixed data, no timers, no login item.
-    init(preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil) {
+    init(
+        preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
+        ultra: Ultra? = nil
+    ) {
+        awake = Awake(preview: true)
         snapshot = preview
         readLocal()
         if let guardState { self.guardState = guardState }
         if let janitor { self.janitor = janitor }
+        if let fans { fanState = fans }
+        if let ultra { self.ultra = ultra }
     }
 
     init() {
+        awake = Awake()
         // quitting during a sign-in must not leave the script with `claude` behind
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
@@ -102,6 +124,13 @@ final class Store {
         if let data = FileManager.default.contents(atPath: CLI.janitorState) {
             janitor = Self.decode(JanitorState.self, from: data)
         }
+        if let data = FileManager.default.contents(atPath: CLI.fanState) {
+            fanState = Self.decode(FanState.self, from: data)
+            if let pick = fanPick, pick == fanMode { fanPick = nil }
+        }
+        if let data = FileManager.default.contents(atPath: CLI.perfState) {
+            ultra = Self.decode(PerfFile.self, from: data)?.ultra
+        }
         if let data = FileManager.default.contents(atPath: CLI.guardState) {
             guardState = Self.decode(GuardState.self, from: data)
             if guardModeOverride == guardState?.snapshot?.mode { guardModeOverride = nil }
@@ -115,6 +144,7 @@ final class Store {
 
     /// While the panel is open the guard's numbers move every few seconds.
     func panelAppeared() {
+        panelOpen = true
         let age = Date.now.timeIntervalSince1970 - (snapshot?.generatedAt ?? 0)
         if age > 30 { Task { await refresh() } }
         live?.cancel()
@@ -127,6 +157,7 @@ final class Store {
     }
 
     func panelDisappeared() {
+        panelOpen = false
         live?.cancel()
         live = nil
     }
@@ -245,6 +276,50 @@ final class Store {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString("cd \(path) && \(command)", forType: .string)
         notice = Notice(text: "Copied the command that starts \(unit.title)")
+    }
+
+    // MARK: Fans
+
+    /// The daemon writes its state every 2 seconds; older than that by a margin means it isn't running.
+    var fanDaemonRunning: Bool {
+        guard let at = fanState?.at else { return false }
+        return Date.now.timeIntervalSince1970 - at < 15
+    }
+
+    /// "auto", "50", "75", "100", or nil when nothing was picked yet.
+    var fanMode: String? {
+        if let pick = fanPick { return pick }
+        guard let state = fanState else { return nil }
+        if state.mode == "fixed", let percent = state.percent { return String(percent) }
+        return state.mode
+    }
+
+    /// The root daemon reads this file every 2 seconds; it only accepts auto or 30-100%.
+    func setFanMode(_ mode: String) {
+        let config: [String: Any] = mode == "auto" ? ["mode": "auto"] : ["mode": "fixed", "percent": Int(mode) ?? 100]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: CLI.fanConfig), options: .atomic)
+            fanPick = mode
+        } catch {
+            notice = Notice(text: "Couldn't save the fan mode: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    // MARK: Ultra
+
+    func setUltra(_ on: Bool) async {
+        guard !ultraBusy else { return }
+        ultraBusy = true
+        ultraPick = on
+        notice = nil
+        let result = await CLI.run(["ultra", on ? "on" : "off"], script: CLI.perf)
+        readLocal()
+        ultraBusy = false
+        ultraPick = nil
+        notice = result.status == 0
+            ? Notice(text: on ? "Ultra is on" : "Ultra is off, and everything it changed is back")
+            : Notice(text: result.message, isError: true)
     }
 
     // MARK: Login item

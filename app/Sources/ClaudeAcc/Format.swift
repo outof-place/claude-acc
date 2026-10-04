@@ -26,6 +26,45 @@ enum Format {
         Date(timeIntervalSince1970: epoch).formatted(monthDay)
     }
 
+    private static let fullStamp = Date.VerbatimFormatStyle(
+        format: "\(weekday: .abbreviated) \(month: .abbreviated) \(day: .defaultDigits), \(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
+        locale: english, timeZone: .current, calendar: .current)
+
+    private static let fullDay = Date.VerbatimFormatStyle(
+        format: "\(weekday: .abbreviated) \(month: .abbreviated) \(day: .defaultDigits), \(year: .defaultDigits)",
+        locale: english, timeZone: .current, calendar: .current)
+
+    /// Exact moment for the details view: "today 18:40", "tomorrow 07:00", "Sat Oct 11, 07:00".
+    static func stamp(_ epoch: Double, now: Date) -> String {
+        let date = Date(timeIntervalSince1970: epoch)
+        let calendar = Calendar.current
+        if calendar.isDate(date, inSameDayAs: now) { return "today \(date.formatted(clock))" }
+        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now), calendar.isDate(date, inSameDayAs: tomorrow) {
+            return "tomorrow \(date.formatted(clock))"
+        }
+        return date.formatted(fullStamp)
+    }
+
+    /// "Sat Oct 28, 2026".
+    static func fullDate(_ epoch: Double) -> String {
+        Date(timeIntervalSince1970: epoch).formatted(fullDay)
+    }
+
+    /// Countdown to the minute: "5d 2h 14m", "2h 06m", "14m".
+    static func countdown(_ epoch: Double, now: Date) -> String {
+        let minutes = max(Int((epoch - now.timeIntervalSince1970) / 60), 0)
+        let (d, h, m) = (minutes / 1440, minutes % 1440 / 60, minutes % 60)
+        if d > 0 { return "\(d)d \(h)h \(String(format: "%02d", m))m" }
+        if h > 0 { return "\(h)h \(String(format: "%02d", m))m" }
+        return "\(m)m"
+    }
+
+    /// "2025-03-28" from the profile API → "Mar 28, 2025".
+    static func isoDay(_ text: String) -> String {
+        guard let date = try? Date(text, strategy: .iso8601.year().month().day()) else { return text }
+        return date.formatted(.dateTime.month(.abbreviated).day().year().locale(english))
+    }
+
     /// "in 1d 12h", "in 2h 25m", "in 40 min".
     static func until(_ epoch: Double, now: Date) -> String {
         let minutes = max(Int((epoch - now.timeIntervalSince1970) / 60), 0)
@@ -60,9 +99,14 @@ enum Format {
         }
     }
 
-    /// Data age without "ago": "12 min", "3h".
+    /// Data age without "ago": "12 min", "3h 5m", "1d 14h".
     static func age(_ seconds: Int) -> String {
-        seconds < 3600 ? "\(seconds / 60) min" : "\(seconds / 3600)h"
+        switch seconds {
+        case ..<60: "\(seconds)s"
+        case ..<3600: "\(seconds / 60) min"
+        case ..<86_400: "\(seconds / 3600)h \(seconds % 3600 / 60)m"
+        default: "\(seconds / 86_400)d \(seconds % 86_400 / 3600)h"
+        }
     }
 
     static func percent(_ value: Double?) -> String {
@@ -79,6 +123,11 @@ enum Format {
         guard let unit = units.first(where: { value >= $0.size }) else { return "\(Int(value)) B" }
         let number = (value / unit.size).formatted(.number.precision(.fractionLength(unit.digits)).locale(english))
         return "\(number) \(unit.name)"
+    }
+
+    /// "3,480".
+    static func rpm(_ value: Double) -> String {
+        value.formatted(.number.precision(.fractionLength(0)).locale(english))
     }
 
     static let violet = Color(red: 0.58, green: 0.49, blue: 1.0)
