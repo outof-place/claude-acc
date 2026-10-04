@@ -53,35 +53,30 @@ The UI is in English; the scripts' messages and the code comments are in Polish.
 
 ```mermaid
 flowchart LR
-    app["Claude Acc.app<br/>menu bar, SwiftUI"]
+    app["Claude Acc.app<br/>menu bar"]
     subgraph user["launchd, your account"]
-        tick["accswitch.py tick<br/>every 2 min"]
-        janitor["janitor.py sweep<br/>login + every 3 h"]
-        guard["devguard.py run<br/>every 5 s"]
+        tick["accswitch.py<br/>every 2 min"]
+        guard["devguard.py<br/>every 5 s"]
+        janitor["janitor.py<br/>login + every 3 h"]
     end
     subgraph root["launchd, root"]
-        fans["fanctl daemon<br/>every 2 s"]
+        fans["fanctl<br/>every 2 s"]
     end
+    hook["Claude Code<br/>PreToolUse hook"]
     keychain[("Keychain<br/>Claude + Orca entries")]
     api[("Anthropic API<br/>usage, profile")]
     orca["Orca CLI<br/>tabs, terminals, agents"]
-    hook["Claude Code<br/>PreToolUse hook"]
+    disk[("build caches<br/>node_modules")]
     smc[("SMC<br/>fans, sensors")]
-    state[("~/.local/share/claude-acc<br/>state files")]
-    tick --> keychain
-    tick --> api
+    app -.-> tick & guard & janitor & fans
+    tick --> keychain & api
     guard --> orca
-    hook -- "devguard.py admit" --> guard
+    janitor --> disk
     fans --> smc
-    tick --> state
-    janitor --> state
-    guard --> state
-    fans --> state
-    app -- "reads" --> state
-    app -- "fans.json" --> fans
+    hook --> guard
 ```
 
-- Every piece runs without the app; the app only reads state files and calls the scripts. Close it and the switching, cleanup, guard and fans keep working.
+- Every piece runs without the app. Each job writes its state to `~/.local/share/claude-acc`, and the app (dotted lines) only reads those files, calls the scripts and writes the fan mode. Close it and the switching, cleanup, guard and fans keep working.
 - The scripts are Python 3.9 standard library only (the `/usr/bin/python3` that ships with the command line tools). Kernel numbers come through `ctypes`: `proc_pid_rusage` for memory, `sysctl` for swap and pressure, `KERN_PROCARGS2` for exact command lines.
 - The app is Swift 6 with main-actor default isolation (SE-0466) and `@concurrent` for process work, Swift Charts for the charts, and SF Rounded throughout.
 - `fanctl` talks to the SMC through IOKit's `AppleSMC` user client. Reading needs no root; the daemon that writes runs as root, reads only a mode from your folder, and writes its readings back atomically.
