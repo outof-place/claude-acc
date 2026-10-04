@@ -281,6 +281,10 @@ class ChoosePTest(Paths):
         vet = self.job("cd apps/charter-service && go vet ./...")
         self.assertEqual(S.choose_p(vet, 30.0, [])[0], 4)  # p8 wolniejsze przy vet
         self.assertEqual(S.choose_p(vet, 10.0, [])[0], 2)
+        build = self.job("cd apps/charter-service && go build ./...")
+        self.assertEqual(
+            S.choose_p(build, 30.0, [])[0], 4
+        )  # -p bez wpływu: domyślne maszyny
 
     def test_agent_and_insensitive(self):
         mine = self.job("cd apps/charter-service && go vet -p 2 ./...")
@@ -336,7 +340,10 @@ class RouteTest(Paths):
         st = self.state()
         handlers = self.job("cd apps/charter-service && go test ./internal/handlers/")
         route, target = S.decide_route(st, handlers, 24.0, 1500, self.cfg, {})
-        self.assertEqual((route["choice"], route["why"], target["job"]), ("depot", "cost", "handlers"))
+        self.assertEqual(
+            (route["choice"], route["why"], target["job"]),
+            ("depot", "cost", "handlers"),
+        )
         self.assertEqual(route["local_eta_s"], 1500)
         # cały moduł: 64 rdzenie przez ~9 min kosztują więcej, niż oszczędzają
         tree = self.job("cd apps/charter-service && go test ./...")
@@ -546,9 +553,15 @@ class HookTest(Paths):
 
     def test_recursive_grep_is_left_to_rg_rewrite(self):
         command = "cd apps/charter-service && go test ./internal/moneyfmt/ && grep -rn TODO internal"
-        event = {"tool_name": "Bash", "cwd": self.repo, "tool_input": {"command": command}}
+        event = {
+            "tool_name": "Bash",
+            "cwd": self.repo,
+            "tool_input": {"command": command},
+        }
         self.assertIsNone(S.hook_rewrite(event))
-        event["tool_input"]["command"] = "cd apps/charter-service && go test ./internal/moneyfmt/ | grep -c ok"
+        event["tool_input"]["command"] = (
+            "cd apps/charter-service && go test ./internal/moneyfmt/ | grep -c ok"
+        )
         self.assertIsNotNone(S.hook_rewrite(event))
 
     def test_leaves_other_commands(self):
