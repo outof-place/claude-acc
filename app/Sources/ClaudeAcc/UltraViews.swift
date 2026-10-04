@@ -68,12 +68,12 @@ struct UltraCard: View {
             return "Turn it on to tune the Mac for agents. Every change is measured, and Off puts back exactly what was there."
         }
         let since = ultra.since.map { " since \(Format.moment($0, now: now))" } ?? ""
-        return "\(ultra.applied.count) changes\(since)"
+        return "\(ultra.applied.count + ultra.rootApplied.count) changes\(since)"
     }
 
     /// On: what Ultra applied; off: what it would do.
     private var rows: [String] {
-        if let ultra, ultra.on { return ultra.applied }
+        if let ultra, ultra.on { return ultra.applied + ultra.rootApplied }
         return Ultra.order
     }
 

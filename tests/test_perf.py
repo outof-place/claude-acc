@@ -221,6 +221,22 @@ class RootRecordTest(Isolated):
         perf.cmd_record(self.cfg, ["shaper", "--forget"])
         self.assertNotIn("shaper", perf.load_state()["applied"])
 
+    def test_record_result_shows_next_to_ultra(self):
+        self.assertEqual(perf.cmd_record(self.cfg, ["vnodes", "786432", "prev=263168", "--result", "5.68", "3.42"]), 0)
+        state = perf.load_state()
+        self.assertEqual(state["applied"]["vnodes"]["detail"], "786432 prev=263168")
+        ultra = state["ultra"]
+        self.assertEqual(ultra["root_applied"], ["vnodes"])
+        self.assertEqual(ultra["results"]["vnodes"]["after"], 3.42)
+        self.assertNotIn("vnodes", ultra["pending_root"])
+        # re-recording without numbers keeps the measured ones; forgetting drops them
+        perf.cmd_record(self.cfg, ["vnodes", "786432", "prev=263168"])
+        self.assertEqual(perf.load_state()["applied"]["vnodes"]["result"]["before"], 5.68)
+        perf.cmd_record(self.cfg, ["vnodes", "--forget"])
+        ultra = perf.load_state()["ultra"]
+        self.assertEqual(ultra["root_applied"], [])
+        self.assertNotIn("vnodes", ultra["results"])
+
     def test_record_refuses_non_root_tweak(self):
         self.assertEqual(perf.cmd_record(self.cfg, ["bg-helpers", "x"]), 2)
 
@@ -645,7 +661,7 @@ class UltraTest(Isolated):
         data = self.status()
         self.assertEqual(
             set(data),
-            {"on", "since", "applied", "pending_root", "pending_manual", "results"},
+            {"on", "since", "applied", "root_applied", "pending_root", "pending_manual", "results"},
         )
         self.assertTrue(data["on"])
         self.assertEqual(data["applied"], perf.ULTRA)

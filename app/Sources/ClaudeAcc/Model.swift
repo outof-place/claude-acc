@@ -141,6 +141,8 @@ struct Ultra: Decodable {
     let on: Bool
     let since: Double?
     let applied: [String]
+    /// Root tweaks perf-root.sh applied: shown with Ultra, undone only by perf-root.sh.
+    let rootApplied: [String]
     let pendingRoot: [String]
     let pendingManual: [String]
     let results: [String: Result]
@@ -150,13 +152,14 @@ struct Ultra: Decodable {
         on = try c.decodeIfPresent(Bool.self, forKey: .on) ?? false
         since = try c.decodeIfPresent(Double.self, forKey: .since)
         applied = try c.decodeIfPresent([String].self, forKey: .applied) ?? []
+        rootApplied = try c.decodeIfPresent([String].self, forKey: .rootApplied) ?? []
         pendingRoot = try c.decodeIfPresent([String].self, forKey: .pendingRoot) ?? []
         pendingManual = try c.decodeIfPresent([String].self, forKey: .pendingManual) ?? []
         results = try c.decodeIfPresent([String: Result].self, forKey: .results) ?? [:]
     }
 
     private enum CodingKeys: String, CodingKey {
-        case on, since, applied, pendingRoot, pendingManual, results
+        case on, since, applied, rootApplied, pendingRoot, pendingManual, results
     }
 
     /// perf.py's ULTRA list, in the order it applies them.
@@ -179,6 +182,14 @@ struct Ultra: Decodable {
             title: "Docker VM", detail: "The VM gives back what containers don't use", unit: "GB", isSetting: true),
         "git-speed": Tweak(
             title: "Git", detail: "untrackedCache and fsmonitor in the repos you list", unit: "ms git status"),
+        "vnodes": Tweak(
+            title: "Bigger file cache", detail: "Three times the vnodes, set again at every boot (root)",
+            unit: "s to rescan node_modules"),
+        "spotlight": Tweak(
+            title: "Spotlight: apps only", detail: "Home folders and system data left out of the index (root)",
+            unit: "files besides apps", isSetting: true),
+        "shaper": Tweak(
+            title: "Upload shaper", detail: "Uploads queue on the Mac instead of in the router (root)", unit: "ms queue"),
         "devguard-max-server": Tweak(
             title: "Dev server size limit", detail: "The guard restarts a bloated server sooner", unit: "GB per server",
             isSetting: true),

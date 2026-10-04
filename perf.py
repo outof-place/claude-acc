@@ -1280,10 +1280,20 @@ TWEAKS = [
     GitSpeed(),
     RootTweak(
         "vnodes",
-        "większy cache vnode (kern.maxvnodes 263168 -> 786432): drzewa node_modules mieszczą się w nim",
-        "lstat 358 tys. wpisów portivo/.pnpm: 3,6 s w każdym przebiegu i 250 tys. vnode z odzysku, "
-        "bo cache ma 263 tys.; 28 mln odzysków w 5 h pracy",
+        "większy cache vnode (kern.maxvnodes 263168 -> 786432): metadane drzew node_modules "
+        "(lstat, open, lookup) mieszczą się w nim; treści plików nie, tę wypiera presja pamięci",
+        "lstat 358 tys. wpisów portivo/.pnpm, drugi przebieg: 3,59 -> 2,51 s, odzysk 253 tys. -> 4,5 tys. "
+        "vnode (czysty pomiar). Koszt ~1,2 KB pamięci jądra na vnode, +0,63 GB. Jądro nie zwalnia "
+        "vnode: po cofnięciu pamięć i cache zostają do restartu",
         "claude-acc perf-root vnodes trial",
+    ),
+    RootTweak(
+        "spotlight",
+        "Spotlight tylko dla aplikacji: wszystkie katalogi domowe poza Applications oraz /Library, "
+        "/opt, /usr/local i /Users/Shared na liście Prywatności",
+        "Spotlight indeksował 510 tys. plików magazynu pnpm i modułów Go, a wyniki z plików i "
+        "folderów i tak są wyłączone; aplikacje (/Applications, ~/Applications) zostają",
+        "claude-acc perf-root spotlight apps-only",
     ),
     RootTweak(
         "shaper",
@@ -1491,8 +1501,10 @@ def typescript_load(cache_dir=None, runs=5):
     return rnd(median(times), 0)
 
 
-def git_status_ms(system, repos, runs=5):
-    """Mediana `git status --porcelain` (ms) po repozytoriach z listy; bez blokad indeksu."""
+def git_status_ms(system, repos, runs=5, write_index=False):
+    """Mediana `git status --porcelain` (ms) po repozytoriach z listy; bez blokad indeksu.
+    `write_index` pozwala gitowi zapisać indeks, jak zwykły status agenta: dopiero wtedy
+    untrackedCache i token fsmonitora trafiają do indeksu."""
     times = []
     for repo in repos:
         for _ in range(runs):
@@ -1500,7 +1512,7 @@ def git_status_ms(system, repos, runs=5):
             subprocess.run(
                 ["git", "-C", repo, "status", "--porcelain"],
                 capture_output=True,
-                env=dict(janitor.ENV, GIT_OPTIONAL_LOCKS="0"),
+                env=janitor.ENV if write_index else dict(janitor.ENV, GIT_OPTIONAL_LOCKS="0"),
                 check=False,
             )
             times.append((time.perf_counter() - started) * 1000)
@@ -1599,7 +1611,8 @@ def pending_manual(state):
     """Rzeczy do kliknięcia przez człowieka: Ultra ich nie zrobi sama."""
     names = []
     spotlight = ultra_state(state)["results"].get("spotlight-privacy")
-    if spotlight and spotlight.get("after") is None:
+    # krok ręczny znika, gdy perf-root.sh przełączył Spotlight na same aplikacje
+    if spotlight and spotlight.get("after") is None and "spotlight" not in state["applied"]:
         names.append("spotlight-privacy")
     record = state["applied"].get("docker-vm")
     if record and record.get("written") and not record.get("active"):
@@ -1681,7 +1694,8 @@ def ultra_on(cfg, system, state):
         before = None
         if name == "bg-helpers" and old is None:
             before = item.measure(cfg, system)
-        if name == "git-speed" and old is None and git_repos(cfg):
+        # także gdy repozytoria doszły do włączonej już poprawki (pusta lista `git_repos`)
+        if name == "git-speed" and not (old or {}).get("repos") and git_repos(cfg):
             before = git_status_ms(system, git_repos(cfg))
         try:
             record, changed = item.apply(cfg, system, old)
@@ -1705,6 +1719,10 @@ def ultra_on(cfg, system, state):
             after = item.measure(cfg, system)
             result = {"before": before, "after": after, "unit": "% rdzenia P"}
         elif name == "git-speed" and before is not None:
+            # fsmonitor startuje demona i buduje cache przy pierwszym statusie: mierzymy
+            # dopiero rozgrzane repo, tak jak zobaczy je następne polecenie agenta
+            git_status_ms(system, git_repos(cfg), runs=2, write_index=True)
+            time.sleep(SETTLE_SECONDS)
             after = git_status_ms(system, git_repos(cfg))
             result = {"before": before, "after": after, "unit": "ms git status"}
         elif name == "claude-hooks-async" and name not in ultra["results"]:
@@ -1722,7 +1740,7 @@ def ultra_on(cfg, system, state):
         if result:
             ultra["results"][name] = result
     spotlight_result(cfg, state, force=True)
-    ultra["pending_root"] = pending_root(cfg, state)
+    sync_root(cfg, state)
     ultra["pending_manual"] = pending_manual(state)
     return report
 
@@ -1745,6 +1763,29 @@ def ultra_off(cfg, system, state):
         del state["applied"][name]
     ultra.update(on=False, applied=[], pending_root=[], pending_manual=[])
     return report
+
+
+# jednostka zmierzonego efektu poprawki roota, jak "unit" w wynikach Ultra
+ROOT_UNITS = {
+    "vnodes": "s drugi przebieg lstat node_modules",
+    "shaper": "ms kolejki wysyłania",
+    "spotlight": "plików w indeksie poza aplikacjami",
+}
+
+
+def sync_root(cfg, state):
+    """Poprawki roota nie należą do Ultra (cofa je tylko perf-root.sh), ale panel pokazuje je
+    obok niej: `root_applied`, ich wyniki i świeżą listę tego, co jeszcze czeka na roota."""
+    ultra = ultra_state(state)
+    names = [n for n in ROOT_UNITS if n in state["applied"]]
+    ultra["root_applied"] = names
+    for name in ROOT_UNITS:
+        result = state["applied"].get(name, {}).get("result")
+        if name in names and result:
+            ultra["results"][name] = dict(result, unit=ROOT_UNITS[name])
+        elif name not in ULTRA:
+            ultra["results"].pop(name, None)
+    ultra["pending_root"] = pending_root(cfg, state) if ultra["on"] else []
 
 
 def refresh_ultra(cfg, state, system):
@@ -1774,6 +1815,7 @@ def refresh_ultra(cfg, state, system):
         result = measure_before_after(tweak("docker-vm"), cfg, system, docker)
         ultra["results"]["docker-vm"] = result
     ultra["pending_manual"] = pending_manual(state)
+    sync_root(cfg, state)
 
 
 def cmd_ultra(cfg, args, system=None):
@@ -2215,15 +2257,30 @@ def cmd_shaper_rate(cfg, args, system=None):
 
 def cmd_record(cfg, args, system=None):
     """Dla perf-root.sh: zapis albo usunięcie poprawki roota w stanie (`record shaper
-    <opis>` / `record shaper --forget`), żeby panel i status ją widziały."""
+    <opis>` / `record shaper --forget`), żeby panel i status ją widziały. `--result
+    PRZED PO` dokłada zmierzony efekt (perf-root.sh trial --keep)."""
     name = args[0] if args else ""
     if tweak(name) is None or not tweak(name).root:
         return 2
+    args = list(args[1:])
+    result = None
+    if "--result" in args:
+        i = args.index("--result")
+        try:
+            result = {"before": float(args[i + 1]), "after": float(args[i + 2])}
+        except (IndexError, ValueError):
+            return 2
+        del args[i : i + 3]
     state = load_state()
     if "--forget" in args:
         state["applied"].pop(name, None)
     else:
-        state["applied"][name] = {"at": time.time(), "detail": " ".join(args[1:])}
+        old = state["applied"].get(name, {})
+        record = {"at": time.time(), "detail": " ".join(args)}
+        if result or old.get("result"):
+            record["result"] = result or old["result"]
+        state["applied"][name] = record
+    sync_root(cfg, state)
     save_state(state)
     log(f"record {' '.join(args)}")
     return 0

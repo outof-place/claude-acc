@@ -11,11 +11,15 @@
 # Działa na ruch z tego Maca i do restartu albo ponownego podłączenia adaptera.
 #
 # vnodes: większy cache vnode (kern.maxvnodes). Jądro trzyma 263168 vnode i przy pracy
-# agentów odzyskuje ich ponad 1000 na sekundę: jedno drzewo node_modules/.pnpm portivo
-# (358 tys. wpisów) nie mieści się w cache, więc każde kolejne skanowanie modułów (tsc,
-# eslint, Turbopack, git status -uall) zaczyna od zera. Koszt: około 1,1 KB pamięci
-# jądra na vnode (vnode, inode APFS, namecache), czyli ~0,6 GB przy 786432. Wartość
-# wraca do domyślnej po restarcie.
+# agentów odzyskuje ich ponad 1000 na sekundę: metadane jednego drzewa node_modules/.pnpm
+# portivo (358 tys. wpisów) nie mieszczą się w cache, więc każde kolejne skanowanie modułów
+# (tsc, eslint, Turbopack, git status -uall) zaczyna od zera. Czysty pomiar drugiego
+# przebiegu lstat: 3,59 -> 2,51 s. Pomaga tylko metadanym; treści plików wypiera presja
+# pamięci, nie odzysk vnode. Koszt: ~1,2 KB pamięci jądra na vnode (vnode, inode APFS,
+# vm object, namecache, ubc), czyli +0,63 GB przy 786432. Jądro nigdy nie zwalnia vnode
+# (vfs.vnstats.vn_dealloc_level=0): po cofnięciu cache przestaje rosnąć, ale pamięć i
+# zajęte vnode zostają do restartu, więc trial bez --keep nie jest pełnym cofnięciem.
+# Bez --persist wartość wraca do domyślnej po restarcie.
 #
 # Uruchomienie:
 #   sudo ./perf-root.sh trial [--rate 27Mbps] [--if en0] [--keep]
@@ -25,7 +29,11 @@
 #   ./perf-root.sh shaper status
 #   sudo ./perf-root.sh vnodes trial [--value 786432] [--keep]
 #        lstat drzewa modułów przed i po, bez --keep wraca stara wartość
-#   sudo ./perf-root.sh vnodes apply|undo [--value 786432]
+#   sudo ./perf-root.sh vnodes apply|undo [--value 786432] [--persist]
+#   sudo ./perf-root.sh spotlight apps-only|undo
+#        Spotlight indeksuje tylko aplikacje: katalogi domowe (poza Applications) i dane
+#        systemu idą na listę Prywatności; undo przywraca poprzednią listę
+#        --persist: LaunchDaemon ustawia wartość przy każdym starcie; undo go zdejmuje
 # Bez --rate limit to `shaper_percent` (90%) uploadu z ostatniego `perf.py bench network`
 # przy tej samej bramie. --dry-run pokazuje polecenia bez wykonywania.
 set -euo pipefail
@@ -34,6 +42,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PERF="$HERE/perf.py"
 DRY=0
 KEEP=0
+PERSIST=0
 RATE=""
 IFACE=""
 VNODES=786432
@@ -42,6 +51,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --keep) KEEP=1 ;;
+    --persist) PERSIST=1 ;;
     --rate) RATE="$2"; shift ;;
     --if) IFACE="$2"; shift ;;
     --value) VNODES="$2"; shift ;;
@@ -182,10 +192,39 @@ trial() {
   rm -rf "$tmp"
 }
 
+# jądro zapomina kern.maxvnodes przy restarcie: ten demon ustawia go od nowa przy starcie
+VNODES_DAEMON=/Library/LaunchDaemons/com.filip.claude-acc.vnodes.plist
+
+vnodes_persist() {
+  echo "przy starcie systemu: kern.maxvnodes=$VNODES ($VNODES_DAEMON)"
+  [ "$DRY" -eq 1 ] && return
+  cat > "$VNODES_DAEMON" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.filip.claude-acc.vnodes</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/sbin/sysctl</string>
+    <string>-w</string>
+    <string>kern.maxvnodes=$VNODES</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLIST
+  chown root:wheel "$VNODES_DAEMON"
+  chmod 644 "$VNODES_DAEMON"
+  launchctl bootout system "$VNODES_DAEMON" 2>/dev/null || true
+  launchctl bootstrap system "$VNODES_DAEMON"
+}
+
 vnodes_apply() {
   need_root vnodes apply
   local before
   before="$(sysctl -n kern.maxvnodes)"
+  PREV_VNODES="$before"
   echo "kern.maxvnodes: $before -> $VNODES"
   do_it sysctl -w kern.maxvnodes="$VNODES"
   if [ "$DRY" -eq 0 ]; then
@@ -195,6 +234,8 @@ vnodes_apply() {
     fi
     as_user record vnodes "$VNODES" "prev=$before"
   fi
+  [ "$PERSIST" -eq 1 ] && vnodes_persist
+  return 0
 }
 
 vnodes_undo() {
@@ -206,8 +247,85 @@ for t in json.load(sys.stdin)["tweaks"]:
         print(t["detail"].split("prev=")[-1])')"
   prev="${prev:-263168}"
   echo "kern.maxvnodes: $(sysctl -n kern.maxvnodes) -> $prev"
+  echo "  (jądro nie zwalnia już zajętych vnode: pamięć wraca dopiero po restarcie)"
   do_it sysctl -w kern.maxvnodes="$prev"
+  if [ -f "$VNODES_DAEMON" ]; then
+    do_it launchctl bootout system "$VNODES_DAEMON" 2>/dev/null || true
+    do_it rm -f "$VNODES_DAEMON"
+  fi
   [ "$DRY" -eq 1 ] || as_user record vnodes --forget
+}
+
+# Lista Prywatności Spotlight siedzi w VolumeConfiguration.plist, ale mds trzyma ją w pamięci
+# i przy `mdutil -i` zapisuje swoją wersję z powrotem. Działa: zapis pliku, SIGKILL dla mds
+# (bez szansy na zapis), launchd stawia go od nowa z listą z dysku, potem przebudowa indeksu,
+# żeby wypadły stare wpisy. `launchctl kickstart` blokuje SIP, zwykły kill nie.
+SPOTLIGHT_CONFIG=/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist
+
+spotlight_exclusions() {
+  # $1: "apps-only" albo plik z listą do przywrócenia; wypisuje poprzednią listę
+  /usr/bin/python3 - "$SPOTLIGHT_CONFIG" "$1" "$(eval echo "~$USER_NAME")" <<'PY'
+import json, os, plistlib, sys
+path, mode, home = sys.argv[1:4]
+raw = open(path, "rb").read()
+data = plistlib.loads(raw)
+before = data.get("Exclusions", [])
+if mode == "apps-only":
+    wanted = [os.path.join(home, n) for n in sorted(os.listdir(home))
+              if not n.startswith(".") and n != "Applications"
+              and os.path.isdir(os.path.join(home, n)) and not os.path.islink(os.path.join(home, n))]
+    wanted += [p for p in ("/Library", "/opt", "/usr/local", "/Users/Shared") if os.path.isdir(p)]
+else:
+    wanted = json.load(open(mode))
+data["Exclusions"] = wanted
+tmp = path + ".tmp"
+with open(tmp, "wb") as f:
+    plistlib.dump(data, f, fmt=plistlib.FMT_BINARY if raw.startswith(b"bplist") else plistlib.FMT_XML)
+st = os.stat(path)
+os.chown(tmp, st.st_uid, st.st_gid)
+os.chmod(tmp, st.st_mode & 0o7777)
+os.replace(tmp, path)
+print(json.dumps(before))
+PY
+}
+
+spotlight_reload() {
+  # mds bez zapisu na wyjściu, launchd go podnosi; potem indeks od zera (mały: same aplikacje)
+  do_it pkill -9 -x mds
+  sleep 5
+  do_it mdutil -E /System/Volumes/Data >/dev/null
+}
+
+spotlight_apply() {
+  need_root spotlight apps-only
+  local state_dir prev
+  state_dir="$(eval echo "~$USER_NAME")/.local/share/claude-acc"
+  if [ "$DRY" -eq 1 ]; then
+    echo "  (dry-run) lista Prywatności: katalogi domowe poza Applications, /Library, /opt, /usr/local"
+    return
+  fi
+  prev="$(spotlight_exclusions apps-only)"
+  # poprzednia lista na undo, tylko przy pierwszym zastosowaniu
+  [ -f "$state_dir/spotlight-exclusions.json" ] || {
+    echo "$prev" > "$state_dir/spotlight-exclusions.json"
+    chown "$USER_NAME" "$state_dir/spotlight-exclusions.json"
+  }
+  spotlight_reload
+  as_user record spotlight "apps-only"
+  echo "Spotlight indeksuje tylko aplikacje; cofnięcie: sudo $0 spotlight undo"
+}
+
+spotlight_undo() {
+  need_root spotlight undo
+  local state_dir
+  state_dir="$(eval echo "~$USER_NAME")/.local/share/claude-acc"
+  [ -f "$state_dir/spotlight-exclusions.json" ] || { echo "brak zapisanej listy" >&2; exit 1; }
+  [ "$DRY" -eq 1 ] && { echo "  (dry-run) przywracam listę z $state_dir/spotlight-exclusions.json"; return; }
+  spotlight_exclusions "$state_dir/spotlight-exclusions.json" >/dev/null
+  spotlight_reload
+  rm -f "$state_dir/spotlight-exclusions.json"
+  as_user record spotlight --forget
+  echo "przywrócona poprzednia lista Prywatności Spotlight"
 }
 
 vnodes_trial() {
@@ -225,7 +343,15 @@ vnodes_trial() {
     trap - INT TERM
     vnodes_undo
   else
-    echo "nowa wartość zostaje do restartu; cofnięcie: sudo $0 vnodes undo"
+    # zmierzony efekt trafia do stanu, żeby panel pokazał przed i po
+    [ "$DRY" -eq 1 ] || as_user record vnodes "$VNODES" "prev=$PREV_VNODES" --result \
+      "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fs"]["warm_s"])' "$tmp/before.json")" \
+      "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fs"]["warm_s"])' "$tmp/after.json")"
+    if [ "$PERSIST" -eq 1 ]; then
+      echo "nowa wartość zostaje, także po restarcie; cofnięcie: sudo $0 vnodes undo"
+    else
+      echo "nowa wartość zostaje do restartu (--persist: na stałe); cofnięcie: sudo $0 vnodes undo"
+    fi
   fi
   [ "$DRY" -eq 1 ] || /usr/bin/python3 -c 'import json,sys
 a, b = (json.load(open(p))["fs"] for p in sys.argv[1:3])
@@ -243,6 +369,8 @@ case "$CMD $SUB" in
   "vnodes trial") vnodes_trial ;;
   "vnodes apply") vnodes_apply ;;
   "vnodes undo") vnodes_undo ;;
+  "spotlight apps-only") spotlight_apply ;;
+  "spotlight undo") spotlight_undo ;;
   *)
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     exit 2

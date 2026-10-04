@@ -38,6 +38,25 @@ Komendy:
   admit                 hook PreToolUse (Bash) dla Claude Code; zdarzenie czyta z stdin
 """
 
+import sys
+
+# Hook idzie przy każdym poleceniu Bash każdego agenta, więc komenda bez śladu dev serwera
+# kończy się tutaj, zanim załadują się ctypes, janitor i wyrażenia regularne. Słowa to
+# minimum, które ma każda komenda pasująca do START (dev, vite, expo, webpack serve);
+# fałszywy alarm (np. "dev" w nazwie pliku) idzie po prostu pełną ścieżką.
+if __name__ == "__main__" and sys.argv[1:2] == ["admit"]:
+    import io
+    import json
+
+    _event = sys.stdin.read()
+    try:
+        _command = (json.loads(_event).get("tool_input") or {}).get("command") or ""
+    except (ValueError, AttributeError):
+        sys.exit(0)
+    if not any(word in _command for word in ("dev", "vite", "expo", "serve")):
+        sys.exit(0)
+    sys.stdin = io.StringIO(_event)
+
 import ctypes
 import ctypes.util
 import fcntl
