@@ -298,6 +298,8 @@ w `perf-state.json`, co było przed nimi. `off` przywraca dokładnie poprzednie 
 | `devguard-budget` | dev | `budget_percent` 25 w `devguard.json` | 35% RAM (16,8 GB) -> 25% (12 GB); polityka |
 | `devguard-max-server` | dev | `max_server_gb` 4 w `devguard.json` | 5 -> 4 GB na serwer; polityka (Turbopack dobija do 7-9 GB) |
 | `git-speed` | dev | `core.untrackedCache` + `core.fsmonitor` w repozytoriach z `git_repos` | klon portivo 71 -> 26 ms; domyślnie pusta lista |
+| `fast-npx-hooks` | claude | hooki formatowania owinięte `npx-fast-wrap.sh` (faza 3) | hook na plikach portivo 3,3-6,6 s -> 39-82 ms; edycja pliku formatowanego 3,25 s p50 przed |
+| `claude-limits` | claude | `env.BASH_MAX_TIMEOUT_MS` 3600000 (faza 3) | ~20 poleceń na dobę ściętych do 10 min wbrew timeoutowi agenta przed |
 
 Hooki zmieniają się na żywo, bez restartu sesji. Po włączeniu wpisy cavemem PostToolUse
 zniknęły z transkryptów także sesji otwartych wcześniej (było 2389 na godzinę, przyszło 6).
@@ -390,6 +392,191 @@ Gdzie ustawić `NODE_COMPILE_CACHE` dla terminali Orki:
 | `skipWebFetchPreflight` (ustawienie) | pomija sprawdzanie bezpieczeństwa domeny przy WebFetch | nie: to zabezpieczenie |
 | `USE_BUILTIN_RIPGREP=0` | używa systemowego rg zamiast dołączonego | nie: dokumentacja podaje to jako obejście zgodności |
 | `async: true` w hooku | „hook runs in background without blocking” (schemat w binarce 2.1.289) | tak, dla cavemem PostToolUse i Stop |
+
+## Faza 3: obrót agentów i limity Claude Code
+
+Cel użytkownika: agenci mają mieć do dyspozycji całą wydajność Maca (szybkie odpowiedzi,
+czytanie plików, edycje, testy Go), a Claude Code ma działać bez sztucznych sufitów.
+
+Wszystko zmierzone 2026-10-04 wieczorem, po stanie z main c75f6d8. Na Macu działały już
+wtedy:
+- Spotlight tylko dla aplikacji,
+- `kern.maxvnodes` 786432,
+- git-speed dla portivo,
+- Docker z 6 GB pamięci,
+- wyłączone Hasła w menu bar,
+- szybka ścieżka hooka admit.
+
+### Skąd liczby
+
+Obrót narzędzia liczę od wpisu asystenta z `tool_use` do wpisu z `tool_result` w
+transkryptach Claude Code, łącznie z subagentami (`~/.claude/projects/**/*.jsonl`). To
+czas, który sesja naprawdę czeka: wykonanie narzędzia razem z hookami Pre i Post.
+
+`perf.py bench agents` liczy to samo dla ostatniej doby i zapisuje w `perf-state.json`.
+
+Ostatnia doba, 109 transkryptów (bez tej sesji badawczej):
+
+| narzędzie | wywołań | p50 | p90 | suma |
+|---|---|---|---|---|
+| Bash: rg/grep/find | 4867 | 238 ms | 722 ms | 261 min |
+| Bash: go test | 280 | 10,6 s | 68 s | 126 min |
+| Bash: pnpm/npm/npx | 722 | 2,1 s | 19,7 s | 111 min |
+| Bash: node | 442 | 2,1 s | 28 s | 111 min |
+| Bash: pliki (ls/cat/sed) | 2460 | 215 ms | 787 ms | 75 min |
+| Bash: git | 1811 | 290 ms | 1,6 s | 46 min |
+| Edit pliku formatowanego (.ts/.tsx/.md/.json/.yml/.css/.mjs) | 362 | **3,25 s** | **9,4 s** | |
+| Write pliku formatowanego | 179 | 805 ms | 7,0 s | |
+| Edit/Write innych plików (.go/.py/.sh/.sql) | 1372 | 102 ms | 160 ms | |
+| Bash: go build/vet/run | 69 | 10,5 s | 62 s | 26 min |
+| Read | 1522 | 93 ms | 268 ms | 9 min |
+| Bash: make | 10 | 87 s | 90 s | 9 min |
+| Bash: golangci-lint | 16 | 679 ms | 27 s | 10 min |
+
+Edycje według rozszerzenia (p50 / p90):
+
+| rozszerzenie | p50 | p90 |
+|---|---|---|
+| .ts | 5,4 s | 11,8 s |
+| .tsx | 7,0 s | 20,1 s |
+| .json | 3,5 s | 5,2 s |
+| .yml | 4,3 s | 7,1 s |
+| .css | 3,7 s | 4,5 s |
+| .mjs | 2,9 s | 9,1 s |
+| .md | 537 ms | 4,6 s |
+| .go, .sh, .py, .sql | 100-126 ms | 158-198 ms |
+
+### Trzy największe wąskie gardła
+
+**1. Hooki formatowania wołały `npx`, który w monorepo pnpm szuka narzędzia sekundami.
+Naprawione.**
+
+- `~/.claude/hooks/auto-format.sh` po każdym Write/Edit woła po kolei `npx --no-install
+  eslint --fix` i `npx --no-install prettier --write`. `ts-typecheck.sh` woła `npx
+  --no-install tsc`.
+- W portivo eslinta i prettiera nie ma w żadnym `node_modules/.bin`. Mimo to npx czyta
+  najpierw całe drzewo modułów i dopiero potem się poddaje:
+  - w `apps/landing-page` trwa to 3,3-8,8 s (kod 127);
+  - w katalogu bez node_modules trwa 0,25 s.
+- Edycja .ts płaciła to dwa razy z rzędu, za nic: obie komendy kończą się błędem i plik
+  zostaje, jaki był.
+
+Poprawka `fast-npx-hooks` nie rusza skryptów hooków użytkownika:
+
+- **Owinięcie:** komenda hooka w `~/.claude/settings.json` dostaje przed sobą
+  `npx-fast-wrap.sh`, który kładzie na początek PATH atrapę `npx` (`hooks/npx-fast/npx`).
+- **Atrapa:** `npx --no-install [--quiet] <narzędzie>` szuka narzędzia w
+  `node_modules/.bin` od bieżącego katalogu w górę. Znalezione uruchamia od razu, a brak
+  kończy kodem 127, jak npx. Każde inne wywołanie npx przekazuje prawdziwemu npx.
+- **Cofnięcie:** oryginalna komenda jest zapisana w `perf-state.json` i wraca bajt w bajt.
+
+Zmierzone na prawdziwych plikach portivo. Formatterów tam nie ma, więc obie wersje niczego
+nie zmieniają; sprawdziłem, że mtime plików jest ten sam:
+
+| | npx | szybki npx |
+|---|---|---|
+| auto-format.sh na `package.json` | 3297 ms | 39 ms |
+| auto-format.sh na `src/i18n.ts` | 6643 ms | 82 ms |
+| `npx --no-install tsc --version` | 236 ms | 54 ms |
+| `npx --version` (przekazane dalej) | 82 ms | 88 ms |
+
+Na żywo, od 21:32, pierwsze 17 minut (włączone przez `perf.py apply`): edycje plików formatowanych p50 78 ms (n=4; Write .md/.json 67-83 ms, Edit .ts z tsc 1,9 s), przed 2,1 s p50 w dobie (n=541). Próbka jest mała, kierunek zgodny z pomiarem wyżej; `perf.py bench agents` pokaże pełną dobę.
+
+**2. Testy Go czekają na zamek i na sufit 10 minut. Zamek zostaje, sufit podniesiony.**
+
+- **Zamek plock (decyzja właściciela, nie ruszam):** testy i buildy charter-service idą
+  przez wspólny zamek `~/.claude/portivo-locks/plock.py go`. Do tego dochodzi `go env
+  GOFLAGS=-p=4`, którego wymaga hook `depot-heavy-go.sh` portivo: jedna kompilacja
+  charter-service to 4-6 GB, dwie naraz 10-12 GB.
+  - Z 422 poleceń pod zamkiem w ostatniej dobie 27 czekało, razem 18 minut, mediana 24 s,
+    najdłużej 153 s.
+- **Sufit 10 minut:** w dwie doby 59 poleceń Bash zatrzymało się na 600 s. Około 40 z nich
+  miało od agenta timeout dłuższy niż 10 minut (15-62 min: testy Go pod zamkiem, czekanie
+  na buildy na Depot, pętle `until ...`). Claude Code ściął je do 10 minut i przeniósł w
+  tło, więc agent musiał potem odpytywać plik z wyjściem.
+- **Poprawka `claude-limits`:** `BASH_MAX_TIMEOUT_MS` = 3600000 (1 h).
+  - Według dokumentacji to tylko sufit, o który model może poprosić. Domyślny limit 2
+    minut się nie zmienia, a limity zadań w tle też nie, bo te zmieniają się dopiero
+    powyżej 2 godzin.
+  - Na żywo: w pierwszych 17 minutach żadne polecenie nie zostało ścięte. Pełny obraz da dopiero doba, bo przed zmianą było około 20 takich poleceń na dobę.
+
+**3. Stały koszt każdego polecenia Bash: około 200 ms. Nic więcej do wyciągnięcia.**
+
+- Nawet `ls` czy `echo` mają p50 215 ms. Przed poleceniem hooki działają równolegle, więc
+  liczy się najdłuższy z nich:
+
+  | hook przed poleceniem Bash | p50 |
+  |---|---|
+  | devguard admit (z szybką ścieżką) | 36 ms |
+  | rg-rewrite.sh (portivo) | 26 ms |
+  | depot-heavy-go.sh (portivo) | 22 ms |
+  | rtk-enforce | 21 ms |
+
+- Po poleceniu czeka już tylko hook Orki (24 ms), bo cavemem chodzi w tle od fazy 2.
+- Snapshot powłoki Claude (147 KB) źródłuje się w 20 ms.
+- Resztę stanowią sam Claude Code i zapis transkryptu.
+
+### Limity Claude Code (2.1.289)
+
+Sprawdzone trzema drogami:
+- dokumentacja (Context7, `/websites/code_claude`: env-vars, workflows, tools-reference);
+- wartości domyślne wprost w binarce;
+- środowisko 9 działających sesji (żadna nie ma ustawionego żadnego z tych limitów).
+
+| pokrętło | teraz | domyślnie | sygnały w transkryptach (48 h) | decyzja |
+|---|---|---|---|---|
+| `BASH_MAX_TIMEOUT_MS` | 3600000 (Ultra) | 600000 | ~40 poleceń z dłuższym timeoutem ściętych do 10 min | **podniesione do 1 h** (`claude-limits`) |
+| `BASH_DEFAULT_TIMEOUT_MS` | brak | 120000 | 24 polecenia bez własnego timeoutu ucięte na 2 min; to głównie `sleep 240`, zawieszone curl i docker | bez zmian; dłuższy domyślny limit przedłużyłby czekanie na zawieszone polecenia; agenci i tak podają timeout (319 razy 300 s) |
+| `BASH_MAX_OUTPUT_LENGTH` | brak | 30000 znaków | 161 razy „Output too large” (wyjście trafia do pliku) | bez zmian; więcej to więcej kontekstu w każdej rozmowie |
+| `MAX_MCP_OUTPUT_TOKENS` | brak | 25000 | 3 przekroczenia | zalecenie: 50000, jeśli te serwery MCP są ważne |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | brak | zależne od modelu | 0 odpowiedzi ucięte na `max_tokens` | bez zmian |
+| `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY` | brak | 10 | najwięcej 3 narzędzia w jednej wiadomości | bez zmian |
+| `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` | brak | 20 | 0 razy „Concurrent subagent limit reached” | bez zmian |
+| `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` | brak | 3 (albo z flag funkcji, ale `DISABLE_TELEMETRY` je wyłącza) | 0 razy „nesting limit reached” | bez zmian |
+| `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS` | brak | liczba rdzeni, tu 16 | brak śladu w transkryptach | bez zmian; podnieść tylko pod konkretny workflow |
+| `workflowSizeGuideline` | brak, czyli `medium` (<10 agentów) | `medium` | to podpowiedź dla modelu, a nie limit | zalecenie na życzenie: `large` (<50) albo `unrestricted`; więcej agentów to więcej tokenów i RAM |
+| `CLAUDE_CODE_SUBAGENT_MODEL` | brak, czyli model główny | `inherit` | | bez zmian; szybszy model przyspieszy subagentów kosztem jakości |
+| myślenie / wysiłek | `effortLevel: xhigh`, myślenie adaptacyjne | | | bez zmian |
+| `MCP_TIMEOUT` / `MCP_TOOL_TIMEOUT` | brak | 30 s / ~28 h | | bez zmian |
+| timeouty hooków | 10-30 s na hook | 600 s | | bez zmian |
+| autocompact | `autoCompactWindow` 1000000, włączony | | | bez zmian |
+| ustawienia agentów w Orce | `claudeAgentTeamsMode: off`, `keepComputerAwakeWhileAgentsRun: true`, hibernacja wyłączona | | | nic nie ogranicza współbieżności |
+
+### Reszta z listy
+
+- **Priorytet drzew agentów:** wszystko pod hostem terminali Orki działa z pri 31 i nice 0
+  (claude, node, pnpm, next-server, air, git, go).
+  - claude liczy w 80% na rdzeniach P, next-server w 90%.
+  - node ma 44%, ale to głównie cavemem worker i dev serwery, które celowo są w tle.
+  - Nic nie działa poniżej domyślnego priorytetu, więc nie ma czego poprawiać.
+- **golangci-lint to agenci, nie hook:** 16 uruchomień na dobę przez plock z
+  `--concurrency 4`, p50 0,7 s (z cache), p90 27 s. Jedno uruchomienie rodzi setki
+  procesów potomnych przez loader pakietów; stąd 254 starty w 30 s. Cache (137 MB) zostaje.
+- **Go:**
+  - `GOCACHE` ma teraz 8,2 GB, `GOMAXPROCS` jest domyślny (16), a `GOFLAGS=-p=4` to
+    wymaganie RAM guarda portivo.
+  - `-buildvcs`: `go test` nie stempluje VCS, a przy `go build` git status trwa po
+    git-speed 28 ms, więc nie ma czego oszczędzać.
+  - Janitor kasuje cały `GOCACHE` po przekroczeniu 20 GB (3 października było to 87,5 GB),
+    więc następne buildy są zimne. Usuwanie tylko najstarszych wpisów byłoby łagodniejsze.
+    Nie zmierzyłem tego, bo w transkryptach różnicy nie widać na tle zmian obciążenia; to
+    temat dla `janitor.py`.
+- **Orca i `ps`:**
+  - Orca odpala `ps -axo pid,ppid,pgid,tpgid,stat,tty,lstart,command` około 1,4 razy na
+    sekundę (70 ms, w tym 60 ms w jądrze); kolumna `tty` każe `ps` przeszukać `/dev`.
+  - Ani w `orca --help`, ani w ustawieniach (`orca-data.json`) nie ma pokrętła do
+    odpytywania. Binarki nie zmieniam, więc to temat dla twórców Orki: mogliby czytać
+    `libproc` albo pominąć `tty`.
+- **WindowServer** (`sudo powermetrics --samplers tasks,gpu_power` i `sudo sample`):
+  - 429 ms CPU na sekundę, 658 wybudzeń/s, 215 terminów poniżej 2 ms na sekundę.
+  - W `sample` aktywna część to `CA::Render::Updater::prepare_layer`, czyli przeliczanie
+    drzewa warstw przy każdej klatce. Koszt rośnie z liczbą warstw na ekranie, a nie z
+    jedną aplikacją.
+  - Bez chowania okien jedno po drugim nie da się wskazać winnego. Narzędzie do tego to
+    `perf.py bench gpu` przed i po.
+- **secd:** w pierwszym `powermetrics` palił 40% CPU, a ctkd 10%. To było uwierzytelnianie
+  Touch ID tego samego `sudo`. Pół minuty później secd miał 0,1%, a nikt nie wołał
+  `security`.
 
 ## Wyniki ogólne: sieć, CPU, GPU
 
@@ -580,6 +767,16 @@ całe 8 GB. Virtualization.framework nie oddaje pamięci, którą raz dotknął 
 
 Najpierw praca agentów, potem ogólne.
 
+0. **Faza 3, na żywo od 2026-10-04 21:32** (włączone przez `perf.py apply`, jeszcze nie
+   przez Ultrę):
+   - **`fast-npx-hooks`:** hooki formatowania bez wolnego npx.
+   - **`claude-limits`:** sufit Bash 1 h.
+
+   Po scaleniu i instalacji `hooks/` musi trafić obok `perf.py`. Potem `claude-acc perf
+   undo fast-npx-hooks claude-limits && claude-acc perf ultra on` przenosi obie poprawki
+   pod Ultrę. Działają tak samo, ale panel pokaże je w karcie Ultry z wynikami „przed” i
+   „po”.
+
 1. **`perf.py ultra on`** (włączone 2026-10-04 wieczorem). Robi jednocześnie:
    - **cavemem worker w tle:** rdzeń P 32% -> 0,1%;
    - **hooki cavemem w tle:** PostToolUse 53 -> 24 ms p50 na każde narzędzie, działa od
@@ -638,7 +835,7 @@ Najpierw praca agentów, potem ogólne.
 
 ```
 perf.py ultra on|off|status [--json]                         # wszystko dla agentów naraz
-perf.py bench [network|cpu|gpu|fs|all] [--runs N] [--json]   # pomiar, zapis w perf-state.json
+perf.py bench [network|cpu|gpu|fs|agents|all] [--runs N] [--json]   # pomiar, zapis w perf-state.json
 perf.py status [--json]                                      # poprawki i ostatnie pomiary
 perf.py list                                                 # poprawki z grupą i efektem
 perf.py apply <nazwa> | --all [--dry-run]

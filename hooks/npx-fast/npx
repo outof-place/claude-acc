@@ -1,0 +1,48 @@
+#!/bin/bash
+# `npx --no-install [--quiet] <narzędzie> [argumenty]` bez npm: szuka narzędzia w
+# node_modules/.bin od bieżącego katalogu w górę i uruchamia je od razu. W monorepo pnpm
+# prawdziwy npx najpierw czyta całe drzewo node_modules i szuka 3,5-8,8 s także wtedy,
+# gdy narzędzia nie ma; hooki formatowania płaciły to przy każdej edycji.
+# Brak narzędzia kończy się kodem 127, jak u npx. Każde inne wywołanie (bez --no-install,
+# z innymi flagami albo ze ścieżką zamiast nazwy) idzie bez zmian do prawdziwego npx.
+here="$(cd "$(dirname "$0")" && pwd)"
+
+real_npx() {
+  local rest="" part
+  local IFS=:
+  for part in $PATH; do
+    [ "$part" = "$here" ] || rest="${rest:+$rest:}$part"
+  done
+  PATH="$rest"
+  export PATH
+  exec npx "$@"
+}
+
+no_install=0
+i=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-install | --no) no_install=1 ;;
+    --quiet | -q) ;;
+    -*) real_npx "$@" ;;
+    *) break ;;
+  esac
+  i=$((i + 1))
+done
+if [ "$no_install" -ne 1 ] || [ "$i" -gt "$#" ]; then
+  real_npx "$@"
+fi
+
+tool="${!i}"
+case "$tool" in */* | *@*) real_npx "$@" ;; esac
+dir="$PWD"
+while :; do
+  if [ -x "$dir/node_modules/.bin/$tool" ]; then
+    shift "$i"
+    exec "$dir/node_modules/.bin/$tool" "$@"
+  fi
+  [ "$dir" = "/" ] && break
+  dir="$(dirname "$dir")"
+done
+echo "npx: $tool: nie ma go w node_modules/.bin" >&2
+exit 127
