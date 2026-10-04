@@ -242,6 +242,10 @@ struct Ultra: Decodable {
             detail: "Every new Go test binary waits ~0.2 s for Gatekeeper. Click +, pick Orca, confirm with Touch ID.",
             command: nil,
             pane: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools"),
+        "devtools-restart": Step(
+            title: "Restart Orca once",
+            detail: "Developer Tools applies to Orca started after the change. A restart closes the sessions in its terminals.",
+            command: nil),
         "docker-quit": Step(title: "Quit Docker once", detail: "The new memory cap is written while Docker is closed.", command: nil),
         "docker-restart": Step(title: "Restart Docker", detail: "The new memory cap applies on its next start.", command: nil),
     ]
