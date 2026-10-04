@@ -1,0 +1,18 @@
+{
+ "last_sweep": {
+  "at": 1790424897.435127,
+  "freed": 3650722202,
+  "items": 41,
+  "duration": 38
+ },
+ "freed_total": 65712999629,
+ "alerts": [
+  {
+   "kind": "spotlight",
+   "projects": [
+    "shop",
+    "mobile-app"
+   ]
+  }
+ ]
+}

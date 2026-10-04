@@ -1,7 +1,10 @@
 import Foundation
 
-/// Odpowiedź `claude-acc status --json`. Całą logikę kont trzyma skrypt,
-/// aplikacja tylko ją pokazuje i woła jego komendy.
+let gigabyte = 1_073_741_824.0
+
+// MARK: - Accounts (`claude-acc status --json`)
+
+/// The script owns all account logic; the app only shows it and calls its commands.
 struct Snapshot: Decodable {
     let generatedAt: Double
     let activeEmail: String?
@@ -11,14 +14,16 @@ struct Snapshot: Decodable {
     let apiBackoffUntil: Double?
     let lastTick: Double?
     let switchedAt: Double?
-    /// Konto wybrane w menu Orca. Wtedy automat stoi, a przełączanie jest zablokowane.
+    /// Account selected in Orca's menu. Auto-switch then stands still and switching is blocked.
     let orcaSelected: String?
     let accounts: [Account]
 
     var active: Account? { accounts.first { $0.active } }
     var others: [Account] { accounts.filter { !$0.active } }
-    /// Konto, na które automat przełączy jako następne.
-    var next: Account? { others.filter { $0.queue != nil }.min { $0.queue! < $1.queue! } }
+    /// The account auto-switch moves to next.
+    var next: Account? {
+        others.compactMap { account in account.queue.map { (account, $0) } }.min { $0.1 < $1.1 }?.0
+    }
     var anyNeedsLogin: Bool { accounts.contains { $0.status == .needsLogin } }
 }
 
@@ -63,14 +68,175 @@ struct Account: Decodable, Identifiable {
     let session: UsageWindow?
     let weekly: UsageWindow?
     let dataAge: Int?
-    /// Miesięczna rocznica startu subskrypcji: API nie podaje daty z rachunku.
+    /// Monthly anniversary of the subscription start: the API has no billing date.
     let renewsAt: Double?
     let subscriptionStatus: String?
 
-    /// Wpis w Orca potrafi trzymać inne konto niż głosi jego etykieta.
-    var mislabeled: Bool { realEmail != nil && realEmail?.lowercased() != email.lowercased() }
-    /// Najbardziej zużyte okno: to ono pierwsze zatrzyma pracę.
-    var worstUsed: Double? {
-        [session?.used, weekly?.used].compactMap { $0 }.max()
+    /// An Orca entry can hold a different account than its label says.
+    var mislabeled: Bool { realEmail.map { $0.lowercased() != email.lowercased() } ?? false }
+    /// The most used window: it is the one that stops work first.
+    var worstUsed: Double? { [session?.used, weekly?.used].compactMap(\.self).max() }
+}
+
+// MARK: - Cleanup (`janitor-state.json`)
+
+struct JanitorState: Decodable {
+    struct Sweep: Decodable {
+        let at: Double
+        let freed: Double
+        let items: Int
+        let duration: Double
     }
+
+    struct Alert: Decodable, Hashable {
+        let kind: String
+        let free: Double?
+        let projects: [String]?
+        let task: String?
+        let error: String?
+    }
+
+    let lastSweep: Sweep?
+    let freedTotal: Double?
+    /// A sweep in progress; a crashed script can leave the mark, so only a fresh one counts.
+    let runningSince: Double?
+    let alerts: [Alert]?
+}
+
+struct DiskSpace {
+    let free: Double
+    let total: Double
+
+    var used: Double { 1 - free / total }
+}
+
+// MARK: - Dev server guard (`devguard-state.json`)
+
+struct GuardState: Decodable {
+    let snapshot: GuardSnapshot?
+    let events: [GuardEvent]?
+    /// `[time, dev servers, swap, compressed]` every 30 seconds, two hours back.
+    let history: [[Double]]?
+}
+
+struct GuardSnapshot: Decodable {
+    let at: Double
+    let mode: String
+    let pressure: MemoryPressure
+    let budget: Double
+    let total: Double
+    let orca: Bool
+    let units: [GuardUnit]
+    let plans: [GuardPlan]
+
+    func plan(for unit: GuardUnit) -> GuardPlan? { plans.first { $0.unit == unit.key } }
+}
+
+struct MemoryPressure: Decodable {
+    let level: Int
+    let notes: [String]?
+    let available: Int?
+    let swapUsed: Double
+    let swapTotal: Double
+    let swapping: Bool
+    let compressed: Double
+    let ram: Double
+}
+
+/// A command and the dev servers it started: one `next dev`, or a whole `pnpm dev` stack.
+struct GuardUnit: Decodable, Identifiable {
+    struct Client: Decodable {
+        let pid: Int
+        let kind: String
+        let name: String
+    }
+
+    struct Tab: Decodable {
+        let url: String?
+        let focused: Bool?
+    }
+
+    let key: String
+    let root: Int
+    let ports: [Int]
+    let kinds: [String]
+    let cwd: [String]
+    let footprint: Double
+    let peak: Double
+    let host: String
+    let command: String?
+    let terminal: String?
+    let clients: [Client]
+    let tabs: [Tab]
+    let attended: Bool
+    let agentWorking: Bool
+    let recyclable: Bool
+    let quiet: Int
+    let protected: Bool
+    let background: Bool?
+    let servers: Int?
+    let launchCwd: String?
+
+    var id: String { key }
+    var isStack: Bool { (servers ?? 1) > 1 }
+
+    var title: String {
+        isStack ? "Dev stack" : URL(fileURLWithPath: cwd.first ?? "").lastPathComponent
+    }
+
+    /// The worktree it runs in: `…/portivo-landing-spacing/apps/landing-page` → `portivo-landing-spacing`.
+    var place: String {
+        let path = isStack ? (launchCwd ?? cwd.first ?? "") : (cwd.first ?? "")
+        let parts = path.split(separator: "/").map(String.init)
+        if let apps = parts.lastIndex(where: { $0 == "apps" || $0 == "packages" }), apps > 0 {
+            return parts[apps - 1]
+        }
+        return isStack ? (parts.last ?? path) : (parts.dropLast().last ?? path)
+    }
+
+    var portLabel: String {
+        guard let first = ports.first else { return "pid \(root)" }
+        return ports.count > 1 ? ":\(first) +\(ports.count - 1)" : ":\(first)"
+    }
+
+    enum Viewers { case you, agents, headless, nobody }
+
+    var viewers: Viewers {
+        if attended { return .you }
+        if !tabs.isEmpty || clients.contains(where: { $0.kind == "orca" }) { return .agents }
+        if clients.contains(where: { $0.kind == "headless" }) { return .headless }
+        return clients.isEmpty ? .nobody : .agents
+    }
+}
+
+/// Numbers behind a decision; the script's own sentence stays in its Polish log.
+struct GuardReason: Decodable {
+    let keep: Int?
+    let minutes: Int?
+    let size: Double?
+    let limit: Double?
+    let level: Int?
+    let total: Double?
+    let budget: Double?
+    let restarts: Int?
+}
+
+struct GuardPlan: Decodable {
+    let unit: String
+    let action: String
+    let code: String?
+    let data: GuardReason?
+}
+
+struct GuardEvent: Decodable, Identifiable {
+    let at: Double
+    let action: String
+    let label: String
+    let size: Double?
+    let code: String?
+    let data: GuardReason?
+    let ports: [Int]?
+    let ok: Bool
+
+    var id: Double { at }
 }

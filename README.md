@@ -2,14 +2,14 @@
 
 Keeps Claude Code working when you have more than one Claude subscription. A menu bar app shows the 5-hour and weekly usage of every account, and a background job moves your running Claude Code sessions to the account with the most headroom once the current one runs out. No restart, no `/login`, no terminal.
 
-<img src="docs/panel.png" width="350" alt="Claude Acc panel: active account with 5-hour and weekly usage bars, the other accounts with their reset times, and a login button for an expired account">
+<img src="docs/panel.png" width="750" alt="Claude Acc panel: on the left the active account with 5-hour and weekly usage and the other accounts in one line each; on the right the dev servers with a memory chart against the budget, who watches each one and what the guard will do, then free disk space and the last cleanup">
 
 The UI text and the code comments are in Polish.
 
 ## What it does
 
-- **Menu bar ring** with the usage of the active account, for whichever window (5 hours or weekly) runs out first. It turns orange at 75% and red at 90%. An orange dot means some account needs to log in again.
-- **Panel** with every account: 5-hour and weekly bars, when each window resets ("za 2h 5min", "za 4d 4h"), which account goes next, and when the subscription renews. For the active account it also shows when, at the current pace, the watcher will switch away from it.
+- **Menu bar ring** with the usage of the active account, for whichever window (5 hours or weekly) runs out first. It turns orange at 75% and red at 90%. An orange dot means some account needs to log in again, a red one that the Mac is running out of memory.
+- **Panel**, wide rather than tall so it fits under the menu bar of a laptop. On the left every account: 5-hour and weekly usage, which account goes next, and (in the tooltip) when each window resets ("in 2h 5m", "in 4d 4h") and when the subscription renews. For the active account it also shows when, at the current pace, the watcher will switch away from it. On the right the Mac: dev servers with a two-hour memory chart against the budget, who watches each one, what the guard is about to do, buttons to restart or stop one and to turn the guard off; free disk space and the last cleanup.
 - **Automatic switching** when the active account is down to 5% of the session or 3% of the week. It picks the account with the most weekly headroom and keeps accounts you mark as last resort (a company seat, say) for the end.
 - **One-click switch** to any account. Running sessions keep working because Claude Code reads its credentials from the Keychain on the fly.
 - **Log in again** for an account whose refresh token died. The button runs `claude auth login` in the background and opens the browser with the email pre-filled. Before saving anything, it asks the API which account you actually signed into, so a browser logged into the wrong account can't overwrite anything.
@@ -20,7 +20,7 @@ The UI text and the code comments are in Polish.
 A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Claude Code reads `Claude Code-credentials`, plus `Claude Code-credentials-<first 8 hex chars of sha256(config dir)>` when `CLAUDE_CONFIG_DIR` is set. [Orca](https://github.com/stablyai/orca) keeps a copy of every account you add to it under `Orca Claude Code Managed Credentials`. Switching accounts means copying one account's `claudeAiOauth` into the entries the live sessions read.
 
 - `accswitch.py` holds all the logic. launchd runs `accswitch.py tick` every 2 minutes, with or without the app.
-- The menu bar app (SwiftUI) is a thin UI. It runs `accswitch.py status --json` every minute and `switch` or `login` when you click.
+- The menu bar app (SwiftUI, Swift 6 with main-actor default isolation, Liquid Glass controls, Swift Charts) is a thin UI. It runs `accswitch.py status --json` every minute and `switch` or `login` when you click, and reads `janitor-state.json` and `devguard-state.json`, every 3 seconds while the panel is open.
 - Usage comes from `GET https://api.anthropic.com/api/oauth/usage`, and the account behind a token from `/api/oauth/profile`.
 
 ## How it avoids logging you out
@@ -36,7 +36,7 @@ Each of these rules comes from an account that actually lost its login while the
 
 ## Requirements
 
-- macOS 14 or newer, with Swift 6 (Xcode or the command line tools) to build the app.
+- macOS 26 or newer, with Swift 6.2 or newer (Xcode or the command line tools) to build the app.
 - `/usr/bin/python3` (ships with the command line tools).
 - Claude Code. Tested with 2.1.282.
 - Orca with your Claude accounts added as managed accounts, and **System default** selected as the active Claude account in Orca. With a managed account selected, Orca puts its own account back whenever a terminal starts and every 15 minutes, undoing every switch, and it refreshes that account's token itself. claude-acc reads Orca's settings, and while an account is selected there the watcher stands down, switching is blocked and the panel tells you to pick System default.
@@ -205,6 +205,8 @@ To see the panel without clicking the menu bar, render it to a PNG, from live da
 ```sh
 "$HOME/Applications/Claude Acc.app/Contents/MacOS/ClaudeAcc" --render panel.png --snapshot docs/demo-snapshot.json
 ```
+
+With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json` and `demo-janitor.json` next to it stand in for the guard and cleanup state. The renderer can't draw Liquid Glass, so buttons come out bordered.
 
 ## Caveats
 
