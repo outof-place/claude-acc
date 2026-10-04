@@ -726,6 +726,9 @@ REPO_HOOKS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hooks")
 HOOKS_DIR = os.path.join(STATE_DIR, "hooks")
 # komenda hooka, którą wolno owinąć: ścieżka i proste argumenty, bez składni powłoki
 PLAIN_COMMAND = re.compile(r"[\w./~$@%+=:,-]+(\s+[\w./~$@%+=:,-]+)*")
+# hooki pauzy limitów (hook.py, ten sam znacznik co jego MARKER) zostają synchroniczne:
+# w tle ich polecenie dla sesji i odmowa dla nowych subagentów przepadają bez śladu
+PAUSE_HOOKS = "claude-acc/hook.py"
 # w zapisie poprzedniej wartości: klucza wcześniej nie było
 MISSING = {"__missing__": True}
 # `change` w edit_json_file: plik ma zniknąć (powstał przez nas i znowu jest pusty)
@@ -994,7 +997,8 @@ class AsyncHooks:
         for spec in cfg.get("async_hooks", []):
             for group in (data.get("hooks") or {}).get(spec["event"], []) or []:
                 for hook in group.get("hooks", []) or []:
-                    if spec["match"] in hook.get("command", ""):
+                    command = hook.get("command", "")
+                    if spec["match"] in command and PAUSE_HOOKS not in command:
                         found.append((spec["event"], hook))
         return found
 
