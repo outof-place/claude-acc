@@ -113,6 +113,11 @@ class Isolated(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        # prawdziwa Orca w /Applications dokładałaby krok "devtools" do każdego testu
+        self.orca_app = os.path.join(self.dir, "Orca.app")
+        patcher = mock.patch.object(perf, "ORCA_APP", self.orca_app)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.cfg = dict(perf.DEFAULT_CONFIG)
 
     def write(self, path, data):
@@ -267,6 +272,52 @@ class RootRecordTest(Isolated):
 
     def test_record_refuses_non_root_tweak(self):
         self.assertEqual(perf.cmd_record(self.cfg, ["bg-helpers", "x"]), 2)
+
+    def test_devtools_is_manual_until_recorded(self):
+        self.assertNotIn("devtools", perf.pending_manual(perf.load_state()))
+        os.makedirs(self.orca_app)
+        self.assertIn("devtools", perf.pending_manual(perf.load_state()))
+        perf.cmd_record(
+            self.cfg,
+            ["devtools", "com.stablyai.orca", "prev=none", "--result", "196.2", "4.1"],
+        )
+        state = perf.load_state()
+        self.assertNotIn("devtools", perf.pending_manual(state))
+        self.assertNotIn("devtools", state["ultra"]["pending_root"])
+        self.assertEqual(state["ultra"]["root_applied"], ["devtools"])
+        self.assertEqual(
+            state["ultra"]["results"]["devtools"],
+            {
+                "before": 196.2,
+                "after": 4.1,
+                "unit": "ms pierwszego uruchomienia nowej binarki",
+            },
+        )
+        perf.cmd_record(self.cfg, ["devtools", "--forget"])
+        self.assertIn("devtools", perf.pending_manual(perf.load_state()))
+
+
+class GatekeeperTest(unittest.TestCase):
+    def test_penalty_is_first_minus_second_exec(self):
+        probe = {"first_ms": 196.2, "second_ms": 3.7}
+        with mock.patch.object(perf, "first_exec", return_value=probe), mock.patch.object(
+            perf, "responsible_app", return_value="Orca"
+        ):
+            result = perf.bench_gatekeeper()
+        self.assertEqual(result["penalty_ms"], 192.5)
+        lines = perf.describe_gatekeeper(result)
+        self.assertIn("Orca", lines[0])
+        self.assertIn("ocena Gatekeepera 192 ms", lines[1])
+
+    def test_without_go(self):
+        with mock.patch.object(perf, "first_exec", return_value=None):
+            result = perf.bench_gatekeeper()
+        self.assertNotIn("penalty_ms", result)
+        self.assertIn("brak pomiaru", perf.describe_gatekeeper(result)[0])
+
+    def test_responsible_app_of_this_process(self):
+        # testy chodzą z Terminala, Orki albo launchd; zawsze jest jakaś odpowiedzialna aplikacja
+        self.assertTrue(perf.responsible_app())
 
 
 class BenchStateTest(Isolated):
