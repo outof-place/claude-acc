@@ -40,7 +40,9 @@ class Env:
         self.other_dir = os.path.join(self.home, ".claude-work")
         json.dump({"config_dir": self.config_dir, "other_config_dirs": [self.other_dir],
                    "hard_session_left": 5, "hard_weekly_left": 3, "min_weekly_left": 6,
-                   "min_session_left": 10, "last_resort": [], "never": []},
+                   "min_session_left": 10, "last_resort": [], "never": [],
+                   # prawdziwe CLI Depot na maszynie testującej nie może dostać tokenów z atrap
+                   "depot_sync": False},
                   open(os.path.join(self.state_dir, "config.json"), "w"))
         self.server = {"access": {}, "refresh": {}, "usage": {}, "log": [], "counter": 0}
         self.keychain = {}
@@ -277,25 +279,104 @@ class StatusTest(unittest.TestCase):
         self.assertFalse(snap["foreign_runtime"])
         self.assertEqual(snap["orca_selected"], "a@x")
 
-    def test_status_json_leaves_tokens_sessions_hold(self):
-        # panel pyta co minutę: token, który trzyma sesja, odświeża tylko ona (druga
-        # wymiana tej samej pary to dla serwera kradzież). Konto, którego token leży
-        # tylko w kopii Orca, panel odświeża, bo nikt inny go nie używa, a bez tego
-        # pokazywał dane sprzed kilkunastu godzin.
+    def test_status_json_never_refreshes_tokens_a_session_may_hold(self):
+        # b@x żyje w sesjach innego katalogu konfiguracji: odświeżenie z panelu
+        # ścigałoby się z tymi sesjami o refresh token
         w = Env()
-        a = w.account("a@x", expires_in=3 * 60)
-        w.account("b@x", expired=True)
+        a = w.account("a@x")
+        b = w.account("b@x", expired=True)
         w.runtime(a)
+        w.runtime(b, services=[scoped(w.other_dir)])
         w.write()
-        held = w.entry(BASE)
 
         r = w.run("status", "--json")
 
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         emails = [x["email"] for x in json.loads(r.stdout)["accounts"]]
         self.assertEqual(sorted(emails), ["a@x", "b@x"])
-        self.assertEqual(w.entry(BASE), held)
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+
+
+class PanelFreshnessTest(unittest.TestCase):
+    def test_status_json_refreshes_idle_account_only_orca_holds(self):
+        # nieaktywne konto, którego tokenu nie trzyma żadna sesja: panel sam go
+        # odświeża, zamiast pokazywać dane sprzed kilkunastu godzin
+        w = Env()
+        a = w.account("a@x")
+        b = w.account("b@x", expired=True, weekly_used=42)
+        w.runtime(a)
+        w.write()
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
         self.assertEqual(len(w.calls("/v1/oauth/token")), 1)
+        self.assertNotEqual(w.managed("b@x")["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["weekly"]["used"], 42)
+        self.assertEqual(row["status"], "ok")
+
+    def test_rate_limit_backoff_grows_and_resets(self):
+        # 15 minut po każdym 429 oślepiało automat, choć API wracało po paru minutach
+        w = Env()
+        a = w.account("a@x")
+        w.runtime(a)
+        w.server["rate_limited"] = True
+        w.write()
+
+        w.run("status", "--json")
+        first = w.saved_state()["api_backoff_until"] - time.time()
+        w.state(api_backoff_until=0)
+        w.run("status", "--json")
+        second = w.saved_state()["api_backoff_until"] - time.time()
+        server = json.load(open(os.path.join(w.fake, "server.json")))
+        server["rate_limited"] = False
+        json.dump(server, open(os.path.join(w.fake, "server.json"), "w"))
+        w.state(api_backoff_until=0)
+        w.run("status", "--json")
+
+        self.assertAlmostEqual(first, 120, delta=15)
+        self.assertAlmostEqual(second, 240, delta=15)
+        self.assertNotIn("api_backoff_until", w.saved_state())
+        self.assertNotIn("api_backoff_step", w.saved_state())
+
+    def test_status_json_stops_polling_usage_of_canceled_subscription(self):
+        # API limitów odpowiada anulowanemu kontu 403, a panel pytał o nie co minutę,
+        # przybliżając 429 dla wszystkich kont; w panelu wisiał przy tym błąd
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.server["subscription"] = {"b@x": "canceled"}
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()), "email": "b@x", "status": "canceled"}})
+
+        w.run("status", "--json")
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(len(w.calls("/api/oauth/usage")), 1)  # tylko aktywne konto, raz
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(row["note"], "subskrypcja: canceled, automat pomija")
+        self.assertIsNone(row["queue"])
+
+    def test_renewed_subscription_returns_to_rotation_by_itself(self):
+        # status subskrypcji sprawdzany w profilu raz na 12 h: po odnowieniu konto
+        # wraca do kolejki bez ręcznego grzebania w stanie
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 13 * 3600, "email": "b@x",
+                                         "status": "canceled"}})
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["subscription_status"], "active")
+        self.assertTrue(row["usable"])
+        self.assertIsNotNone(row["queue"])
+        self.assertEqual(row["weekly"]["used"], 20)
 
 
 class TickTest(unittest.TestCase):
@@ -384,6 +465,122 @@ class TickTest(unittest.TestCase):
 
         live = w.entry(scoped(w.config_dir))
         self.assertEqual(live["claudeAiOauth"]["accessToken"], w.managed("b@x")["claudeAiOauth"]["accessToken"])
+
+
+FAKE_DEPOT = os.path.join(HERE, "fakes-depot", "depot")
+DEPOT_FALLBACK = "Claude Acc Depot fallback token"
+
+
+def with_depot(w):
+    """Włącza synchronizację Depot z atrapą CLI zamiast prawdziwego `depot`."""
+    path = os.path.join(w.state_dir, "config.json")
+    cfg = json.load(open(path))
+    cfg.update({"depot_sync": True, "depot_bin": FAKE_DEPOT})
+    json.dump(cfg, open(path, "w"))
+    return w
+
+
+def depot_store(w):
+    path = os.path.join(w.fake, "depot.json")
+    return json.load(open(path)) if os.path.exists(path) else {"secrets": {}, "calls": []}
+
+
+class DepotTest(unittest.TestCase):
+    def test_sandboxes_get_account_with_most_headroom_other_than_local(self):
+        w = with_depot(Env())
+        a = w.account("a@x", weekly_used=5)
+        w.account("b@x", weekly_used=60)
+        c = w.account("c@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+
+        w.run("tick")
+
+        self.assertEqual(depot_store(w)["secrets"].get("CLAUDE_CODE_OAUTH_TOKEN"),
+                         w.managed("c@x")["claudeAiOauth"]["accessToken"])
+        self.assertEqual(w.saved_state()["depot_email"], "c@x")
+        self.assertEqual(w.managed("c@x")["claudeAiOauth"], c["claudeAiOauth"])  # ważny token: bez odświeżania
+
+    def test_token_is_not_resent_while_account_still_carries(self):
+        w = with_depot(Env())
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        w.run("tick")
+        w.run("tick")
+
+        adds = [c for c in depot_store(w)["calls"] if c[:3] == ["claude", "secrets", "add"]]
+        self.assertEqual(len(adds), 1)
+
+    def test_sandboxes_leave_account_that_became_local(self):
+        w = with_depot(Env())
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=5)
+        w.account("c@x", weekly_used=30)
+        w.runtime(a)
+        w.write()
+        w.run("tick")
+        self.assertEqual(w.saved_state()["depot_email"], "b@x")
+
+        w.run("switch", "b@x")
+
+        # b jest teraz lokalne, a zwolnione ma najwięcej zapasu (90% tygodnia) przed c (70%)
+        self.assertEqual(w.saved_state()["depot_email"], "a@x")
+        self.assertEqual(depot_store(w)["secrets"]["CLAUDE_CODE_OAUTH_TOKEN"],
+                         w.managed("a@x")["claudeAiOauth"]["accessToken"])
+
+    def test_short_lived_token_of_idle_account_is_refreshed_before_sending(self):
+        w = with_depot(Env())
+        a = w.account("a@x", expires_in=3 * 60)
+        b = w.account("b@x", expires_in=3600)
+        w.runtime(a)
+        w.write()
+
+        w.run("tick")
+
+        fresh = w.managed("b@x")["claudeAiOauth"]
+        self.assertNotEqual(fresh["accessToken"], b["claudeAiOauth"]["accessToken"])
+        self.assertEqual(depot_store(w)["secrets"]["CLAUDE_CODE_OAUTH_TOKEN"], fresh["accessToken"])
+        # token aktywnego konta rotują sesje Claude Code: automat go nie dotyka
+        self.assertEqual(w.managed("a@x")["claudeAiOauth"], a["claudeAiOauth"])
+
+    def test_depot_failure_does_not_stop_switching(self):
+        w = with_depot(Env())
+        a = w.account("a@x", session_used=99)
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        w.run("tick", FAKE_DEPOT_FAIL="1")
+
+        self.assertEqual(w.saved_state()["active_email"], "b@x")
+        self.assertNotIn("depot_email", w.saved_state())
+
+    def test_fallback_token_when_no_other_account_has_headroom(self):
+        w = with_depot(Env())
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=99)
+        w.runtime(a)
+        w.keychain[f"{DEPOT_FALLBACK}|{USER}"] = "sk-ant-oat01-fallback"
+        w.write()
+
+        w.run("tick")
+
+        self.assertEqual(depot_store(w)["secrets"]["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-fallback")
+        self.assertEqual(w.saved_state()["depot_email"], "fallback")
+
+    def test_sync_is_off_without_the_setting(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        w.run("tick", PATH=f"{os.path.dirname(FAKE_DEPOT)}:{FAKES}:/usr/bin:/bin")
+
+        self.assertEqual(depot_store(w)["calls"], [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,19 @@
+#!/usr/bin/python3
+"""Atrapa CLI Depot: `depot claude secrets add NAME --value TOKEN` zapisuje sekret w $HOME/fake/depot.json."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fakes"))
+import _store
+
+args = sys.argv[1:]
+store = _store.load("depot.json", {"secrets": {}, "calls": []})
+store["calls"].append(args)
+if os.environ.get("FAKE_DEPOT_FAIL"):
+    _store.save("depot.json", store)
+    sys.stderr.write("unauthenticated: Invalid token\n")
+    sys.exit(1)
+if args[:3] == ["claude", "secrets", "add"] and "--value" in args:
+    store["secrets"][args[3]] = args[args.index("--value") + 1]
+_store.save("depot.json", store)
+print(f"Successfully added secret '{args[3]}'" if len(args) > 3 else "ok")

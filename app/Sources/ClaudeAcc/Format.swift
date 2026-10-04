@@ -99,12 +99,13 @@ enum Format {
         }
     }
 
-    /// Data age without "ago": "12 min", "3h".
+    /// Data age without "ago": "12 min", "3h 5m", "1d 14h".
     static func age(_ seconds: Int) -> String {
         switch seconds {
         case ..<60: "\(seconds)s"
         case ..<3600: "\(seconds / 60) min"
-        default: "\(seconds / 3600)h \(seconds % 3600 / 60)m"
+        case ..<86_400: "\(seconds / 3600)h \(seconds % 3600 / 60)m"
+        default: "\(seconds / 86_400)d \(seconds % 86_400 / 3600)h"
         }
     }
 

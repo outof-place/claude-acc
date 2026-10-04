@@ -30,6 +30,9 @@ if url.endswith("/api/oauth/usage"):
         reply(429, {"error": "rate_limited"})
     if not email:
         reply(401, {"error": "invalid token"})
+    if server.get("subscription", {}).get(email, "active") != "active":
+        # tak odpowiada prawdziwe API kontu z anulowaną subskrypcją
+        reply(403, {"error": "forbidden"})
     reply(200, server["usage"][email])
 if url.endswith("/api/oauth/profile"):
     if not email:
@@ -37,7 +40,7 @@ if url.endswith("/api/oauth/profile"):
     reply(200, {"account": {"email": email},
                 "organization": {"rate_limit_tier": "default_claude_max_20x",
                                  "subscription_created_at": "2026-09-15T10:00:00Z",
-                                 "subscription_status": "active"}})
+                                 "subscription_status": server.get("subscription", {}).get(email, "active")}})
 if url.endswith("/v1/oauth/token"):
     params = dict(p.split("=", 1) for p in conf.get("data", "").split("&"))
     token = params.get("refresh_token")
