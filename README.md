@@ -98,7 +98,7 @@ A Turbopack dev server grows fivefold under an agent's edits, and `turbopackMemo
 
 <img src="docs/guard-timeline.svg" width="760" alt="Area chart of the memory of all dev servers over about an hour, peaking near 15 GB below a 16.8 GB budget line, with dots where the guard restarted or stopped a server and the total dropped right after">
 
-With agents compiling, macOS on Auto kept the fans at about 2,000 rpm and let the hottest CPU sensor reach **115 °C**. The fixed settings, as the SMC reports them on the same Mac:
+With agents compiling, macOS on Auto kept the fans at about 2,000 rpm and let the hottest CPU sensor reach **115&nbsp;°C**. The fixed settings, as the SMC reports them on the same Mac:
 
 | Setting | Fan speed |
 | --- | --- |

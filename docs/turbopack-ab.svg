@@ -50,11 +50,12 @@
 <path class="s1" d="M56.0,222.9 L72.2,199.1 L88.4,184.9 L104.7,169.8 L120.9,162.6 L137.1,157.4 L153.3,144.0 L169.6,131.5 L185.8,123.2 L202.0,110.5 L218.2,97.7 L234.4,98.0 L250.7,96.5 L266.9,95.8 L283.1,95.8 L299.3,95.1 L315.6,94.8 L331.8,95.2 L348.0,94.6 L364.2,94.5 L380.4,94.1 L396.7,94.0 L412.9,94.2 L429.1,92.7 L445.3,92.3 L461.6,92.4 L477.8,95.2 L494.0,92.4 L510.2,91.8 L526.4,94.4 L542.7,91.1 L558.9,108.5 L575.1,109.2 L591.3,108.7 L607.6,127.6 L623.8,127.6 L640.0,127.6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <circle class="s1f ring" cx="640.0" cy="127.6" r="4" stroke-width="2"/>
 <rect class="s1f" x="650.0" y="107.6" width="8" height="8" rx="2"/>
-<text class="ink" x="662.0" y="115.6" font-size="12" font-weight="600">auto · 6.0 GB</text>
+<text class="ink" x="662.0" y="115.6" font-size="12" font-weight="600">auto · 4.7 GB</text>
 <path class="s2" d="M56.0,222.9 L72.2,199.6 L88.4,185.2 L104.7,171.3 L120.9,163.6 L137.1,158.4 L153.3,147.1 L169.6,135.4 L185.8,122.6 L202.0,111.8 L218.2,100.5 L234.4,98.4 L250.7,96.7 L266.9,96.5 L283.1,95.9 L299.3,95.4 L315.6,95.6 L331.8,95.4 L348.0,95.1 L364.2,95.3 L380.4,94.5 L396.7,94.4 L412.9,94.3 L429.1,93.8 L445.3,93.7 L461.6,93.8 L477.8,92.8 L494.0,92.5 L510.2,92.8 L526.4,92.4 L542.7,92.3 L558.9,108.9 L575.1,109.2 L591.3,109.2 L607.6,129.7 L623.8,129.7 L640.0,129.7" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <circle class="s2f ring" cx="640.0" cy="129.7" r="4" stroke-width="2"/>
 <rect class="s2f" x="650.0" y="135.7" width="8" height="8" rx="2"/>
-<text class="ink" x="662.0" y="143.7" font-size="12" font-weight="600">full · 6.0 GB</text>
+<text class="ink" x="662.0" y="143.7" font-size="12" font-weight="600">full · 4.6 GB</text>
+<text class="muted" x="542.7" y="79.1" font-size="11" text-anchor="middle">auto 6.01 · full 5.97 GB at 30 edits</text>
 <text class="muted" x="56.0" y="276" font-size="11" text-anchor="middle">warm</text>
 <text class="muted" x="218.2" y="276" font-size="11" text-anchor="middle">10 edits</text>
 <text class="muted" x="380.4" y="276" font-size="11" text-anchor="middle">20</text>
