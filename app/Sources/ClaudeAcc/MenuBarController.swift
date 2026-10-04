@@ -38,11 +38,11 @@ final class MenuBarController: NSObject {
     }
 
     @objc private func toggle() {
-        panel.isVisible ? close() : open()
+        panel.isOpen ? close() : open()
     }
 
     @objc private func spaceChanged() {
-        if panel.isVisible { close() }
+        if panel.isOpen { close() }
     }
 
     private func open() {
@@ -61,13 +61,14 @@ final class MenuBarController: NSObject {
     }
 
     private func close() {
-        guard panel.isVisible else { return }
+        guard panel.isOpen else { return }
         settle?.cancel()
         if let outsideClicks { NSEvent.removeMonitor(outsideClicks) }
         outsideClicks = nil
         item.button?.highlight(false)
-        panel.dismiss()
-        store.panelDisappeared()
+        // the panel stops its clocks and spinners only once it's gone: that re-render must
+        // not land in the middle of the fade
+        panel.dismiss { [weak self] in self?.store.panelDisappeared() }
     }
 
     /// Centred on the ring's screen, right under the menu bar, never past its edges.
@@ -77,7 +78,8 @@ final class MenuBarController: NSObject {
         let width = min(size.width, area.width - 16)
         let x = (area.midX - width / 2).rounded()
         let y = area.maxY - 6 - size.height
-        panel.setFrame(NSRect(x: x, y: y, width: width, height: size.height), display: true)
+        let card = NSRect(x: x, y: y, width: width, height: size.height)
+        panel.setFrame(PanelWindow.frame(forCard: card), display: true)
     }
 }
 
@@ -103,12 +105,22 @@ private final class PassThroughHostingView<Content: View>: NSHostingView<Content
 
 /// A borderless panel on the system popover material with rounded corners. It can become key
 /// (Escape closes it) without activating the app, so the app you work in keeps focus.
+///
+/// The shadow is the card layer's own, not the window's: WindowServer draws a window shadow
+/// outside the layers we animate, so it popped in at full strength and lingered through the
+/// fade. On the layer it fades and moves with the panel. The window is that much bigger, and
+/// its transparent margin lets clicks through.
 final class PanelWindow: NSPanel {
-    static let openDuration = 0.32
+    static let openDuration = 0.34
+    static let closeDuration = 0.2
     private static let radius: CGFloat = 24
+    /// Room for the shadow around the card; none on top, where the menu bar is.
+    static let margin = NSEdgeInsets(top: 0, left: 40, bottom: 64, right: 40)
 
     var onCancel: (() -> Void)?
     private(set) var contentSize: CGSize = .zero
+    private(set) var isOpen = false
+    private let card = ShadowCard(radius: radius)
     private let backdrop = NSVisualEffectView()
 
     init() {
@@ -118,18 +130,35 @@ final class PanelWindow: NSPanel {
         level = .popUpMenu
         backgroundColor = .clear
         isOpaque = false
-        hasShadow = true
+        hasShadow = false
         isMovable = false
         hidesOnDeactivate = false
         animationBehavior = .none
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
 
+        let root = MarginView()
+        root.wantsLayer = true
+        // a click on the shadow is a click outside the panel
+        root.onClick = { [weak self] in self?.onCancel?() }
+        contentView = root
+        card.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(card)
+        let m = Self.margin
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: m.left),
+            card.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -m.right),
+            card.topAnchor.constraint(equalTo: root.topAnchor, constant: m.top),
+            card.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -m.bottom),
+        ])
+
         backdrop.material = .popover
         backdrop.blendingMode = .behindWindow
         backdrop.state = .active
         backdrop.maskImage = Self.roundedMask(radius: Self.radius)
-        backdrop.wantsLayer = true
-        contentView = backdrop
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(backdrop)
+        pin(backdrop, to: card)
+        card.layer?.opacity = 0
     }
 
     override var canBecomeKey: Bool { true }
@@ -143,81 +172,83 @@ final class PanelWindow: NSPanel {
             .onGeometryChange(for: CGSize.self) { $0.size } action: { [weak self] size in
                 self?.contentSize = size
                 resized(size)
-                self?.invalidateShadow()
             })
         host.translatesAutoresizingMaskIntoConstraints = false
         backdrop.addSubview(host)
-        NSLayoutConstraint.activate([
-            host.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
-            host.trailingAnchor.constraint(equalTo: backdrop.trailingAnchor),
-            host.topAnchor.constraint(equalTo: backdrop.topAnchor),
-            host.bottomAnchor.constraint(equalTo: backdrop.bottomAnchor),
-        ])
+        pin(host, to: backdrop)
         contentSize = host.fittingSize
+    }
+
+    /// The window frame that puts the card itself at `rect`.
+    static func frame(forCard rect: NSRect) -> NSRect {
+        NSRect(
+            x: rect.minX - margin.left, y: rect.minY - margin.bottom,
+            width: rect.width + margin.left + margin.right, height: rect.height + margin.top + margin.bottom)
     }
 
     /// Fades in and drops a few points from under the menu bar, settling with a soft spring.
     func present() {
-        guard let layer = backdrop.layer else {
-            makeKeyAndOrderFront(nil)
-            return
-        }
+        guard let layer = card.layer else { return }
+        isOpen = true
+        // pick up from wherever a close left off, so a quick reopen doesn't jump
+        let from = layer.presentation() ?? layer
+        let startOpacity = layer.animation(forKey: "out") == nil ? 0 : from.opacity
+        let startTransform = layer.animation(forKey: "out") == nil
+            ? Self.dropTransform(size: card.bounds.size, scale: 0.965, lift: 12) : from.transform
         layer.removeAllAnimations()
-        alphaValue = 1
+        layer.opacity = 1
+        layer.transform = CATransform3DIdentity
         makeKeyAndOrderFront(nil)
 
-        let size = backdrop.bounds.size
-        let start = Self.dropTransform(size: size, scale: 0.97, lift: 10)
-        let drop = CASpringAnimation(perceptualDuration: Self.openDuration, bounce: 0.12)
+        let drop = CASpringAnimation(perceptualDuration: Self.openDuration, bounce: 0.1)
         drop.keyPath = "transform"
-        drop.fromValue = NSValue(caTransform3D: start)
+        drop.fromValue = NSValue(caTransform3D: startTransform)
         drop.toValue = NSValue(caTransform3D: CATransform3DIdentity)
         let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = 0
+        fade.fromValue = startOpacity
         fade.toValue = 1
-        fade.duration = 0.16
+        fade.duration = 0.18
         fade.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
-        layer.add(drop, forKey: "drop")
-        layer.add(fade, forKey: "fade")
+        layer.add(drop, forKey: "in")
+        layer.add(fade, forKey: "fade-in")
     }
 
-    /// A quick fade with a slight lift, then out of the way.
-    func dismiss() {
-        guard let layer = backdrop.layer else {
-            orderOut(nil)
-            return
-        }
+    /// Eases back up into the menu bar while it fades, then leaves the screen; `done` runs
+    /// after that, so whatever the app does next can't stall the animation.
+    func dismiss(done: @escaping () -> Void) {
+        guard let layer = card.layer, isOpen else { return }
+        isOpen = false
+        let from = layer.presentation() ?? layer
+        let end = Self.dropTransform(size: card.bounds.size, scale: 0.975, lift: 8)
+        layer.removeAllAnimations()
+        // the model holds the end state, so nothing flashes back when the animations finish
+        layer.opacity = 0
+        layer.transform = end
+
         CATransaction.begin()
         CATransaction.setCompletionBlock { [weak self] in
             MainActor.assumeIsolated {
-                guard let self else { return }
                 // a reopen during the fade already took the panel back
-                if layer.animation(forKey: "drop") == nil { self.orderOut(nil) }
+                guard let self, !self.isOpen else { return }
+                self.orderOut(nil)
+                done()
             }
         }
+        // ease-in-out on the way out: it leaves gently, then gets out of the way
+        let curve = CAMediaTimingFunction(controlPoints: 0.4, 0, 0.2, 1)
         let fade = CABasicAnimation(keyPath: "opacity")
-        fade.fromValue = 1
+        fade.fromValue = from.opacity
         fade.toValue = 0
-        fade.duration = 0.12
-        fade.timingFunction = CAMediaTimingFunction(name: .easeIn)
-        fade.fillMode = .forwards
-        fade.isRemovedOnCompletion = false
+        fade.duration = Self.closeDuration
+        fade.timingFunction = curve
         let lift = CABasicAnimation(keyPath: "transform")
-        lift.toValue = NSValue(caTransform3D: Self.dropTransform(size: backdrop.bounds.size, scale: 0.985, lift: 6))
-        lift.duration = 0.12
-        lift.timingFunction = CAMediaTimingFunction(name: .easeIn)
-        lift.fillMode = .forwards
-        lift.isRemovedOnCompletion = false
-        layer.removeAnimation(forKey: "drop")
+        lift.fromValue = NSValue(caTransform3D: from.transform)
+        lift.toValue = NSValue(caTransform3D: end)
+        lift.duration = Self.closeDuration
+        lift.timingFunction = curve
         layer.add(fade, forKey: "out")
         layer.add(lift, forKey: "lift")
         CATransaction.commit()
-    }
-
-    override func orderOut(_ sender: Any?) {
-        super.orderOut(sender)
-        backdrop.layer?.removeAnimation(forKey: "out")
-        backdrop.layer?.removeAnimation(forKey: "lift")
     }
 
     /// Scale about the top centre (AppKit layers scale about their origin, bottom left), then
@@ -227,6 +258,15 @@ final class PanelWindow: NSPanel {
         let shift = CATransform3DMakeTranslation(
             size.width * (1 - scale) / 2, size.height * (1 - scale) + lift, 0)
         return CATransform3DConcat(scaled, shift)
+    }
+
+    private func pin(_ view: NSView, to parent: NSView) {
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: parent.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: parent.trailingAnchor),
+            view.topAnchor.constraint(equalTo: parent.topAnchor),
+            view.bottomAnchor.constraint(equalTo: parent.bottomAnchor),
+        ])
     }
 
     private static func roundedMask(radius: CGFloat) -> NSImage {
@@ -239,5 +279,39 @@ final class PanelWindow: NSPanel {
         image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
         image.resizingMode = .stretch
         return image
+    }
+}
+
+/// The transparent margin around the card: clicks there close the panel like any click outside.
+private final class MarginView: NSView {
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+}
+
+/// The card's layer carries the shadow along a rounded path, so it costs no offscreen pass
+/// and fades and moves with the card.
+private final class ShadowCard: NSView {
+    private let radius: CGFloat
+
+    init(radius: CGFloat) {
+        self.radius = radius
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.42
+        layer?.shadowRadius = 26
+        layer?.shadowOffset = CGSize(width: 0, height: -16)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: radius, cornerHeight: radius, transform: nil)
     }
 }

@@ -7,14 +7,14 @@
       "claude-hooks-async",
       "node-compile-cache",
       "devguard-budget",
-      "docker-vm",
+      "devguard-max-server",
       "git-speed"
     ],
     "pending_root": [
       "vnodes"
     ],
     "pending_manual": [
-      "docker-quit"
+      "spotlight-privacy"
     ],
     "results": {
       "bg-helpers": {
@@ -24,7 +24,7 @@
       },
       "claude-hooks-async": {
         "before": 53.0,
-        "after": null,
+        "after": 24.0,
         "unit": "ms per tool call"
       },
       "node-compile-cache": {
@@ -37,15 +37,20 @@
         "after": 25,
         "unit": "% RAM"
       },
-      "docker-vm": {
-        "before": 8.0,
-        "after": 6.0,
-        "unit": "GB"
-      },
       "git-speed": {
         "before": 71.0,
         "after": 26.0,
         "unit": "ms git status"
+      },
+      "devguard-max-server": {
+        "before": 5,
+        "after": 4,
+        "unit": "GB per server"
+      },
+      "spotlight-privacy": {
+        "before": 509825,
+        "after": null,
+        "unit": "files"
       }
     }
   }

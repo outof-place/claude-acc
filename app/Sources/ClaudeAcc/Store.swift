@@ -32,6 +32,9 @@ final class Store {
     private(set) var guardBusy: String?
     private(set) var fanState: FanState?
     private(set) var ultra: Ultra?
+    /// CPU and GPU load since the previous reading.
+    private(set) var load: LoadReading?
+    @ObservationIgnored private let loadSampler = LoadSampler()
     /// Turning Ultra on or off measures as it goes, which takes a while.
     private(set) var ultraBusy = false
     /// The state just asked for, until perf.py is done.
@@ -60,7 +63,7 @@ final class Store {
     /// Rendering the panel to a file: fixed data, no timers, no login item.
     init(
         preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
-        ultra: Ultra? = nil
+        ultra: Ultra? = nil, load: LoadReading? = nil
     ) {
         awake = Awake(preview: true)
         snapshot = preview
@@ -69,6 +72,7 @@ final class Store {
         if let janitor { self.janitor = janitor }
         if let fans { fanState = fans }
         if let ultra { self.ultra = ultra }
+        if let load { self.load = load }
     }
 
     init() {
@@ -84,6 +88,8 @@ final class Store {
         poller = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
+                // a baseline, so the panel opens with the last minute's load instead of a dash
+                self?.sampleLoad()
                 try? await Task.sleep(for: .seconds(60))
             }
         }
@@ -151,6 +157,7 @@ final class Store {
         live = Task { [weak self] in
             while !Task.isCancelled {
                 self?.readLocal()
+                self?.sampleLoad()
                 try? await Task.sleep(for: .seconds(3))
             }
         }
@@ -304,6 +311,10 @@ final class Store {
         } catch {
             notice = Notice(text: "Couldn't save the fan mode: \(error.localizedDescription)", isError: true)
         }
+    }
+
+    func sampleLoad() {
+        if let reading = loadSampler.sample(), reading != load { load = reading }
     }
 
     // MARK: Ultra

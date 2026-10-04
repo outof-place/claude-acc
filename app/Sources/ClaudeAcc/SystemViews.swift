@@ -109,8 +109,9 @@ struct FansCard: View {
     ]
 
     var body: some View {
-        Card("Fans & Heat", symbol: "thermometer.medium") {
+        Card("Load & Heat", symbol: "thermometer.medium") {
             VStack(alignment: .leading, spacing: 12) {
+                LoadMeters(load: store.load)
                 if let state = live {
                     readings(state)
                     HStack(spacing: 6) {
@@ -159,17 +160,12 @@ struct FansCard: View {
             }
         }
         let sensors = state.sensors ?? [:]
-        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
-            GridRow {
-                Temperature(label: "P-cores", value: sensors["pcores"] ?? state.cpu)
-                Temperature(label: "E-cores", value: sensors["ecores"])
-                Temperature(label: "GPU", value: sensors["gpu"] ?? state.gpu)
-            }
-            GridRow {
-                Temperature(label: "SSD", value: sensors["ssd"])
-                Temperature(label: "Battery", value: sensors["battery"])
-                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
-            }
+        HStack(spacing: 6) {
+            Temperature(label: "P-cores", value: sensors["pcores"] ?? state.cpu)
+            Temperature(label: "E-cores", value: sensors["ecores"])
+            Temperature(label: "GPU", value: sensors["gpu"] ?? state.gpu)
+            Temperature(label: "SSD", value: sensors["ssd"])
+            Temperature(label: "Battery", value: sensors["battery"])
         }
         if let history = state.history, history.count > 2 {
             ThermalChart(history: history)
@@ -201,6 +197,51 @@ struct FansCard: View {
     }
 }
 
+/// CPU and GPU load like Activity Monitor: all cores, split into performance and efficiency.
+private struct LoadMeters: View {
+    let load: LoadReading?
+
+    var body: some View {
+        HStack(spacing: 14) {
+            meter(load?.cpu, label: cpuLabel)
+            meter(load?.gpu, label: "GPU")
+        }
+    }
+
+    private var cpuLabel: String {
+        guard let p = load?.pCores, let e = load?.eCores else { return "CPU" }
+        return "CPU · P \(Int(p.rounded()))% · E \(Int(e.rounded()))%"
+    }
+
+    private func meter(_ value: Double?, label: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                Text(value.map { "\(Int($0.rounded()))" } ?? "–")
+                    .font(.title3.weight(.semibold))
+                    .monospacedDigit()
+                    .contentTransition(.numericText(value: value ?? 0))
+                Text("%").font(.caption2).foregroundStyle(.secondary)
+            }
+            UsageBar(fraction: (value ?? 0) / 100, tint: Self.tint(value), height: 5)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.smooth, value: value)
+    }
+
+    private static func tint(_ value: Double?) -> Color {
+        switch value ?? 0 {
+        case ..<60: Format.violet
+        case ..<85: .orange
+        default: .red
+        }
+    }
+}
+
 private struct Temperature: View {
     let label: String
     let value: Double?
@@ -208,7 +249,7 @@ private struct Temperature: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(value.map { "\(Int($0.rounded()))°" } ?? "–")
-                .font(.title3.weight(.semibold))
+                .font(.headline)
                 .monospacedDigit()
                 .foregroundStyle(Self.tint(value))
                 .contentTransition(.numericText(value: value ?? 0))

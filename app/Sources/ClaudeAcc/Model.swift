@@ -160,7 +160,9 @@ struct Ultra: Decodable {
     }
 
     /// perf.py's ULTRA list, in the order it applies them.
-    static let order = ["bg-helpers", "claude-hooks-async", "node-compile-cache", "devguard-budget", "docker-vm", "git-speed"]
+    static let order = [
+        "bg-helpers", "claude-hooks-async", "node-compile-cache", "devguard-budget", "devguard-max-server", "git-speed",
+    ]
 
     static let catalog: [String: Tweak] = [
         "bg-helpers": Tweak(
