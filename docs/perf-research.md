@@ -578,6 +578,82 @@ Sprawdzone trzema drogami:
   Touch ID tego samego `sudo`. Pół minuty później secd miał 0,1%, a nikt nie wołał
   `security`.
 
+### Gatekeeper: każda nowa binarka z Orki czeka na ocenę
+
+Każdy `go test` buduje świeżą binarkę testu dla każdego pakietu, a `go run` i natywne
+moduły node robią to samo. macOS przy pierwszym uruchomieniu takiej binarki pyta, czy
+proces odpowiedzialny za nią (ten, który `responsibility_get_pid_responsible_for_pid`
+wskazuje dla powłoki) był na liście Narzędzi deweloperskich (Prywatność i ochrona,
+`kTCCServiceDeveloperTool` w systemowym TCC.db), kiedy startował. Jeśli nie, syspolicyd
+ocenia binarkę:
+skan XProtect i zapytanie HTTPS do Apple o bilet notaryzacji (około 150 ms, limit 3 s,
+więc na słabej sieci dużo gorzej). Widać to w `log stream` syspolicyd przy każdym
+pierwszym exec. Drugie uruchomienie tej samej binarki idzie już z pamięci podręcznej.
+
+Za każdą powłoką agenta stoi Orca (`com.stablyai.orca`), a na liście był tylko Terminal.
+
+Pierwsze uruchomienie świeżo zbudowanej binarki Go (każda z inną stałą, więc inny hash;
+mediana z 8-10, `perf.py bench gatekeeper` mierzy to samo tam, gdzie go uruchomisz):
+
+| skąd | pierwsze | drugie |
+|---|---|---|
+| Terminal (Narzędzie deweloperskie) | 4,3 ms | 3,3 ms |
+| proces z odrzuconą odpowiedzialnością (`posix_spawn` z disclaim) | 208,5 ms | |
+| terminal w Orce, przed | 196,2 ms | 3,7 ms |
+| terminal w Orce, kopia tej samej binarki (ten sam hash, nowy plik) | 76,8 ms | |
+| terminal w Orce, po dodaniu Orki, ta sama Orca | 196,5 ms | 3,6 ms |
+| terminal w Orce, po restarcie Orki | 4,1-4,4 ms | 3,4 ms |
+| terminal w Orce po restarcie, kopia tej samej binarki | 4,0 ms | |
+
+Prawdziwe repo, kopia portivo `apps/auth-service` (8 pakietów), `go test -count=1`:
+
+| | Terminal | Orca przed | Orca po dodaniu, bez restartu | Orca po restarcie |
+|---|---|---|---|---|
+| `-run ^$ ./...` (sam build i start binarek, 3 razy) | 2,30-2,39 s | 2,67-2,83 s | 2,64-2,84 s | 2,26-2,46 s |
+| pełne `./...` | 23-32 s | 26-33 s | 21,8 s | nie mierzone |
+
+- Po restarcie Orki pierwszy exec spada ze 196 do 4,1 ms (około 48 razy), czyli tyle, ile
+  w Terminalu. Sam build i start binarek auth-service skraca się o około 0,4 s na przebieg,
+  czyli około 50 ms na pakiet.
+- Na pełnych testach różnica ginie w szumie samych testów.
+- Kara rośnie jednak z liczbą pakietów: charter-service ma 272 pakiety testowe, czyli do
+  około 53 s oceny na pełny przebieg modułu, jeśli syspolicyd ocenia je po kolei.
+- Każde `go test` jednego pakietu, które agent puszcza po edycji, płaci 0,2 s, a bez sieci
+  do Apple nawet do 3 s.
+
+Naprawa to Orca na liście Narzędzi deweloperskich:
+
+- **Skryptem się nie da.** Na macOS 27 SIP chroni systemowy TCC.db także przed rootem:
+  `sqlite3` pod sudo dostaje „attempt to write a readonly database”, a `test -w` jako
+  root zwraca fałsz. `tccutil` umie tylko kasować. Profil PPPC nie ma usługi
+  DeveloperTool i wymaga MDM.
+- **Ręcznie:** Ustawienia systemowe > Prywatność i ochrona > Narzędzia deweloperskie >
+  „+” > `/Applications/Orca.app` > Otwórz, potwierdzić Touch ID.
+- `claude-acc perf-root devtools add` (bez sudo, w Terminalu) otwiera ten panel
+  (`x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools`),
+  czeka do 5 minut, aż wpis Orki pojawi się w TCC.db, i zapisuje go w stanie perf.py.
+  Czytanie bazy wymaga tylko Pełnego dostępu do dysku, który Terminal ma.
+- **Cofnięcie:** `claude-acc perf-root devtools undo` otwiera ten sam panel. Zaznacz Orkę
+  i kliknij „-” (albo wyłącz przełącznik, jeśli przed zmianą był wyłączony). Skrypt czeka,
+  aż wpis wróci do stanu sprzed zmiany, i usuwa zapis.
+- `claude-acc perf-root devtools status` pokazuje listę.
+- Ultra nie zrobi tego sama, więc dopóki wpisu nie ma, pokazuje `devtools` w
+  `pending_manual`.
+- `claude-acc perf bench gatekeeper` uruchomione z terminala Orki, która wystartowała po
+  zapisie devtools, samo zapisuje swój pierwszy exec jako wynik „po” (przed: 196,2 ms),
+  jeśli devtools nie ma jeszcze wyniku.
+- **Działa dopiero po restarcie Orki.** Po dodaniu wpisu ta sama Orca (uruchomiona
+  wcześniej) dalej płaci 196 ms, nawet w nowym terminalu. W logu syspolicyd binarki z jej
+  terminali dalej dostają `GK performScan` i `evaluateScanResult: 2`, a pytanie do TCC
+  przychodzi dopiero po skanie. Binarki z Terminala w ogóle nie docierają do syspolicyd.
+  Zwolnienie jest więc przypięte do procesu odpowiedzialnego w chwili jego startu (Apple
+  przy Terminalu też każe go zrestartować). Restart Orki zamyka sesje w jej terminalach,
+  więc perf.py tylko o niego prosi: `devtools-restart` w `pending_manual`, dopóki działająca
+  Orca wystartowała przed zapisem.
+- Ryzyko: aplikacja na tej liście może uruchamiać programy, które nie spełniają zasad
+  Gatekeepera. To ten sam poziom zaufania, jaki Terminal ma od początku, a Orca i tak
+  uruchamia dowolne polecenia agentów.
+
 ## Wyniki ogólne: sieć, CPU, GPU
 
 ### Sieć (TKB, kabel)
@@ -760,12 +836,20 @@ całe 8 GB. Virtualization.framework nie oddaje pamięci, którą raz dotknął 
 | `USE_BUILTIN_RIPGREP=0` | dokumentacja podaje to jako obejście zgodności, nie przyspieszenie |
 | async dla hooków Orki | Orca zarządza tymi wpisami sama i pokazuje z nich stan agentów; to nie nasze |
 | `feature.manyFiles` / `index.skipHash` | na klonie portivo bez zysku względem samego untrackedCache, a skipHash myli narzędzia na libgit2 |
+| Orca w Narzędziach deweloperskich skryptem (`sqlite3` do TCC.db pod sudo) | SIP chroni systemowy TCC.db także przed rootem („attempt to write a readonly database”); `tccutil` tylko kasuje, profil PPPC nie zna DeveloperTool i wymaga MDM; zostaje „+” w Ustawieniach |
+| `spctl --master-disable` zamiast listy Narzędzi | wyłącza Gatekeepera dla wszystkiego, co przychodzi z sieci, nie tylko dla binarek agentów; Narzędzia deweloperskie dają ten sam zysk tylko dla Orki |
 | wykluczenia Time Machine | Time Machine nie ma tu skonfigurowanego dysku |
 | przeniesienie magazynu pnpm do `.noindex` | pnpm zapisuje ścieżkę magazynu w każdym projekcie i po zmianie każe reinstalować |
 
 ## Rekomendacje, od największego efektu
 
 Najpierw praca agentów, potem ogólne.
+
+- **Orca w Narzędziach deweloperskich** (`claude-acc perf-root devtools add` w Terminalu
+  i jedno „+” w Ustawieniach): pierwsze uruchomienie każdej nowej binarki testu Go w
+  terminalu agenta spada ze 196 do 4,1 ms (około 48 razy), a `go test -run ^$` w
+  auth-service z 2,67-2,83 do 2,26-2,46 s. Działa po restarcie Orki. Włączone
+  2026-10-04: wpis o 22:13, restart Orki o 22:16. Szczegóły w sekcji Gatekeeper.
 
 0. **Faza 3, na żywo od 2026-10-04 21:32** (włączone przez `perf.py apply`, jeszcze nie
    przez Ultrę):
@@ -835,7 +919,7 @@ Najpierw praca agentów, potem ogólne.
 
 ```
 perf.py ultra on|off|status [--json]                         # wszystko dla agentów naraz
-perf.py bench [network|cpu|gpu|fs|agents|all] [--runs N] [--json]   # pomiar, zapis w perf-state.json
+perf.py bench [network|cpu|gpu|fs|agents|gatekeeper|all] [--runs N] [--json]   # pomiar, zapis w perf-state.json
 perf.py status [--json]                                      # poprawki i ostatnie pomiary
 perf.py list                                                 # poprawki z grupą i efektem
 perf.py apply <nazwa> | --all [--dry-run]
@@ -845,6 +929,7 @@ sudo ./perf-root.sh vnodes trial [--value 786432] [--keep]   # cache vnode: pomi
 sudo ./perf-root.sh vnodes apply|undo
 sudo ./perf-root.sh trial [--rate 27Mbps] [--keep]           # ogranicznik: pomiar przed i po
 sudo ./perf-root.sh shaper apply|undo                        # ./perf-root.sh shaper status bez sudo
+./perf-root.sh devtools add|undo|status [--app /Applications/Orca.app]   # bez sudo, w Terminalu; "+" w Ustawieniach
 ```
 
 Stan dla panelu jest w `~/.local/share/claude-acc/perf-state.json`:

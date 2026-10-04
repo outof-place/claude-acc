@@ -1913,6 +1913,27 @@ def first_exec(count=8):
     return {"first_ms": rnd(median(first), 1), "second_ms": rnd(median(second), 1)}
 
 
+DEVTOOLS_BEFORE_MS = 196.2  # pierwszy exec w terminalu Orki spoza Narzędzi deweloperskich
+
+
+def record_gatekeeper(cfg, state, result):
+    """Pierwszy pomiar z terminala Orki uruchomionej po zapisie devtools to wynik "po"."""
+    record = state["applied"].get("devtools")
+    if (
+        not record
+        or record.get("result")
+        or result.get("responsible") != "Orca"
+        or result.get("first_ms") is None
+    ):
+        return False
+    started = orca_started()
+    if not started or started < record["at"]:
+        return False  # ta sama Orca co przed zmianą: to jeszcze pomiar "przed"
+    record["result"] = {"before": DEVTOOLS_BEFORE_MS, "after": result["first_ms"]}
+    sync_root(cfg, state)
+    return True
+
+
 def bench_gatekeeper():
     """Ile kosztuje pierwsze uruchomienie nowej binarki tam, gdzie działa ten proces.
 
@@ -2703,6 +2724,8 @@ def cmd_bench(cfg, args, system=None):
         # stan czytany tuż przed zapisem: pomiar trwa, a w tym czasie coś mogło go zmienić
         state = load_state()
         record_bench(state, kind, result, started, load)
+        if kind == "gatekeeper" and record_gatekeeper(cfg, state, result):
+            print("zapisane jako wynik devtools", file=sys.stderr)
         save_state(state)
         results[kind] = result
         log(f"bench {kind}: {json.dumps(result)}")
@@ -2892,7 +2915,10 @@ def cmd_record(cfg, args, system=None):
         state["applied"].pop(name, None)
     else:
         old = state["applied"].get(name, {})
-        record = {"at": time.time(), "detail": " ".join(args)}
+        detail = " ".join(args)
+        # ten sam opis to ta sama zmiana (np. dopisany wynik): jej chwila się nie przesuwa
+        at = old["at"] if old.get("detail") == detail and "at" in old else time.time()
+        record = {"at": at, "detail": detail}
         if result or old.get("result"):
             record["result"] = result or old["result"]
         state["applied"][name] = record

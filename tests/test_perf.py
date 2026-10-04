@@ -302,6 +302,46 @@ class RootRecordTest(Isolated):
         perf.cmd_record(self.cfg, ["devtools", "--forget"])
         self.assertIn("devtools", perf.pending_manual(perf.load_state()))
 
+    def test_rerecord_keeps_the_moment_of_change(self):
+        perf.cmd_record(self.cfg, ["devtools", "com.stablyai.orca", "prev=none"])
+        at = perf.load_state()["applied"]["devtools"]["at"]
+        with mock.patch.object(perf.time, "time", return_value=at + 100):
+            perf.cmd_record(
+                self.cfg,
+                ["devtools", "com.stablyai.orca", "prev=none", "--result", "196.2", "4.1"],
+            )
+            self.assertEqual(perf.load_state()["applied"]["devtools"]["at"], at)
+            perf.cmd_record(self.cfg, ["devtools", "com.other", "prev=none"])
+        self.assertEqual(perf.load_state()["applied"]["devtools"]["at"], at + 100)
+
+    def test_gatekeeper_bench_records_after_from_restarted_orca(self):
+        perf.cmd_record(self.cfg, ["devtools", "com.stablyai.orca", "prev=none"])
+        at = perf.load_state()["applied"]["devtools"]["at"]
+        probes = [
+            # z Terminala: nie mówi nic o Orce
+            ({"responsible": "Terminal", "first_ms": 4.3, "second_ms": 3.3}, at + 60),
+            # Orca sprzed zmiany: to jeszcze "przed"
+            ({"responsible": "Orca", "first_ms": 196.5, "second_ms": 3.6}, at - 60),
+            # Orca po restarcie
+            ({"responsible": "Orca", "first_ms": 4.1, "second_ms": 3.4}, at + 60),
+            # kolejny pomiar nie nadpisuje pierwszego
+            ({"responsible": "Orca", "first_ms": 9.9, "second_ms": 3.4}, at + 60),
+        ]
+        for probe, started in probes:
+            self.orca_started = started
+            with mock.patch.object(
+                perf, "bench_gatekeeper", return_value=dict(probe, penalty_ms=1.0)
+            ):
+                self.run_cmd(perf.cmd_bench, "gatekeeper")
+            if probe["first_ms"] == 196.5:
+                self.assertNotIn("result", perf.load_state()["applied"]["devtools"])
+        state = perf.load_state()
+        self.assertEqual(
+            state["applied"]["devtools"]["result"], {"before": 196.2, "after": 4.1}
+        )
+        self.assertEqual(state["ultra"]["results"]["devtools"]["after"], 4.1)
+        self.assertEqual(state["bench"]["gatekeeper"]["result"]["first_ms"], 9.9)
+
     def test_devtools_wants_orca_started_after_it(self):
         os.makedirs(self.orca_app)
         perf.cmd_record(self.cfg, ["devtools", "com.stablyai.orca", "prev=none"])
