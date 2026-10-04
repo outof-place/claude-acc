@@ -49,7 +49,7 @@ cd claude-acc
 ./install.sh
 ```
 
-The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads the two launchd jobs (the account watcher and the janitor), then builds and opens `~/Applications/Claude Acc.app`. The app adds itself to your login items on first run. You can turn that off in the panel.
+The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads the three launchd jobs (the account watcher, the janitor and the dev server guard), then builds and opens `~/Applications/Claude Acc.app`. The app adds itself to your login items on first run. You can turn that off in the panel.
 
 ## Command line
 
@@ -67,6 +67,10 @@ The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-
 | `claude-acc mac report` | What slows the Mac down: top processes, Spotlight, orphaned dev servers, data of uninstalled apps, broken launchd entries |
 | `claude-acc mac spotlight` | Projects whose `node_modules` Spotlight indexes, and the settings pane to exclude them |
 | `claude-acc mac optimize [--dry-run\|--undo]` | Faster Dock, window and Finder animations, and disabling launch agents whose app is gone. Reversible |
+| `claude-acc guard status [--json]` | Dev servers, their memory, who watches them and what the guard is about to do |
+| `claude-acc guard once [--dry-run]` | One guard pass, at most one action |
+| `claude-acc guard stop <pid\|:port>` | Stop a dev server the way the guard does |
+| `claude-acc guard recycle <pid\|:port>` | Restart a dev server in its own Orca terminal |
 
 ## Configuration
 
@@ -96,7 +100,7 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `caches` | `.turbo`, `node_modules/.cache`, `node_modules/.vite`, unchanged for 7 days | daily |
 | `node_modules` | every `node_modules` of a project where no file changed and git didn't move for 30 days | daily |
 | `tmp` | `go-build*` in `$TMPDIR` older than 6 hours | every run |
-| `caps` | the oldest entries of folders listed in `caps` once a folder is over its limit | every run |
+| `caps` | the oldest entries of folders listed in `caps` once a folder is over its limit (the guard also runs it every 10 minutes) | every run |
 | `go` | the Go build cache, once it's over 20 GB (Go trims entries unused for 5 days on its own) | daily |
 | `npm` | `npm cache verify`, npx packages unused for 30 days (not the ones a running process uses, like MCP servers), npm logs older than a week | daily |
 | `pnpm` | `pnpm store prune`, and after every run that removed a `node_modules` | weekly |
@@ -129,6 +133,61 @@ Configuration lives in `~/.local/share/claude-acc/janitor.json`. Every key is op
 | `skip` | `[]` | Task names to leave out, like `["docker", "brew"]` |
 | `caps` | `[]` | Folders agents fill without end, like `[{"path": "~/.cache/portivo-perf/*/builds", "max_gb": 10, "keep": 1}]`. Entries over `max_gb` go oldest first (by creation date, since `rsync -a` copies mtimes); the `keep` newest always stay, and so does anything changed in the last `fresh_minutes` (10) |
 
+## Dev server guard
+
+With a few worktrees open in Orca, every agent starts its own `next dev` and opens a preview tab. Measured on a 48 GB Mac on 2026-10-04:
+
+- a Turbopack dev server holds its module graph in native Rust memory and reaches 7-8 GB of footprint after an hour of agent edits. A restarted one was back from 2.3 to 7.8 GB within 10 minutes. Next.js has its own restart watchdog, but it only watches the V8 heap, and Turbopack's `turbopackMemoryEviction: 'auto'` waits for memory pressure feedback from the OS;
+- the OS never gives it. With 12.7 of 13.3 GB of swap used, `kern.memorystatus_vm_pressure_level` still said normal, right until jetsam started killing processes with reason `low-swap`;
+- an open preview keeps an HMR websocket, so every file an agent saves is a recompile and a page reload: one `tokens.css` edit cost the server with a preview 10 s of CPU, the six servers without one 0.1 s.
+
+`devguard.py` runs from launchd all the time (`KeepAlive`, standard priority, so it gets the CPU exactly when the Mac is choking) and looks every 5 seconds:
+
+- memory the way jetsam counts it: `phys_footprint` from `proc_pid_rusage`, plus CPU time and disk writes, read through `ctypes` without forking anything per process;
+- who watches each server: TCP clients from one `lsof` (an Orca tab, a browser, a headless Chrome), Orca's preview tabs, and whether the tab is the one you are looking at (active tab of the worktree selected in Orca);
+- memory pressure from swap growth and the compressor's `vm.compressor.compactor.swapouts_queued_pressure` counter. Swap that stays full after memory was freed is only a warning; full and still growing is critical;
+- Orca's worktrees, agents and terminals through the `orca` CLI, so it knows which terminal a server runs in and whether an agent is working there. It never starts Orca.
+
+What it does, gentlest first:
+
+| Action | When |
+| --- | --- |
+| background QoS (`PRIO_DARWIN_BG`, efficiency cores and throttled disk) | a server you are not looking at; back to normal priority once you switch to its preview |
+| restart in its own Orca terminal | the server is over `max_server_gb` and has been quiet for `quiet_seconds`. Turbopack comes back from its disk cache in seconds and the preview reconnects by itself. The exact argv comes from `KERN_PROCARGS2` and goes back in with `orca terminal send`, only into a plain shell that is back at its prompt |
+| stop | a second server of the same app nobody watches, a server whose agent or terminal is gone, a server nobody watched or used for `idle_minutes` (twice that while an agent works in its worktree), and a server restarted `max_recycles_per_hour` times within an hour, which is the HMR loop again |
+| free the biggest | dev servers over `budget_percent` of RAM, or memory pressure. With a warning only servers without a preview or bloated ones; when critical, also ones agents watch. The server you watch is never stopped, at most restarted |
+
+One action at a time, then `cooldown_seconds` to let memory settle, and the swap growth window starts over so an old trend can't trigger the next one. A server younger than `grace_minutes` is left alone. After a stop the guard closes the server's background preview tabs in Orca (they would only keep reloading), writes a `devguard: ...` comment on the worktree card when the card has no comment of someone else's, sends a notification, and logs the command to bring the server back.
+
+`devguard.py admit` is a `PreToolUse` hook for Claude Code. When an agent is about to start a dev server (also through `orca terminal create --command`, `cd`, `pnpm -C`, `--filter`), it refuses a second server of an app that already runs and gives the agent its URL instead, and refuses a new one when memory is critical or the servers are over budget. It denies even under `--dangerously-skip-permissions`. `DEVGUARD_ALLOW=1` in front of the command lets it through. Add it to `~/.claude/settings.json`:
+
+```json
+{ "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
+  { "type": "command", "command": "/usr/bin/python3 $HOME/.local/share/claude-acc/devguard.py admit", "timeout": 10 }
+] } ] } }
+```
+
+Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is optional.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `enforce` | `observe` only reports and logs |
+| `budget_percent` | `35` | All dev servers together, as % of RAM |
+| `max_server_gb` | `5` | A single server above this is bloated |
+| `swap_warn_percent` / `swap_critical_percent` | `12` / `20` | Swap as % of RAM for a warning and, while it grows, for critical |
+| `available_critical_percent` | `10` | `kern.memorystatus_level` at or below this is critical |
+| `quiet_seconds` | `30` | No CPU and no terminal output for this long before a watched server is restarted (10 times that for the one you watch) |
+| `grace_minutes` | `3` | A new server is left alone this long |
+| `duplicate_minutes` / `orphan_minutes` / `idle_minutes` | `5` / `10` / `45` | When a duplicate, an orphan and an idle server go |
+| `cooldown_seconds` | `45` | Pause after every action |
+| `max_recycles_per_hour` | `2` | More restarts of one app than this is a loop: stop instead |
+| `background_unattended` | `true` | Background QoS for servers you don't watch |
+| `close_tabs` / `orca_comment` / `notify` | `true` | What happens around a stop |
+| `protect` | `[]` | Server paths (or anything above them) and ports like `":3000"` the guard never touches |
+| `scope` | `[]` | When set, the guard only sees servers under these paths |
+| `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
+| `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |
+
 ## Tests
 
 ```sh
@@ -138,6 +197,8 @@ Configuration lives in `~/.local/share/claude-acc/janitor.json`. Every key is op
 The tests run the real script end to end against fake `security`, `curl` and `claude` binaries put first on `PATH`, so they never touch your Keychain or your accounts. They cover logging in, switching during a 429, keeping MCP tokens, cancelling a login halfway, and leaving an account whose token died.
 
 The janitor tests run the real script on a temporary `$HOME` with the real `lsof`: caches that go, caches kept because a file is open or a dev server works in the app, a shell prompt that doesn't block, protected paths, stale and active projects, an interrupted delete, and `caps` dropping the oldest snapshots.
+
+The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, and that the hook sends a second start to the running one.
 
 To see the panel without clicking the menu bar, render it to a PNG, from live data or from a JSON file:
 
