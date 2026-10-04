@@ -1213,7 +1213,24 @@ def decide_route(state, job, gb, wall, cfg, cache):
         "cost_usd": None,
         "saves_s": None,
     }
+    target = depot_target(job, gb, wall, cfg, cache) if gb > cfg["small_gb"] else None
     if gb <= mem["free_for_admission_gb"]:
+        # mieści się teraz; Depot tylko wtedy, gdy jest tam dużo szybszy, niż kosztuje
+        # (cały internal/handlers: ~25 min lokalnie, 8 min na Depot za $0,19)
+        if target and wall - target["eta_s"] > lam * target["units"]:
+            saves = wall - target["eta_s"]
+            route = dict(
+                base,
+                choice="depot",
+                why="cost",
+                local_eta_s=round(wall),
+                depot_eta_s=target["eta_s"],
+                units=target["units"],
+                cost_usd=target["cost_usd"],
+                saves_s=round(saves),
+                text=f"Depot: saves {human_s(saves)} for ${target['cost_usd']:.2f}",
+            )
+            return route, target
         return dict(
             base,
             choice="local",
@@ -1221,7 +1238,6 @@ def decide_route(state, job, gb, wall, cfg, cache):
             local_eta_s=round(wall),
             text="local, fits",
         ), None
-    target = depot_target(job, gb, wall, cfg, cache)
     if gb > mem["idle_max_gb"]:
         if target:
             route = dict(
@@ -1927,6 +1943,9 @@ def requeue_local(entry, job, command, argv, opts, cfg, history, cache):
 # ---------- hook i status ----------
 
 
+RECURSIVE_GREP = re.compile(r"(^|[\s;&|(])grep\s+(-[A-Za-z]*[rR][A-Za-z]*|--recursive)")
+
+
 def hook_rewrite(event):
     """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run."""
     if event.get("tool_name") != "Bash":
@@ -1935,9 +1954,11 @@ def hook_rewrite(event):
     command = tool_input.get("command") or ""
     if not command.strip():
         return None
+    if RECURSIVE_GREP.search(command):
+        return None  # tę komendę przepisuje rg-rewrite.sh; dwa updatedInput to wynik losowy
     try:
         job = classify(command, event.get("cwd") or os.getcwd())
-    except Exception:
+    except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
         return None
     if job is None:
         return None

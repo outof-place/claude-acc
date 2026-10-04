@@ -331,6 +331,18 @@ class RouteTest(Paths):
             route["saves_s"], self.cfg["lambda_s_per_unit"] * route["units"]
         )
 
+    def test_fits_but_depot_is_much_faster(self):
+        self.set_memory(75)  # 36 GB: cały handlers (24 GB) się mieści
+        st = self.state()
+        handlers = self.job("cd apps/charter-service && go test ./internal/handlers/")
+        route, target = S.decide_route(st, handlers, 24.0, 1500, self.cfg, {})
+        self.assertEqual((route["choice"], route["why"], target["job"]), ("depot", "cost", "handlers"))
+        self.assertEqual(route["local_eta_s"], 1500)
+        # cały moduł: 64 rdzenie przez ~9 min kosztują więcej, niż oszczędzają
+        tree = self.job("cd apps/charter-service && go test ./...")
+        route, target = S.decide_route(st, tree, 24.0, 1500, self.cfg, {})
+        self.assertEqual((route["choice"], route["why"]), ("local", "fits"))
+
     def test_waiting_small_job_stays_local(self):
         st = self.state()
         self.running(st, 18.0, wall=30)
@@ -531,6 +543,13 @@ class HookTest(Paths):
         self.assertEqual(argv[-2:], ["--shell", original])
         again = dict(event, tool_input=updated)
         self.assertIsNone(S.hook_rewrite(again))  # już owinięte
+
+    def test_recursive_grep_is_left_to_rg_rewrite(self):
+        command = "cd apps/charter-service && go test ./internal/moneyfmt/ && grep -rn TODO internal"
+        event = {"tool_name": "Bash", "cwd": self.repo, "tool_input": {"command": command}}
+        self.assertIsNone(S.hook_rewrite(event))
+        event["tool_input"]["command"] = "cd apps/charter-service && go test ./internal/moneyfmt/ | grep -c ok"
+        self.assertIsNotNone(S.hook_rewrite(event))
 
     def test_leaves_other_commands(self):
         for command in (
