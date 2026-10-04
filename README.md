@@ -33,6 +33,8 @@ cd claude-acc
 
 Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads three launchd jobs (the account watcher, the janitor and the dev server guard) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
 
+After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app and the command and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
+
 ## What it does
 
 | | |
@@ -155,6 +157,7 @@ Each of these rules comes from an account that actually lost its login while the
 | `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
 | `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
 | `claude-acc fans install\|uninstall` | Install the fan daemon, or remove it and give the fans back to macOS |
+| `claude-acc uninstall` | Remove the launchd jobs, the app and this command; settings stay |
 
 ## Configuration
 
