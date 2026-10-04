@@ -20,6 +20,7 @@ Komendy:
   switch --auto     przełącz na następne z kolejki
   login <email>     zaloguj konto ponownie w przeglądarce, bez Orca i terminala
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
+  resume            zdejmij pauzę limitów ręcznie (do czasu, aż limity wrócą)
   depot [--force]   token sandboxów `depot claude`: konto i ważność, --force wysyła od nowa
   depot --fallback  zapisz długi token z `claude setup-token` na wypadek braku konta z zapasem
   watch [sekundy]   pętla ticków na pierwszym planie
@@ -49,6 +50,10 @@ LOG_PATH = os.path.join(STATE_DIR, "switch.log")
 LOCK_PATH = os.path.join(STATE_DIR, "lock")
 LOGIN_LOCK_PATH = os.path.join(STATE_DIR, "login.lock")
 USAGE_CACHE_PATH = os.path.join(STATE_DIR, "usage-cache.json")
+# istnieje tylko w trakcie pauzy limitów; hook w sesjach Claude Code (hook.py) tylko go czyta
+PAUSE_PATH = os.path.join(STATE_DIR, "pause.json")
+# znaczniki hooka z bieżącego epizodu pauzy; kasowane razem z nią
+PAUSE_MARKS_DIR = os.path.join(STATE_DIR, "pause-marks")
 # ile token aktywnego konta musi być przeterminowany, zanim automat sam go odświeży:
 # wcześniej robią to sesje Claude Code i drugi odświeżający zabija konto
 IDLE_REFRESH_AFTER = 15 * 60
@@ -1139,6 +1144,7 @@ def snapshot(cfg):
         "last_tick": state.get("last_tick"),
         "switched_at": state.get("switched_at"),
         "orca_selected": orca,
+        "pause": load_json(PAUSE_PATH, None),
         "accounts": items,
     }
 
@@ -1393,6 +1399,91 @@ def active_usage(account, cfg):
     return cached_usage(account, cfg, max_age=0, refresh=False, stale_ok=False)
 
 
+# ---------- pauza limitów ----------
+#
+# Gdy aktywne konto się kończy, a żadne inne nie ma zapasu, sesje Claude Code
+# dostają przez hook czas na punkt kontrolny: kończą krok, zapisują stan i
+# czekają, aż budzik je wznowi. Bez tego agenci padali w połowie pracy i trzeba
+# ich było odpalać od nowa. Plik pauzy to jedyny kontrakt z hookiem (hook.py).
+
+def clock(epoch):
+    """Godzina, a gdy to nie dziś, także dzień: "14:30", "3.10 22:00"."""
+    moment = datetime.fromtimestamp(epoch)
+    return f"{moment:%H:%M}" if moment.date() == datetime.now().date() else f"{moment.day}.{moment:%m %H:%M}"
+
+
+def usable_again_at(data, cfg):
+    """Kiedy konto znów będzie miało zapas na pracę: najpóźniejszy z resetów
+    okien, które je blokują. None, gdy API nie podało czasu resetu."""
+    session_left, weekly_left = headroom(data)
+    blocking = []
+    if session_left < cfg["min_session_left"]:
+        blocking.append((data.get("five_hour") or {}).get("resets_at"))
+    if weekly_left < cfg["min_weekly_left"]:
+        blocking.append((data.get("seven_day") or {}).get("resets_at"))
+    resets = [parse_ts(r) for r in blocking]
+    if any(r is None for r in resets):
+        return None
+    return max((r.timestamp() for r in resets), default=time.time())
+
+
+def start_pause(active, reason, datas, cfg):
+    """Ogłasza pauzę albo odświeża jej szacunek wznowienia. Pauza zdjęta ręcznie
+    nie wraca, dopóki limity nie odżyją."""
+    if load_state().get("pause_dismissed"):
+        return
+    times = [t for t in (usable_again_at(d, cfg) for d in datas) if t]
+    resume_at = int(min(times)) if times else None
+    pause = load_json(PAUSE_PATH, None)
+    if pause:
+        fresh = dict(pause, resume_at=resume_at, reason=reason, account=active.email)
+        if fresh != pause:
+            write_json(PAUSE_PATH, fresh)
+        return
+    now = int(time.time())
+    write_json(PAUSE_PATH, {"episode": str(now), "since": now, "account": active.email,
+                            "reason": reason, "resume_at": resume_at})
+    when = f", wznowienie ok. {clock(resume_at)}" if resume_at else ""
+    log(f"pauza limitów: {reason}, brak konta z zapasem{when}")
+    notify("Claude: pauza limitów", f"Żadne konto nie ma zapasu. Sesje kończą bieżący krok i czekają{when}")
+
+
+def drop_pause():
+    """Kasuje plik pauzy i znaczniki hooka; wstrzymane sesje budzą się, gdy plik znika.
+    True, gdy pauza była."""
+    if not os.path.exists(PAUSE_PATH):
+        return False
+    os.remove(PAUSE_PATH)
+    shutil.rmtree(PAUSE_MARKS_DIR, ignore_errors=True)
+    return True
+
+
+def end_pause(why):
+    """Koniec epizodu: limity wróciły, automat przełączył konto albo przestał pilnować."""
+    state = load_state()
+    if state.pop("pause_dismissed", None):
+        save_state(state)
+    if drop_pause():
+        log(f"koniec pauzy limitów: {why}")
+        notify("Claude: limity wróciły", "Wstrzymane sesje wznawiają pracę")
+
+
+def cmd_resume(cfg, _args):
+    """Ręczne zdjęcie pauzy (przycisk w panelu). Trzyma do końca epizodu: automat
+    nie ogłosi jej znowu, dopóki limity nie wrócą i nie skończą się od nowa."""
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę")
+        return 1
+    if not drop_pause():
+        print("pauzy nie ma")
+        return 0
+    update_state(pause_dismissed=True)
+    log("pauza limitów zdjęta ręcznie")
+    print("pauza zdjęta, sesje wznawiają pracę")
+    return 0
+
+
 def cmd_tick(cfg, _args):
     """Jeden przebieg pilnowania. Uruchamiany przez launchd co 2 minuty."""
     lock = take_lock(wait=10)
@@ -1405,7 +1496,9 @@ def cmd_tick(cfg, _args):
     orca = orca_selected(accounts)
     if orca:
         # Orca sama pilnuje wybranego konta i odświeża jego token: drugi gracz
-        # w tym samym miejscu to wyścig o refresh token i wylogowane konta
+        # w tym samym miejscu to wyścig o refresh token i wylogowane konta.
+        # Pauzy, której automat już nie zdejmie, nie trzymamy.
+        end_pause(f"Orca ma wybrane konto {orca}, automat stoi")
         if load_state().get("orca_notified") != orca:
             log(f"tick: Orca ma wybrane konto {orca}, automat stoi, dopóki w Orca nie będzie System default")
             notify("Claude: automat wstrzymany", f"W Orca wybrane jest {orca}. Wybierz System default.")
@@ -1418,6 +1511,7 @@ def cmd_tick(cfg, _args):
 
     if not active:
         # ktoś zalogował się ręcznie albo trwa /login: ręce precz, tylko jedno ostrzeżenie
+        end_pause("runtime ma konto spoza Orca")
         if not state.get("hands_off_notified"):
             log("tick: wpis runtime zawiera dane spoza Orca, nie przełączam")
             notify("Claude: nieznane konto", "Runtime ma dane spoza Orca. Automat nic nie zmienia.")
@@ -1442,22 +1536,39 @@ def cmd_tick(cfg, _args):
         # refresh token padł (400), więc sesje i tak zaraz się wylogują: to jest
         # "konto realnie padło", przechodzimy na konto z zapasem
         reason = f"{active.email}: token nie działa"
+        carries = roomy = False
     else:
         record_history(active.email, data)
         session_left, weekly_left = headroom(data)
-        if session_left > cfg["hard_session_left"] and weekly_left > cfg["hard_weekly_left"]:
-            return 0  # konto jeszcze niesie, nie ruszamy go
         reason = f"{active.email}: tydzień {weekly_left:.0f}%, sesja {session_left:.0f}%"
-    candidates = queue(survey(accounts, cfg, exclude_id=active.id))
+        carries = session_left > cfg["hard_session_left"] and weekly_left > cfg["hard_weekly_left"]
+        # pauzę zdejmujemy dopiero przy zapasie, z jakim automat bierze konto, a nie
+        # tuż nad progiem porzucenia: inaczej sesje budziłyby się na minutę
+        roomy = session_left >= cfg["min_session_left"] and weekly_left >= cfg["min_weekly_left"]
+    if roomy:
+        end_pause(f"{active.email} ma znowu zapas")
+        return 0
+    paused = os.path.exists(PAUSE_PATH)
+    if carries and not paused:
+        return 0  # konto jeszcze niesie, nie ruszamy go
+    rows = survey(accounts, cfg, exclude_id=active.id)
+    candidates = queue(rows)
+    if candidates and carries:
+        # trwa pauza, a inne konto odżyło: aktywne jeszcze niesie, więc zostaje,
+        # sesje wracają do pracy, a przełączenie przyjdzie przy progu jak zwykle
+        end_pause(f"{candidates[0]['account'].email} ma znowu zapas")
+        return 0
     if not candidates:
-        log(f"tick: {reason}, brak konta z zapasem")
-        if state.get("last_warning") != "brak-kont":
-            notify("Claude: koniec limitów", "Żadne konto nie ma zapasu. Sprawdź Claude Acc w pasku menu")
-            update_state(last_warning="brak-kont")
+        if not paused:
+            log(f"tick: {reason}, brak konta z zapasem")
+        # pauza ogłasza się raz na epizod (log i powiadomienie), kolejne przebiegi
+        # tylko odświeżają szacunek wznowienia
+        start_pause(active, reason, ([data] if data else []) + [r["data"] for r in rows if r["data"]], cfg)
         return 1
 
     target = candidates[0]["account"]
     switch_to(target, cfg, reason)
+    end_pause(f"przełączono na {target.email}")
     depot_sync_safe(accounts, cfg, target)  # sandboxy nie mogą zostać na nowym koncie lokalnym
     left = headroom(candidates[0]["data"])[1]
     if target.email in cfg["last_resort"]:
@@ -1465,7 +1576,6 @@ def cmd_tick(cfg, _args):
                f"Prywatne konta bez zapasu, przełączam na {target.email}")
     else:
         notify("Claude: zmiana konta", f"{active.email} → {target.email} (zostało {left:.0f}% tygodnia)")
-    update_state(last_warning=None)
     return 0
 
 
@@ -1510,8 +1620,8 @@ def cmd_depot(cfg, args):
 
 
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
-            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "watch": cmd_watch,
-            "depot": cmd_depot}
+            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "resume": cmd_resume,
+            "watch": cmd_watch, "depot": cmd_depot}
 
 
 def main(argv):

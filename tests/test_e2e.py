@@ -136,7 +136,33 @@ class Env:
         json.dump(keychain, open(os.path.join(self.fake, "keychain.json"), "w"))
         return blob
 
+    def set_usage(self, email, session_used=None, weekly_used=None, rate_limited=None):
+        """Zmiana po stronie serwera w trakcie testu: reset okna, zużycie, 429."""
+        path = os.path.join(self.fake, "server.json")
+        server = json.load(open(path))
+        if session_used is not None:
+            server["usage"][email]["five_hour"]["utilization"] = session_used
+        if weekly_used is not None:
+            server["usage"][email]["seven_day"]["utilization"] = weekly_used
+        if rate_limited is not None:
+            server["rate_limited"] = rate_limited
+        json.dump(server, open(path, "w"))
+
+    def forget_usage_cache(self):
+        """Kolejny przebieg czyta limity z serwera, a nie z pamięci podręcznej."""
+        path = os.path.join(self.state_dir, "usage-cache.json")
+        if os.path.exists(path):
+            os.remove(path)
+
     # --- odczyt ---
+
+    def pause(self):
+        path = os.path.join(self.state_dir, "pause.json")
+        return json.load(open(path)) if os.path.exists(path) else None
+
+    def notifications(self):
+        path = os.path.join(self.fake, "notify.log")
+        return open(path).read().splitlines() if os.path.exists(path) else []
 
     def entry(self, service, account=USER):
         raw = json.load(open(os.path.join(self.fake, "keychain.json"))).get(f"{service}|{account}")
@@ -581,6 +607,133 @@ class DepotTest(unittest.TestCase):
         w.run("tick", PATH=f"{os.path.dirname(FAKE_DEPOT)}:{FAKES}:/usr/bin:/bin")
 
         self.assertEqual(depot_store(w)["calls"], [])
+
+
+class PauseTest(unittest.TestCase):
+    """Pauza limitów: gdy aktywne konto się kończy, a żadne inne nie ma zapasu,
+    sesje dostają czas na punkt kontrolny zamiast paść w połowie pracy agentów."""
+
+    def exhausted_world(self):
+        # a@x ma 3% sesji (próg 5%), b@x ma 1% tygodnia: nie ma dokąd przełączyć
+        w = Env()
+        a = w.account("a@x", session_used=97, weekly_used=40)
+        w.account("b@x", weekly_used=99)
+        w.runtime(a)
+        w.write()
+        return w, a
+
+    def test_pause_starts_when_no_account_has_headroom(self):
+        w, a = self.exhausted_world()
+
+        w.run("tick")
+
+        pause = w.pause()
+        self.assertIsNotNone(pause)
+        self.assertEqual(pause["account"], "a@x")
+        # najwcześniej zapas wraca z resetem okna 5h aktywnego konta (za 3 h w atrapie)
+        self.assertAlmostEqual(pause["resume_at"], time.time() + 3 * 3600, delta=120)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], a["claudeAiOauth"])
+        snap = json.loads(w.run("status", "--json").stdout)
+        self.assertEqual(snap["pause"]["account"], "a@x")
+
+    def test_pause_is_announced_once_per_episode(self):
+        # powiadomienie co 2 minuty przez całą pauzę to spam, a nie ostrzeżenie
+        w, _ = self.exhausted_world()
+
+        for _ in range(3):
+            w.forget_usage_cache()
+            w.run("tick")
+
+        # osascript dostaje tekst z json.dumps, więc polskie litery są tam jako \uXXXX
+        self.assertEqual(len([n for n in w.notifications() if '"Claude: pauza limit' in n]), 1)
+        self.assertIsNotNone(w.pause())
+
+    def test_pause_ends_when_active_window_resets(self):
+        w, _ = self.exhausted_world()
+        w.run("tick")
+
+        w.set_usage("a@x", session_used=0)
+        w.forget_usage_cache()
+        w.run("tick")
+
+        self.assertIsNone(w.pause())
+
+    def test_pause_ends_by_switching_once_another_account_recovers(self):
+        w, _ = self.exhausted_world()
+        w.run("tick")
+
+        w.set_usage("b@x", weekly_used=10)
+        w.forget_usage_cache()
+        w.run("tick")
+
+        self.assertIsNone(w.pause())
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"]["accessToken"],
+                         w.managed("b@x")["claudeAiOauth"]["accessToken"])
+
+    def test_pause_waits_for_real_headroom_not_the_switch_threshold(self):
+        # 6% sesji to już ponad próg porzucenia (5%), ale za mało na sensowną pracę:
+        # zdjęcie pauzy przy 6% budziłoby sesje na minutę
+        w, _ = self.exhausted_world()
+        w.run("tick")
+
+        w.set_usage("a@x", session_used=94)
+        w.forget_usage_cache()
+        w.run("tick")
+
+        self.assertIsNotNone(w.pause())
+
+    def test_rate_limited_read_keeps_pause_as_it_was(self):
+        w, _ = self.exhausted_world()
+        w.run("tick")
+
+        w.set_usage("a@x", session_used=0, rate_limited=True)
+        w.forget_usage_cache()
+        w.run("tick")
+
+        self.assertIsNotNone(w.pause())
+
+    def test_resume_by_hand_lasts_until_limits_recover(self):
+        w, _ = self.exhausted_world()
+        w.run("tick")
+
+        r = w.run("resume")
+        w.run("tick")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIsNone(w.pause())  # ręczne wznowienie nie wraca przy następnym przebiegu
+        w.set_usage("a@x", session_used=0)
+        w.forget_usage_cache()
+        w.run("tick")
+        w.set_usage("a@x", session_used=97)
+        w.forget_usage_cache()
+        w.run("tick")
+        self.assertIsNotNone(w.pause())  # nowy epizod po powrocie i ponownym wyczerpaniu
+
+    def test_no_pause_while_orca_has_its_own_account_selected(self):
+        w, _ = self.exhausted_world()
+        w.run("tick")
+
+        w.orca_selects("a@x")
+        w.run("tick")
+
+        self.assertIsNone(w.pause())
+
+    def test_no_pause_while_runtime_holds_an_account_outside_orca(self):
+        # automat nie pilnuje obcego konta, więc nikt by tej pauzy nie zdjął
+        w, _ = self.exhausted_world()
+        w.run("tick")
+
+        path = os.path.join(w.fake, "keychain.json")
+        keychain = json.load(open(path))
+        stranger = {"claudeAiOauth": {"accessToken": "at-stranger", "refreshToken": "rt-stranger",
+                                      "expiresAt": int((time.time() + 3600) * 1000)}}
+        for service in (scoped(w.config_dir), BASE):
+            keychain[f"{service}|{USER}"] = json.dumps(stranger)
+        json.dump(keychain, open(path, "w"))
+        w.run("tick")
+
+        self.assertIsNone(w.pause())
+        self.assertTrue(w.saved_state().get("hands_off_notified"))  # to była gałąź obcego konta
 
 
 if __name__ == "__main__":
