@@ -158,6 +158,8 @@ można z nich stroić λ.
 
 ## `config.json`
 
+Inny plik konfiguracji (np. na jedną próbę) wskazuje zmienna `SCHED_CONFIG`.
+
 ```
 headroom_gb          4      zapas pamięci, którego scheduler nie rusza
 lambda_s_per_unit    6      ile sekund czekania jest warta jedna jednostka Depot ($0,006)
