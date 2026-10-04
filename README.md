@@ -1,27 +1,116 @@
+<div align="center">
+
+<img src="docs/panel.png" width="900" alt="Claude Acc panel in three columns: the active Claude account with session and weekly usage and the other accounts; dev servers with a memory chart against the budget and what the guard will do, plus free disk space; Stay Awake and fans with temperatures and a 20-minute chart">
+
 # claude-acc
 
-Keeps Claude Code working when you have more than one Claude subscription. A menu bar app shows the 5-hour and weekly usage of every account, and a background job moves your running Claude Code sessions to the account with the most headroom once the current one runs out. No restart, no `/login`, no terminal.
+**A menu bar control room for a Mac that runs Claude Code agents all day.**
 
-<img src="docs/panel.png" width="750" alt="Claude Acc panel: on the left the active account with 5-hour and weekly usage and the other accounts in one line each; on the right the dev servers with a memory chart against the budget, who watches each one and what the guard will do, then free disk space and the last cleanup">
+It rotates your Claude subscriptions before one hits the wall, keeps the agents' dev servers from eating your RAM, cleans up what they leave on disk, holds the Mac awake on a hotspot, and spins the fans up before the chip cooks.
 
-The UI text and the code comments are in Polish.
+[Install](#install) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Numbers](#numbers) · [Command line](#command-line)
+
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-111?logo=apple) ![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white) ![Python](https://img.shields.io/badge/Python-stdlib%20only-3776AB?logo=python&logoColor=white) ![License MIT](https://img.shields.io/badge/license-MIT-2ea44f)
+
+</div>
+
+## Install
+
+```sh
+brew install outof-place/tap/claude-acc
+claude-acc-setup          # scripts, launchd jobs and the menu bar app, into your account
+claude-acc fans install   # optional: fan control, a small root helper (asks for Touch ID)
+```
+
+Or from source:
+
+```sh
+git clone https://github.com/outof-place/claude-acc.git
+cd claude-acc
+./install.sh              # builds the app and fanctl, then runs setup.sh
+./install-fans.sh         # optional, root
+```
+
+Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads three launchd jobs (the account watcher, the janitor and the dev server guard) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
 
 ## What it does
 
-- **Menu bar ring** with the usage of the active account, for whichever window (5 hours or weekly) runs out first. It turns orange at 75% and red at 90%. An orange dot means some account needs to log in again, a red one that the Mac is running out of memory.
-- **Panel**, wide rather than tall so it fits under the menu bar of a laptop. On the left every account: 5-hour and weekly usage, which account goes next, and (in the tooltip) when each window resets ("in 2h 5m", "in 4d 4h") and when the subscription renews. For the active account it also shows when, at the current pace, the watcher will switch away from it. On the right the Mac: dev servers with a two-hour memory chart against the budget, who watches each one, what the guard is about to do, buttons to restart or stop one and to turn the guard off; free disk space and the last cleanup.
-- **Automatic switching** when the active account is down to 5% of the session or 3% of the week. It picks the account with the most weekly headroom and keeps accounts you mark as last resort (a company seat, say) for the end.
-- **One-click switch** to any account. Running sessions keep working because Claude Code reads its credentials from the Keychain on the fly.
-- **Log in again** for an account whose refresh token died. The button runs `claude auth login` in the background and opens the browser with the email pre-filled. Before saving anything, it asks the API which account you actually signed into, so a browser logged into the wrong account can't overwrite anything.
-- **Mac janitor** that keeps the disk free of build caches and tool junk that agents leave behind, at login and every 3 hours. The panel shows free space, the last cleanup and a button to clean up now. See [Mac janitor](#mac-janitor).
+| | |
+| --- | --- |
+| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`. Click any account for its plan, subscription start, renewal and both resets to the minute. |
+| **Dev server guard** | Agents in [Orca](https://github.com/stablyai/orca) each run their own `next dev` with a preview tab, and Turbopack grows to 6-9 GB per server under their edits. The guard watches every dev server's real memory (the number macOS kills by), knows who is looking at it, restarts a bloated one in its own Orca terminal in seconds, stops duplicates, orphans and loops, and turns away an agent about to start a second server of the same app. |
+| **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
+| **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
+| **Fans & heat** | P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
+
+<img src="docs/panel-details.png" width="900" alt="The same panel with one account opened: plan, subscription status and start, renewal date with a countdown, the 5-hour and weekly windows with their exact resets, place in the switching order, and buttons to switch or sign in again">
+
+The UI is in English; the scripts' messages and the code comments are in Polish.
 
 ## How it works
+
+```mermaid
+flowchart LR
+    app["Claude Acc.app<br/>menu bar, SwiftUI"]
+    subgraph user["launchd, your account"]
+        tick["accswitch.py tick<br/>every 2 min"]
+        janitor["janitor.py sweep<br/>login + every 3 h"]
+        guard["devguard.py run<br/>every 5 s"]
+    end
+    subgraph root["launchd, root"]
+        fans["fanctl daemon<br/>every 2 s"]
+    end
+    keychain[("Keychain<br/>Claude + Orca entries")]
+    api[("Anthropic API<br/>usage, profile")]
+    orca["Orca CLI<br/>tabs, terminals, agents"]
+    hook["Claude Code<br/>PreToolUse hook"]
+    smc[("SMC<br/>fans, sensors")]
+    state[("~/.local/share/claude-acc<br/>state files")]
+    tick --> keychain
+    tick --> api
+    guard --> orca
+    hook -- "devguard.py admit" --> guard
+    fans --> smc
+    tick --> state
+    janitor --> state
+    guard --> state
+    fans --> state
+    app -- "reads" --> state
+    app -- "fans.json" --> fans
+```
+
+- Every piece runs without the app; the app only reads state files and calls the scripts. Close it and the switching, cleanup, guard and fans keep working.
+- The scripts are Python 3.9 standard library only (the `/usr/bin/python3` that ships with the command line tools). Kernel numbers come through `ctypes`: `proc_pid_rusage` for memory, `sysctl` for swap and pressure, `KERN_PROCARGS2` for exact command lines.
+- The app is Swift 6 with main-actor default isolation (SE-0466) and `@concurrent` for process work, Swift Charts for the charts, and SF Rounded throughout.
+- `fanctl` talks to the SMC through IOKit's `AppleSMC` user client. Reading needs no root; the daemon that writes runs as root, reads only a mode from your folder, and writes its readings back atomically.
+
+### Accounts under the hood
 
 A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Claude Code reads `Claude Code-credentials`, plus `Claude Code-credentials-<first 8 hex chars of sha256(config dir)>` when `CLAUDE_CONFIG_DIR` is set. [Orca](https://github.com/stablyai/orca) keeps a copy of every account you add to it under `Orca Claude Code Managed Credentials`. Switching accounts means copying one account's `claudeAiOauth` into the entries the live sessions read.
 
 - `accswitch.py` holds all the logic. launchd runs `accswitch.py tick` every 2 minutes, with or without the app.
-- The menu bar app (SwiftUI, Swift 6 with main-actor default isolation, Liquid Glass controls, Swift Charts) is a thin UI. It runs `accswitch.py status --json` every minute and `switch` or `login` when you click, and reads `janitor-state.json` and `devguard-state.json`, every 3 seconds while the panel is open.
 - Usage comes from `GET https://api.anthropic.com/api/oauth/usage`, and the account behind a token from `/api/oauth/profile`.
+
+## Numbers
+
+Measured on a MacBook Pro 16" M4 Max with 48 GB, on 2026-10-04, with several agents working in Orca.
+
+<img src="docs/turbopack-ab.svg" width="760" alt="Line chart: memory of a Turbopack next dev server over 30 cycles of an agent editing a CSS file and a component and requesting two pages, then a minute idle. Both arms start at 1.2 GB, reach about 6 GB by the 30th edit and settle at about 4.6 GB idle; the auto and full memory eviction settings give the same curve">
+
+A Turbopack dev server grows fivefold under an agent's edits, and `turbopackMemoryEviction: "full"` changes nothing: 6.01 GB against 5.97 GB after 30 edits. Next.js restarts a dev server only when its V8 heap fills, and Turbopack's memory lives outside it. What does work is a restart: the server comes back from its disk cache in seconds at a third of the size, which is what the guard does once a server passes 5 GB and goes quiet.
+
+<img src="docs/guard-timeline.svg" width="760" alt="Area chart of the memory of all dev servers over about an hour, peaking near 15 GB below a 16.8 GB budget line, with dots where the guard restarted or stopped a server and the total dropped right after">
+
+With agents compiling, macOS on Auto kept the fans at about 2,000 rpm and let the hottest CPU sensor reach **115 °C**. The fixed settings, as the SMC reports them on the same Mac:
+
+| Setting | Fan speed |
+| --- | --- |
+| macOS Auto, idle | ~1,400 rpm |
+| 50% | ~3,560 rpm |
+| 75% | ~4,670 rpm |
+| Max | 5,777 rpm |
+
+On any fixed setting the daemon goes to full speed when a sensor passes 95 °C and comes back below 85 °C.
 
 ## How it avoids logging you out
 
@@ -36,20 +125,10 @@ Each of these rules comes from an account that actually lost its login while the
 
 ## Requirements
 
-- macOS 26 or newer, with Swift 6.2 or newer (Xcode or the command line tools) to build the app.
+- macOS 26 or newer on Apple silicon, with Swift 6.2 or newer (Xcode or the command line tools) to build the app. Homebrew builds it for you.
 - `/usr/bin/python3` (ships with the command line tools).
 - Claude Code. Tested with 2.1.282.
 - Orca with your Claude accounts added as managed accounts, and **System default** selected as the active Claude account in Orca. With a managed account selected, Orca puts its own account back whenever a terminal starts and every 15 minutes, undoing every switch, and it refreshes that account's token itself. claude-acc reads Orca's settings, and while an account is selected there the watcher stands down, switching is blocked and the panel tells you to pick System default.
-
-## Install
-
-```sh
-git clone https://github.com/outofplace-space/claude-acc.git
-cd claude-acc
-./install.sh
-```
-
-The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads the three launchd jobs (the account watcher, the janitor and the dev server guard), then builds and opens `~/Applications/Claude Acc.app`. The app adds itself to your login items on first run. You can turn that off in the panel.
 
 ## Command line
 
@@ -71,6 +150,9 @@ The installer copies the scripts to `~/.local/share/claude-acc`, adds a `claude-
 | `claude-acc guard once [--dry-run]` | One guard pass, at most one action |
 | `claude-acc guard stop <pid\|:port>` | Stop a dev server the way the guard does |
 | `claude-acc guard recycle <pid\|:port>` | Restart a dev server in its own Orca terminal |
+| `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
+| `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
+| `claude-acc fans install\|uninstall` | Install the fan daemon, or remove it and give the fans back to macOS |
 
 ## Configuration
 
@@ -188,6 +270,23 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
 | `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |
 
+## Stay Awake
+
+The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
+
+With **Auto on any hotspot** it switches itself on whenever the Mac joins a network that macOS marks as expensive: an iPhone or Android hotspot over Wi-Fi or USB, or a cellular modem. It turns off again when you leave that network, unless you turned it on yourself. **Keep the hotspot alive** sends one small request every 25 seconds, so a phone doesn't drop a hotspot it thinks nobody uses. The settings live in the app's preferences.
+
+## Fans & heat
+
+`fanctl` reads the SMC: every fan's speed, minimum, maximum and target, and the temperature sensors grouped by what they measure: P-cores (`Tp*`), E-cores (`Te*`), GPU (`Tg*`), SSD (`TH*`) and battery (`TB*`). The panel shows the hottest of each group, the fan speeds and a 20-minute chart of CPU and GPU temperature. Reading needs no root, so the card works without the daemon.
+
+Setting the fans needs root, so `claude-acc fans install` puts `fanctl` in `/usr/local/libexec` (owned by root) and loads it as a LaunchDaemon. Every 2 seconds it follows the mode the panel writes to `~/.local/share/claude-acc/fans.json`:
+
+- `{"mode": "auto"}` gives the fans back to macOS, `{"mode": "fixed", "percent": 50}` holds them at that share of the range between their minimum and maximum. Until you pick a mode, the daemon only reads.
+- Above 95 °C on any CPU or GPU sensor it goes to full speed, and back to your setting below 85 °C.
+- Another fan app (Mole, Macs Fan Control, TG Pro) wins: when the fans move to a speed the daemon didn't set, the panel says so and the daemon leaves them alone. It only takes the fans back after sleep, when macOS reset them to auto under a fixed setting.
+- When the daemon stops, it gives the fans back to macOS, unless another app had them.
+
 ## Tests
 
 ```sh
@@ -206,7 +305,7 @@ To see the panel without clicking the menu bar, render it to a PNG, from live da
 "$HOME/Applications/Claude Acc.app/Contents/MacOS/ClaudeAcc" --render panel.png --snapshot docs/demo-snapshot.json
 ```
 
-With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json` and `demo-janitor.json` next to it stand in for the guard and cleanup state. The renderer can't draw Liquid Glass, so buttons come out bordered.
+With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json` and `demo-fans.json` next to it stand in for the guard, cleanup and fan state. `--open <account id>` renders that account opened. Lists that scroll in the panel come out in full.
 
 ## Caveats
 
