@@ -1188,12 +1188,15 @@ def refresh_memory(state, cfg, mem=None):
     swap.append([now, mem["swap_gb"]])
     internal["swap"] = swap[-240:]
     day = time.strftime("%Y-%m-%d")
+    # ile zmieściłby pusty Mac: uczone tylko z odczytów bez lokalnych jobów (ich footprint liczy
+    # też strony skompresowane, więc dostępne + joby potrafi przekroczyć RAM)
     avail = [a for a in internal.get("avail", []) if now - a[2] < 7 * 86400]
-    if avail and avail[-1][0] == day:
-        avail[-1][1] = max(avail[-1][1], available + jobs_now)
-        avail[-1][2] = now
-    else:
-        avail.append([day, available + jobs_now, now])
+    if not local:
+        if avail and avail[-1][0] == day:
+            avail[-1][1] = max(avail[-1][1], available)
+            avail[-1][2] = now
+        else:
+            avail.append([day, available, now])
     internal["avail"] = avail[-8:]
     idle_top = max([a[1] for a in avail] + [cfg["idle_floor_pct"] / 100 * ram])
     state["host"]["ram_gb"] = round(ram, 1)
