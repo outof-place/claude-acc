@@ -41,7 +41,12 @@ Komendy:
 import sys
 
 DEV_WORDS = ("dev", "vite", "expo", "serve")
-GO_WORDS = ("go ", "golangci-lint", "make", "govulncheck")
+# słowa, bez których komenda nie ma pracy dla schedulera (Go i JS); fałszywy alarm to tylko
+# klasyfikacja w sched.py, która odpowie None
+SCHED_WORDS = (
+    "go ", "golangci-lint", "make", "govulncheck", "vitest", "jest", "playwright", "next ",
+    "tsc", "eslint", "turbo", "pnpm", "npm ", "npx ", "yarn", "bun ", "bunx", "node_modules/.bin/",
+)  # fmt: skip
 
 
 def sched_rewrite(event):
@@ -65,7 +70,7 @@ def sched_rewrite(event):
 # Hook idzie przy każdym poleceniu Bash każdego agenta, więc komenda bez śladu dev serwera
 # ani Go kończy się tutaj, zanim załadują się ctypes, janitor i wyrażenia regularne. Słowa to
 # minimum, które ma każda komenda pasująca do START (dev, vite, expo, webpack serve);
-# fałszywy alarm (np. "dev" w nazwie pliku) idzie po prostu pełną ścieżką. Komenda z Go,
+# fałszywy alarm (np. "dev" w nazwie pliku) idzie po prostu pełną ścieżką. Komenda z Go albo JS,
 # a bez dev serwera, idzie od razu do schedulera, bez reszty tego pliku.
 if __name__ == "__main__" and sys.argv[1:2] == ["admit"]:
     import io
@@ -78,7 +83,7 @@ if __name__ == "__main__" and sys.argv[1:2] == ["admit"]:
     except (ValueError, AttributeError):
         sys.exit(0)
     if not any(word in _command for word in DEV_WORDS):
-        if any(word in _command for word in GO_WORDS):
+        if any(word in _command for word in SCHED_WORDS):
             _out = sched_rewrite(_parsed)
             if _out:
                 print(json.dumps(_out))

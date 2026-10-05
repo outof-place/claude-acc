@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -636,6 +637,38 @@ class PlanTest(Paths):
         st["queue"] = [self.entry("tiny", 0.3, small=True)]
         self.assertEqual(S.plan(st, self.cfg, time.time()), {})
 
+    def test_quick_small_jobs_use_memory_free_now(self):
+        # długi job trzyma rezerwę na wzrost, którego jeszcze nie ma; krótki mały job (testy JS,
+        # jeden pakiet Go) startuje w pamięci dostępnej teraz, zamiast czekać minutami na cudzą prognozę
+        st = self.state()  # level 60: 28,8 GB dostępne
+        st["running"].append(
+            {"id": "big", "where": "local", "label": "go test ./...", "mem_predicted_gb": 20.0,
+             "mem_now_gb": 2.0, "predicted_wall_s": 1500, "started_at": time.time()}
+        )
+        S.refresh_memory(st, self.cfg)  # wolne 20,8 - 18 rezerwy = 2,8
+        st["queue"] = [self.entry("vitest", 3.0, small=True), self.entry("vet", 13.7, ago=1)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vitest": ("overtake", "vet")})
+        # głowa czeka ponad starve_s: mały wyprzedza, jeśli zostawia jej miejsce w pamięci teraz,
+        # a po 2 × starve_s już nikt (strumień testów JS nie zagłodzi dużego joba Go)
+        st["queue"] = [self.entry("vet", 13.7, ago=150), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vitest": ("overtake", "vet")})
+        st["queue"] = [self.entry("vet", 23.0, ago=150), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})  # 24,8 - 23 < 3
+        st["queue"] = [self.entry("vet", 13.7, ago=300), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        # świeżo wpuszczony mały job jeszcze nie zajął pamięci: liczy się jego prognoza
+        st["running"].append(
+            {"id": "q1", "where": "local", "label": "vitest", "mem_predicted_gb": 22.0,
+             "mem_now_gb": 0.0, "small": True, "predicted_wall_s": 60, "started_at": time.time()}
+        )
+        S.refresh_memory(st, self.cfg)
+        st["queue"] = [self.entry("vitest2", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})  # 24,8 - 22 = 2,8 < 3
+        self.set_memory(60, pressure="critical")
+        st = self.state()
+        st["queue"] = [self.entry("tiny", 0.5, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+
     def test_warn_pressure_admits_what_fits(self):
         # macOS trzyma „warn” godzinami przy połowie wolnej pamięci: przy nim startuje to, co
         # mieści się w wolnej pamięci, także kilka naraz; jeden naraz robił z kolejki stary zamek
@@ -878,6 +911,126 @@ class RtkTest(Paths):
         self.assertEqual(
             S.classify(argv[-1], self.repo)["class"], S.classify(original, self.repo)["class"]
         )
+
+
+def make_node_repo(root, depot_exec=True):
+    os.makedirs(os.path.join(root, ".git"))
+    write(os.path.join(root, "package.json"), '{"name": "shop", "private": true}')
+    write(os.path.join(root, "pnpm-workspace.yaml"), "packages:\n  - apps/*\n")
+    write(os.path.join(root, "apps/web/package.json"), '{"name": "web"}')
+    write(os.path.join(root, "apps/web/src/a.test.ts"), "")
+    if depot_exec:
+        write(os.path.join(root, "scripts/depot-exec.sh"), FAKE_DEPOT_EXEC, 0o755)
+
+
+class NodeTest(Paths):
+    """Testy, buildy i typecheck JS idą przez tę samą kolejkę co Go, w każdym projekcie z
+    package.json. Pomyłki, które ten test łapie: dev serwer, tryb watch albo instalacja w kolejce
+    (agent czekałby na coś, co się nie kończy), job JS na Depot, wyjątek rtk, który nie pokrywa
+    owiniętej komendy (dwa hooki z updatedInput, losowy wynik), i wyjątek, który zabiera rtk
+    komendzie spoza kolejki."""
+
+    WRAPPED = {
+        "cd apps/web && npx vitest run": "shop:test:apps/web:vitest",
+        "cd apps/web && pnpm vitest run src/a.test.ts": "shop:test:apps/web:vitest:filtered",
+        "cd apps/web && pnpm exec playwright test --grep login 2>&1 | tail -20": "shop:e2e:apps/web:playwright:filtered",
+        "cd apps/web && npm run build": "shop:build:apps/web:build",
+        "cd apps/web && next build": "shop:build:apps/web:next",
+        "pnpm -C apps/web test": "shop:test:apps/web:test",
+        "pnpm --filter web test:unit": "shop:test:filter=web:test:unit",
+        "pnpm typecheck": "shop:typecheck:.:typecheck",
+        "pnpm -r lint": "shop:lint:.:lint:all",
+        "turbo run build test": "shop:build:.:turbo:all",
+        "cd apps/web && tsc --noEmit -p tsconfig.json": "shop:typecheck:apps/web:tsc",
+        "cd apps/web && ./node_modules/.bin/jest": "shop:test:apps/web:jest",
+        "cd apps/web && bun test": "shop:test:apps/web:bun",
+        "cd apps/web && CI=1 npm test": "shop:test:apps/web:test",
+        "cd apps/web && yarn e2e": "shop:e2e:apps/web:e2e",
+    }
+    LEFT_ALONE = (
+        "pnpm dev",
+        "pnpm install",
+        "pnpm add -D vitest",
+        "cd apps/web && npx vitest --watch",
+        "cd apps/web && pnpm test:watch",
+        "cd apps/web && npx playwright show-report",
+        "npx playwright install chromium",
+        "cd apps/web && next dev",
+        "tsc --version",
+        "cd apps/web && npx tsc -w",
+        "echo 'pnpm test'",
+        "SCHED_OFF=1 pnpm test",
+        "npx prettier --check .",
+        "git status",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.shop = os.path.join(self.dir, "shop")
+        make_node_repo(self.shop)
+
+    def test_node_work_is_classified(self):
+        for command, cls in self.WRAPPED.items():
+            j = S.classify(command, self.shop)
+            self.assertIsNotNone(j, command)
+            self.assertEqual(j["class"], cls, command)
+            self.assertEqual(j["lang"], "node", command)
+
+    def test_dev_watch_and_installs_stay_out(self):
+        for command in self.LEFT_ALONE:
+            self.assertIsNone(S.classify(command, self.shop), command)
+        outside = os.path.join(self.dir, "no-package")
+        os.makedirs(outside)
+        self.assertIsNone(S.classify("npx vitest run", outside))  # bez package.json
+
+    def test_switch_off_in_config(self):
+        with open(S.CONFIG_PATH, "w") as f:
+            json.dump({"node": False}, f)
+        self.assertIsNone(S.classify("cd apps/web && npx vitest run", self.shop))
+        self.assertIsNotNone(S.classify("cd apps/charter-service && go vet ./...", self.repo))
+
+    def test_priors_and_learning(self):
+        full = S.classify("cd apps/web && npx vitest run", self.shop)
+        one = S.classify("cd apps/web && pnpm vitest run src/a.test.ts", self.shop)
+        gb, s = S.prior(full, 4)
+        self.assertLess(S.prior(one, 4)[0], gb)  # jeden plik testów lżejszy niż cały pakiet
+        self.assertLess(gb, self.cfg["small_gb"])  # pakiet testów JS to mały job: wyprzedza Go
+        rows = [{"where": "local", "class": full["class"], "peak_gb": 0.5, "wall_s": 3.0, "p": None}] * 3
+        self.assertEqual(S.predict(full, 4, rows)[2], "history:3")
+
+    def test_never_routed_to_depot(self):
+        job = S.classify("cd apps/web && npx vitest run", self.shop)
+        self.assertIsNone(S.depot_target(job, 30.0, 3000, self.cfg, {}))
+        with mock.patch.object(S, "go_list", side_effect=AssertionError("go list dla JS")):
+            self.assertFalse(S.uses_pg(job, {}))
+            self.assertFalse(S.count1_safe(job, {}))
+        self.assertFalse(S.likely_heavy(job))
+
+    def rtk_excluded(self, segment):
+        pats = []
+        for p in S.RTK_EXCLUDES:
+            pats.append(re.compile(p if p.startswith("^") else r"^" + re.escape(p) + r"($|\s)"))
+        return any(r.search(segment) for r in pats)
+
+    def test_rtk_exclusions_cover_what_we_wrap_and_nothing_else(self):
+        for command in self.WRAPPED:
+            words = [S.strip_prefix(w)[1] for w, _ in S.split_segments(command) if w]
+            wrapped = [" ".join(w) for w in words if w and S.parse_node(w, self.shop)]
+            self.assertTrue(wrapped, command)
+            for g in wrapped:
+                self.assertTrue(self.rtk_excluded(g), g)
+        for command in ("pnpm install", "pnpm add -D vitest", "npx prettier --check .",
+                        "git status", "npm ls", "yarn why react", "pnpm list"):
+            self.assertFalse(self.rtk_excluded(command), command)
+
+    def test_hook_wraps_node_commands(self):
+        event = {"tool_name": "Bash", "cwd": self.shop,
+                 "tool_input": {"command": "cd apps/web && pnpm test 2>&1 | tail -5"}}
+        with mock.patch.object(S, "with_rtk", side_effect=lambda c: c):
+            out = S.hook_rewrite(event)
+        argv = shlex.split(out["hookSpecificOutput"]["updatedInput"]["command"])
+        self.assertEqual(argv[:4], ["/usr/bin/python3", S.SELF, "run", "--via"])
+        self.assertEqual(argv[-1], "cd apps/web && pnpm test 2>&1 | tail -5")
 
 
 class StateTest(Paths):
