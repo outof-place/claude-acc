@@ -7,6 +7,10 @@ args = sys.argv[1:]
 cmd = args[0]
 opt = lambda flag: args[args.index(flag) + 1] if flag in args else None
 key = f"{opt('-s')}|{opt('-a')}"
+# każde wywołanie w kolejności: testy liczą odczyty Pęku kluczy na przebieg
+os.makedirs(_store.ROOT, exist_ok=True)
+with open(os.path.join(_store.ROOT, "security.log"), "a") as log:
+    log.write(f"{cmd} {key}\n")
 kc = _store.load("keychain.json", {})
 if cmd == "find-generic-password":
     if key in kc:
@@ -14,6 +18,9 @@ if cmd == "find-generic-password":
         sys.exit(0)
     sys.exit(44)
 if cmd == "add-generic-password":
+    if os.environ.get("FAKE_FAIL_WRITE_SERVICE") == opt("-s"):
+        print("security: SecKeychainItemModifyContent: fake failure", file=sys.stderr)
+        sys.exit(1)
     if os.environ.get("FAKE_SLOW_WRITE_SERVICE") == opt("-s"):
         open(os.path.join(_store.ROOT, "slow-write-started"), "w").close()
         time.sleep(3)
