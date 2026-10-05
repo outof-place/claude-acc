@@ -191,3 +191,20 @@ pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ci�
 depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)
 count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
 ```
+
+## rtk
+
+Hook rtk (`rtk-rewrite.sh`) też przepisuje `go test`, `go build`, `go vet`, `make`, `golangci-lint
+run` i `govulncheck`. Dwa hooki PreToolUse z `updatedInput` na tej samej komendzie dają losowy wynik,
+więc na Macu z rtk te narzędzia idą w jego wyjątki, w `~/Library/Application Support/rtk/config.toml`:
+
+```
+[hooks]
+exclude_commands = ["go", "make", "golangci-lint", "govulncheck"]
+```
+
+W środku opakowania `with_rtk` pyta `rtk rewrite` o tę samą komendę z pustym `HOME`, czyli bez tych
+wyjątków, więc reguły rtk mają jedno źródło i agent dalej dostaje krótkie wyjście. Kod 3 („przepisz,
+ale zapytaj”, bo w pustym HOME rtk nie widzi ustawień Claude) to dla nas zwykłe przepisanie. Gdy rtk
+nie ma albo nic nie przepisuje, komenda zostaje bez zmian. Na Depot idzie komenda bez opakowań, czyli
+bez rtk.

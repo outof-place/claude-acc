@@ -28,6 +28,7 @@ import os
 import random
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -2038,6 +2039,30 @@ def requeue_local(entry, job, command, argv, opts, cfg, history, cache):
 
 RECURSIVE_GREP = re.compile(r"(^|[\s;&|(])grep\s+(-[A-Za-z]*[rR][A-Za-z]*|--recursive)")
 
+def with_rtk(command):
+    """Komenda tak, jak przepisałby ją hook rtk bez naszych wyjątków: komendy schedulera są w jego
+    exclude_commands (dwa hooki z updatedInput na tej samej komendzie dają losowy wynik), więc
+    `rtk` dokładamy tu, w środku opakowania. `rtk rewrite` to jedno źródło jego reguł; config
+    z wyjątkami czyta z HOME, więc pytamy go z pustym HOME. Kod 3 („przepisz, ale zapytaj”,
+    bo tam nie widzi ustawień Claude) to dla nas zwykłe przepisanie."""
+    rtk = shutil.which("rtk")
+    if not rtk:
+        return command
+    home = os.path.join(STATE_DIR, "rtk-home")
+    try:
+        os.makedirs(home, exist_ok=True)
+        r = subprocess.run(
+            [rtk, "rewrite", command],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env=dict(os.environ, HOME=home, RTK_TELEMETRY_DISABLED="1"),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return command
+    out = (r.stdout or "").strip()
+    return out if r.returncode in (0, 3) and out else command
+
 
 def hook_rewrite(event):
     """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run."""
@@ -2063,7 +2088,7 @@ def hook_rewrite(event):
         parts += ["--agent", str(agent)]
     updated = dict(tool_input)
     updated["command"] = (
-        " ".join(shlex.quote(p) for p in parts) + " --shell " + shlex.quote(command)
+        " ".join(shlex.quote(p) for p in parts) + " --shell " + shlex.quote(with_rtk(command))
     )
     return {
         "hookSpecificOutput": {
