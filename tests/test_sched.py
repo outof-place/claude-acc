@@ -677,6 +677,67 @@ class HookTest(Paths):
         )
 
 
+class RtkTest(Paths):
+    """Hook rtk ma komendy schedulera w exclude_commands, więc `rtk` dokłada scheduler, pytając
+    `rtk rewrite` z pustym HOME (bez naszych wyjątków): jedno źródło reguł rtk. Pomyłki, które ten
+    test łapie: nasze wyjątki wpadające do zapytania (wtedy rtk nic nie przepisuje), wynik z kodem
+    1 albo błędem wzięty za przepisanie, i hook bez rtk w środku."""
+
+    def fake_rtk(self, rc, out):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+        return calls, run
+
+    def test_asks_rtk_without_our_exclusions(self):
+        calls, run = self.fake_rtk(3, "rtk go test ./...\n")
+        with mock.patch.object(S.shutil, "which", return_value="/opt/homebrew/bin/rtk"), \
+                mock.patch.object(S.subprocess, "run", side_effect=run):
+            self.assertEqual(S.with_rtk("go test ./..."), "rtk go test ./...")
+        argv, kw = calls[0]
+        self.assertEqual(argv, ["/opt/homebrew/bin/rtk", "rewrite", "go test ./..."])
+        self.assertNotEqual(kw["env"]["HOME"], os.environ.get("HOME"))
+        self.assertTrue(kw["env"]["HOME"].startswith(S.STATE_DIR))
+
+    def test_keeps_the_command_when_rtk_has_nothing(self):
+        for rc, out in ((1, ""), (0, ""), (2, "garbage")):
+            calls, run = self.fake_rtk(rc, out)
+            with mock.patch.object(S.shutil, "which", return_value="/x/rtk"), \
+                    mock.patch.object(S.subprocess, "run", side_effect=run):
+                self.assertEqual(S.with_rtk("go run ./cmd/x"), "go run ./cmd/x", rc)
+        with mock.patch.object(S.shutil, "which", return_value=None):
+            self.assertEqual(S.with_rtk("go test ./..."), "go test ./...")
+        with mock.patch.object(S.shutil, "which", return_value="/x/rtk"), mock.patch.object(
+            S.subprocess, "run", side_effect=subprocess.TimeoutExpired("rtk", 3)
+        ):
+            self.assertEqual(S.with_rtk("go test ./..."), "go test ./...")
+
+    @unittest.skipUnless(shutil.which("rtk"), "rtk nie jest zainstalowane")
+    def test_real_rtk_rewrites_go_and_node(self):
+        self.assertEqual(S.with_rtk("go test ./..."), "rtk go test ./...")
+        self.assertEqual(
+            S.with_rtk("cd apps/web && npx vitest run src/a.test.ts"),
+            "cd apps/web && rtk vitest src/a.test.ts",
+        )
+        self.assertEqual(S.with_rtk("go run ./cmd/x"), "go run ./cmd/x")
+
+    def test_hook_runs_rtk_inside_the_wrapper(self):
+        original = "cd apps/charter-service && go test ./internal/money/ 2>&1 | tail -5"
+        event = {"tool_name": "Bash", "cwd": self.repo, "tool_input": {"command": original}}
+        inner = "cd apps/charter-service && rtk go test ./internal/money/ 2>&1 | tail -5"
+        with mock.patch.object(S, "with_rtk", return_value=inner):
+            updated = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+        argv = shlex.split(updated["command"])
+        self.assertEqual(argv[-2:], ["--shell", inner])
+        # wnętrze z rtk klasyfikuje się tak samo jak komenda agenta
+        self.assertEqual(
+            S.classify(argv[-1], self.repo)["class"], S.classify(original, self.repo)["class"]
+        )
+
+
 class StateTest(Paths):
     def test_public_state_and_memory_gauge(self):
         st = self.state()
