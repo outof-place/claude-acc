@@ -11,12 +11,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "janitor.py")
+ACC = os.path.join(os.path.dirname(HERE), "acc.py")
 SYSTEM_TASKS = ["tmp", "go", "npm", "pnpm", "docker", "xcode", "brew", "uv", "logs"]
 OLD = 60  # dni: starsze niż każdy próg w konfiguracji
 
@@ -55,10 +57,12 @@ class Env:
     def exists(self, rel):
         return os.path.exists(os.path.join(self.work, rel))
 
-    def sweep(self, *args):
+    def sweep(self, *args, launcher=False):
+        """launcher=True: tak jak launchd po setup.sh, `<python> acc.py janitor sweep`."""
         env = dict(os.environ, HOME=self.home)
+        start = [sys.executable, ACC, "janitor"] if launcher else ["/usr/bin/python3", SCRIPT]
         done = subprocess.run(
-            ["/usr/bin/python3", SCRIPT, "sweep", "--force", *args],
+            [*start, "sweep", "--force", *args],
             capture_output=True,
             text=True,
             env=env,
@@ -73,6 +77,23 @@ class Env:
 
     def cleanup(self):
         shutil.rmtree(self.home, ignore_errors=True)
+
+
+class WriteJsonTest(unittest.TestCase):
+    def test_same_bytes_as_json_dump(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        folder = tempfile.mkdtemp(prefix="write-json-test-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        data = {"ścieżka": "~/zażółć", "liczby": [1, 2.5, None], "zagnieżdżone": {"b": True, "a": []}}
+        for kwargs in ({}, {"indent": 1}, {"indent": 1, "ensure_ascii": False}):
+            path = os.path.join(folder, "state.json")
+            janitor.write_json(path, data, **kwargs)
+            with open(path) as f:
+                written = f.read()
+            self.assertEqual(written, json.dumps(data, **kwargs), kwargs)
+            self.assertEqual(os.listdir(folder), ["state.json"])  # plik tymczasowy nie zostaje
 
 
 class GoCacheTrimTest(unittest.TestCase):
@@ -244,6 +265,13 @@ class JanitorTest(unittest.TestCase):
         self.assertFalse(
             os.path.exists(os.path.join(self.env.state_dir, "janitor-state.json"))
         )
+
+    @unittest.skipUnless(os.path.exists(ACC), "brak acc.py")
+    def test_sweep_through_launcher_does_the_same(self):
+        self.app("idle")
+        self.env.sweep(launcher=True)
+        self.assertFalse(self.env.exists("idle/.next"))
+        self.assertIn("next", self.env.state()["task_runs"])
 
     def test_interrupted_delete_is_finished(self):
         self.env.file("app/package.json", 0, "{}")

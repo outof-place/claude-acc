@@ -26,6 +26,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "perf.py")
+ACC = os.path.join(ROOT, "acc.py")
 sys.path.insert(0, ROOT)
 
 import perf
@@ -489,6 +490,14 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(perf.short_command(WORKER), "cavemem")
         self.assertEqual(perf.short_command("/usr/bin/vim a.txt"), "vim")
 
+    def test_short_command_names_claude_acc_scripts_in_both_launch_forms(self):
+        state = "/Users/x/.local/share/claude-acc"
+        for script, args in (("devguard", "run"), ("accswitch", "tick"), ("janitor", "sweep"), ("perf", "keep")):
+            direct = f"/usr/bin/python3 {state}/{script}.py {args}"
+            launcher = f"{state}/python {state}/acc.py {script} {args}"
+            self.assertEqual(perf.short_command(direct), script)
+            self.assertEqual(perf.short_command(launcher), script)
+
 
 ORCA = 'if [ -z "${HOME-}" ]; then printf "{}"; fi  # ORCA_AGENT_HOOK_PORT'
 CAVE = "/x/node /x/lib/node_modules/cavemem/dist/index.js hook run"
@@ -848,6 +857,33 @@ class HookWrapTest(Isolated):
         item.undo(again, FakeSystem({}))
         self.assertEqual(self.text(self.claude), before)
         self.assertFalse(os.path.exists(self.hooks_dir))
+
+    def test_devguard_hook_in_either_form_stays_as_it_is(self):
+        # hook strażnika: dawniej python ze skryptem, teraz natywny front claude-acc-hook
+        guard = [
+            "/usr/bin/python3 $HOME/.local/share/claude-acc/devguard.py admit",
+            "$HOME/.local/share/claude-acc/claude-acc-hook",
+        ]
+        settings = claude_settings()
+        settings["hooks"]["PreToolUse"] = [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": command, "timeout": 5}]}
+            for command in guard
+        ]
+        self.write(self.claude, settings)
+        before = self.text(self.claude)
+
+        records = {}
+        for name in ("fast-npx-hooks", "claude-hooks-async"):
+            records[name], changed = perf.tweak(name).apply(self.cfg, FakeSystem({}))
+            self.assertTrue(changed, name)  # własne hooki tych poprawek się zmieniły
+        pre = self.read(self.claude)["hooks"]["PreToolUse"]
+        self.assertEqual(
+            [group["hooks"] for group in pre],
+            [[{"type": "command", "command": command, "timeout": 5}] for command in guard],
+        )
+        for name, record in records.items():
+            perf.tweak(name).undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), before)
 
     def test_installed_hooks_are_not_deleted_on_undo(self):
         """Gdy perf.py działa z katalogu instalacji, hooks/ to pliki instalacji, nie kopie."""
@@ -1296,9 +1332,10 @@ class RealProcessTest(unittest.TestCase):
         self.dummy.wait()
         shutil.rmtree(self.home, ignore_errors=True)
 
-    def perf(self, *args):
+    def perf(self, *args, launcher=False):
+        start = [sys.executable, ACC, "perf"] if launcher else ["/usr/bin/python3", SCRIPT]
         done = subprocess.run(
-            ["/usr/bin/python3", SCRIPT, *args],
+            [*start, *args],
             capture_output=True,
             text=True,
             env=dict(os.environ, HOME=self.home),
@@ -1317,6 +1354,21 @@ class RealProcessTest(unittest.TestCase):
         ).stdout
         return int(out.strip())
 
+    @unittest.skipUnless(os.path.exists(ACC), "brak acc.py")
+    def test_apply_keep_and_undo_through_launcher(self):
+        # tak startuje po setup.sh: `<python> acc.py perf keep`; perf nie może wziąć siebie
+        # ani launchera za proces pomocniczy i ma znaleźć wydmuszkę tak jak przy starcie wprost
+        time.sleep(0.2)
+        normal = self.priority()
+        self.perf("apply", "bg-helpers", launcher=True)
+        self.assertEqual(self.priority(), perf.BACKGROUND_PRI)
+        self.perf("keep", launcher=True)
+        with open(self.state_path) as f:
+            procs = json.load(f)["applied"]["bg-helpers"]["procs"]
+        self.assertEqual([p["pid"] for p in procs], [self.dummy.pid])
+        self.perf("undo", "bg-helpers", launcher=True)
+        self.assertEqual(self.priority(), normal)
+
     def test_apply_and_undo(self):
         time.sleep(0.2)
         normal = self.priority()
@@ -1333,6 +1385,50 @@ class RealProcessTest(unittest.TestCase):
         self.assertEqual(self.priority(), normal)
         with open(self.state_path) as f:
             self.assertNotIn("bg-helpers", json.load(f)["applied"])
+
+
+class SaveStateTest(Isolated):
+    def test_unchanged_state_is_not_rewritten(self):
+        state = perf.load_state()
+        state["applied"]["x"] = {"at": 1, "detail": "zażółć"}
+        perf.save_state(state)
+        before = os.stat(perf.STATE_PATH)
+
+        time.sleep(0.01)
+        perf.save_state(perf.load_state())
+        after = os.stat(perf.STATE_PATH)
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+
+        state["applied"]["x"]["at"] = 2
+        perf.save_state(state)
+        self.assertEqual(perf.load_state()["applied"]["x"]["at"], 2)
+
+
+class OwnProcessesTest(unittest.TestCase):
+    """Jeden przebieg pyta ps raz, a lista starsza niż dwie sekundy idzie od nowa."""
+
+    def setUp(self):
+        perf._OWN_PROCESSES[:] = [None, {}]
+        self.addCleanup(perf._OWN_PROCESSES.__setitem__, slice(None), [None, {}])
+
+    def test_one_ps_per_run_and_a_fresh_one_after_two_seconds(self):
+        out = "  7 /usr/bin/a --x\n  9 /usr/bin/b\n"
+        clock = [100.0, 101.5, 102.5, 102.5]  # zapis, odczyt z pamięci, przeterminowana, zapis
+        with mock.patch.object(perf.janitor, "run", return_value=out) as run, mock.patch.object(
+            perf.time, "monotonic", side_effect=clock
+        ):
+            first = perf.own_processes()
+            first[7] = "zmienione przez wołającego"
+            self.assertEqual(perf.own_processes(), {7: "/usr/bin/a --x", 9: "/usr/bin/b"})
+            self.assertEqual(run.call_count, 1)
+            perf.own_processes()
+            self.assertEqual(run.call_count, 2)
+
+    def test_failed_ps_is_not_remembered(self):
+        with mock.patch.object(perf.janitor, "run", side_effect=[None, "  5 /bin/x\n"]) as run:
+            self.assertEqual(perf.own_processes(), {})
+            self.assertEqual(perf.own_processes(), {5: "/bin/x"})
+            self.assertEqual(run.call_count, 2)
 
 
 if __name__ == "__main__":
