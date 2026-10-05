@@ -494,9 +494,10 @@ class PlanTest(Paths):
         st["queue"] = [self.entry("tiny", 0.3, small=True)]
         self.assertEqual(S.plan(st, self.cfg, time.time()), {})
 
-    def test_warn_pressure_runs_one_job_at_a_time(self):
-        # macOS trzyma „warn” godzinami przy połowie wolnej pamięci: kolejka nie może stanąć
-        self.set_memory(50, pressure="warn")  # 24 GB dostępne, 20 GB ponad zapas
+    def test_warn_pressure_admits_what_fits(self):
+        # macOS trzyma „warn” godzinami przy połowie wolnej pamięci: przy nim startuje to, co
+        # mieści się w wolnej pamięci, także kilka naraz; jeden naraz robił z kolejki stary zamek
+        self.set_memory(60, pressure="warn")  # 28,8 GB dostępne, wolne 20,8
         st = self.state()
         st["queue"] = [
             self.entry("vet", 13.7, ago=3),
@@ -505,16 +506,21 @@ class PlanTest(Paths):
         ]
         self.assertEqual(
             S.plan(st, self.cfg, time.time()),
-            {"vet": ("fits", None), "tiny": ("overtake", "build")},
-        )  # głowa sama, jak w starym zamku; drugi duży czeka, mały go wyprzedza
+            {"vet": ("fits", None), "build": ("fits", None), "tiny": ("fits", None)},
+        )
         st["running"].append(
             {"id": "vet", "where": "local", "mem_predicted_gb": 13.7, "mem_now_gb": 2.0}
         )
-        st["queue"] = [self.entry("build", 6.6, ago=2), self.entry("tiny", 0.3, small=True)]
-        S.refresh_memory(st, self.cfg)
+        st["queue"] = [self.entry("build", 6.6, ago=2)]
+        S.refresh_memory(st, self.cfg)  # wolne 20,8 - 11,7 rezerwy vet = 9,1
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"build": ("fits", None)})
+        self.set_memory(40, pressure="warn")  # 19,2 GB: vet nie mieści się z rezerwą na dev serwer
+        st = self.state()
+        st["queue"] = [self.entry("vet", 13.7, ago=3)]
         self.assertEqual(
-            S.plan(st, self.cfg, time.time()), {"tiny": ("overtake", "build")}
-        )
+            S.plan(st, self.cfg, time.time()), {"vet": ("fits", None)}
+        )  # sam na Macu: bez rezerwy na dev serwer
+        self.set_memory(50, pressure="warn")
         st = self.state()
         st["queue"] = [self.entry("huge", 24.0, ago=600)]
         self.assertEqual(

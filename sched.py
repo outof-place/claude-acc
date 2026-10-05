@@ -1248,23 +1248,15 @@ def plan(state, cfg, now):
         if (job.get("route") or {}).get("choice") == "depot":
             continue
         need = job["mem_predicted_gb"]
-        if pressure == "warn" and need > 2.0:
-            # macOS potrafi trzymać „warn” godzinami przy połowie wolnej pamięci: wtedy głowa
-            # startuje sama, jak w starym zamku, ale tylko w dostępnej pamięci
-            alone = not any_local and not admitted
-            if blocked is None and alone and need <= mem["available_gb"] - cfg["headroom_gb"]:
-                admitted[job["id"]] = ("fits", None)
-                free -= need
-                any_local = True
-                continue
-            blocked = blocked or job
-            continue
         if blocked is None:
             spare = mem["available_gb"] - cfg["headroom_gb"]
             alone = not any_local and not admitted
             # sam na Macu: bez rezerwy na dev serwer, a po 30 s czekania nawet ponad pamięć
-            # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP)
-            if need <= free or (alone and (need <= spare or now - job["enqueued_at"] >= 30)):
+            # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP).
+            # Przy „warn” bez tego ostatniego: macOS trzyma go tu godzinami przy połowie wolnej
+            # pamięci, więc startuje to, co się mieści, ale nic ponad dostępną pamięć.
+            overcommit = pressure != "warn" and now - job["enqueued_at"] >= 30
+            if need <= free or (alone and (need <= spare or overcommit)):
                 admitted[job["id"]] = ("fits", None)
                 free -= need
                 any_local = True
@@ -1398,8 +1390,6 @@ def update_queue_view(state, cfg):
         free = max(0.0, mem["free_for_admission_gb"])
         if mem.get("pressure") == "critical":
             code, text = "pressure", "paused: memory pressure is critical"
-        elif mem.get("pressure") == "warn" and job["mem_predicted_gb"] > 2:
-            code, text = "pressure", "waiting: memory pressure, one job at a time"
         elif (
             head_blocked is not None
             and now - head_blocked["enqueued_at"] > cfg["starve_s"]
