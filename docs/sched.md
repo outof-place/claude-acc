@@ -5,6 +5,11 @@ jednego zamka na wszystko. Każdy bieg przechodzi przez `sched.py run`; hook Pre
 (`devguard.py admit`) sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje.
 Pomiary, z których wzięły się liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
 
+Presja pamięci jądra (`kern.memorystatus_vm_pressure_level`): przy `critical` nic nie startuje,
+przy `warn` joby do 2 GB startują normalnie, a większe pojedynczo (jak stary zamek), o ile mieszczą
+się w dostępnej pamięci minus zapas. macOS potrafi trzymać `warn` godzinami przy połowie wolnej
+pamięci, więc czekanie na jego koniec zatrzymałoby wszystkie komendy Go agentów.
+
 Pliki w `~/.local/share/claude-acc/sched/`:
 
 | plik | kto pisze | po co |
