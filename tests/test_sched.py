@@ -8,7 +8,9 @@ pliku (SCHED_FAKE_MEMORY), więc wynik nie zależy od tego Maca. Nic nie dotyka 
 Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -16,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -215,6 +218,40 @@ class ClassifyTest(Paths):
         opaque = S.opaque_job(["./scripts/por25-gorun.sh", "x"], self.repo)
         self.assertEqual(opaque["class"], "repo:script:por25-gorun.sh")
         self.assertEqual(S.prior(opaque, 4), (8.0, 300))
+
+
+class WaitTest(Paths):
+    """Subagent z 5-minutowym cache czeka na długą pracę krótkimi wywołaniami. Pomyłki, które ten
+    test łapie: czekanie dłuższe niż żyje cache (następne wywołanie zapisuje cały kontekst od
+    nowa), sukces przed spełnieniem warunku i wyjście, po którym agent nie wie, że ma wołać dalej."""
+
+    def wait(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = S.cmd_wait(list(args))
+        return rc, out.getvalue()
+
+    def test_returns_as_soon_as_the_condition_holds(self):
+        flag = os.path.join(self.dir, "done")
+        timer = threading.Timer(0.3, lambda: open(flag, "w").close())
+        timer.start()
+        self.addCleanup(timer.cancel)
+        start = time.time()
+        rc, out = self.wait("--max", "5", "--every", "0.1", "--", f"test -e {shlex.quote(flag)}")
+        self.assertEqual(rc, 0, out)
+        self.assertLess(time.time() - start, 3)
+
+    def test_stops_at_the_cap_and_says_to_call_again(self):
+        start = time.time()
+        rc, out = self.wait("--max", "0.5", "--every", "0.1", "--", "false")
+        self.assertEqual(rc, S.EXIT_TIMEOUT)
+        self.assertLess(time.time() - start, 2)
+        self.assertIn("ponownie", out)
+
+    def test_default_cap_fits_a_five_minute_cache(self):
+        rc, out = self.wait("--max", "x", "--", "true")
+        self.assertEqual(rc, 64)  # zły limit to błąd, nie czekanie bez końca
+        self.assertLess(S.WAIT_MAX_S, 300)
 
 
 class PredictTest(Paths):
