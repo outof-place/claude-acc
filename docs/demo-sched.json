@@ -1,0 +1,305 @@
+{
+  "version": 1,
+  "updated_at": 1791190800.0,
+  "idle_since": null,
+  "host": {
+    "ram_gb": 48,
+    "cores_p": 12,
+    "cores_e": 4
+  },
+  "config": {
+    "headroom_gb": 4.0,
+    "lambda_s_per_unit": 6,
+    "unit_usd": 0.006,
+    "small_gb": 4.5,
+    "small_wall_s": 120
+  },
+  "memory": {
+    "level_pct": 52,
+    "available_gb": 24.96,
+    "headroom_gb": 4.0,
+    "devserver_reserve_gb": 3.1,
+    "jobs_now_gb": 7.9,
+    "reserved_gb": 5.8,
+    "others_gb": 15.14,
+    "free_for_admission_gb": 12.06,
+    "idle_max_gb": 32.5,
+    "swap_used_gb": 5.7,
+    "swap_growth_2m_gb": 0.0,
+    "pressure": "normal"
+  },
+  "running": [
+    {
+      "id": "j-1791190777-3f2a",
+      "class": "charter-service:vet:tree",
+      "kind": "vet",
+      "label": "go vet ./...",
+      "module": "apps/charter-service",
+      "repo": "Untitled",
+      "cmd": "cd apps/charter-service && rtk proxy go vet ./...",
+      "agent": {
+        "session": "747c2327",
+        "name": "worker-3",
+        "worktree": "~/Documents/portivo-app/Untitled",
+        "pane": "35f566f4:4fba499d"
+      },
+      "where": "local",
+      "route": {
+        "choice": "local",
+        "why": "fits",
+        "local_eta_s": 41,
+        "depot_eta_s": null,
+        "units": null,
+        "cost_usd": null,
+        "lambda": 6,
+        "saves_s": null,
+        "text": "local, fits"
+      },
+      "p": 4,
+      "p_by": "scheduler",
+      "mem_predicted_gb": 13.7,
+      "predicted_wall_s": 41,
+      "small": false,
+      "count1_dropped": false,
+      "started_at": 1791190776.6,
+      "elapsed_s": 23.4,
+      "eta_s": 17.6,
+      "progress": 0.57,
+      "mem_now_gb": 7.9,
+      "mem_peak_gb": 11.2,
+      "cpu_cores": 7.8,
+      "paused": false,
+      "pause_reason": null,
+      "depot": null
+    },
+    {
+      "id": "j-1791190640-91c0",
+      "class": "charter-service:test:pkg:internal/handlers",
+      "kind": "test",
+      "label": "go test ./internal/handlers/",
+      "module": "apps/charter-service",
+      "repo": "Untitled",
+      "cmd": "cd apps/charter-service && go test -count=1 ./internal/handlers/ 2>&1 | tail -40",
+      "agent": {
+        "session": "a78eb852",
+        "name": "fala-21",
+        "worktree": "~/Documents/portivo-app/.claude/worktrees/agent-a785629f",
+        "pane": null
+      },
+      "where": "depot",
+      "route": {
+        "choice": "depot",
+        "why": "cost",
+        "local_eta_s": 1518,
+        "depot_eta_s": 480,
+        "units": 32,
+        "cost_usd": 0.19,
+        "lambda": 6,
+        "saves_s": 1038,
+        "text": "Depot: saves 17m18s for $0.19"
+      },
+      "p": 8,
+      "p_by": "depot",
+      "mem_predicted_gb": 24.0,
+      "predicted_wall_s": 480,
+      "small": false,
+      "count1_dropped": false,
+      "started_at": 1791190640.0,
+      "elapsed_s": 160,
+      "eta_s": 320,
+      "progress": 0.33,
+      "mem_now_gb": 0.0,
+      "mem_peak_gb": 0.0,
+      "cpu_cores": null,
+      "paused": false,
+      "pause_reason": null,
+      "depot": {
+        "target": "depot-ci",
+        "job": "handlers",
+        "cores": 8,
+        "run_id": "b8wnlc5t4b",
+        "url": "https://depot.dev/orgs/1h6766hwvw/ci/runs/b8wnlc5t4b",
+        "units": 10.7,
+        "cost_usd": 0.06
+      }
+    }
+  ],
+  "queue": [
+    {
+      "id": "j-1791190759-c41d",
+      "class": "charter-service:lint:tree",
+      "kind": "lint",
+      "label": "golangci-lint run ./...",
+      "module": "apps/charter-service",
+      "repo": "Untitled",
+      "cmd": "cd apps/charter-service && golangci-lint run --concurrency=4 ./...",
+      "agent": {
+        "session": "c1d0e9aa",
+        "name": "worker-1",
+        "worktree": "~/Documents/portivo-app/Untitled",
+        "pane": "35f566f4:77aa01c3"
+      },
+      "where": "local",
+      "route": {
+        "choice": "local",
+        "why": "waits",
+        "local_eta_s": 98,
+        "depot_eta_s": 205,
+        "units": 13.7,
+        "cost_usd": 0.08,
+        "lambda": 6,
+        "saves_s": -107,
+        "text": "local: waits 18s, Depot would take 3m25s and $0.08"
+      },
+      "mem_predicted_gb": 14.5,
+      "predicted_wall_s": 80,
+      "small": false,
+      "count1_dropped": false,
+      "position": 1,
+      "enqueued_at": 1791190759.0,
+      "waited_s": 41,
+      "eta_start_s": 18,
+      "reason": {
+        "code": "memory",
+        "need_gb": 14.5,
+        "free_gb": 12.06,
+        "after": [
+          "j-1791190777-3f2a"
+        ],
+        "text": "waiting for 14.5 GB, 12.1 free · starts when go vet ends"
+      }
+    }
+  ],
+  "overtakes": [
+    {
+      "at": 1791190788.0,
+      "id": "j-1791190788-0b7e",
+      "label": "go test ./internal/moneyfmt/",
+      "passed": "j-1791190759-c41d",
+      "passed_label": "golangci-lint run ./...",
+      "mem_gb": 0.2,
+      "wall_s": 1.0
+    }
+  ],
+  "recent": [
+    {
+      "id": "j-1791190788-0b7e",
+      "label": "go test ./internal/moneyfmt/",
+      "where": "local",
+      "rc": 0,
+      "finished_at": 1791190789.0,
+      "wall_s": 1.0,
+      "peak_gb": 0.2,
+      "predicted_gb": 0.3,
+      "waited_s": 0,
+      "cost_usd": null,
+      "route_text": "local, fits"
+    },
+    {
+      "id": "j-1791190190-77e1",
+      "label": "go build ./...",
+      "where": "local",
+      "rc": 0,
+      "finished_at": 1791190420.0,
+      "wall_s": 16.1,
+      "peak_gb": 4.5,
+      "predicted_gb": 6.6,
+      "waited_s": 0,
+      "cost_usd": null,
+      "route_text": "local, fits"
+    },
+    {
+      "id": "j-1791189620-1a9b",
+      "label": "go test -race ./...",
+      "where": "depot",
+      "rc": 0,
+      "finished_at": 1791190160.0,
+      "wall_s": 512,
+      "peak_gb": null,
+      "predicted_gb": 34.0,
+      "waited_s": 0,
+      "cost_usd": 1.63,
+      "route_text": "Depot: needs 34 GB, Mac max ~32"
+    },
+    {
+      "id": "j-1791189880-5c2d",
+      "label": "go test ./internal/service/",
+      "where": "local",
+      "rc": 1,
+      "finished_at": 1791189900.0,
+      "wall_s": 48.2,
+      "peak_gb": 3.1,
+      "predicted_gb": 3.0,
+      "waited_s": 22,
+      "cost_usd": null,
+      "route_text": "local: waits 22s, Depot would cost $0.03"
+    },
+    {
+      "id": "j-1791189200-e04f",
+      "label": "go vet ./...",
+      "where": "local",
+      "rc": 0,
+      "finished_at": 1791189500.0,
+      "wall_s": 40.7,
+      "peak_gb": 13.7,
+      "predicted_gb": 13.7,
+      "waited_s": 0,
+      "cost_usd": null,
+      "route_text": "local, fits"
+    },
+    {
+      "id": "j-1791188400-9e31",
+      "label": "go test ./...",
+      "where": "local",
+      "rc": 0,
+      "finished_at": 1791188700.0,
+      "wall_s": 31.0,
+      "peak_gb": 0.5,
+      "predicted_gb": 1.5,
+      "waited_s": 0,
+      "cost_usd": null,
+      "route_text": "local, fits"
+    },
+    {
+      "id": "j-1791187100-b3a0",
+      "label": "make test-tenant-leakage",
+      "where": "depot",
+      "rc": 0,
+      "finished_at": 1791187900.0,
+      "wall_s": 520,
+      "peak_gb": null,
+      "predicted_gb": 8.0,
+      "waited_s": 0,
+      "cost_usd": 0.42,
+      "route_text": "Depot: saves 6m10s for $0.42"
+    },
+    {
+      "id": "j-1791186500-4d88",
+      "label": "go test ./internal/money/",
+      "where": "local",
+      "rc": 0,
+      "finished_at": 1791187200.0,
+      "wall_s": 0.9,
+      "peak_gb": 0.3,
+      "predicted_gb": 0.6,
+      "waited_s": 0,
+      "cost_usd": null,
+      "route_text": "local, fits"
+    }
+  ],
+  "today": {
+    "date": "2026-10-05",
+    "jobs_local": 209,
+    "jobs_depot": 3,
+    "wait_s": 140,
+    "old_lock_wait_s": 4040,
+    "wait_saved_s": 3900,
+    "depot_units": 377,
+    "depot_cost_usd": 2.26,
+    "local_kept_usd": 1.92,
+    "overtakes": 7,
+    "pauses": 0,
+    "peak_concurrency": 3,
+    "max_reserved_gb": 18.2
+  }
+}

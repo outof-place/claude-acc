@@ -10,6 +10,7 @@ Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -470,6 +471,43 @@ class GuardTest(unittest.TestCase):
         verdict = self.admit("pnpm exec next dev", self.app("blog"))
         self.assertEqual(verdict["permissionDecision"], "deny")
         self.assertIn("budżetu", verdict["permissionDecisionReason"])
+
+    def go_module(self, name):
+        root = os.path.join(self.home, name)
+        os.makedirs(os.path.join(root, ".git"), exist_ok=True)
+        with open(os.path.join(root, "go.mod"), "w") as f:
+            f.write("module x\n")
+        return root
+
+    def test_admit_wraps_go_commands_in_the_scheduler(self):
+        # bez słów dev serwera: szybka ścieżka; ze słowem "dev" w ścieżce: pełna ścieżka
+        for name in ("svc", "devtools"):
+            root = self.go_module(name)
+            command = "go test -count=1 ./... 2>&1 | tail -5"
+            event = {
+                "tool_name": "Bash",
+                "cwd": root,
+                "session_id": "s-1",
+                "tool_input": {
+                    "command": command,
+                    "timeout": 600000,
+                    "description": "testy",
+                },
+            }
+            out = json.loads(self.run_guard("admit", stdin=json.dumps(event)))[
+                "hookSpecificOutput"
+            ]
+            self.assertNotIn("permissionDecision", out)
+            updated = out["updatedInput"]
+            self.assertEqual(
+                (updated["timeout"], updated["description"]), (600000, "testy")
+            )
+            argv = shlex.split(updated["command"])
+            self.assertIn("run", argv)
+            self.assertEqual(argv[argv.index("--via") + 1], "hook")
+            self.assertEqual(argv[-2:], ["--shell", command])
+        self.assertIsNone(self.admit("go version", self.go_module("svc")))
+        self.assertIsNone(self.admit("rtk git status", self.go_module("svc")))
 
 
 if __name__ == "__main__":

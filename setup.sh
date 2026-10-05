@@ -48,7 +48,7 @@ done
 [ -d "$APP_SRC" ] || { echo "brak aplikacji: --app \"<Claude Acc.app>\"" >&2; exit 2; }
 
 mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
-cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$STATE/"
+cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$SRC/sched.py" "$STATE/"
 # hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
@@ -80,6 +80,7 @@ case "$1" in
   clean) shift; exec /usr/bin/python3 "$STATE/janitor.py" sweep --force "$@" ;;
   guard) shift; exec /usr/bin/python3 "$STATE/devguard.py" "$@" ;;
   perf) shift; exec /usr/bin/python3 "$STATE/perf.py" "$@" ;;
+  sched) shift; exec /usr/bin/python3 "$STATE/sched.py" "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka

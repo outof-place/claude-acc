@@ -34,6 +34,10 @@ final class Store {
     private(set) var guardBusy: String?
     private(set) var fanState: FanState?
     private(set) var ultra: Ultra?
+    /// The Go build scheduler: running, queued, memory split, today.
+    private(set) var sched: SchedState?
+    /// kern.memorystatus_level, for the Builds memory lane while the scheduler is idle.
+    private(set) var memoryLevel: Double?
     /// CPU and GPU load since the previous reading.
     private(set) var load: LoadReading?
     @ObservationIgnored private let loadSampler = LoadSampler()
@@ -65,7 +69,7 @@ final class Store {
     /// Rendering the panel to a file: fixed data, no timers, no login item.
     init(
         preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
-        ultra: Ultra? = nil, load: LoadReading? = nil
+        ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil
     ) {
         awake = Awake(preview: true)
         snapshot = preview
@@ -75,6 +79,7 @@ final class Store {
         if let fans { fanState = fans }
         if let ultra { self.ultra = ultra }
         if let load { self.load = load }
+        if let sched { self.sched = sched }
     }
 
     init() {
@@ -136,6 +141,10 @@ final class Store {
             fanState = Self.decode(FanState.self, from: data)
             if let pick = fanPick, pick == fanMode { fanPick = nil }
         }
+        if let data = FileManager.default.contents(atPath: CLI.schedState) {
+            sched = Self.decode(SchedState.self, from: data)
+        }
+        memoryLevel = Self.kernelMemoryLevel()
         if let data = FileManager.default.contents(atPath: CLI.perfState) {
             ultra = Self.decode(PerfFile.self, from: data)?.ultra
         }
@@ -160,7 +169,8 @@ final class Store {
             while !Task.isCancelled {
                 self?.readLocal()
                 self?.sampleLoad()
-                try? await Task.sleep(for: .seconds(3))
+                // the scheduler rewrites its state every second while builds run
+                try? await Task.sleep(for: .seconds(self?.sched?.busy == true ? 1 : 3))
             }
         }
     }
@@ -326,6 +336,12 @@ final class Store {
         } catch {
             notice = Notice(text: "Couldn't save the fan mode: \(error.localizedDescription)", isError: true)
         }
+    }
+
+    static func kernelMemoryLevel() -> Double? {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        return sysctlbyname("kern.memorystatus_level", &value, &size, nil, 0) == 0 ? Double(value) : nil
     }
 
     func sampleLoad() {
