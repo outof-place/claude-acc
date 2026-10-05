@@ -2117,45 +2117,29 @@ def requeue_local(entry, job, command, argv, opts, cfg, history, cache):
 
 RECURSIVE_GREP = re.compile(r"(^|[\s;&|(])grep\s+(-[A-Za-z]*[rR][A-Za-z]*|--recursive)")
 
-# komendy, które hook rtk przepisuje na `rtk ...` (krótsze wyjście dla agenta). Gdzie rtk jest,
-# te komendy idą w jego [hooks] exclude_commands: dwa hooki z updatedInput na tej samej komendzie
-# dają losowy wynik. `rtk` dokłada wtedy ten hook, w środku opakowania schedulera.
-RTK_REWRITES = {"go": ("test", "build", "vet"), "make": None, "golangci-lint": ("run",)}
-RTK_WORD = re.compile(
-    r"((?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|()'\"]*\s+)*)([\w.-]+)(?:\s+([\w-]+))?"
-)
-
-
 def with_rtk(command):
-    """Komenda z `rtk` przed narzędziami z RTK_REWRITES, gdy rtk jest zainstalowane. Tekst w
-    cudzysłowach, przypisania VAR=wartość i człony zaczęte od rtk zostają bez zmian."""
-    if not shutil.which("rtk"):
+    """Komenda tak, jak przepisałby ją hook rtk bez naszych wyjątków: komendy schedulera są w jego
+    exclude_commands (dwa hooki z updatedInput na tej samej komendzie dają losowy wynik), więc
+    `rtk` dokładamy tu, w środku opakowania. `rtk rewrite` to jedno źródło jego reguł; config
+    z wyjątkami czyta z HOME, więc pytamy go z pustym HOME. Kod 3 („przepisz, ale zapytaj”,
+    bo tam nie widzi ustawień Claude) to dla nas zwykłe przepisanie."""
+    rtk = shutil.which("rtk")
+    if not rtk:
         return command
-    out, i, n, start, quote = [], 0, len(command), True, None
-    while i < n:
-        c = command[i]
-        if quote:
-            if c == "\\" and quote == '"' and i + 1 < n:
-                out.append(command[i : i + 2])
-                i += 2
-                continue
-            if c == quote:
-                quote = None
-        elif c in "'\"":
-            quote, start = c, False
-        elif c in ";&|(\n":
-            start = True
-        elif start and not c.isspace():
-            start = False
-            m = RTK_WORD.match(command, i)
-            verbs = RTK_REWRITES.get(m.group(2), ()) if m else ()
-            if m and (verbs is None or m.group(3) in verbs):
-                out.append(m.group(1) + "rtk ")
-                i += len(m.group(1))
-                continue
-        out.append(c)
-        i += 1
-    return "".join(out)
+    home = os.path.join(STATE_DIR, "rtk-home")
+    try:
+        os.makedirs(home, exist_ok=True)
+        r = subprocess.run(
+            [rtk, "rewrite", command],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env=dict(os.environ, HOME=home, RTK_TELEMETRY_DISABLED="1"),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return command
+    out = (r.stdout or "").strip()
+    return out if r.returncode in (0, 3) and out else command
 
 
 def hook_rewrite(event):
