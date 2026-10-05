@@ -162,6 +162,8 @@ Each of these rules comes from an account that actually lost its login while the
 | `claude-acc guard once [--dry-run]` | One guard pass, at most one action |
 | `claude-acc guard stop <pid\|:port>` | Stop a dev server the way the guard does |
 | `claude-acc guard recycle <pid\|:port>` | Restart a dev server in its own Orca terminal |
+| `claude-acc guard pin <:port\|dir> [--for 12h \| --forever] [--reason TEXT] [--no-restart]` | An exception for a while: the guard never stops that server |
+| `claude-acc guard unpin <:port\|dir\|all>` / `claude-acc guard pins` | Drop a pin / list pins with their reasons and expiry |
 | `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
 | `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
 | `claude-acc fans install\|uninstall` | Install the fan daemon, or remove it and give the fans back to macOS |
@@ -268,6 +270,19 @@ What it does, gentlest first:
 
 One action at a time, then `cooldown_seconds` to let memory settle, and the swap growth window starts over so an old trend can't trigger the next one. A server younger than `grace_minutes` is left alone. After a stop the guard closes the server's background preview tabs in Orca (they would only keep reloading), writes a `devguard: ...` comment on the worktree card when the card has no comment of someone else's, sends a notification, and logs the command to bring the server back.
 
+### Pins: exceptions for a while
+
+Some servers have to stay up even when nobody watches them: a server a film pipeline captures from every few minutes, a demo you are about to show. `protect` in the config is permanent; a pin is the same promise for a while, set from the terminal (by you or by an agent) without editing JSON:
+
+```sh
+claude-acc guard pin :3747 --for 24h --reason "hero film captures"
+claude-acc guard pin ~/code/site/apps/web          # a directory: every server in or below it
+claude-acc guard pins
+claude-acc guard unpin :3747
+```
+
+A pinned server is never stopped: not as idle, a duplicate, an orphan, over budget or under pressure. When it bloats over `max_server_gb` it is still restarted in its terminal (it is back in seconds), and a restart loop only warns. `--no-restart` holds even that, until memory is critical: then the biggest pinned server is restarted, never stopped, and only when nothing unpinned is left to free. Pins last 12 hours unless you say `--for 90m`, `--for 2d` or `--forever`, live in `~/.local/share/claude-acc/devguard-pins.json`, take effect on the next pass without restarting the guard, and show up in `guard status` with their reason and expiry. Expired ones are ignored.
+
 `devguard.py admit` is a `PreToolUse` hook for Claude Code. When an agent is about to start a dev server (also through `orca terminal create --command`, `cd`, `pnpm -C`, `--filter`), it refuses a second server of an app that already runs and gives the agent its URL instead, and refuses a new one when memory is critical or the servers are over budget. It denies even under `--dangerously-skip-permissions`. `DEVGUARD_ALLOW=1` in front of the command lets it through. Add it to `~/.claude/settings.json`:
 
 ```json
@@ -285,6 +300,7 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `max_server_gb` | `5` | A single server above this is bloated |
 | `swap_warn_percent` / `swap_critical_percent` | `12` / `20` | Swap as % of RAM for a warning and, while it grows, for critical |
 | `available_critical_percent` | `10` | `kern.memorystatus_level` at or below this is critical |
+| `kernel_pressure` | `true` | Take the kernel's pressure level (`kern.memorystatus_vm_pressure_level`) into account; `false` relies on swap and `memorystatus_level` alone |
 | `quiet_seconds` | `30` | No CPU and no terminal output for this long before a watched server is restarted (10 times that for the one you watch) |
 | `grace_minutes` | `3` | A new server is left alone this long |
 | `duplicate_minutes` / `orphan_minutes` / `idle_minutes` | `5` / `10` / `45` | When a duplicate, an orphan and an idle server go |
@@ -292,7 +308,7 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `max_recycles_per_hour` | `2` | More restarts of one app than this is a loop: stop instead |
 | `background_unattended` | `true` | Background QoS for servers you don't watch |
 | `close_tabs` / `orca_comment` / `notify` | `true` | What happens around a stop |
-| `protect` | `[]` | Server paths (or anything above them) and ports like `":3000"` the guard never touches |
+| `protect` | `[]` | Server paths (or anything above them) and ports like `":3000"` the guard never touches; for a while, use `guard pin` |
 | `scope` | `[]` | When set, the guard only sees servers under these paths |
 | `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
 | `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |

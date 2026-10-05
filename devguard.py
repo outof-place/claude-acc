@@ -35,6 +35,12 @@ Komendy:
   once [--dry-run]      jeden pomiar i co najwyżej jedna akcja
   stop <pid|:port>      zatrzymaj serwer tak, jak robi to strażnik
   recycle <pid|:port>   restart w tym samym terminalu Orki
+  pin <:port|katalog> [--for 12h | --forever] [--reason TEKST] [--no-restart]
+                        wyjątek na czas: strażnik go nie zatrzyma (bezczynność, duplikat,
+                        sierota, budżet); spuchnięty dostaje restart, z --no-restart nawet
+                        nie to, poza krytyczną presją
+  unpin <:port|katalog|all>   zdejmij przypięcie
+  pins                  przypięcia, ich powody i terminy
   admit                 hook PreToolUse (Bash) dla Claude Code; zdarzenie czyta z stdin
 """
 
@@ -106,6 +112,8 @@ CONFIG_PATH = os.path.join(STATE_DIR, "devguard.json")
 STATE_PATH = os.path.join(STATE_DIR, "devguard-state.json")
 LOG_PATH = os.path.join(STATE_DIR, "devguard.log")
 LOCK_PATH = os.path.join(STATE_DIR, "devguard.lock")
+# wyjątki dodane z terminala (`pin`): osobny plik, który pętla czyta przy każdym pomiarze
+PINS_PATH = os.path.join(STATE_DIR, "devguard-pins.json")
 
 GB = janitor.GB
 MB = 1024**2
@@ -129,6 +137,8 @@ DEFAULT_CONFIG = {
     # kern.memorystatus_level: procent pamięci, którą jądro uważa za dostępną
     "available_critical_percent": 10,
     "available_warn_percent": 20,
+    # czy liczyć się z poziomem presji jądra (kern.memorystatus_vm_pressure_level)
+    "kernel_pressure": True,
     # swap urósł o tyle MB w ostatnich 2 minutach: system właśnie wypycha pamięć
     "swapping_mb": 256,
     # albo kompresor wrzucił do swapu tyle segmentów w tym samym oknie
@@ -395,6 +405,9 @@ class Pressure:
     def __init__(self, cfg, state, now):
         self.ram = sysctl_int("hw.memsize") or 16 * GB
         self.kernel = sysctl_int("kern.memorystatus_vm_pressure_level") or 1
+        # poziom jądra jest tylko dodatkiem; testy i ci, którym jego ostrzeżenia hałasują,
+        # wyłączają go w konfiguracji
+        kernel = self.kernel if cfg.get("kernel_pressure", True) else 1
         self.available = sysctl_int("kern.memorystatus_level")
         self.swap_total, self.swap_used = swap_usage()
         self.compressed = sysctl_int("vm.compressor_bytes_used") or 0
@@ -419,7 +432,7 @@ class Pressure:
         available = self.available if self.available is not None else 100
         self.reasons = []
         self.notes = []
-        if self.kernel >= 4:
+        if kernel >= 4:
             self.reasons.append("jądro: presja krytyczna")
         if available <= cfg["available_critical_percent"]:
             self.reasons.append(f"dostępne tylko {available}% pamięci")
@@ -428,7 +441,7 @@ class Pressure:
         if self.reasons:
             self.level = 2
             return
-        if self.kernel >= 2:
+        if kernel >= 2:
             self.reasons.append("jądro: ostrzeżenie o presji")
         if available <= cfg["available_warn_percent"]:
             self.reasons.append(f"dostępne {available}% pamięci")
@@ -671,6 +684,7 @@ class Unit:
         self.worktree = None
         self.consumers = []  # worktree, z których agenci oglądają serwer
         self.protected = False
+        self.pin = None  # przypięcie z `pin`, które obejmuje tę jednostkę
         # z historii
         self.age = 0
         self.quiet = 0
@@ -746,6 +760,7 @@ class Unit:
             "age": round(self.age),
             "quiet": round(self.quiet),
             "protected": self.protected,
+            "pin": self.pin,
             "background": self.background,
             "servers": len(self.servers),
             "launch_cwd": self.launch_cwd,
@@ -858,6 +873,7 @@ class World:
             for p in cfg["protect"]
             if str(p).lstrip(":").isdigit()
         }
+        pins = load_pins(now)
         history = state.setdefault("units", {})
         seen = set()
         for unit in self.units:
@@ -878,6 +894,9 @@ class World:
                 for s in unit.servers
                 for p in protect
             )
+            unit.pin = next((p for p in pins if pin_matches(p, unit)), None)
+            if unit.pin:
+                unit.protected = True
             seen.add(unit.key)
             h = history.get(unit.key)
             if h is None:
@@ -1026,6 +1045,29 @@ def decide(cfg, world, state):
                     )
                 )
 
+    # przypięte: nigdy stop; spuchnięte dostają restart (wstaje z cache w kilka sekund),
+    # chyba że przypięcie mówi --no-restart
+    for unit in units:
+        pin = getattr(unit, "pin", None)
+        if not pin or unit.age < grace or unit.biggest < max_fp:
+            continue
+        if pin.get("level") == "hold" or not unit.recyclable:
+            continue
+        if unit.quiet < cfg["quiet_seconds"] * (10 if unit.attended else 1):
+            continue
+        plans.append(
+            Plan(
+                unit,
+                "recycle",
+                70,
+                f"spuchł do {janitor.human(unit.biggest)} (limit {cfg['max_server_gb']} GB); "
+                "przypięty, więc restart zamiast zatrzymania",
+                "bloated",
+                size=unit.biggest,
+                limit=max_fp,
+            )
+        )
+
     total = sum(u.footprint for u in units)
     budget = cfg["budget_percent"] / 100 * pressure.ram
     idle_pool = cfg["idle_minutes"] * MINUTE / 3
@@ -1074,6 +1116,27 @@ def decide(cfg, world, state):
             plans.append(
                 Plan(top, action, 90 if pressure.level == 2 else 80, why, code, **data)
             )
+        elif pressure.level == 2:
+            # Mac się dusi, a zostały tylko przypięte: restart największego, nigdy stop
+            pinned = [
+                u
+                for u in units
+                if getattr(u, "pin", None) and u.recyclable and u.age >= grace
+            ]
+            if pinned:
+                top = max(pinned, key=lambda u: u.footprint)
+                plans.append(
+                    Plan(
+                        top,
+                        "recycle",
+                        90,
+                        "brak pamięci: "
+                        + ", ".join(pressure.reasons)
+                        + "; przypięty, więc restart zamiast zatrzymania",
+                        "pressure",
+                        level=2,
+                    )
+                )
 
     for plan in plans:
         if plan.action != "recycle":
@@ -1081,11 +1144,10 @@ def decide(cfg, world, state):
         count = recent_recycles(state, plan.unit.app_key, now)
         if count >= cfg["max_recycles_per_hour"]:
             plan.data["restarts"] = count
-            if plan.unit.attended:
+            if plan.unit.attended or getattr(plan.unit, "pin", None):
                 plan.action, plan.code = "warn", "loop_watched"
-                plan.reason += (
-                    f"; {count} restarty w godzinę, nie ruszam, bo go oglądasz"
-                )
+                why = "go oglądasz" if plan.unit.attended else "jest przypięty"
+                plan.reason += f"; {count} restarty w godzinę, nie ruszam, bo {why}"
             else:
                 plan.action, plan.code = "stop", "loop"
                 plan.reason += f"; {count} restarty w godzinę to pętla, zatrzymuję"
@@ -1503,7 +1565,9 @@ def print_status(snap):
         flags = []
         if u["agent_working"]:
             flags.append("agent pracuje")
-        if u["protected"]:
+        if u.get("pin"):
+            flags.append(pin_phrase(u["pin"]))
+        elif u["protected"]:
             flags.append("chroniony")
         if u.get("background"):
             flags.append("QoS tła")
@@ -1521,6 +1585,137 @@ def print_status(snap):
             print(f"    -> {verb}: {plan['reason']}")
     if not snap["units"]:
         print("  (żaden dev serwer nie działa)")
+
+
+# ---------- przypięcia ----------
+
+DEFAULT_PIN_HOURS = 12
+
+
+def load_pins(now=None):
+    """Aktywne przypięcia; wygasłe pętla po prostu pomija, sprząta je dopiero `pin`/`unpin`."""
+    now = now or time.time()
+    pins = janitor.load_json(PINS_PATH, {}).get("pins", [])
+    return [
+        p
+        for p in pins
+        if isinstance(p, dict)
+        and p.get("target")
+        and (p.get("until") is None or p["until"] > now)
+    ]
+
+
+def save_pins(pins):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    janitor.write_json(PINS_PATH, {"pins": pins})
+
+
+def pin_target(raw, cwd=None):
+    """`:3747` dla portu, bezwzględna ścieżka dla katalogu (serwera albo nad nim)."""
+    raw = raw.strip()
+    if raw.lstrip(":").isdigit():
+        return ":" + raw.lstrip(":")
+    return os.path.realpath(os.path.join(cwd or os.getcwd(), os.path.expanduser(raw)))
+
+
+def pin_matches(pin, unit):
+    target = pin["target"]
+    if target.startswith(":"):
+        return target[1:].isdigit() and int(target[1:]) in unit.ports
+    return any(
+        s.cwd == target or s.cwd.startswith(target + "/") for s in unit.servers
+    )
+
+
+def parse_duration(text):
+    """`90m`, `12h`, `2d`, `1,5h` -> sekundy."""
+    match = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*([mhd])", text.strip().lower())
+    if not match:
+        raise ValueError(f"nie rozumiem czasu {text!r}: podaj np. 90m, 12h albo 2d")
+    value = float(match.group(1).replace(",", "."))
+    return value * {"m": MINUTE, "h": HOUR, "d": 24 * HOUR}[match.group(2)]
+
+
+def pin_phrase(pin):
+    parts = ["przypięty"]
+    if pin.get("until"):
+        parts.append("do " + time.strftime("%d.%m %H:%M", time.localtime(pin["until"])))
+    else:
+        parts.append("bez terminu")
+    if pin.get("level") == "hold":
+        parts.append("bez restartów")
+    text = " ".join(parts)
+    return f"{text}: {pin['reason']}" if pin.get("reason") else text
+
+
+def cmd_pin(_cfg, args):
+    usage = "użycie: pin <:port|katalog> [--for 12h | --forever] [--reason TEKST] [--no-restart]"
+    if not args or args[0].startswith("--"):
+        print(usage)
+        return 2
+    now = time.time()
+    target = pin_target(args[0])
+    until, reason, level = now + DEFAULT_PIN_HOURS * HOUR, "", "keep"
+    rest = list(args[1:])
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--for" and rest:
+            until = now + parse_duration(rest.pop(0))
+        elif flag == "--forever":
+            until = None
+        elif flag == "--reason" and rest:
+            reason = rest.pop(0)
+        elif flag == "--no-restart":
+            level = "hold"
+        else:
+            print(usage)
+            return 2
+    pin = {
+        "target": target,
+        "until": until,
+        "reason": reason,
+        "level": level,
+        "at": now,
+    }
+    pins = [p for p in load_pins(now) if p["target"] != target] + [pin]
+    save_pins(pins)
+    log(f"przypięcie {short(target)}: {pin_phrase(pin)}")
+    print(f"{short(target)}: {pin_phrase(pin)}")
+    return 0
+
+
+def cmd_unpin(_cfg, args):
+    if not args:
+        print("użycie: unpin <:port|katalog|all>")
+        return 2
+    now = time.time()
+    pins = load_pins(now)
+    if args[0] == "all":
+        gone, kept = pins, []
+    else:
+        target = pin_target(args[0])
+        gone = [p for p in pins if p["target"] == target]
+        kept = [p for p in pins if p["target"] != target]
+    save_pins(kept)
+    if not gone:
+        print(f"nie ma przypięcia {args[0]}")
+        return 1
+    for pin in gone:
+        log(f"zdjęte przypięcie {short(pin['target'])}")
+    print(f"zdjęte: {', '.join(short(p['target']) for p in gone)}")
+    return 0
+
+
+def cmd_pins(_cfg, args):
+    pins = load_pins()
+    if "--json" in args:
+        print(json.dumps(pins))
+        return 0
+    if not pins:
+        print("(brak przypięć)")
+    for pin in pins:
+        print(f"  {short(pin['target'])}  {pin_phrase(pin)}")
+    return 0
 
 
 def find_unit(world, target):
@@ -1716,6 +1911,9 @@ COMMANDS = {
     "status": cmd_status,
     "stop": cmd_manual("stop"),
     "recycle": cmd_manual("recycle"),
+    "pin": cmd_pin,
+    "unpin": cmd_unpin,
+    "pins": cmd_pins,
     "admit": cmd_admit,
 }
 

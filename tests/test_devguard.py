@@ -168,6 +168,117 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(plans(world(u, level=2)), [("a", "stop")])
 
 
+PIN_KEEP = {"target": ":3747", "level": "keep", "until": None, "reason": "film"}
+PIN_HOLD = {"target": ":3747", "level": "hold", "until": None, "reason": "film"}
+
+
+class PinTest(unittest.TestCase):
+    """Przypięcia z `pin`: wyjątek na czas, którego strażnik nie zatrzymuje."""
+
+    def pinned(self, pin, **attrs):
+        return unit("a", protected=True, pin=pin, ports=[3747], **attrs)
+
+    def test_pinned_is_never_stopped_for_idle_or_budget(self):
+        idle = self.pinned(PIN_KEEP, quiet=99_999)
+        self.assertEqual(plans(world(idle), budget_percent=1), [])
+
+    def test_pinned_duplicate_and_orphan_stay(self):
+        old = unit("old", cwd="/w/app", watched=True)
+        dup = unit("dup", cwd="/w/app", start=5, protected=True, pin=PIN_KEEP)
+        orphan = self.pinned(PIN_KEEP, host="orphan", recyclable=False)
+        self.assertEqual(plans(world(old, dup)), [])
+        self.assertEqual(plans(world(orphan)), [])
+
+    def test_pinned_bloated_is_recycled_never_stopped(self):
+        self.assertEqual(
+            plans(world(self.pinned(PIN_KEEP, fp_gb=7))), [("a", "recycle")]
+        )
+        stuck = self.pinned(PIN_KEEP, fp_gb=7, recyclable=False)
+        self.assertEqual(plans(world(stuck)), [])
+
+    def test_no_restart_pin_is_left_alone_until_critical(self):
+        held = self.pinned(PIN_HOLD, fp_gb=7)
+        self.assertEqual(plans(world(held)), [])
+        self.assertEqual(
+            plans(world(held, level=2, reasons=["swap"])), [("a", "recycle")]
+        )
+
+    def test_critical_pressure_frees_unpinned_first(self):
+        held = self.pinned(PIN_HOLD, fp_gb=7)
+        other = unit("b", 3)
+        self.assertEqual(plans(world(held, other, level=2))[0], ("b", "stop"))
+
+    def test_pinned_restart_loop_only_warns(self):
+        state = {"recycles": [[NOW - 600, "/w/a"], [NOW - 1200, "/w/a"]]}
+        got = plans(world(self.pinned(PIN_KEEP, fp_gb=7)), state)
+        self.assertEqual(got, [("a", "warn")])
+
+    def test_pin_matches_port_and_directory_below(self):
+        u = unit("a", cwd="/w/repo/apps/web", ports=[3747])
+        self.assertTrue(dg.pin_matches({"target": ":3747"}, u))
+        self.assertTrue(dg.pin_matches({"target": "/w/repo"}, u))
+        self.assertFalse(dg.pin_matches({"target": "/w/rep"}, u))
+        self.assertFalse(dg.pin_matches({"target": ":3000"}, u))
+
+    def test_durations(self):
+        self.assertEqual(dg.parse_duration("90m"), 90 * 60)
+        self.assertEqual(dg.parse_duration("1,5h"), 5400)
+        self.assertEqual(dg.parse_duration("2d"), 2 * 86400)
+        with self.assertRaises(ValueError):
+            dg.parse_duration("soon")
+
+
+class PinCommandTest(unittest.TestCase):
+    """`pin`, `unpin`, `pins` na prawdziwym pliku przypięć w katalogu testu."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        patches = [
+            mock.patch.object(dg, "PINS_PATH", os.path.join(self.tmp, "pins.json")),
+            mock.patch.object(dg, "STATE_DIR", self.tmp),
+            mock.patch.object(dg, "LOG_PATH", os.path.join(self.tmp, "devguard.log")),
+            mock.patch("builtins.print"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_pin_defaults_to_twelve_hours_and_keep(self):
+        self.assertEqual(dg.cmd_pin({}, [":3747", "--reason", "film hero"]), 0)
+        (pin,) = dg.load_pins()
+        self.assertEqual(
+            (pin["target"], pin["level"], pin["reason"]), (":3747", "keep", "film hero")
+        )
+        self.assertAlmostEqual(pin["until"] - time.time(), 12 * 3600, delta=5)
+
+    def test_pin_replaces_the_same_target_and_expires(self):
+        dg.cmd_pin({}, ["3747", "--for", "1h"])
+        dg.cmd_pin({}, [":3747", "--forever", "--no-restart"])
+        (pin,) = dg.load_pins()
+        self.assertEqual((pin["until"], pin["level"]), (None, "hold"))
+        dg.cmd_pin({}, [":3000", "--for", "1m"])
+        self.assertEqual(len(dg.load_pins(time.time() + 120)), 1)
+
+    def test_directory_pin_is_absolute(self):
+        dg.cmd_pin({}, [self.tmp])
+        (pin,) = dg.load_pins()
+        self.assertEqual(pin["target"], os.path.realpath(self.tmp))
+
+    def test_unpin_one_and_all(self):
+        dg.cmd_pin({}, [":3747"])
+        dg.cmd_pin({}, [":3000"])
+        self.assertEqual(dg.cmd_unpin({}, [":3747"]), 0)
+        self.assertEqual([p["target"] for p in dg.load_pins()], [":3000"])
+        self.assertEqual(dg.cmd_unpin({}, [":9999"]), 1)
+        self.assertEqual(dg.cmd_unpin({}, ["all"]), 0)
+        self.assertEqual(dg.load_pins(), [])
+
+    def test_bad_arguments(self):
+        self.assertEqual(dg.cmd_pin({}, []), 2)
+        self.assertEqual(dg.cmd_pin({}, [":3747", "--soon"]), 2)
+
+
 class PressureTest(unittest.TestCase):
     def measure(self, swap_gb, history=None, swapouts=100, kernel=1, available=50):
         values = {
@@ -312,7 +423,9 @@ class GuardTest(unittest.TestCase):
             # prawdziwy swap tego Maca nie może wpływać na wynik testu
             "swap_warn_percent": 1000,
             "swap_critical_percent": 1000,
+            "kernel_pressure": False,
             "available_critical_percent": 0,
+            "available_warn_percent": 0,
             "budget_percent": 1000,
         }
         data.update(extra)
