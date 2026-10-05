@@ -653,6 +653,51 @@ class HookTest(Paths):
         )
 
 
+class RtkTest(Paths):
+    """Hook rtk ma komendy Go w exclude_commands, więc `rtk` dokłada scheduler. Pomyłki, które
+    ten test łapie: brak rtk w środku (agent dostaje pełne wyjście go test), rtk w cudzysłowie
+    albo przed `go run`/`go env` (zmieniony tekst albo wyjście, którego rtk nie zna), podwójne rtk
+    i rtk tam, gdzie go nie ma."""
+
+    CASES = (
+        ("go test ./...", "rtk go test ./..."),
+        ("GOFLAGS=-p=4 go vet ./...", "GOFLAGS=-p=4 rtk go vet ./..."),
+        ("cd apps/x && go build ./... 2>&1 | tail -5", "cd apps/x && rtk go build ./... 2>&1 | tail -5"),
+        ("rtk proxy go test ./...", "rtk proxy go test ./..."),
+        ("rtk go test ./...", "rtk go test ./..."),
+        ("go run ./cmd/x", "go run ./cmd/x"),
+        ("make -C apps/x lint && golangci-lint run ./...", "rtk make -C apps/x lint && rtk golangci-lint run ./..."),
+        ('echo "a && go test" && go build ./...', 'echo "a && go test" && rtk go build ./...'),
+        ("x=$(go env GOCACHE); go test ./...", "x=$(go env GOCACHE); rtk go test ./..."),
+        ("(cd apps/x; go vet ./...)", "(cd apps/x; rtk go vet ./...)"),
+    )
+
+    def test_rtk_before_go_tools(self):
+        with mock.patch.object(S.shutil, "which", return_value="/opt/homebrew/bin/rtk"):
+            for command, expected in self.CASES:
+                self.assertEqual(S.with_rtk(command), expected, command)
+
+    def test_no_rtk_no_change(self):
+        with mock.patch.object(S.shutil, "which", return_value=None):
+            for command, _ in self.CASES:
+                self.assertEqual(S.with_rtk(command), command, command)
+
+    def test_hook_runs_rtk_inside_the_wrapper(self):
+        original = "cd apps/charter-service && go test ./internal/money/ 2>&1 | tail -5"
+        event = {"tool_name": "Bash", "cwd": self.repo, "tool_input": {"command": original}}
+        with mock.patch.object(S.shutil, "which", return_value="/opt/homebrew/bin/rtk"):
+            updated = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+        argv = shlex.split(updated["command"])
+        self.assertEqual(
+            argv[-2:],
+            ["--shell", "cd apps/charter-service && rtk go test ./internal/money/ 2>&1 | tail -5"],
+        )
+        # wnętrze z rtk klasyfikuje się tak samo jak komenda agenta
+        self.assertEqual(
+            S.classify(argv[-1], self.repo)["class"], S.classify(original, self.repo)["class"]
+        )
+
+
 class StateTest(Paths):
     def test_public_state_and_memory_gauge(self):
         st = self.state()
