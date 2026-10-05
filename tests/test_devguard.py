@@ -511,6 +511,21 @@ class GuardTest(unittest.TestCase):
         self.assertIsNone(self.admit("go version", self.go_module("svc")))
         self.assertIsNone(self.admit("rtk git status", self.go_module("svc")))
 
+    def test_admit_wraps_node_commands_in_the_scheduler(self):
+        # testy JS w każdym projekcie z package.json; pnpm idzie szybką ścieżką, vitest (ma w sobie
+        # "vite") pełną; dev serwer i instalacja zostają poza kolejką
+        root = os.path.join(self.home, "shop")
+        os.makedirs(os.path.join(root, ".git"), exist_ok=True)
+        with open(os.path.join(root, "package.json"), "w") as f:
+            f.write('{"name": "shop"}')
+        for command in ("pnpm test 2>&1 | tail -5", "npx vitest run"):
+            out = self.admit(command, root)
+            self.assertIsNotNone(out, command)
+            argv = shlex.split(out["updatedInput"]["command"])
+            self.assertEqual(argv[argv.index("--via") + 1], "hook", command)
+            self.assertIn("vitest" if "vitest" in command else "pnpm test", argv[-1])
+        self.assertIsNone(self.admit("pnpm install", root))
+
 
 if __name__ == "__main__":
     unittest.main()
