@@ -33,6 +33,9 @@ BASE_DIR = os.path.dirname(PAUSE_PATH)
 STATE_PATH = os.path.join(BASE_DIR, "state.json")
 POLL = float(os.environ.get("CLAUDE_ACC_HOOK_POLL", "20"))
 MAX_WAIT = 8 * 86400  # pauza tygodniowa trwa najwyżej kilka dni
+# Claude Code ubija hook z asyncRewake po jego timeout (bez niego po 600 s), więc budzik
+# dostaje limit dłuższy niż własne czekanie. Bez tego pauza dłuższa niż 10 min nikogo nie budziła.
+WATCH_TIMEOUT = MAX_WAIT + 60
 MARKER = "claude-acc/hook.py"  # po tym poznajemy własne wpisy w settings.json (perf.py też)
 BACKUP_SUFFIX = ".bak-claude-acc"
 
@@ -247,8 +250,10 @@ def entries():
         "PostToolUse": {"matcher": "*", "hooks": [{"type": "command", "command": guard("post"), "timeout": 10}]},
         "PreToolUse": {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": guard("agent"), "timeout": 10}]},
         "UserPromptSubmit": {"hooks": [{"type": "command", "command": guard("prompt"), "timeout": 10}]},
-        "Stop": {"hooks": [{"type": "command", "command": guard("watch"), "asyncRewake": True}]},
-        "StopFailure": {"matcher": "rate_limit", "hooks": [{"type": "command", "command": always, "asyncRewake": True}]},
+        "Stop": {"hooks": [{"type": "command", "command": guard("watch"), "asyncRewake": True,
+                            "timeout": WATCH_TIMEOUT}]},
+        "StopFailure": {"matcher": "rate_limit", "hooks": [{"type": "command", "command": always, "asyncRewake": True,
+                                                            "timeout": WATCH_TIMEOUT}]},
     }
 
 
