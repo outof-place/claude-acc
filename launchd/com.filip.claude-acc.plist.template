@@ -5,8 +5,9 @@
   <key>Label</key><string>com.filip.claude-acc</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>__HOME__/.local/share/claude-acc/accswitch.py</string>
+    <string>__HOME__/.local/share/claude-acc/python</string>
+    <string>__HOME__/.local/share/claude-acc/acc.py</string>
+    <string>accswitch</string>
     <string>tick</string>
   </array>
   <key>StartInterval</key><integer>120</integer>

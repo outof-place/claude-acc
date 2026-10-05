@@ -34,10 +34,26 @@ enum CLI {
     static let janitorLog = directory + "/janitor.log"
     static let guardLog = directory + "/devguard.log"
 
+    /// The interpreter setup.sh links (uv's CPython), or the system one.
+    static let python: String = {
+        let linked = directory + "/python"
+        return FileManager.default.isExecutableFile(atPath: linked) ? linked : "/usr/bin/python3"
+    }()
+
+    /// acc.py runs a script from cached bytecode: Python compiles the file it is given on
+    /// every start, 7-15 ms of each `status --json` the app asks for.
+    static let launcher = directory + "/acc.py"
+
     static func process(_ args: [String], script: String = accounts) -> Process {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [script] + args
+        process.executableURL = URL(fileURLWithPath: python)
+        let name = (script as NSString).lastPathComponent
+        if name.hasSuffix(".py"), (script as NSString).deletingLastPathComponent == directory,
+           FileManager.default.fileExists(atPath: launcher) {
+            process.arguments = [launcher, String(name.dropLast(3))] + args
+        } else {
+            process.arguments = [script] + args
+        }
         // an app started from Finder gets a thin environment: the script needs USER
         // (the Keychain account name) and a PATH that finds `claude` and `orca`
         var env = ProcessInfo.processInfo.environment
