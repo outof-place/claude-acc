@@ -645,6 +645,7 @@ def finish_job(raw):
         "pkgs": raw["pkgs"],
         "argv": raw["argv"],
         "go_dir": raw["dir"],
+        "env": raw["env"],
         "label": label,
     }
 
@@ -856,8 +857,80 @@ def depot_key(job):
     return (job["module_name"], job["kind"], job["scope"], comp)
 
 
+# flagi, które piszą plik u agenta: na Depot powstałby na zdalnej maszynie i nie wrócił
+OUTPUT_FLAGS = (
+    "-o", "-c", "-coverprofile", "-cpuprofile", "-memprofile", "-blockprofile", "-mutexprofile",
+    "-trace", "-outputdir",
+)  # fmt: skip
+# GOFLAGS z samymi tymi flagami nic nie zmienia na Depot (depot-exec i tak ustawia -p)
+DEPOT_SAFE_GOFLAGS = ("-p", "-count")
+
+
+def depot_blocker(job):
+    """Dlaczego job musi zostać na tym Macu, albo None. Depot dostaje drzewo repo (śledzone i
+    nieśledzone pliki bez .gitignore) pod inną ścieżką, bez zmiennych z komendy, i odsyła tylko
+    wyjście: ścieżka bezwzględna, z ~ albo $, względna poza repo albo ignorowana, zmienna
+    środowiska i plik zapisany przez -o czy -coverprofile dałyby tam inny wynik niż tutaj."""
+    if "depot_blocker" in job:
+        return job["depot_blocker"]
+    reason = None
+    flags = job.get("flags") or {}
+    env = job.get("env") or {}
+    written = [f for f in OUTPUT_FLAGS if f in flags]
+    goflags = (env.get("GOFLAGS") or "").split()
+    if written:
+        reason = f"{written[0]} writes a file on this Mac"
+    elif any(k != "GOFLAGS" for k in env):
+        name = next(k for k in env if k != "GOFLAGS")
+        reason = f"{name}=… does not reach Depot"
+    elif any(f.partition("=")[0] not in DEPOT_SAFE_GOFLAGS for f in goflags):
+        reason = "GOFLAGS does not reach Depot"
+    else:
+        reason = local_path_in(job)
+    job["depot_blocker"] = reason
+    return reason
+
+
+def local_path_in(job):
+    """Pierwszy argument komendy, który wskazuje plik spoza tego, co jedzie na Depot, albo None."""
+    repo, here = job["repo_dir"], job.get("go_dir") or job["repo_dir"]
+    inside = []
+    for word in list(job.get("argv") or [])[1:]:
+        for piece in re.split(r"[=,]", word):
+            if not piece or piece.startswith("-"):
+                continue
+            if piece.startswith(("/", "~", "$")):
+                return f"{word} is a path on this Mac"
+            if "/" not in piece and not piece.startswith(".."):
+                continue
+            path = os.path.normpath(os.path.join(here, piece.removesuffix("/...")))
+            rel = os.path.relpath(path, repo)
+            if rel == ".." or rel.startswith("../"):
+                return f"{word} points outside the repo"
+            if os.path.exists(path):
+                inside.append((rel, word))
+    if inside:
+        try:
+            r = subprocess.run(
+                ["git", "-C", repo, "check-ignore", "--stdin"],
+                input="\n".join(rel for rel, _ in inside),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            ignored = set(r.stdout.split()) if r.returncode == 0 else set()
+        except (OSError, subprocess.SubprocessError):
+            ignored = set()
+        for rel, word in inside:
+            if rel in ignored:
+                return f"{word} is gitignored, so it stays on this Mac"
+    return None
+
+
 def depot_target(job, gb, wall, cfg, cache):
     """Dokąd na Depot i za ile: {target, job, cores, eta_s, units, cost_usd, argv, cwd} albo None."""
+    if depot_blocker(job):
+        return None
     repo = job["repo_dir"]
     etas = (cache.get("depot_eta") or {}).get("jobs") or {}
     ci = DEPOT_CI_JOBS.get(depot_key(job))
@@ -1419,12 +1492,17 @@ def decide_route(state, job, gb, wall, cfg, cache):
                 text=f"Depot: needs {gb:.0f} GB, Mac max ~{max(0, mem['idle_max_gb']):.0f}",
             )
             return route, target
-        text = f"local: needs {gb:.0f} GB, no Depot route, runs when the Mac is free"
+        why_not = f"local only ({depot_blocker(job)})" if depot_blocker(job) else "local: no Depot route"
+        text = f"{why_not}: needs {gb:.0f} GB, runs when the Mac is free"
         return dict(base, choice="local", why="no_depot", text=text), None
     wait, _ = blockers_eta(state, {"mem_predicted_gb": gb})
     local_eta = wait + wall
     if not target:
-        text = f"local: waits {human_s(wait)}, no Depot route"
+        text = (
+            f"local only ({depot_blocker(job)}): waits {human_s(wait)}"
+            if depot_blocker(job)
+            else f"local: waits {human_s(wait)}, no Depot route"
+        )
         return dict(
             base,
             choice="local",
