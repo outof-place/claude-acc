@@ -73,6 +73,15 @@ enum Format {
         return h > 0 ? "in \(h)h \(m)m" : "in \(m) min"
     }
 
+    /// "3d 4h", "2h 15m", "40m", "now": time left, short enough for a line under a usage bar.
+    static func left(_ epoch: Double, now: Date) -> String {
+        let minutes = Int((epoch - now.timeIntervalSince1970) / 60)
+        if minutes <= 0 { return "now" }
+        let (h, m) = (minutes / 60, minutes % 60)
+        if h >= 24 { return "\(h / 24)d \(h % 24)h" }
+        return h > 0 ? "\(h)h \(m)m" : "\(m)m"
+    }
+
     /// "just now", "35s ago", "12 min ago", "3h ago", "2d ago".
     static func ago(_ epoch: Double?, now: Date) -> String {
         guard let epoch else { return "never" }

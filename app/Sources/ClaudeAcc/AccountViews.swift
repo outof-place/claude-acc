@@ -484,8 +484,8 @@ private struct AccountRow: View {
                 Text("No data").font(.caption).foregroundStyle(.secondary)
             } else {
                 HStack(spacing: 10) {
-                    MiniUsage(label: "5h", used: account.session?.used, stale: account.status != .ok)
-                    MiniUsage(label: "wk", used: account.weekly?.used, stale: account.status != .ok)
+                    MiniUsage(label: "5h", window: account.session, stale: account.status != .ok)
+                    MiniUsage(label: "wk", window: account.weekly, stale: account.status != .ok)
                 }
                 .transition(.opacity)
             }
@@ -495,10 +495,12 @@ private struct AccountRow: View {
 
 private struct MiniUsage: View {
     let label: String
-    let used: Double?
+    let window: UsageWindow?
     let stale: Bool
+    @Environment(\.now) private var now
 
     var body: some View {
+        let used = window?.used
         let tint = stale || (used ?? 0) < 1 ? Color.secondary : Format.tint(used)
         VStack(alignment: .trailing, spacing: 3) {
             HStack(spacing: 3) {
@@ -510,6 +512,20 @@ private struct MiniUsage: View {
             .font(.caption2.weight(.semibold))
             UsageBar(fraction: (used ?? 0) / 100, tint: stale ? .secondary : Format.tint(used), height: 4)
                 .frame(width: 64)
+            // time to the reset; an unused 5h window has none (it starts on first use), but the
+            // line keeps its height so the bars of all rows stay aligned
+            HStack(spacing: 2) {
+                if let reset = window?.resetsAt {
+                    Image(systemName: "arrow.clockwise")
+                        .imageScale(.small)
+                    Text(Format.left(reset, now: now))
+                        .monospacedDigit()
+                } else {
+                    Text(" ")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
         }
     }
 }
