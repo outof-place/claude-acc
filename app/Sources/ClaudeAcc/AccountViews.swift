@@ -350,6 +350,8 @@ private struct AccountRow: View {
     let isOpen: Bool
     let toggle: () -> Void
     @State private var hovering = false
+    /// Measured once the button shows; the guess keeps the first fade close.
+    @State private var switchWidth: CGFloat = 34
     @Environment(\.now) private var now
 
     var body: some View {
@@ -360,6 +362,10 @@ private struct AccountRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Switch sits over the end of the address, not in place of the usage: the bars
+                // stay readable under the pointer and the row keeps its height
+                .mask(alignment: .trailing) { fade }
+                .overlay(alignment: .trailing) { switchButton }
             if isNext { Chip("Next", tint: Format.violet) }
             if account.lastResort { Chip("Backup") }
             trailing
@@ -368,7 +374,7 @@ private struct AccountRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .help(isOpen ? "" : caption)
-        .background(hovering || isOpen ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .rect(cornerRadius: 14, style: .continuous))
+        .background(isHovered || isOpen ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .rect(cornerRadius: 14, style: .continuous))
         .contentShape(.rect(cornerRadius: 14, style: .continuous))
         .onTapGesture(perform: toggle)
         .onHover { hovering = $0 }
@@ -380,6 +386,45 @@ private struct AccountRow: View {
             .disabled(store.busy != nil || account.status == .needsLogin || switchBlocked)
             Button("Sign In Again", systemImage: "person.badge.key") { Task { await store.login(account) } }
                 .disabled(store.busy != nil)
+        }
+    }
+
+    private var isHovered: Bool {
+        hovering || store.previewHoverAccount == account.id
+    }
+
+    private var offersSwitch: Bool {
+        guard isHovered, !switchBlocked, account.status != .needsLogin else { return false }
+        switch store.busy {
+        case .switching(let email), .loggingIn(let email): return email != account.email
+        case nil: return true
+        }
+    }
+
+    /// The address fades out where the button covers it; without the button it's fully drawn.
+    private var fade: some View {
+        HStack(spacing: 0) {
+            Rectangle()
+            LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                .frame(width: offersSwitch ? 14 : 0)
+            Color.clear
+                .frame(width: offersSwitch ? switchWidth : 0)
+        }
+    }
+
+    @ViewBuilder private var switchButton: some View {
+        if offersSwitch {
+            // icon only: the address is narrow, and it should still say which account this is
+            Button { Task { await store.switchTo(account) } } label: {
+                Label("Switch", systemImage: "arrow.triangle.swap").labelStyle(.iconOnly)
+            }
+                .panelButton()
+                .controlSize(.small)
+                .disabled(store.busy != nil)
+                .help("Switch to this account")
+                .fixedSize()
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { switchWidth = $0 }
+                .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .trailing)))
         }
     }
 
@@ -423,12 +468,6 @@ private struct AccountRow: View {
                     .panelButton(prominent: true)
                     .controlSize(.small)
                     .disabled(store.busy != nil)
-            } else if hovering && !switchBlocked {
-                Button("Switch", systemImage: "arrow.triangle.swap") { Task { await store.switchTo(account) } }
-                    .panelButton()
-                    .controlSize(.small)
-                    .disabled(store.busy != nil)
-                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
             } else if account.session == nil && account.weekly == nil {
                 Text("No data").font(.caption).foregroundStyle(.secondary)
             } else {
