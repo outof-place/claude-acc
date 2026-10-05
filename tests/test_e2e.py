@@ -360,14 +360,14 @@ class PanelFreshnessTest(unittest.TestCase):
         self.assertIsNone(row["queue"])
 
     def test_renewed_subscription_returns_to_rotation_by_itself(self):
-        # status subskrypcji sprawdzany w profilu raz na 12 h: po odnowieniu konto
-        # wraca do kolejki bez ręcznego grzebania w stanie
+        # status anulowanego konta sprawdzany w profilu co godzinę: po odnowieniu konto
+        # wraca do kolejki bez ręcznego grzebania w stanie (przy 12 h czekało pół dnia)
         w = Env()
         a = w.account("a@x")
         w.account("b@x", weekly_used=20)
         w.runtime(a)
         w.write()
-        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 13 * 3600, "email": "b@x",
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 2 * 3600, "email": "b@x",
                                          "status": "canceled"}})
 
         snap = json.loads(w.run("status", "--json").stdout)

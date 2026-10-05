@@ -901,10 +901,11 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
         may_refresh = refresh(a) if callable(refresh) else refresh
         # Anulowane konto automat pomija. Limitów o nie nie pytamy: API odpowiada
         # 403, a panel pytał co minutę i przybliżał 429 dla reszty kont. Status
-        # odświeża profil raz na 12 h, więc po odnowieniu konto samo wraca do rotacji.
+        # sprawdzamy w profilu co godzinę (ten endpoint nie dławi), więc po
+        # odnowieniu konto szybko samo wraca do rotacji.
         status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
         if status and status != "active":
-            status = (identity(a, cfg, refresh=may_refresh) or {}).get("status")
+            status = (identity(a, cfg, max_age=3600, refresh=may_refresh) or {}).get("status")
         if status and status != "active":
             rows.append({"account": a, "data": None, "why": f"subskrypcja: {status}, automat pomija",
                          "usable": False, "error": True, "skipped": True})
