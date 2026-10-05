@@ -16,6 +16,8 @@ let package = Package(
         .executableTarget(name: "ClaudeAcc", path: "Sources/ClaudeAcc", swiftSettings: settings),
         // fan control through the SMC; runs as a root LaunchDaemon, see install-fans.sh
         .executableTarget(name: "fanctl", path: "Sources/fanctl", swiftSettings: settings),
+        // the PreToolUse hook's native front: answers most Bash commands without starting Python
+        .executableTarget(name: "claude-acc-hook", path: "Sources/hook", swiftSettings: settings),
     ],
     swiftLanguageModes: [.v6]
 )
