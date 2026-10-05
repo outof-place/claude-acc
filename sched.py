@@ -1249,6 +1249,14 @@ def plan(state, cfg, now):
             continue
         need = job["mem_predicted_gb"]
         if pressure == "warn" and need > 2.0:
+            # macOS potrafi trzymać „warn” godzinami przy połowie wolnej pamięci: wtedy głowa
+            # startuje sama, jak w starym zamku, ale tylko w dostępnej pamięci
+            alone = not any_local and not admitted
+            if blocked is None and alone and need <= mem["available_gb"] - cfg["headroom_gb"]:
+                admitted[job["id"]] = ("fits", None)
+                free -= need
+                any_local = True
+                continue
             blocked = blocked or job
             continue
         if blocked is None:
@@ -1391,7 +1399,7 @@ def update_queue_view(state, cfg):
         if mem.get("pressure") == "critical":
             code, text = "pressure", "paused: memory pressure is critical"
         elif mem.get("pressure") == "warn" and job["mem_predicted_gb"] > 2:
-            code, text = "pressure", "waiting: memory pressure, only small jobs start"
+            code, text = "pressure", "waiting: memory pressure, one job at a time"
         elif (
             head_blocked is not None
             and now - head_blocked["enqueued_at"] > cfg["starve_s"]
