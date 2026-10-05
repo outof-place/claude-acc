@@ -505,7 +505,9 @@ class GuardTest(unittest.TestCase):
             argv = shlex.split(updated["command"])
             self.assertIn("run", argv)
             self.assertEqual(argv[argv.index("--via") + 1], "hook")
-            self.assertEqual(argv[-2:], ["--shell", command])
+            # z rtk na PATH scheduler sam wstawia rtk w środku (hook rtk ma Go w wyjątkach)
+            inner = ("rtk " + command) if shutil.which("rtk") else command
+            self.assertEqual(argv[-2:], ["--shell", inner])
         self.assertIsNone(self.admit("go version", self.go_module("svc")))
         self.assertIsNone(self.admit("rtk git status", self.go_module("svc")))
 
