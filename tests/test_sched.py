@@ -217,6 +217,82 @@ class ClassifyTest(Paths):
         self.assertEqual(S.prior(opaque, 4), (8.0, 300))
 
 
+class SubtreeTest(Paths):
+    """`./x/...` obejmuje część modułu. Pomyłka, którą ten test łapie: wzorzec na jeden mały
+    pakiet przewidziany jak cały moduł (24 GB, 25 min) i wysłany na Depot do joba `full`, który
+    za ~$1,7 testuje cały moduł zamiast komendy agenta (portivo, 2026-10-05: 4 takie biegi)."""
+
+    PACKAGES = (
+        "cmd",
+        "internal/handlers",
+        "internal/handlers/e2e",
+        "internal/money",
+        "internal/moneyfmt",
+        "internal/worker/emailsend",
+        "internal/worker/emailsend/tmpl",
+    )
+    EMAILSEND = "internal/worker/emailsend"
+
+    def setUp(self):
+        super().setUp()
+        for pkg in self.PACKAGES:
+            write(os.path.join(self.charter, pkg, "x.go"), "package x\n")
+        write(os.path.join(self.charter, "internal/money/testdata/fixture.go"), "package fixture\n")
+
+    def test_part_of_the_module_is_a_subtree(self):
+        subtree = ("subtree", self.EMAILSEND)
+        cases = {
+            "cd apps/charter-service && go test -count=1 ./internal/worker/emailsend/...": subtree,
+            "cd apps/charter-service/internal/worker && go test ./emailsend/...": subtree,
+            "cd apps/charter-service/internal/worker/emailsend && go test ./...": subtree,
+            "cd apps/charter-service && go test charter-service/internal/worker/emailsend/...": subtree,
+            "cd apps/charter-service && go test ./internal/money/... ./internal/moneyfmt/...": (
+                "subtree",
+                "internal/money internal/moneyfmt",
+            ),
+            "cd apps/charter-service && go test ./...": ("tree", "./..."),
+            "cd apps/charter-service && go test charter-service/...": ("tree", "./..."),
+            "cd apps/charter-service && go test ./internal/money/... ./...": ("tree", "./..."),
+        }
+        for command, expected in cases.items():
+            j = self.job(command)
+            self.assertEqual((j["scope"], j["scope_detail"]), expected, command)
+        self.assertEqual(
+            self.job("cd apps/charter-service && go test ./internal/worker/emailsend/...")["class"],
+            "charter-service:test:subtree:internal/worker/emailsend",
+        )
+
+    def test_prior_grows_with_the_share_of_packages(self):
+        # 2 z 7 pakietów (testdata się nie liczy): między jednym pakietem (3 GB, 40 s) a całym
+        # modułem (24 GB, 1500 s), w proporcji
+        small = self.job("cd apps/charter-service && go test ./internal/worker/emailsend/...")
+        self.assertEqual(S.prior(small, 4), (9.0, 457))
+        # internal/handlers to sam w sobie 24 GB i 25 min: poddrzewo z nim nie może być lżejsze
+        for command in (
+            "cd apps/charter-service && go test ./internal/handlers/...",
+            "cd apps/charter-service && go test ./internal/...",
+        ):
+            self.assertEqual(S.prior(self.job(command), 4), (24.0, 1500), command)
+        # wzorca z ... w środku nie rozwiązujemy: ostrożnie, jak cały moduł
+        odd = self.job("cd apps/charter-service && go test ./internal/.../tmpl")
+        self.assertEqual(S.prior(odd, 4), (24.0, 1500))
+
+    def test_depot_runs_the_agents_command_not_the_full_suite(self):
+        command = "cd apps/charter-service && go test -count=1 ./internal/worker/emailsend/..."
+        small = self.job(command)
+        gb, wall = S.prior(small, 4)
+        target = S.depot_target(small, gb, wall, self.cfg, {})
+        self.assertEqual(target["target"], "depot-exec")
+        self.assertEqual(
+            target["argv"][-5:],
+            ["--", "go", "test", "-count=1", "./internal/worker/emailsend/..."],
+        )
+        st = self.state()
+        self.assertEqual(S.decide_route(st, small, gb, wall, self.cfg, {})[0]["choice"], "local")
+        tree = self.job("cd apps/charter-service && go test ./...")
+        self.assertEqual(S.depot_target(tree, 24.0, 1500, self.cfg, {})["job"], "full")
+
+
 class PredictTest(Paths):
     def test_priors_from_measurements(self):
         tree = self.job("cd apps/charter-service && go test -run '^$' ./...")
