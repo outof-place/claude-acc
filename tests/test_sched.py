@@ -504,6 +504,35 @@ class RouteTest(Paths):
             S.decide_route(st, small, 5.3, 38, dear, {})[0]["choice"], "local"
         )
 
+    def test_local_files_keep_the_job_off_depot(self):
+        # Depot dostaje drzewo repo pod inną ścieżką, bez zmiennych z komendy, i nie odsyła plików:
+        # nakładka ze scratchpadu dawała tam exit 1 bez testów, czyli fałszywy czerwony wynik
+        st = self.state()
+        self.running(st, 18.0, wall=300)  # moneyfmt bez tego poszedłby na Depot (test wyżej)
+        here = "cd apps/charter-service && "
+        for command in (
+            "go test -overlay=/tmp/o.json ./internal/moneyfmt/",
+            "go test -overlay /tmp/o.json ./internal/moneyfmt/",
+            "go test -coverprofile=c.out ./internal/moneyfmt/",
+            "go test -modfile=../../../alt.mod ./internal/moneyfmt/",
+            "GOFLAGS=-overlay=$TMPDIR/o.json go test ./internal/moneyfmt/",
+            "FIXTURES=~/fx go test ./internal/moneyfmt/",
+            "go test ./internal/moneyfmt/ -args -golden=/tmp/g",
+        ):
+            job = self.job(here + command)
+            self.assertIsNone(S.depot_target(job, 3.0, 40, self.cfg, {}), command)
+            route, target = S.decide_route(st, job, 3.0, 40, self.cfg, {})
+            self.assertEqual((route["choice"], target), ("local", None), command)
+            self.assertIn("local only", route["text"], command)
+        # wzorzec -run ze slashem i samo -count w GOFLAGS to nie pliki: dalej Depot
+        clean = self.job(here + "GOFLAGS=-count=1 go test -run 'TestA/b' ./internal/moneyfmt/")
+        self.assertEqual(S.decide_route(st, clean, 3.0, 40, self.cfg, {})[0]["choice"], "depot")
+        # nie zmieści się nigdy: zamiast Depot zostaje lokalnie i mówi dlaczego
+        race = self.job(here + "go test -race -coverprofile=/tmp/c.out ./...")
+        route, target = S.decide_route(st, race, 33.6, 2250, self.cfg, {})
+        self.assertEqual((route["choice"], target), ("local", None))
+        self.assertIn("-coverprofile", route["text"])
+
     def test_no_depot_route(self):
         shutil.rmtree(os.path.join(self.repo, "scripts"))
         st = self.state()
