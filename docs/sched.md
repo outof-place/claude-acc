@@ -1,15 +1,22 @@
-# Scheduler Go: stan dla panelu i historia biegów
+# Scheduler Go i JS: stan dla panelu i historia biegów
 
-`sched.py` wpuszcza komendy Go agentów (build, vet, test, lint, cele make) po pamięci zamiast
-jednego zamka na wszystko. Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse
-(`devguard.py admit`) sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje.
-Pomiary, z których wzięły się liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
+`sched.py` wpuszcza ciężkie komendy agentów po pamięci zamiast jednego zamka na wszystko: Go
+(build, vet, test, lint, cele make) i JS (testy, e2e, buildy, typecheck, lint, w każdym projekcie z
+`package.json`). Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse (`devguard.py admit`)
+sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje. Pomiary, z których wzięły się
+liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
 
 Presja pamięci jądra (`kern.memorystatus_vm_pressure_level`): przy `critical` nic nie startuje,
 przy `warn` startuje to, co mieści się w wolnej pamięci (także kilka jobów naraz), ale bez furtki
 „sam na Macu po 30 s ponad pamięć”. macOS potrafi trzymać `warn` godzinami przy połowie wolnej
 pamięci, a jeden job naraz robił z kolejki stary zamek: czekanie dłuższe niż 5 minut kasuje też
 cache promptu subagenta.
+
+Mały job (`small`, niżej) startuje, gdy mieści się w pamięci dostępnej teraz, nawet jeśli
+`free_for_admission_gb` jest zjedzone przez rezerwy długich jobów na wzrost, którego jeszcze nie ma.
+Od tej pamięci odejmują się tylko prognozy świeżo wpuszczonych małych jobów. Głowa kolejki czekająca
+dłużej niż `starve_s` zostawia sobie miejsce i tutaj, a po `2 × starve_s` jej rezerwacja jest twarda:
+żaden mały job jej już nie wyprzedza, więc strumień krótkich testów nie zagłodzi dużego.
 
 Pliki w `~/.local/share/claude-acc/sched/`:
 
@@ -77,7 +84,7 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | pole | znaczenie |
 |---|---|
 | `id` | `j-<epoch>-<4 hex>` |
-| `class` | `<moduł>:<czasownik>:<zakres>[:race][:compile]`, np. `charter-service:vet:tree`, `charter-service:test:pkg:internal/handlers:compile` |
+| `class` | Go: `<moduł>:<czasownik>:<zakres>[:race][:compile]`, np. `charter-service:vet:tree`, `charter-service:test:pkg:internal/handlers:compile`; JS: patrz sekcja JS |
 | `kind` | `build`, `vet`, `test`, `lint`, `make`, `generate`, `run`, `other` |
 | `label` | komenda Go bez otoczki (`cd`, `rtk proxy`, potoki), do wyświetlenia |
 | `module` | katalog modułu Go względem repo, np. `apps/charter-service` |
@@ -190,7 +197,27 @@ drop_count1          true   zdejmuj -count=1 w iteracji agenta dla pakietów bez
 pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ciężki job dostaje SIGSTOP
 depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)
 count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
+node                 true   testy, buildy i typecheck JS w kolejce
 ```
+
+## JS
+
+Hook owija komendy, które kończą się same i zjadają pamięć: `vitest`, `jest`, `playwright test`,
+`next build`, `vite build`, `tsc`, `vue-tsc`, `eslint`, `turbo run`, także przez `npx`, `bunx`,
+`pnpm|yarn|bun exec|dlx`, `npm exec` i `node_modules/.bin/`, oraz skrypty menedżera pakietów
+(`pnpm test`, `npm run test:unit`, `yarn build`, `bun run typecheck`, `pnpm -r --filter web test`),
+których nazwa pasuje do rodzaju: `test`, `e2e`, `build`, `typecheck`, `lint`, `check`. Nigdy:
+skrypty i flagi, które się nie kończą albo czekają na człowieka (`dev`, `watch`, `serve`, `start`,
+`preview`, `storybook`, `--ui`, `-w` w `tsc` i `vitest`), instalacje i wszystko poza katalogiem z
+`package.json` (szukanym w górę, do `.git`).
+
+Klasa: `<repo>:<rodzaj>:<pakiet albo filter=X>:<narzędzie>[:all][:filtered]`, np.
+`shop:test:apps/web:vitest`. `all` to bieg na całym monorepo (`-r`, `--workspaces`, każde
+`turbo run`), `filtered` to wybrane testy (`-t`, `--grep`, `--project`, pliki w argumentach). Do pierwszych
+biegów klasy przewidywanie bierze się z tabeli (GB, sekundy): `test` 3,0/90, `e2e` 3,5/180, `build`
+4,0/180, `typecheck` 2,5/60, `lint` 2,0/60, `check` 3,0/120; `all` razy 1,5 GB i 2 czasu, `filtered`
+połowa GB (najmniej 1) i 0,4 czasu. Potem p90 z historii, jak w Go. Joby JS biegną tylko lokalnie:
+nie idą na Depot i nie dostają Postgresa. `"node": false` w `config.json` wyłącza całą tę część.
 
 ## `sched.py wait`
 
@@ -202,17 +229,13 @@ długim `sleep`. Agent z cache godzinnym podaje większe `--max`. Zły argument:
 
 ## rtk
 
-Hook rtk (`rtk-rewrite.sh`) też przepisuje `go test`, `go build`, `go vet`, `make`, `golangci-lint
-run` i `govulncheck`. Dwa hooki PreToolUse z `updatedInput` na tej samej komendzie dają losowy wynik,
-więc na Macu z rtk te narzędzia idą w jego wyjątki, w `~/Library/Application Support/rtk/config.toml`:
+Hook rtk (`rtk-rewrite.sh`) też przepisuje komendy, które owija scheduler. Dwa hooki PreToolUse z
+`updatedInput` na tej samej komendzie dają losowy wynik, więc na Macu z rtk te komendy idą w jego
+wyjątki, w `~/Library/Application Support/rtk/config.toml`, w sekcji `[hooks]`. Linię
+`exclude_commands` drukuje `sched.py rtk-excludes`; test pilnuje, żeby wyjątki obejmowały wszystko,
+co scheduler owija, i nic więcej (rtk dalej skraca `pnpm install` czy `git`).
 
-```
-[hooks]
-exclude_commands = ["go", "make", "golangci-lint", "govulncheck"]
-```
-
-W środku opakowania `with_rtk` pyta `rtk rewrite` o tę samą komendę z pustym `HOME`, czyli bez tych
-wyjątków, więc reguły rtk mają jedno źródło i agent dalej dostaje krótkie wyjście. Kod 3 („przepisz,
-ale zapytaj”, bo w pustym HOME rtk nie widzi ustawień Claude) to dla nas zwykłe przepisanie. Gdy rtk
-nie ma albo nic nie przepisuje, komenda zostaje bez zmian. Na Depot idzie komenda bez opakowań, czyli
-bez rtk.
+W środku opakowania `with_rtk` pyta `rtk rewrite` o tę samą komendę z pustym `HOME`, czyli bez
+naszych wyjątków, więc reguły rtk mają jedno źródło i agent dalej dostaje krótkie wyjście. Gdy rtk
+nie ma albo nic nie przepisuje, komenda zostaje bez zmian. Na Depot idzie komenda bez opakowań,
+czyli bez rtk.
