@@ -110,7 +110,7 @@ enum Format {
     }
 
     static func percent(_ value: Double?) -> String {
-        value.map { "\(Int($0.rounded()))%" } ?? "–"
+        value.map { "\(Int($0.rounded()))%" } ?? "-"
     }
 
     /// "8.2 GB", "412 MB": powers of 1024 and one decimal from a gigabyte up, like janitor.py,

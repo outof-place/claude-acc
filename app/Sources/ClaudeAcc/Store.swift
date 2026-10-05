@@ -57,6 +57,8 @@ final class Store {
     @ObservationIgnored private var refreshAgain = false
     @ObservationIgnored private var poller: Task<Void, Never>?
     @ObservationIgnored private var live: Task<Void, Never>?
+    /// The state files as last read: a file that didn't change costs one stat and wakes no view.
+    @ObservationIgnored private var files: [String: StateFile] = [:]
 
     private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -131,30 +133,53 @@ final class Store {
     }
 
     /// Cleanup and guard state from their files, and free disk space: no script runs.
+    /// Observation tells every view that reads a property about every assignment, equal or
+    /// not, so only what changed is assigned: an unchanged file isn't even read again.
     func readLocal() {
-        if let data = FileManager.default.contents(atPath: CLI.janitorState) {
+        if let data = changedFile(CLI.janitorState) {
             janitor = Self.decode(JanitorState.self, from: data)
         }
-        if let data = FileManager.default.contents(atPath: CLI.fanState) {
+        if let data = changedFile(CLI.fanState) {
             fanState = Self.decode(FanState.self, from: data)
-            if let pick = fanPick, pick == fanMode { fanPick = nil }
         }
-        if let data = FileManager.default.contents(atPath: CLI.schedState) {
+        if let pick = fanPick, pick == fanMode { fanPick = nil }
+        if let data = changedFile(CLI.schedState) {
             sched = Self.decode(SchedState.self, from: data)
         }
-        memoryLevel = Self.kernelMemoryLevel()
-        if let data = FileManager.default.contents(atPath: CLI.perfState) {
+        let level = Self.kernelMemoryLevel()
+        if level != memoryLevel { memoryLevel = level }
+        if let data = changedFile(CLI.perfState) {
             ultra = Self.decode(PerfFile.self, from: data)?.ultra
         }
-        if let data = FileManager.default.contents(atPath: CLI.guardState) {
+        if let data = changedFile(CLI.guardState) {
             guardState = Self.decode(GuardState.self, from: data)
-            if guardModeOverride == guardState?.snapshot?.mode { guardModeOverride = nil }
         }
+        if let mode = guardModeOverride, mode == guardState?.snapshot?.mode { guardModeOverride = nil }
         let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]
         if let values = try? URL(fileURLWithPath: "/System/Volumes/Data").resourceValues(forKeys: keys),
            let free = values.volumeAvailableCapacityForImportantUsage, let total = values.volumeTotalCapacity, total > 0 {
-            disk = DiskSpace(free: Double(free), total: Double(total))
+            let space = DiskSpace(free: Double(free), total: Double(total))
+            // free space moves by the byte; the card shows tenths of a gigabyte
+            if disk?.total != space.total || disk.map({ Format.bytes($0.free) }) != Format.bytes(space.free) {
+                disk = space
+            }
         }
+    }
+
+    /// The file's bytes when they differ from the last read, nil when they don't or it's gone.
+    /// The daemons replace their files by rename, so inode, mtime and size tell a new version
+    /// apart without reading it; a rewrite with the same bytes is caught by comparing them.
+    private func changedFile(_ path: String) -> Data? {
+        var info = stat()
+        guard stat(path, &info) == 0 else {
+            files[path] = nil
+            return nil
+        }
+        let stamp = StateFile.Stamp(info)
+        if files[path]?.stamp == stamp { return nil }
+        guard let data = FileManager.default.contents(atPath: path) else { return nil }
+        defer { files[path] = StateFile(stamp: stamp, data: data) }
+        return files[path]?.data == data ? nil : data
     }
 
     /// While the panel is open the guard's numbers move every few seconds.
@@ -371,4 +396,24 @@ final class Store {
         try? SMAppService.mainApp.register()
         UserDefaults.standard.set(true, forKey: key)
     }
+}
+
+/// A state file as last read by the panel.
+private struct StateFile {
+    struct Stamp: Equatable {
+        let inode: UInt64
+        let size: Int64
+        let seconds: Int
+        let nanoseconds: Int
+
+        init(_ info: stat) {
+            inode = info.st_ino
+            size = info.st_size
+            seconds = info.st_mtimespec.tv_sec
+            nanoseconds = info.st_mtimespec.tv_nsec
+        }
+    }
+
+    let stamp: Stamp
+    let data: Data
 }

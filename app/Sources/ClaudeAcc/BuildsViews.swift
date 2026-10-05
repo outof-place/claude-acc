@@ -257,7 +257,6 @@ private struct MemoryLane: View {
                 }
             }
             .frame(height: 10)
-            .animation(.smooth, value: lane.free)
             HStack(spacing: 4) {
                 Text("\(String(format: "%.1f", lane.free)) GB free for builds")
                     .foregroundStyle(.primary)
@@ -269,7 +268,6 @@ private struct MemoryLane: View {
             .font(.caption2)
             .foregroundStyle(.secondary)
             .monospacedDigit()
-            .contentTransition(.numericText())
         }
     }
 }
@@ -336,7 +334,9 @@ private struct RunningRow: View {
                     WhereChip(job: job)
                 }
                 HStack(spacing: 8) {
-                    UsageBar(fraction: job.progress ?? 0, tint: job.paused == true ? .orange : Format.violet, height: 5)
+                    UsageBar(
+                        fraction: job.progress ?? 0, tint: job.paused == true ? .orange : Format.violet,
+                        height: 5, live: true)
                     Text(remaining)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
