@@ -583,5 +583,69 @@ class DepotTest(unittest.TestCase):
         self.assertEqual(depot_store(w)["calls"], [])
 
 
+TOKEN_FALLBACK = "Claude Acc token fallback"
+
+
+class TokenTest(unittest.TestCase):
+    def test_token_comes_from_account_with_most_headroom_other_than_local(self):
+        w = Env()
+        a = w.account("a@x", weekly_used=5)
+        w.account("b@x", weekly_used=60)
+        w.account("c@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+
+        out = w.run("token", "--json")
+
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["email"], "c@x")
+        self.assertEqual(got["source"], "rotation")
+        self.assertEqual(got["token"], w.managed("c@x")["claudeAiOauth"]["accessToken"])
+
+    def test_token_avoids_the_depot_account_while_another_carries(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=5)
+        w.account("c@x", weekly_used=30)
+        w.runtime(a)
+        w.state(depot_email="b@x")
+        w.write()
+
+        got = json.loads(w.run("token", "--json").stdout)
+
+        self.assertEqual(got["email"], "c@x")
+
+    def test_short_lived_idle_token_is_refreshed_and_active_is_never_touched(self):
+        w = Env()
+        a = w.account("a@x", expires_in=3 * 60)
+        b = w.account("b@x", expires_in=10 * 60)
+        w.runtime(a)
+        w.write()
+
+        got = json.loads(w.run("token", "--json", "--min-minutes", "30").stdout)
+
+        fresh = w.managed("b@x")["claudeAiOauth"]
+        self.assertNotEqual(fresh["accessToken"], b["claudeAiOauth"]["accessToken"])
+        self.assertEqual(got["token"], fresh["accessToken"])
+        self.assertEqual(w.managed("a@x")["claudeAiOauth"], a["claudeAiOauth"])
+
+    def test_fallback_token_without_headroom_and_error_without_either(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=99)
+        w.runtime(a)
+        w.write()
+
+        out = w.run("token", "--json")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "")
+
+        w.keychain[f"{TOKEN_FALLBACK}|{USER}"] = "sk-ant-oat01-fallback"
+        w.write()
+        got = json.loads(w.run("token", "--json").stdout)
+        self.assertEqual((got["token"], got["source"]), ("sk-ant-oat01-fallback", "fallback"))
+
+
 if __name__ == "__main__":
     unittest.main()

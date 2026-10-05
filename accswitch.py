@@ -22,6 +22,10 @@ Komendy:
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
   depot [--force]   token sandboxów `depot claude`: konto i ważność, --force wysyła od nowa
   depot --fallback  zapisz długi token z `claude setup-token` na wypadek braku konta z zapasem
+  token [--json] [--min-minutes N]
+                    token OAuth dla procesów spoza sesji (evale `claude -p`): konto z
+                    największym zapasem poza lokalnym, w miarę możliwości inne niż Depot
+  token --fallback  zapisz długi token z `claude setup-token` dla `token` bez konta z zapasem
   watch [sekundy]   pętla ticków na pierwszym planie
 """
 
@@ -93,6 +97,7 @@ DEFAULT_CONFIG = {
 
 DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
 DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
+TOKEN_FALLBACK_SERVICE = "Claude Acc token fallback"
 
 
 # ---------- drobne narzędzia ----------
@@ -1508,9 +1513,76 @@ def cmd_depot(cfg, args):
     return 0
 
 
+# ---------- token dla procesów spoza sesji ----------
+
+def pick_token(accounts, cfg, active, min_valid):
+    """Token konta z największym zapasem poza lokalnym, jak sandboxy Depot.
+
+    Konto sandboxów Depot bierzemy dopiero, gdy innego nie ma: dwie strony palące
+    jedno konto wyczerpują je dwa razy szybciej. Odświeżamy wyłącznie konta
+    nieaktywne, bo token aktywnego rotują sesje Claude Code. Zwraca (email, token,
+    expires_at) albo None.
+    """
+    now = time.time()
+    rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
+    depot_email = load_state().get("depot_email")
+    rows = [r for r in rows if r["account"].email != depot_email] + \
+           [r for r in rows if r["account"].email == depot_email]
+    for row in rows:
+        target = row["account"]
+        expires = oauth_of(target.creds_json or "").get("expiresAt", 0) / 1000
+        creds_json, note = ensure_fresh(target, cfg, force=expires - now < min_valid)
+        if not creds_json:
+            log(f"token: {target.email}: {note}")
+            continue
+        oauth = oauth_of(creds_json)
+        token, expires = oauth.get("accessToken"), oauth.get("expiresAt", 0) / 1000
+        if token and expires - now >= min_valid:
+            return target.email, token, int(expires)
+    return None
+
+
+def cmd_token(cfg, args):
+    """Token OAuth dla procesu spoza sesji; bez konta z zapasem token zapasowy."""
+    if "--fallback" in args:
+        import getpass
+        token = getpass.getpass("token z `claude setup-token` (nie pokazuje się): ").strip()
+        if not token.startswith("sk-ant-"):
+            print("to nie wygląda na token Claude Code")
+            return 1
+        kc_write(TOKEN_FALLBACK_SERVICE, KEYCHAIN_USER, token)
+        print("token zapasowy zapisany w Pęku kluczy")
+        return 0
+    minutes = 30
+    if "--min-minutes" in args:
+        minutes = int(args[args.index("--min-minutes") + 1])
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę", file=sys.stderr)
+        return 1
+    accounts = load_accounts()
+    picked = pick_token(accounts, cfg, find_active(accounts, cfg), minutes * 60)
+    if picked:
+        email, token, expires = picked
+        source = "rotation"
+    else:
+        token = kc_read(TOKEN_FALLBACK_SERVICE, KEYCHAIN_USER)
+        if not token:
+            print("brak konta z zapasem poza lokalnym i brak tokenu zapasowego (`claude-acc token --fallback`)",
+                  file=sys.stderr)
+            return 1
+        email, expires, source = "fallback", 0, "fallback"
+    log(f"token: wydany dla {email} ({source})")
+    if "--json" in args:
+        print(json.dumps({"email": email, "token": token, "expiresAt": expires, "source": source}))
+    else:
+        print(token)
+    return 0
+
+
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
             "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "watch": cmd_watch,
-            "depot": cmd_depot}
+            "depot": cmd_depot, "token": cmd_token}
 
 
 def main(argv):
