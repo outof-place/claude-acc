@@ -237,9 +237,9 @@ nie idą na Depot i nie dostają Postgresa. `"node": false` w `config.json` wył
 
 `sched.py wait [--max S] [--every S] -- 'WARUNEK'` sprawdza WARUNEK (komendę powłoki) co `--every`
 sekund (5) i kończy się kodem 0, gdy WARUNEK zwróci 0, albo kodem 75 po `--max` sekundach (270).
-Domyślny limit jest krótszy niż 5-minutowy cache promptu subagenta: agent, który czeka w pętli
-wywołań `wait`, odświeża cache przy każdym, zamiast pisać cały kontekst od nowa po jednym długim
-`sleep`. Agent z cache godzinnym (executor) podaje `--max` do 3000.
+Domyślny limit jest krótszy niż 5-minutowy cache promptu subagenta Claude Code: agent, który czeka
+w pętli wywołań `wait`, odświeża cache przy każdym, zamiast pisać cały kontekst od nowa po jednym
+długim `sleep`. Agent z cache godzinnym podaje większe `--max`. Zły argument: kod 64.
 
 ## rtk
 
