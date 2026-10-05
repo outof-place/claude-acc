@@ -17,7 +17,8 @@ struct Reading: Codable {
     var gpu: Double?
     /// Hottest sensor per part, °C: pcores, ecores, gpu, ssd, battery.
     var sensors: [String: Double] = [:]
-    /// [time, cpu, gpu, average rpm] every 5 seconds, 20 minutes back (written by the daemon).
+    /// [time, cpu, gpu, average rpm] every 5 seconds, 20 minutes back (written by the daemon;
+    /// temperatures to 0.1 °C, rpm and time whole).
     var history: [[Double]]?
     /// What the daemon holds the fans at: "auto" or "fixed", and the share of the range.
     var mode: String?
@@ -54,9 +55,18 @@ final class Fans {
 
     init(smc: SMC) { self.smc = smc }
 
-    var count: Int { Int((try? smc.number("FNum")) ?? 0) }
+    /// FNum doesn't change while the Mac runs: read until it answers, then kept.
+    private var fanCount: Int?
 
-    func reading() -> Reading {
+    var count: Int {
+        if let fanCount { return fanCount }
+        guard let value = try? smc.number("FNum") else { return 0 }
+        fanCount = Int(value)
+        return Int(value)
+    }
+
+    /// `sensors: false` reads only the fans: a dozen SMC calls instead of ~170 on an M4 Max.
+    func reading(sensors withSensors: Bool = true) -> Reading {
         var reading = Reading()
         for i in 0..<count {
             reading.fans.append(FanReading(
@@ -67,6 +77,7 @@ final class Fans {
                 target: (try? smc.number("F\(i)Tg")) ?? 0,
                 manual: ((try? smc.number(modeKey(i))) ?? 0) >= 1))
         }
+        guard withSensors else { return reading }
         for (part, keys) in sensors {
             if let value = hottest(keys) { reading.sensors[part] = value }
         }
