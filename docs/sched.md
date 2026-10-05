@@ -192,6 +192,14 @@ depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (
 count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
 ```
 
+## `sched.py wait`
+
+`sched.py wait [--max S] [--every S] -- 'WARUNEK'` sprawdza WARUNEK (komendę powłoki) co `--every`
+sekund (5) i kończy się kodem 0, gdy WARUNEK zwróci 0, albo kodem 75 po `--max` sekundach (270).
+Domyślny limit jest krótszy niż 5-minutowy cache promptu subagenta Claude Code: agent, który czeka
+w pętli wywołań `wait`, odświeża cache przy każdym, zamiast pisać cały kontekst od nowa po jednym
+długim `sleep`. Agent z cache godzinnym podaje większe `--max`. Zły argument: kod 64.
+
 ## rtk
 
 Hook rtk (`rtk-rewrite.sh`) też przepisuje `go test`, `go build`, `go vet`, `make`, `golangci-lint

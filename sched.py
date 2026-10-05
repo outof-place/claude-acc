@@ -5,6 +5,7 @@
                (--shell 'KOMENDA' | -- ARGV...)
   sched.py status [--json]
   sched.py classify (--shell 'KOMENDA' | -- ARGV...)
+  sched.py wait [--max S] [--every S] -- 'WARUNEK'
 
 `run` klasyfikuje komendę (moduł, czasownik, zakres pakietów), przewiduje jej szczyt pamięci i
 czas z historii, a potem:
@@ -17,6 +18,8 @@ czas z historii, a potem:
 Komenda biegnie jako dziecko tego procesu: agent widzi jej wyjście na żywo i dostaje jej kod
 wyjścia. Stan dla panelu: sched/state.json, historia: sched/history.jsonl (docs/sched.md).
 Hook PreToolUse (devguard.py admit) owija komendy agentów przez hook_rewrite().
+`wait` czeka na warunek najwyżej --max sekund (domyślnie 270), żeby subagent z 5-minutowym
+cache wołał go w kółko zamiast blokować się dłużej, niż żyje jego cache.
 """
 
 import ctypes
@@ -2173,7 +2176,43 @@ def cmd_classify(args):
     return 0 if job else 1
 
 
-COMMANDS = {"run": cmd_run, "status": cmd_status, "classify": cmd_classify}
+WAIT_MAX_S = 270  # krócej niż 5-minutowy cache subagenta, z zapasem na samo wywołanie
+
+
+def cmd_wait(args):
+    """Czeka, aż WARUNEK (komenda powłoki) skończy się kodem 0, najwyżej --max sekund. Kod 0:
+    spełniony; 75: jeszcze nie, zawołaj ponownie (każde wywołanie odświeża cache agenta)."""
+    if "--" not in args or not args[args.index("--") + 1 :]:
+        log("użycie: sched.py wait [--max S] [--every S] -- 'WARUNEK'")
+        return 64
+    opts, condition = args[: args.index("--")], args[args.index("--") + 1 :]
+    limit, every = float(WAIT_MAX_S), 5.0
+    try:
+        for flag, value in zip(opts[::2], opts[1::2]):
+            if flag == "--max":
+                limit = float(value)
+            elif flag == "--every":
+                every = float(value)
+    except ValueError:
+        log("--max i --every to liczby sekund")
+        return 64
+    command = condition[0] if len(condition) == 1 else " ".join(shlex.quote(a) for a in condition)
+    start = time.time()
+    while True:
+        done = subprocess.run(
+            ["/bin/sh", "-c", command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0
+        waited = time.time() - start
+        if done:
+            print(f"gotowe po {human_s(waited)}")
+            return 0
+        if waited >= limit:
+            print(f"jeszcze nie po {human_s(waited)}: zawołaj ponownie (każde wywołanie odświeża cache agenta)")
+            return EXIT_TIMEOUT
+        time.sleep(max(0.05, min(every, limit - waited)))
+
+
+COMMANDS = {"run": cmd_run, "status": cmd_status, "classify": cmd_classify, "wait": cmd_wait}
 
 
 def main(argv):
