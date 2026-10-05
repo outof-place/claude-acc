@@ -188,14 +188,17 @@ count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, który
 
 ## rtk
 
-Hook rtk (`rtk-rewrite.sh`) też przepisuje `go test`, `go build`, `go vet`, `make` i `golangci-lint
-run`. Dwa hooki PreToolUse z `updatedInput` na tej samej komendzie dają losowy wynik, więc na Macu z
-rtk te narzędzia idą w jego wyjątki, w `~/Library/Application Support/rtk/config.toml`:
+Hook rtk (`rtk-rewrite.sh`) też przepisuje `go test`, `go build`, `go vet`, `make`, `golangci-lint
+run` i `govulncheck`. Dwa hooki PreToolUse z `updatedInput` na tej samej komendzie dają losowy wynik,
+więc na Macu z rtk te narzędzia idą w jego wyjątki, w `~/Library/Application Support/rtk/config.toml`:
 
 ```
 [hooks]
-exclude_commands = ["go", "make", "golangci-lint"]
+exclude_commands = ["go", "make", "golangci-lint", "govulncheck"]
 ```
 
-Wtedy `hook_rewrite` sam wstawia `rtk` przed tymi komendami w środku opakowania (`with_rtk`),
-więc agent dalej dostaje krótkie wyjście rtk. Na Depot idzie komenda bez opakowań, czyli bez rtk.
+W środku opakowania `with_rtk` pyta `rtk rewrite` o tę samą komendę z pustym `HOME`, czyli bez tych
+wyjątków, więc reguły rtk mają jedno źródło i agent dalej dostaje krótkie wyjście. Kod 3 („przepisz,
+ale zapytaj”, bo w pustym HOME rtk nie widzi ustawień Claude) to dla nas zwykłe przepisanie. Gdy rtk
+nie ma albo nic nie przepisuje, komenda zostaje bez zmian. Na Depot idzie komenda bez opakowań, czyli
+bez rtk.
