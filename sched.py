@@ -19,20 +19,17 @@ wyjścia. Stan dla panelu: sched/state.json, historia: sched/history.jsonl (docs
 Hook PreToolUse (devguard.py admit) owija komendy agentów przez hook_rewrite().
 """
 
-import ctypes
-import ctypes.util
-import fcntl
-import hashlib
 import json
 import os
-import random
 import re
 import shlex
-import signal
-import subprocess
 import sys
-import threading
 import time
+import types
+
+# ctypes, subprocess, hashlib, random, threading, signal i fcntl ładują się w funkcjach, które
+# ich używają: hook (hook_rewrite) idzie przy każdej komendzie Go agenta i potrzebuje tylko
+# klasyfikacji, a te importy to razem ~20 ms (sam ctypes.util z find_library ~10 ms)
 
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(HOME, ".local/share/claude-acc")
@@ -158,63 +155,77 @@ def load_config():
 
 # ---------- pamięć i procesy (ctypes, bez importu perf.py: hook musi być szybki) ----------
 
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_kernel = types.SimpleNamespace(libc=None)
 
 
-class _RusageV0(ctypes.Structure):
-    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
-        (n, ctypes.c_uint64)
-        for n in (
-            "user_time",
-            "system_time",
-            "pkg_idle_wkups",
-            "interrupt_wkups",
-            "pageins",
-            "wired_size",
-            "resident_size",
-            "phys_footprint",
-            "proc_start_abstime",
-            "proc_exit_abstime",
-        )
-    ]
+def kernel():
+    """ctypes, libc i struktury jądra, ładowane przy pierwszym odczycie pamięci albo procesu."""
+    if _kernel.libc is not None:
+        return _kernel
+    import ctypes
+    import ctypes.util
+
+    class RusageV0(ctypes.Structure):
+        _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+            (n, ctypes.c_uint64)
+            for n in (
+                "user_time",
+                "system_time",
+                "pkg_idle_wkups",
+                "interrupt_wkups",
+                "pageins",
+                "wired_size",
+                "resident_size",
+                "phys_footprint",
+                "proc_start_abstime",
+                "proc_exit_abstime",
+            )
+        ]
+
+    class Timebase(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+    class XswUsage(ctypes.Structure):
+        _fields_ = [
+            ("total", ctypes.c_uint64),
+            ("avail", ctypes.c_uint64),
+            ("used", ctypes.c_uint64),
+            ("pagesize", ctypes.c_uint32),
+            ("encrypted", ctypes.c_bool),
+        ]
+
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    tb = Timebase()
+    libc.mach_timebase_info(ctypes.byref(tb))
+    _kernel.ctypes = ctypes
+    _kernel.RusageV0 = RusageV0
+    _kernel.XswUsage = XswUsage
+    _kernel.tick_s = (tb.numer / tb.denom if tb.denom else 1.0) / 1e9
+    _kernel.libc = libc
+    return _kernel
 
 
-class _Timebase(ctypes.Structure):
-    _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
-
-
-class _XswUsage(ctypes.Structure):
-    _fields_ = [
-        ("total", ctypes.c_uint64),
-        ("avail", ctypes.c_uint64),
-        ("used", ctypes.c_uint64),
-        ("pagesize", ctypes.c_uint32),
-        ("encrypted", ctypes.c_bool),
-    ]
-
-
-_tb = _Timebase()
-_libc.mach_timebase_info(ctypes.byref(_tb))
-_TICK_S = (_tb.numer / _tb.denom if _tb.denom else 1.0) / 1e9
 PROC_PGRP_ONLY = 2
 PROC_PPID_ONLY = 6
 
 
 def sysctl_int(name):
-    value = ctypes.c_uint64(0)
-    size = ctypes.c_size_t(8)
-    if _libc.sysctlbyname(
-        name.encode(), ctypes.byref(value), ctypes.byref(size), None, 0
+    k = kernel()
+    value = k.ctypes.c_uint64(0)
+    size = k.ctypes.c_size_t(8)
+    if k.libc.sysctlbyname(
+        name.encode(), k.ctypes.byref(value), k.ctypes.byref(size), None, 0
     ):
         return None
     return value.value & ((1 << (8 * size.value)) - 1)
 
 
 def swap_used_gb():
-    info = _XswUsage()
-    size = ctypes.c_size_t(ctypes.sizeof(info))
-    if _libc.sysctlbyname(
-        b"vm.swapusage", ctypes.byref(info), ctypes.byref(size), None, 0
+    k = kernel()
+    info = k.XswUsage()
+    size = k.ctypes.c_size_t(k.ctypes.sizeof(info))
+    if k.libc.sysctlbyname(
+        b"vm.swapusage", k.ctypes.byref(info), k.ctypes.byref(size), None, 0
     ):
         return 0.0
     return info.used / GB
@@ -222,18 +233,20 @@ def swap_used_gb():
 
 def proc_usage(pid):
     """(phys_footprint w bajtach, CPU w s) procesu albo None."""
-    info = _RusageV0()
-    if _libc.proc_pid_rusage(pid, 0, ctypes.byref(info)) != 0:
+    k = kernel()
+    info = k.RusageV0()
+    if k.libc.proc_pid_rusage(pid, 0, k.ctypes.byref(info)) != 0:
         return None
-    return info.phys_footprint, (info.user_time + info.system_time) * _TICK_S
+    return info.phys_footprint, (info.user_time + info.system_time) * k.tick_s
 
 
 def _listpids(kind, arg):
-    buf = (ctypes.c_int * 2048)()
-    n = _libc.proc_listpids(kind, arg, buf, ctypes.sizeof(buf))
+    k = kernel()
+    buf = (k.ctypes.c_int * 2048)()
+    n = k.libc.proc_listpids(kind, arg, buf, k.ctypes.sizeof(buf))
     if n <= 0:
         return []
-    return [p for p in buf[: n // ctypes.sizeof(ctypes.c_int)] if p > 0]
+    return [p for p in buf[: n // k.ctypes.sizeof(k.ctypes.c_int)] if p > 0]
 
 
 def job_pids(root):
@@ -322,7 +335,16 @@ def devserver_reserve_gb():
 
 WRAPPERS = {"rtk", "time", "nice", "env", "caffeinate", "command", "exec", "nohup"}
 GO_VERBS = {"build", "test", "vet", "run", "install", "generate"}
-SKIP_MARKERS = ("sched.py", "plock.py", "depot-exec.sh", "depot-ci.sh", "SCHED_OFF=1")
+# "acc.py' sched": ta sama komenda, gdy katalog domowy ma spację, a ścieżka idzie w cudzysłowie
+SKIP_MARKERS = (
+    "sched.py",
+    "acc.py sched",
+    "acc.py' sched",
+    "plock.py",
+    "depot-exec.sh",
+    "depot-ci.sh",
+    "SCHED_OFF=1",
+)
 REDIRECTS = re.compile(r"(?:(?<=\s)|^)(?:\d*>&\d+|&>>?\s*\S+|\d*>>?\s*\S+|\d*<\s*\S+)")
 TAKES_VALUE = {
     "-run", "-p", "-count", "-tags", "-timeout", "-o", "-ldflags", "-gcflags", "-skip",
@@ -841,10 +863,15 @@ def refresh_depot_eta(cache, repo_dir):
     script = os.path.join(repo_dir, "scripts/depot-cost.py")
     jobs = {}
     if os.path.isfile(script):
+        import subprocess
+
+        # ten sam interpreter co reszta claude-acc: python z setup.sh, bez niego systemowy
+        python = os.path.join(STATE_DIR, "python")
+        python = python if os.access(python, os.X_OK) else "/usr/bin/python3"
         try:
             since = load_config().get("depot_eta_since")
             out = subprocess.run(
-                ["/usr/bin/python3", script, "eta", "--json"] + (["--since", since] if since else []),
+                [python, script, "eta", "--json"] + (["--since", since] if since else []),
                 cwd=repo_dir,
                 capture_output=True,
                 text=True,
@@ -873,6 +900,8 @@ def refresh_depot_eta(cache, repo_dir):
 
 
 def go_list(args, cwd, timeout=60):
+    import subprocess
+
     try:
         out = subprocess.run(
             ["go", "list"] + args,
@@ -886,7 +915,9 @@ def go_list(args, cwd, timeout=60):
     return out.stdout if out.returncode == 0 else None
 
 
-EXEC_IMPORT = re.compile(r'^\s*(?:import\s+)?(?:([\w.]+)\s+)?"os/exec"', re.M)
+# wzorce, których hook nie używa, jako tekst: re kompiluje je przy pierwszym użyciu (i trzyma
+# w swoim cache), a nie przy każdym załadowaniu modułu przez hook
+EXEC_IMPORT = r'(?m)^\s*(?:import\s+)?(?:([\w.]+)\s+)?"os/exec"'
 
 
 def exec_calls(path):
@@ -898,7 +929,7 @@ def exec_calls(path):
         return False
     if "os.StartProcess(" in text or "syscall.Exec(" in text:
         return True
-    m = EXEC_IMPORT.search(text)
+    m = re.search(EXEC_IMPORT, text)
     if not m:
         return False
     alias = m.group(1) or "exec"
@@ -922,6 +953,8 @@ def go_files(directory, tests=True):
 
 
 def files_signature(paths):
+    import hashlib
+
     sig = []
     for path in paths:
         try:
@@ -1032,14 +1065,14 @@ def uses_pg(job, cache):
     return bool(inputs and inputs["pg"])
 
 
-COUNT1 = re.compile(r"(?<![\w-])-count(?:=| )1(?![\w.])")
+COUNT1 = r"(?<![\w-])-count(?:=| )1(?![\w.])"
 
 
 def drop_count1(command):
     """Komenda bez jedynego -count=1 (albo -count 1); None, gdy nie da się tego zrobić jednoznacznie."""
-    if len(COUNT1.findall(command)) != 1:
+    if len(re.findall(COUNT1, command)) != 1:
         return None
-    return re.sub(r" ?" + COUNT1.pattern, "", command, count=1)
+    return re.sub(r" ?" + COUNT1, "", command, count=1)
 
 
 # ---------- stan ----------
@@ -1054,6 +1087,8 @@ class Locked:
         self.ok = False
 
     def __enter__(self):
+        import fcntl
+
         os.makedirs(SCHED_DIR, exist_ok=True)
         self.fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
         try:
@@ -1064,6 +1099,8 @@ class Locked:
         return self
 
     def __exit__(self, *exc):
+        import fcntl
+
         if self.ok:
             fcntl.flock(self.fd, fcntl.LOCK_UN)
         os.close(self.fd)
@@ -1131,8 +1168,10 @@ def save_state(state):
     state["idle_since"] = None if busy else (state.get("idle_since") or now)
     os.makedirs(SCHED_DIR, exist_ok=True)
     tmp = f"{STATE_PATH}.tmp{os.getpid()}"
+    # dumps i jeden zapis: json.dump pisze kawałkami przez koder w Pythonie (3x wolniej)
+    data = json.dumps(state, ensure_ascii=False, indent=1)
     with open(tmp, "w") as f:
-        json.dump(state, f, ensure_ascii=False, indent=1)
+        f.write(data)
     os.replace(tmp, STATE_PATH)
 
 
@@ -1147,8 +1186,9 @@ def load_cache():
 def save_cache(cache):
     os.makedirs(SCHED_DIR, exist_ok=True)
     tmp = f"{CACHE_PATH}.tmp{os.getpid()}"
+    data = json.dumps(cache)
     with open(tmp, "w") as f:
-        json.dump(cache, f)
+        f.write(data)
     os.replace(tmp, CACHE_PATH)
 
 
@@ -1161,6 +1201,8 @@ def reap(state):
             continue
         pgid = job.get("child_pgid")
         if pgid and alive(pgid):
+            import signal
+
             for sig in (signal.SIGCONT, signal.SIGTERM):
                 try:
                     os.killpg(pgid, sig)
@@ -1421,6 +1463,8 @@ def update_queue_view(state, cfg):
 
 def safety(state, cfg):
     """SIGSTOP najmłodszego ciężkiego joba, gdy swap rośnie; SIGCONT, gdy pamięć odpuści."""
+    import signal
+
     mem = state["memory"]
     growth = mem.get("swap_growth_2m_gb", 0)
     local = [
@@ -1457,6 +1501,8 @@ def safety(state, cfg):
 
 
 def new_id():
+    import random
+
     return f"j-{int(time.time())}-{random.randrange(16**4):04x}"
 
 
@@ -1473,6 +1519,8 @@ def goflags_with(p, extra=()):
     """GOFLAGS z env albo `go env` (maszynowe -p=4), z naszym -p i dodatkami."""
     base = os.environ.get("GOFLAGS")
     if base is None:
+        import subprocess
+
         try:
             base = subprocess.run(
                 ["go", "env", "GOFLAGS"], capture_output=True, text=True, timeout=10
@@ -1754,6 +1802,9 @@ def start_depot(state, entry, target):
 
 
 def run_local(entry, job, command, argv, cfg):
+    import signal
+    import subprocess
+
     env = dict(os.environ)
     extra = []
     if (
@@ -1936,12 +1987,14 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
         save_state(state)
 
 
-DEPOT_LINE = re.compile(
-    r"run (\w+): exit (-?\d+) after (\d+)s on (\d+) cores \(~([\d.]+) units\)"
-)
+DEPOT_LINE = r"run (\w+): exit (-?\d+) after (\d+)s on (\d+) cores \(~([\d.]+) units\)"
 
 
 def run_depot(entry, target, cfg, job, command, argv, opts, history, cache):
+    import signal
+    import subprocess
+    import threading
+
     jid = entry["id"]
     log(
         f"Depot ({target['target']} {target['job']}, {target['cores']} rdzeni): {entry['route']['text']}"
@@ -1965,7 +2018,7 @@ def run_depot(entry, target, cfg, job, command, argv, opts, history, cache):
         for line in proc.stderr:
             sys.stderr.write(line)
             sys.stderr.flush()
-            m = DEPOT_LINE.search(line)
+            m = re.search(DEPOT_LINE, line)
             if m:
                 info["run_id"], info["units"] = m.group(1), float(m.group(5))
             elif not info["run_id"]:
@@ -2041,6 +2094,21 @@ def requeue_local(entry, job, command, argv, opts, cfg, history, cache):
 RECURSIVE_GREP = re.compile(r"(^|[\s;&|(])grep\s+(-[A-Za-z]*[rR][A-Za-z]*|--recursive)")
 
 
+def runner():
+    """Początek owiniętej komendy: python z setup.sh i acc.py, które uruchamia ten plik z
+    bajtkodu (start z samego pliku to 12 ms kompilacji przy każdej komendzie Go), albo
+    systemowy python i sam plik, gdy instalacja jest starsza."""
+    python = os.path.join(STATE_DIR, "python")
+    launcher = os.path.join(STATE_DIR, "acc.py")
+    if (
+        os.path.dirname(SELF) == STATE_DIR
+        and os.access(python, os.X_OK)
+        and os.path.isfile(launcher)
+    ):
+        return [python, launcher, "sched"]
+    return ["/usr/bin/python3", SELF]
+
+
 def hook_rewrite(event):
     """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run."""
     if event.get("tool_name") != "Bash":
@@ -2057,7 +2125,7 @@ def hook_rewrite(event):
         return None
     if job is None:
         return None
-    parts = ["/usr/bin/python3", SELF, "run", "--via", "hook"]
+    parts = runner() + ["run", "--via", "hook"]
     if event.get("session_id"):
         parts += ["--session", str(event["session_id"])]
     agent = event.get("agent_type") or event.get("subagent_type")

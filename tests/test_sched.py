@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -623,6 +624,78 @@ class HookTest(Paths):
         again = dict(event, tool_input=updated)
         self.assertIsNone(S.hook_rewrite(again))  # już owinięte
 
+    def test_hook_runs_through_the_managed_python_and_launcher(self):
+        python = os.path.join(S.STATE_DIR, "python")
+        launcher = os.path.join(S.STATE_DIR, "acc.py")
+        os.symlink(sys.executable, python)
+        open(launcher, "w").close()
+        original = "cd apps/charter-service && go test ./internal/money/"
+        event = {
+            "tool_name": "Bash",
+            "cwd": self.repo,
+            "tool_input": {"command": original},
+        }
+        updated = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+        argv = shlex.split(updated["command"])
+        self.assertEqual(argv[:6], [python, launcher, "sched", "run", "--via", "hook"])
+        self.assertEqual(argv[-2:], ["--shell", original])
+        self.assertIsNone(
+            S.hook_rewrite(dict(event, tool_input=updated))
+        )  # już owinięte
+        os.remove(
+            launcher
+        )  # starsza instalacja bez acc.py: sam plik i systemowy python
+        argv = shlex.split(
+            S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]["command"]
+        )
+        self.assertEqual(argv[:2], ["/usr/bin/python3", S.SELF])
+
+    def test_launcher_in_a_quoted_path_is_not_wrapped_twice(self):
+        state = os.path.join(self.dir, "home with space/.local/share/claude-acc")
+        os.makedirs(state)
+        for name, value in (
+            ("STATE_DIR", state),
+            ("SELF", os.path.join(state, "sched.py")),
+        ):
+            patcher = mock.patch.object(S, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        os.symlink(sys.executable, os.path.join(state, "python"))
+        open(os.path.join(state, "acc.py"), "w").close()
+        event = {
+            "tool_name": "Bash",
+            "cwd": self.repo,
+            "tool_input": {"command": "cd apps/charter-service && go test ./..."},
+        }
+        updated = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+        self.assertIn("acc.py' sched run", updated["command"])
+        # owinięta komenda sama mówi, że jest owinięta (SKIP_MARKERS), nie tylko przez to,
+        # że klasyfikacja nie widzi Go w cudzysłowie
+        self.assertTrue(any(m in updated["command"] for m in S.SKIP_MARKERS))
+        self.assertIsNone(S.hook_rewrite(dict(event, tool_input=updated)))
+
+    def test_depot_eta_runs_on_the_managed_python(self):
+        """`depot-cost.py eta` idzie tym samym pythonem co reszta, bez niego systemowym."""
+        write(
+            os.path.join(self.repo, "scripts/depot-cost.py"),
+            'import json\nprint(json.dumps({"go-heavy/full": {"p50_s": 99}}))\n',
+        )
+        used = os.path.join(self.dir, "used")
+        write(
+            os.path.join(S.STATE_DIR, "python"),
+            f'#!/bin/sh\necho "$@" >> {used}\nexec /usr/bin/python3 "$@"\n',
+            0o755,
+        )
+        cache = {}
+        self.assertTrue(S.refresh_depot_eta(cache, self.repo))
+        self.assertEqual(cache["depot_eta"]["jobs"]["go-heavy/full"]["p50_s"], 99)
+        with open(used) as f:
+            self.assertIn("depot-cost.py eta --json", f.read())
+        os.remove(os.path.join(S.STATE_DIR, "python"))
+        os.remove(used)
+        self.assertTrue(S.refresh_depot_eta({}, self.repo))
+        self.assertFalse(os.path.exists(used))
+
     def test_recursive_grep_is_left_to_rg_rewrite(self):
         command = "cd apps/charter-service && go test ./internal/moneyfmt/ && grep -rn TODO internal"
         event = {
@@ -652,8 +725,46 @@ class HookTest(Paths):
             S.hook_rewrite({"tool_name": "Read", "tool_input": {"file_path": "/x"}})
         )
 
+    def test_hook_loads_nothing_it_does_not_use(self):
+        """Hook idzie przy każdej komendzie Go: ctypes, subprocess i reszta czekają na `run`."""
+        event = {
+            "tool_name": "Bash",
+            "cwd": self.repo,
+            "tool_input": {"command": "cd apps/charter-service && go test ./..."},
+        }
+        code = (
+            "import json, sys\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "m = type(sys)('acc_sched')\n"
+            f"SourceFileLoader('acc_sched', {SCRIPT!r}).exec_module(m)\n"
+            f"out = m.hook_rewrite(json.loads({json.dumps(event)!r}))\n"
+            "heavy = ('ctypes', 'subprocess', 'hashlib', 'random', 'threading', 'signal', 'fcntl')\n"
+            "print(bool(out), [h for h in heavy if h in sys.modules])\n"
+        )
+        done = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(done.stdout.strip(), "True []")
+
 
 class StateTest(Paths):
+    def test_kernel_reads_load_on_first_use(self):
+        footprint, cpu = S.proc_usage(os.getpid())
+        self.assertGreater(footprint, 1024**2)
+        self.assertGreater(cpu, 0)
+        self.assertGreater(S.job_usage(os.getpid())[0], 0)
+        self.assertGreater(S.sysctl_int("hw.memsize"), 1024**3)
+
+    def test_state_file_format_is_unchanged(self):
+        st = self.state()
+        st["queue"].append({"id": "q", "label": "go test ./internal/zażółć"})
+        S.save_state(st)
+        with open(S.STATE_PATH) as f:
+            self.assertEqual(f.read(), json.dumps(st, ensure_ascii=False, indent=1))
+
     def test_public_state_and_memory_gauge(self):
         st = self.state()
         S.save_state(st)
