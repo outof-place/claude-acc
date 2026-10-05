@@ -10,6 +10,13 @@ przy `warn` joby do 2 GB startują normalnie, a większe pojedynczo (jak stary z
 się w dostępnej pamięci minus zapas. macOS potrafi trzymać `warn` godzinami przy połowie wolnej
 pamięci, więc czekanie na jego koniec zatrzymałoby wszystkie komendy Go agentów.
 
+Zakres joba: `tree` to cały moduł (`./...` w jego katalogu), `subtree` to wzorce z `...` na części
+modułu (`./internal/push/...` albo `./...` w podkatalogu), `pkg` i `handlers` to jeden pakiet, a `pkgs`
+kilka. Przewidywanie dla `subtree` leży między jednym pakietem a całym modułem, w proporcji do liczby
+pakietów (bez `testdata`, `vendor` i zagnieżdżonych modułów); poddrzewo z `internal/handlers` waży co
+najmniej tyle co on. Na Depot `subtree` idzie przez `depot-exec` z komendą agenta, bo joby CI
+(`full`, `handlers`) testują stały zestaw pakietów.
+
 Pliki w `~/.local/share/claude-acc/sched/`:
 
 | plik | kto pisze | po co |

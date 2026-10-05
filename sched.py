@@ -22,6 +22,7 @@ Hook PreToolUse (devguard.py admit) owija komendy agentów przez hook_rewrite().
 import ctypes
 import ctypes.util
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -114,6 +115,7 @@ GENERIC = {
     ("script", None): (8.0, 300),
 }
 SMALL_MODULES = ("auth-service",)  # cały moduł nigdy nie przekroczył 1,8 GB
+HANDLERS = "internal/handlers"  # jeden pakiet, a pamięci i czasu tyle co cały charter-service
 RACE_FACTOR = 1.4
 # klasy, które stary hak depot-heavy-go.sh wysyłał na Depot, i ich job Depot CI:
 # (moduł, rodzaj, zakres, tylko kompilacja) -> (job, rdzenie, p50 s)
@@ -437,11 +439,37 @@ def parse_go(argv):
     return verb, flags, pkgs, cdir
 
 
+def pattern_rel(pattern, module_dir, here):
+    """Ścieżka wzorca względem modułu, bez końcowego /... ("." = cały moduł); None, gdy wzorzec
+    ma ... w środku albo wychodzi poza moduł."""
+    if pattern.endswith("/..."):
+        base = pattern[:-4]
+    elif "..." in pattern:
+        return None
+    else:
+        base = pattern
+    if base.startswith((".", "/")):
+        rel = os.path.relpath(os.path.normpath(os.path.join(here, base)), module_dir)
+    else:
+        mod = module_path(module_dir)
+        if not mod or not (base == mod or base.startswith(mod + "/")):
+            return None
+        rel = base[len(mod) + 1 :] or "."
+    return None if rel == ".." or rel.startswith("../") else rel
+
+
 def scope_of(pkgs, module_dir, here):
+    """(zakres, szczegół). tree: cały moduł (`./...` w jego katalogu); subtree: wzorce z ... na
+    części modułu, szczegół to ich ścieżki względem modułu (wzorzec nierozwiązany zostaje jak
+    jest); pkgs: kilka pakietów; pkg albo handlers: jeden. Bez chodzenia po katalogach, bo
+    klasyfikacja idzie też w hooku."""
     if not pkgs:
         pkgs = ["."]
-    if any(p.endswith("...") for p in pkgs):
-        return "tree", "./..."
+    if any("..." in p for p in pkgs):
+        rels = [pattern_rel(p, module_dir, here) for p in pkgs]
+        if "." in rels:
+            return "tree", "./..."
+        return "subtree", " ".join(r if r is not None else p for r, p in zip(rels, pkgs))
     if len(pkgs) > 1:
         return "pkgs", " ".join(pkgs)
     p = pkgs[0]
@@ -451,7 +479,7 @@ def scope_of(pkgs, module_dir, here):
         rel = p.split("/", 1)[1] if "/" in p else p  # ścieżka importu: bez nazwy modułu
     rel = rel.strip("/")
     rel = "." if rel in ("", ".") else rel
-    return ("handlers" if rel == "internal/handlers" else "pkg"), rel
+    return ("handlers" if rel == HANDLERS else "pkg"), rel
 
 
 def classify(command, cwd, argv=None):
@@ -585,6 +613,8 @@ def finish_job(raw):
         cls = f"{name}:make:{detail}"
     elif scope in ("pkg", "handlers"):
         cls = f"{name}:{kind}:pkg:{detail}"
+    elif scope == "subtree":
+        cls = f"{name}:{kind}:subtree:{detail}"
     else:
         cls = f"{name}:{kind}:{scope}"
     if race:
@@ -661,6 +691,35 @@ def p_sensitive(job):
     )
 
 
+@functools.lru_cache(maxsize=16)
+def go_packages(root):
+    """Katalogi pakietów Go pod root, jak dla wzorca root/...: bez testdata, vendor, katalogów
+    zaczętych od . albo _ i zagnieżdżonych modułów (node_modules pominięte dla szybkości)."""
+    found = []
+    for d, subdirs, files in os.walk(root):
+        subdirs[:] = [
+            s for s in subdirs
+            if not s.startswith((".", "_"))
+            and s not in ("testdata", "vendor", "node_modules")
+            and not os.path.isfile(os.path.join(d, s, "go.mod"))
+        ]  # fmt: skip
+        if any(f.endswith(".go") for f in files):
+            found.append(d)
+    return tuple(found)
+
+
+def subtree_share(job):
+    """Część pakietów modułu objęta poddrzewem joba; 1.0, gdy wzorca nie da się rozwiązać."""
+    total = go_packages(job["module_dir"])
+    dirs = set()
+    for rel in job["scope_detail"].split():
+        root = os.path.join(job["module_dir"], rel)
+        if "..." in rel or not os.path.isdir(root):
+            return 1.0
+        dirs.update(go_packages(root))
+    return min(1.0, len(dirs) / len(total)) if total else 1.0
+
+
 def prior(job, p):
     """(GB, s) z pomiarów albo ostrożne wartości ogólne."""
     name, kind, scope, comp = (
@@ -669,6 +728,27 @@ def prior(job, p):
         job["scope"],
         job["compile"] or job.get("filtered", False),
     )
+    if scope == "subtree":
+        # między jednym pakietem a całym modułem, w proporcji do liczby pakietów; poddrzewo
+        # z internal/handlers (sam waży tyle co cały moduł) nie jest lżejsze od niego
+        share = subtree_share(job)
+        lo_gb, lo_s = base_prior(name, kind, "pkg", comp, p)
+        hi_gb, hi_s = base_prior(name, kind, "tree", comp, p)
+        gb = lo_gb + (hi_gb - lo_gb) * share
+        s = round(lo_s + (hi_s - lo_s) * share)
+        if any(r == HANDLERS or HANDLERS.startswith(r + "/") for r in job["scope_detail"].split()):
+            h_gb, h_s = base_prior(name, kind, "handlers", comp, p)
+            gb, s = max(gb, h_gb), max(s, h_s)
+    else:
+        gb, s = base_prior(name, kind, scope, comp, p)
+    if job.get("filtered"):
+        gb, s = gb * 1.2, s * 1.5  # kompilacja jak przy -run '^$' i kilka testów w procesie
+    if job["race"]:
+        gb, s = gb * RACE_FACTOR, s * 1.5
+    return round(gb, 2), s
+
+
+def base_prior(name, kind, scope, comp, p):
     if name in SMALL_MODULES and kind != "script":
         val = (
             (2.0, 90)
@@ -695,12 +775,7 @@ def prior(job, p):
             nearest = min(val, key=lambda k: abs(k - p))
             gb, s = val[nearest]
             val = (gb * p / nearest if p > nearest else gb, s)
-    gb, s = val
-    if job.get("filtered"):
-        gb, s = gb * 1.2, s * 1.5  # kompilacja jak przy -run '^$' i kilka testów w procesie
-    if job["race"]:
-        gb, s = gb * RACE_FACTOR, s * 1.5
-    return round(gb, 2), s
+    return val
 
 
 def read_history(limit_bytes=8 * 1024 * 1024):
@@ -1770,7 +1845,7 @@ def run_local(entry, job, command, argv, cfg):
         and job["kind"] == "build"
         and "-o" not in job["flags"]
         and "-ldflags" not in job["flags"]
-        and job["scope"] in ("tree", "pkgs")
+        and job["scope"] in ("tree", "subtree", "pkgs")
     ):
         extra.append(
             "-ldflags=-w"
