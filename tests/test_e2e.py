@@ -643,6 +643,32 @@ class TokenTest(unittest.TestCase):
         got = json.loads(w.run("token", "--json", "--prefer", "c@x", "--avoid", "c@x").stdout)
         self.assertEqual(got["email"], "b@x")
 
+    def test_active_returns_the_live_token_of_the_local_account_without_refresh(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=5)
+        w.runtime(a)
+        w.write()
+        live = w.session_refresh("a@x")
+
+        got = json.loads(w.run("token", "--active", "--json").stdout)
+
+        self.assertEqual((got["email"], got["source"]), ("a@x", "active"))
+        self.assertEqual(got["token"], live["claudeAiOauth"]["accessToken"])
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+
+    def test_active_refuses_a_short_lived_token_instead_of_refreshing_it(self):
+        w = Env()
+        a = w.account("a@x", expires_in=5 * 60)
+        w.runtime(a)
+        w.write()
+
+        out = w.run("token", "--active", "--json", "--min-minutes", "30")
+
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "")
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+
     def test_unknown_flag_or_help_never_prints_a_token(self):
         w = Env()
         a = w.account("a@x")

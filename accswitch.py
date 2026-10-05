@@ -25,6 +25,8 @@ Komendy:
   token [--json] [--min-minutes N]
                     token OAuth dla procesów spoza sesji (evale `claude -p`): konto z
                     największym zapasem poza lokalnym, w miarę możliwości inne niż Depot
+  token --active    token konta aktywnego w zarządzanym katalogu (tylko odczyt, bez
+                    odświeżania: token aktywnego rotują sesje); idzie za przełączeniem konta
   token --fallback  zapisz długi token z `claude setup-token` dla `token` bez konta z zapasem
   watch [sekundy]   pętla ticków na pierwszym planie
 """
@@ -1551,7 +1553,8 @@ def pick_token(accounts, cfg, active, min_valid, prefer=None, avoid=()):
 
 def cmd_token(cfg, args):
     """Token OAuth dla procesu spoza sesji; bez konta z zapasem token zapasowy."""
-    usage = "użycie: claude-acc token [--json] [--min-minutes N] [--prefer EMAIL] [--avoid EMAIL] | token --fallback"
+    usage = ("użycie: claude-acc token [--json] [--min-minutes N] [--prefer EMAIL] [--avoid EMAIL]"
+             " | token --active [--json] [--min-minutes N] | token --fallback")
     if "--help" in args or "-h" in args:
         print(usage)
         return 0
@@ -1573,7 +1576,7 @@ def cmd_token(cfg, args):
             del rest[i:i + 2]
     prefer = (picked_flags.get("--prefer") or [None])[-1]
     avoid = tuple(picked_flags.get("--avoid", []))
-    unknown = [a for a in rest if a not in ("--json", "--fallback")]
+    unknown = [a for a in rest if a not in ("--json", "--fallback", "--active")]
     if unknown:
         # nieznana flaga nigdy nie może skończyć się wypisaniem tokenu
         print(f"nieznany argument {' '.join(unknown)}; {usage}", file=sys.stderr)
@@ -1590,6 +1593,28 @@ def cmd_token(cfg, args):
     minutes = 30
     if "--min-minutes" in args:
         minutes = int(args[args.index("--min-minutes") + 1])
+    if "--active" in args:
+        # Konto, na którym pracuje użytkownik: token z wpisu runtime, który sesje odświeżyły
+        # ostatnio. Tylko odczyt: odświeżenie tokenu aktywnego konta zabija sesje, które go
+        # trzymają, więc przy krótkiej ważności odmawiamy i zostawiamy to sesjom.
+        accounts = load_accounts()
+        active = find_active(accounts, cfg)
+        oauth = oauth_of(freshest_runtime(cfg) or "")
+        token, expires = oauth.get("accessToken"), oauth.get("expiresAt", 0) / 1000
+        if not token:
+            print("brak tokenu w zarządzanym katalogu", file=sys.stderr)
+            return 1
+        if expires - time.time() < minutes * 60:
+            print(f"token aktywnego konta ważny krócej niż {minutes} min; odświeżą go sesje Claude Code",
+                  file=sys.stderr)
+            return 1
+        email = active.email if active else "nieznane"
+        log(f"token: wydany dla {email} (active)")
+        if "--json" in args:
+            print(json.dumps({"email": email, "token": token, "expiresAt": int(expires), "source": "active"}))
+        else:
+            print(token)
+        return 0
     lock = take_lock(wait=25)
     if not lock:
         print("inny przebieg właśnie trwa, spróbuj za chwilę", file=sys.stderr)
