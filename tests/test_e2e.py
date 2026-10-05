@@ -630,6 +630,18 @@ class TokenTest(unittest.TestCase):
         self.assertEqual(got["token"], fresh["accessToken"])
         self.assertEqual(w.managed("a@x")["claudeAiOauth"], a["claudeAiOauth"])
 
+    def test_unknown_flag_or_help_never_prints_a_token(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        for args in (["--help"], ["-h"], ["--jsn"], ["--min-minutes"], ["--min-minutes", "x"]):
+            out = w.run("token", *args)
+            self.assertNotIn("at-", out.stdout + out.stderr, args)
+            self.assertEqual(out.returncode, 0 if args[0] in ("--help", "-h") else 2, args)
+
     def test_fallback_token_without_headroom_and_error_without_either(self):
         w = Env()
         a = w.account("a@x")

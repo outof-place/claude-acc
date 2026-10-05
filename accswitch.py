@@ -1544,6 +1544,22 @@ def pick_token(accounts, cfg, active, min_valid):
 
 def cmd_token(cfg, args):
     """Token OAuth dla procesu spoza sesji; bez konta z zapasem token zapasowy."""
+    usage = "użycie: claude-acc token [--json] [--min-minutes N] | token --fallback"
+    if "--help" in args or "-h" in args:
+        print(usage)
+        return 0
+    rest = list(args)
+    if "--min-minutes" in rest:
+        i = rest.index("--min-minutes")
+        if i + 1 >= len(rest) or not rest[i + 1].isdigit():
+            print(usage, file=sys.stderr)
+            return 2
+        del rest[i:i + 2]
+    unknown = [a for a in rest if a not in ("--json", "--fallback")]
+    if unknown:
+        # nieznana flaga nigdy nie może skończyć się wypisaniem tokenu
+        print(f"nieznany argument {' '.join(unknown)}; {usage}", file=sys.stderr)
+        return 2
     if "--fallback" in args:
         import getpass
         token = getpass.getpass("token z `claude setup-token` (nie pokazuje się): ").strip()
