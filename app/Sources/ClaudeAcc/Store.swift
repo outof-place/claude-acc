@@ -49,6 +49,8 @@ final class Store {
     private var guardModeOverride: String?
     /// Rendering only: the account whose details start open.
     @ObservationIgnored var previewOpenAccount: String?
+    /// Rendering only: the account drawn as if the pointer were over it.
+    @ObservationIgnored var previewHoverAccount: String?
     /// Stay Awake lives as long as the app: power assertions and the hotspot watch.
     let awake: Awake
 
