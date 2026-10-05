@@ -1,0 +1,44 @@
+{
+ "version": 1,
+ "checked_at": 1791190800.0,
+ "error": null,
+ "running": [
+  {
+   "id": "depot-k4v2qp8mzt",
+   "kind": "ci",
+   "label": "gates · prepush",
+   "repo": "portivo",
+   "agent": null,
+   "where": "depot",
+   "route": {"choice": "depot", "why": "ci", "text": "Depot CI: running"},
+   "elapsed_s": 95.0,
+   "eta_s": 160.0,
+   "progress": 0.37,
+   "depot": {"target": "ci", "job": "gates · prepush", "cores": null, "run_id": "k4v2qp8mzt", "url": null, "cost_usd": null}
+  }
+ ],
+ "recent": [
+  {
+   "id": "depot-6dc0mpb5xs",
+   "label": "go-heavy · affected, isolation",
+   "where": "depot",
+   "rc": 0,
+   "finished_at": 1791190500.0,
+   "wall_s": 412.0,
+   "cost_usd": null,
+   "route_text": "Depot CI run 6dc0mpb5xs: finished",
+   "url": null
+  },
+  {
+   "id": "depot-h24bxsvf0k",
+   "label": "gates · prepush",
+   "where": "depot",
+   "rc": 1,
+   "finished_at": 1791189900.0,
+   "wall_s": 204.0,
+   "cost_usd": null,
+   "route_text": "Depot CI run h24bxsvf0k: failed",
+   "url": null
+  }
+ ]
+}

@@ -34,6 +34,8 @@ final class Store {
     private(set) var ultra: Ultra?
     /// The Go build scheduler: running, queued, memory split, today.
     private(set) var sched: SchedState?
+    /// Depot CI runs of the whole organization, also those started outside the scheduler.
+    private(set) var depot: DepotRuns?
     /// kern.memorystatus_level, for the Builds memory lane while the scheduler is idle.
     private(set) var memoryLevel: Double?
     /// CPU and GPU load since the previous reading.
@@ -56,6 +58,7 @@ final class Store {
     @ObservationIgnored private var loginCancelled = false
     @ObservationIgnored private var refreshAgain = false
     @ObservationIgnored private var poller: Task<Void, Never>?
+    @ObservationIgnored private var depotSyncing = false
     @ObservationIgnored private var live: Task<Void, Never>?
     /// The state files as last read: a file that didn't change costs one stat and wakes no view.
     @ObservationIgnored private var files: [String: StateFile] = [:]
@@ -69,7 +72,7 @@ final class Store {
     /// Rendering the panel to a file: fixed data, no timers, no login item.
     init(
         preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
-        ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil
+        ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil, depot: DepotRuns? = nil
     ) {
         awake = Awake(preview: true)
         snapshot = preview
@@ -80,6 +83,7 @@ final class Store {
         if let ultra { self.ultra = ultra }
         if let load { self.load = load }
         if let sched { self.sched = sched }
+        if let depot { self.depot = depot }
     }
 
     init() {
@@ -146,6 +150,9 @@ final class Store {
         if let data = changedFile(CLI.schedState) {
             sched = Self.decode(SchedState.self, from: data)
         }
+        if let data = changedFile(CLI.depotState) {
+            depot = Self.decode(DepotRuns.self, from: data)
+        }
         let level = Self.kernelMemoryLevel()
         if level != memoryLevel { memoryLevel = level }
         if let data = changedFile(CLI.perfState) {
@@ -192,9 +199,24 @@ final class Store {
             while !Task.isCancelled {
                 self?.readLocal()
                 self?.sampleLoad()
+                self?.syncDepot()
                 // the scheduler rewrites its state every second while builds run
                 try? await Task.sleep(for: .seconds(self?.sched?.busy == true ? 1 : 3))
             }
+        }
+    }
+
+    /// Asks Depot for the organization's runs: every 15 s while one runs, else every minute.
+    /// The script skips the network when its file is that fresh, so two callers never double it.
+    private func syncDepot() {
+        guard !depotSyncing else { return }
+        let maxAge = depot?.running.isEmpty == false ? 15 : 60
+        if Date.now.timeIntervalSince1970 - (depot?.checkedAt ?? 0) < Double(maxAge) { return }
+        depotSyncing = true
+        Task { [weak self] in
+            _ = await CLI.run(["depot", "--max-age", String(maxAge)], script: CLI.sched)
+            self?.depotSyncing = false
+            self?.readLocal()
         }
     }
 

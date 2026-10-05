@@ -111,6 +111,8 @@ class Paths(unittest.TestCase):
             "LOCK_PATH": os.path.join(sched_dir, "lock"),
             "CONFIG_PATH": os.path.join(sched_dir, "config.json"),
             "CACHE_PATH": os.path.join(sched_dir, "cache.json"),
+            "DEPOT_PATH": os.path.join(sched_dir, "depot.json"),
+            "DEPOT_LOCK": os.path.join(sched_dir, "depot.lock"),
             "DEVGUARD_STATE": os.path.join(state_dir, "devguard-state.json"),
             "DEVGUARD_CONFIG": os.path.join(state_dir, "devguard.json"),
             "SELF": os.path.join(state_dir, "sched.py"),
@@ -836,6 +838,159 @@ class StateTest(Paths):
         S.reap(st)
         self.assertEqual(st["running"], [])
         self.assertIsNotNone(sleeper.wait(timeout=5))  # sierota zabita
+
+
+FAKE_DEPOT_API = r"""#!%s
+# podróbka CLI Depot dla `sched.py depot`: odpowiedzi z $FAKE_DEPOT_DATA, wywołania do $FAKE_DEPOT_CALLS
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_DEPOT_CALLS"], "a") as f:
+    f.write(" ".join(args) + "\n")
+if os.environ.get("FAKE_DEPOT_FAIL"):
+    sys.stderr.write("unauthenticated: Invalid token\n")
+    sys.exit(1)
+with open(os.environ["FAKE_DEPOT_DATA"]) as f:
+    data = json.load(f)
+if args[:3] == ["ci", "run", "list"]:
+    out = data["runs"]
+elif args[:2] == ["ci", "status"]:
+    out = data["status"].get(args[2])
+elif args[:3] == ["ci", "metrics", "--run"]:
+    out = data["metrics"].get(args[3])
+else:
+    out = None
+if out is None:
+    sys.stderr.write("not_found: Run not found\n")
+    sys.exit(1)
+print(json.dumps(out))
+""" % sys.executable
+
+
+def depot_status(rid, workflow, jobs):
+    return {
+        "org_id": "org1",
+        "run_id": rid,
+        "workflows": [
+            {
+                "name": workflow,
+                "jobs": [
+                    {
+                        "job_display_name": name,
+                        "status": status,
+                        "attempts": [{"view_url": f"https://depot.dev/orgs/org1/workflows/w?job={rid}-{name}"}],
+                    }
+                    for name, status in jobs
+                ],
+            }
+        ],
+    }
+
+
+class DepotTest(Paths):
+    """`sched.py depot`: biegi Depot CI spoza schedulera (bramka pushu, depot-ci.sh agenta)."""
+
+    def setUp(self):
+        super().setUp()
+        bindir = os.path.join(self.dir, "bin")
+        write(os.path.join(bindir, "depot"), FAKE_DEPOT_API, 0o755)
+        self.calls = os.path.join(self.dir, "depot-calls.log")
+        self.data = os.path.join(self.dir, "depot-data.json")
+        patcher = mock.patch.dict(
+            os.environ,
+            {
+                "PATH": bindir + os.pathsep + os.environ.get("PATH", ""),
+                "FAKE_DEPOT_CALLS": self.calls,
+                "FAKE_DEPOT_DATA": self.data,
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gate = [("prepush", "finished")]
+        with open(self.data, "w") as f:
+            json.dump(
+                {
+                    "runs": [
+                        {"run_id": "run0live1", "repo": "o/portivo", "status": "running", "created_at": "2026-10-05T22:30:00Z"},
+                        {"run_id": "run1sched", "repo": "o/portivo", "status": "running", "created_at": "2026-10-05T22:29:00Z"},
+                        {"run_id": "run2fail1", "repo": "o/portivo", "status": "failed", "created_at": "2026-10-05T22:15:56.626Z"},
+                        {"run_id": "run3green", "repo": "o/portivo", "status": "finished", "created_at": "2026-10-05T22:00:00Z"},
+                        {"run_id": "run4cancl", "repo": "o/portivo", "status": "cancelled", "created_at": "2026-10-05T21:50:00Z"},
+                    ],
+                    "status": {
+                        "run0live1": depot_status("run0live1", "gates", [("prepush", "running")]),
+                        "run1sched": depot_status("run1sched", "depot-exec-8", [("exec", "running")]),
+                        "run2fail1": depot_status(
+                            "run2fail1", "go-heavy", [("affected", "finished"), ("isolation", "failed")]
+                        ),
+                        "run3green": depot_status("run3green", "gates", gate),
+                        "run4cancl": depot_status("run4cancl", "gates", gate),
+                    },
+                    "metrics": {
+                        "run2fail1": {"run": {"started_at": "2026-10-05T22:15:56.919Z", "finished_at": "2026-10-05T22:19:06.268Z"}},
+                        "run3green": {"run": {"started_at": "2026-10-05T22:00:00Z", "finished_at": "2026-10-05T22:05:00Z"}},
+                    },
+                },
+                f,
+            )
+        # job schedulera, który sam poszedł na Depot: karta pokazuje go jako jego wiersz
+        st = S.empty_state(self.cfg)
+        st["running"] = [{"id": "j-1", "where": "depot", "depot": {"run_id": "run1sched"}}]
+        S.save_state(st)
+        self.now = S.iso_epoch("2026-10-05T22:31:00Z")
+
+    def calls_for(self, rid):
+        with open(self.calls) as f:
+            return [line for line in f if rid in line]
+
+    def test_runs_outside_the_scheduler_show_up(self):
+        out = S.sync_depot({}, self.cfg, now=self.now)
+        self.assertIsNone(out["error"])
+        self.assertEqual([j["id"] for j in out["running"]], ["depot-run0live1"])
+        live = out["running"][0]
+        self.assertEqual(live["where"], "depot")
+        self.assertEqual(live["label"], "gates · prepush")
+        self.assertEqual(live["repo"], "portivo")
+        self.assertEqual(live["elapsed_s"], 60.0)
+        # ETA z mediany zielonych biegów tej samej etykiety (run3green: 5 min)
+        self.assertEqual(live["eta_s"], 240.0)
+        self.assertEqual(live["progress"], 0.2)
+        self.assertEqual(live["depot"]["run_id"], "run0live1")
+        self.assertIn("job=run0live1-prepush", live["depot"]["url"])
+        recent = {r["id"]: r for r in out["recent"]}
+        self.assertEqual(list(recent), ["depot-run2fail1", "depot-run3green", "depot-run4cancl"])
+        fail = recent["depot-run2fail1"]
+        self.assertEqual(fail["label"], "go-heavy · affected, isolation")
+        self.assertEqual(fail["rc"], 1)
+        self.assertEqual(fail["wall_s"], 189.3)
+        self.assertIn("job=run2fail1-isolation", fail["url"])  # czerwony job pierwszy
+        self.assertEqual(recent["depot-run3green"]["rc"], 0)
+        cancelled = recent["depot-run4cancl"]
+        self.assertEqual(cancelled["rc"], 130)
+        self.assertIsNone(cancelled["wall_s"])  # metryk brak: koniec = utworzenie
+        self.assertEqual(cancelled["finished_at"], S.iso_epoch("2026-10-05T21:50:00Z"))
+
+    def test_finished_runs_are_asked_once(self):
+        first = S.sync_depot({}, self.cfg, now=self.now)
+        S.sync_depot(first, self.cfg, now=self.now + 15)
+        self.assertEqual(len(self.calls_for("run2fail1")), 2)  # status i metrics, raz
+        self.assertEqual(len(self.calls_for("run0live1")), 2)  # biegnący: status przy każdym odczycie
+
+    def test_cli_error_keeps_the_last_runs_and_says_why(self):
+        first = S.sync_depot({}, self.cfg, now=self.now)
+        with mock.patch.dict(os.environ, {"FAKE_DEPOT_FAIL": "1"}):
+            out = S.sync_depot(first, self.cfg, now=self.now + 60)
+        self.assertEqual(out["error"], "unauthenticated: Invalid token")
+        self.assertEqual(out["running"], [])
+        self.assertEqual(out["recent"], first["recent"])
+
+    def test_command_writes_the_file_and_honours_max_age(self):
+        self.assertEqual(S.cmd_depot([]), 0)
+        with open(S.DEPOT_PATH) as f:
+            saved = json.load(f)
+        self.assertEqual(saved["running"][0]["id"], "depot-run0live1")
+        before = len(open(self.calls).readlines())
+        S.cmd_depot(["--max-age", "60"])
+        self.assertEqual(len(open(self.calls).readlines()), before)  # świeży plik: bez sieci
 
 
 class RunTest(unittest.TestCase):

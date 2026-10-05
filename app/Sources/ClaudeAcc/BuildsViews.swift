@@ -91,6 +91,8 @@ struct SchedState: Decodable {
         let peakGb: Double?
         let costUsd: Double?
         let routeText: String?
+        /// Depot CI runs only: the job on depot.dev, the failed one first.
+        let url: String?
     }
 
     struct Today: Decodable {
@@ -132,6 +134,28 @@ struct SchedState: Decodable {
     var busy: Bool { !running.isEmpty || !queue.isEmpty }
 }
 
+/// `sched/depot.json`, written by `sched.py depot`: the organization's Depot CI runs, shaped as
+/// the scheduler's jobs and recent runs. The push gate and agents' depot-ci.sh never pass
+/// through the scheduler, so this file is the only place they show up.
+struct DepotRuns: Decodable {
+    let checkedAt: Double?
+    let error: String?
+    let running: [SchedState.Job]
+    let recent: [SchedState.Recent]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        checkedAt = try c.decodeIfPresent(Double.self, forKey: .checkedAt)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        running = try c.decodeIfPresent([SchedState.Job].self, forKey: .running) ?? []
+        recent = try c.decodeIfPresent([SchedState.Recent].self, forKey: .recent) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case checkedAt, error, running, recent
+    }
+}
+
 // MARK: - Card
 
 /// Agents' Go builds and tests, admitted by memory instead of one lock: what runs where, who
@@ -143,12 +167,16 @@ struct BuildsCard: View {
     var body: some View {
         Card("Builds", symbol: "square.stack.3d.up.fill") {
             if let state = store.sched {
+                let depotRunning = depotRunning(state)
                 VStack(alignment: .leading, spacing: 12) {
                     MemoryLane(lane: MemoryLane.Lane(state: state, liveLevel: busy(state) ? nil : store.memoryLevel))
-                    if busy(state) {
+                    if busy(state) || !depotRunning.isEmpty {
                         CardScroll {
                             VStack(alignment: .leading, spacing: 10) {
                                 ForEach(state.running) { job in
+                                    RunningRow(job: job).transition(.blurReplace)
+                                }
+                                ForEach(depotRunning) { job in
                                     RunningRow(job: job).transition(.blurReplace)
                                 }
                                 ForEach(state.queue) { job in
@@ -159,11 +187,12 @@ struct BuildsCard: View {
                     } else {
                         RecentRuns(recent: Array(state.recent.prefix(4)), now: now)
                     }
+                    DepotRecent(depot: store.depot, now: now)
                     if let today = state.today {
                         TodayLine(today: today)
                     }
                 }
-                .animation(.smooth, value: state.running.map(\.id) + state.queue.map(\.id))
+                .animation(.smooth, value: state.running.map(\.id) + depotRunning.map(\.id) + state.queue.map(\.id))
             } else {
                 VStack(alignment: .leading, spacing: 4) {
                     Label("The build scheduler hasn't run yet", systemImage: "square.stack.3d.up")
@@ -186,11 +215,20 @@ struct BuildsCard: View {
         state.busy && now.timeIntervalSince1970 - (state.updatedAt ?? 0) < 30
     }
 
+    /// Depot CI runs still going, minus those the scheduler sent itself (its own rows show
+    /// them). A file nobody refreshed for two minutes says nothing about now.
+    private func depotRunning(_ state: SchedState) -> [SchedState.Job] {
+        guard let depot = store.depot, now.timeIntervalSince1970 - (depot.checkedAt ?? 0) < 120 else { return [] }
+        let own = Set(state.running.compactMap { $0.depot?.runId })
+        return depot.running.filter { !own.contains($0.depot?.runId ?? "") }
+    }
+
     @ViewBuilder private func status(_ state: SchedState) -> some View {
-        if busy(state) {
+        let running = (busy(state) ? state.running.count : 0) + depotRunning(state).count
+        if running > 0 || busy(state) {
             HStack(spacing: 4) {
-                Chip("\(state.running.count) running", tint: Format.violet)
-                if !state.queue.isEmpty {
+                Chip("\(running) running", tint: Format.violet)
+                if busy(state), !state.queue.isEmpty {
                     Chip("\(state.queue.count) queued", tint: .orange)
                 }
             }
@@ -294,6 +332,7 @@ private struct KindIcon: View {
         case "make": "wrench.and.screwdriver"
         case "generate": "gearshape.2"
         case "run": "play"
+        case "ci": "cloud"
         default: "terminal"
         }
     }
@@ -304,7 +343,7 @@ private struct WhereChip: View {
 
     var body: some View {
         if job.onDepot {
-            let chip = Chip("Depot \(job.depot?.cores.map { "\($0)c" } ?? "")", symbol: "cloud", tint: .blue)
+            let chip = Chip(job.depot?.cores.map { "Depot \($0)c" } ?? "Depot", symbol: "cloud", tint: .blue)
             if let link = job.depot?.url, let url = URL(string: link) {
                 Button { NSWorkspace.shared.open(url) } label: { chip }
                     .buttonStyle(.plain)
@@ -364,7 +403,8 @@ private struct RunningRow: View {
     }
 
     private var remaining: String {
-        guard let eta = job.etaS else { return "" }
+        // a Depot CI run with no green run of its kind to measure by: how long it has run so far
+        guard let eta = job.etaS else { return job.elapsedS.map { "\(Format.age(Int($0.rounded()))) so far" } ?? "" }
         return eta < 1 ? "finishing" : "\(Format.age(Int(eta.rounded()))) left"
     }
 
@@ -437,22 +477,32 @@ private struct RecentRuns: View {
                 Text("Nothing built yet today").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(recent) { run in
-                HStack(spacing: 8) {
-                    StatusDot(color: run.rc == 0 ? .green : .red, size: 6)
-                    Text(run.label)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer(minLength: 4)
-                    Text(summary(run))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                        .lineLimit(1)
+                if let link = run.url, let url = URL(string: link) {
+                    Button { NSWorkspace.shared.open(url) } label: { row(run) }
+                        .buttonStyle(.plain)
+                        .help((run.routeText.map { $0 + ". " } ?? "") + "Open on Depot")
+                } else {
+                    row(run).help(run.routeText ?? "")
                 }
-                .help(run.routeText ?? "")
             }
         }
+    }
+
+    private func row(_ run: SchedState.Recent) -> some View {
+        HStack(spacing: 8) {
+            StatusDot(color: run.rc == 0 ? .green : .red, size: 6)
+            Text(run.label)
+                .font(.caption)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Text(summary(run))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .contentShape(.rect)
     }
 
     private func summary(_ run: SchedState.Recent) -> String {
@@ -463,6 +513,32 @@ private struct RecentRuns: View {
         }
         if let at = run.finishedAt { parts.append(Format.ago(at, now: now)) }
         return parts.joined(separator: " · ")
+    }
+}
+
+/// The organization's last finished Depot CI runs, and why there are none when Depot can't be
+/// asked (no CLI, not logged in).
+private struct DepotRecent: View {
+    let depot: DepotRuns?
+    let now: Date
+
+    var body: some View {
+        if let depot, !depot.recent.isEmpty || depot.error != nil {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("Depot CI", systemImage: "cloud")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                if let error = depot.error {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                }
+                if !depot.recent.isEmpty {
+                    RecentRuns(recent: Array(depot.recent.prefix(3)), now: now)
+                }
+            }
+        }
     }
 }
 

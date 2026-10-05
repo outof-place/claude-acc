@@ -12,6 +12,7 @@ Pliki w `~/.local/share/claude-acc/sched/`:
 | `state.json` | każdy proces `sched.py run`, pod `flock` na `lock` | stan dla panelu: co biegnie, kto czeka i dlaczego, pamięć, bilans dnia |
 | `history.jsonl` | `sched.py run` na końcu biegu; `scripts/depot-cost.py history` w portivo dopisuje biegi Depot | jeden wiersz na skończony bieg, z wejściami decyzji o trasie |
 | `lock` | wszyscy | `fcntl.flock` na czas czytania i zapisu stanu |
+| `depot.json` | `sched.py depot`, pod `flock` na `depot.lock` | biegi Depot CI całej organizacji dla karty (niżej) |
 | `config.json` | człowiek | nadpisania domyślnych ustawień (niżej) |
 
 ## Kiedy `state.json` się zmienia
@@ -132,7 +133,7 @@ Trasa minimalizuje `czas do wyniku + λ × jednostki Depot`:
 | pole | znaczenie |
 |---|---|
 | `overtakes[]` | `{at, id, label, passed, passed_label, mem_gb, wall_s}`: mały job wpuszczony przed `passed` |
-| `recent[]` | `{id, label, where, rc, finished_at, wall_s, peak_gb, predicted_gb, waited_s, cost_usd, route_text}` |
+| `recent[]` | `{id, label, where, rc, finished_at, wall_s, peak_gb, predicted_gb, waited_s, cost_usd, route_text, depot_run_id}` |
 | `today.jobs_local`, `today.jobs_depot` | liczba skończonych jobów |
 | `today.wait_s` | suma prawdziwego czekania |
 | `today.old_lock_wait_s` | czekanie, które byłoby przy starym zamku: scheduler prowadzi wirtualny zamek FIFO (start = max(przyjście, zwolnienie poprzedniego), z prawdziwymi czasami biegów) |
@@ -140,6 +141,32 @@ Trasa minimalizuje `czas do wyniku + λ × jednostki Depot`:
 | `today.depot_units`, `today.depot_cost_usd` | zużycie Depot przez scheduler |
 | `today.local_kept_usd` | koszt Depot, którego uniknęły lokalne biegi klas, które stary hak `depot-heavy-go.sh` wysyłał na Depot |
 | `today.overtakes`, `today.pauses`, `today.peak_concurrency`, `today.max_reserved_gb` | liczniki dnia |
+
+## `depot.json`: biegi Depot CI spoza schedulera
+
+Scheduler zna tylko joby, które sam wysłał na Depot. Bramka pushu (`.husky/pre-push`, workflow
+`gates`) i `scripts/depot-ci.sh` albo `depot-exec.sh` odpalone wprost przez agenta omijają go
+(`SKIP_MARKERS`), więc karta Builds bierze je z API Depot. `sched.py depot [--max-age S] [--json]`
+pyta `depot ci run list` o 15 ostatnich biegów, bieg biegnący przy każdym odczycie o
+`depot ci status`, a skończony raz o `ci status` i `ci metrics --run` (czasy); potem leży w pliku.
+Aplikacja woła komendę, dopóki panel jest otwarty: co 15 s, gdy coś biegnie, inaczej co minutę;
+z `--max-age` komenda nie idzie do sieci, gdy plik jest młodszy.
+
+```
+version, checked_at   epoch ostatniego odczytu
+error                 ostatnia linia błędu CLI (brak `depot`, brak logowania) albo null
+running[]             biegi queued/running w kształcie joba z `running[]`: where=depot, kind=ci,
+                      label "workflow · joby", depot {target: ci, run_id, url}, elapsed_s, eta_s
+                      i progress z mediany zielonych biegów tej samej etykiety
+recent[]              do 6 skończonych w kształcie `recent[]`: rc 0 (finished), 1 (failed),
+                      130 (cancelled), url do joba na depot.dev (czerwony pierwszy)
+_runs                 szczegóły biegów po run_id; skończone (`final`) nie są pytane drugi raz
+```
+
+Biegi, które scheduler sam wysłał (ich `run_id` w `running[].depot` albo `recent[].depot_run_id`
+w `state.json`), w `depot.json` się nie powtarzają. Karta pokazuje biegnące razem z jobami
+schedulera, a skończone w sekcji „Depot CI”; plik starszy niż 2 min nie daje wierszy biegnących.
+Organizację wybiera `depot_org` w `config.json` (pusta: domyślna organizacja CLI).
 
 ## Kiedy scheduler zdejmuje `-count=1`
 
@@ -184,4 +211,5 @@ drop_count1          true   zdejmuj -count=1 w iteracji agenta dla pakietów bez
 pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ciężki job dostaje SIGSTOP
 depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)
 count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
+depot_org            ""     organizacja Depot dla `sched.py depot`; pusta: domyślna organizacja CLI
 ```

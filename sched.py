@@ -5,6 +5,7 @@
                (--shell 'KOMENDA' | -- ARGV...)
   sched.py status [--json]
   sched.py classify (--shell 'KOMENDA' | -- ARGV...)
+  sched.py depot [--max-age S] [--json]
 
 `run` klasyfikuje komendę (moduł, czasownik, zakres pakietów), przewiduje jej szczyt pamięci i
 czas z historii, a potem:
@@ -17,6 +18,9 @@ czas z historii, a potem:
 Komenda biegnie jako dziecko tego procesu: agent widzi jej wyjście na żywo i dostaje jej kod
 wyjścia. Stan dla panelu: sched/state.json, historia: sched/history.jsonl (docs/sched.md).
 Hook PreToolUse (devguard.py admit) owija komendy agentów przez hook_rewrite().
+`depot` zapisuje do sched/depot.json biegi Depot CI całej organizacji, także te, które
+wystartowały poza schedulerem (bramka pushu, scripts/depot-ci.sh agentów); aplikacja woła go,
+dopóki panel jest otwarty.
 """
 
 import json
@@ -39,6 +43,8 @@ HISTORY_PATH = os.path.join(SCHED_DIR, "history.jsonl")
 LOCK_PATH = os.path.join(SCHED_DIR, "lock")
 CONFIG_PATH = os.environ.get("SCHED_CONFIG") or os.path.join(SCHED_DIR, "config.json")
 CACHE_PATH = os.path.join(SCHED_DIR, "cache.json")
+DEPOT_PATH = os.path.join(SCHED_DIR, "depot.json")
+DEPOT_LOCK = os.path.join(SCHED_DIR, "depot.lock")
 DEVGUARD_STATE = os.path.join(STATE_DIR, "devguard-state.json")
 DEVGUARD_CONFIG = os.path.join(STATE_DIR, "devguard.json")
 SELF = os.path.join(STATE_DIR, "sched.py")
@@ -60,6 +66,8 @@ DEFAULTS = {
     # szablon testpg czyta migracje, Dockerfile i atlasa w procesie testu (os.ReadFile, LookPath)
     "count1_trusted_exec": ["internal/testhelpers/testpg"],
     "idle_floor_pct": 65,
+    # organizacja Depot dla `depot` (pusta: domyślna organizacja CLI; potrzebna przy kilku)
+    "depot_org": "",
 }
 PUBLIC_CONFIG = (
     "headroom_gb",
@@ -1945,6 +1953,7 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
                     "waited_s": waited,
                     "cost_usd": cost,
                     "route_text": me["route"]["text"],
+                    "depot_run_id": (depot_info or {}).get("run_id"),
                 }
             ]
             + state["recent"]
@@ -2151,6 +2160,287 @@ def public_state(state):
     return {k: v for k, v in state.items() if not k.startswith("_")}
 
 
+# ---------- Depot CI: biegi organizacji dla karty Builds ----------
+
+# Scheduler widzi tylko joby, które sam wysłał na Depot; bramka pushu i scripts/depot-ci.sh albo
+# depot-exec.sh odpalone przez agenta omijają go (SKIP_MARKERS), więc karta bierze je z API Depot.
+DEPOT_STATUSES = ("queued", "running", "finished", "failed", "cancelled")
+DEPOT_FINAL = {"finished": 0, "failed": 1, "cancelled": 130}
+DEPOT_LIST_N = 15
+DEPOT_RECENT_N = 6
+
+
+def depot_cli():
+    """CLI Depot; aplikacja startuje z ubogim PATH, więc sprawdzamy też Homebrew."""
+    import shutil
+
+    found = shutil.which("depot")
+    if found:
+        return found
+    paths = ("/opt/homebrew/bin/depot", "/usr/local/bin/depot")
+    return next((p for p in paths if os.access(p, os.X_OK)), None)
+
+
+def depot_call(cli, args, org):
+    """(dane, None) z `depot ARGS -o json` albo (None, ostatnia linia błędu)."""
+    import subprocess
+
+    cmd = [cli] + args + (["--org", org] if org else []) + ["-o", "json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return None, str(err)
+    if r.returncode != 0:
+        lines = [x.strip() for x in (r.stderr or r.stdout).splitlines() if x.strip()]
+        return None, lines[-1] if lines else f"depot exit {r.returncode}"
+    try:
+        return json.loads(r.stdout), None
+    except ValueError:
+        return None, "depot returned unreadable output"
+
+
+def iso_epoch(text):
+    """2026-10-05T22:15:56.626Z -> epoch (UTC); None, gdy pola nie ma."""
+    import calendar
+
+    m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(\.\d+)?", text or "")
+    if not m:
+        return None
+    whole = calendar.timegm(tuple(int(x) for x in m.groups()[:6]) + (0, 0, 0))
+    return whole + float(m.group(7) or 0)
+
+
+def depot_detail(cli, run, org):
+    """Nazwy workflow i jobów, link do joba (najpierw czerwonego) i czasy jednego biegu.
+
+    `ci status` niesie nazwy, statusy i view_url, `ci metrics --run` czasy startu i końca;
+    bieg skończony pytamy o oba raz, potem leży w depot.json (`final`)."""
+    rid = run["run_id"]
+    final = run.get("status") in DEPOT_FINAL
+    status, _ = depot_call(cli, ["ci", "status", rid], org)
+    if status is None:
+        return None
+    metrics = (
+        depot_call(cli, ["ci", "metrics", "--run", rid], org)[0] if final else None
+    )
+    names, urls, failed_urls, done, total = [], [], [], 0, 0
+    for wf in status.get("workflows") or []:
+        jobs = wf.get("jobs") or []
+        job_names = [j.get("job_display_name") or "?" for j in jobs]
+        names.append(
+            wf.get("name", "?") + (" · " + ", ".join(job_names) if job_names else "")
+        )
+        for j in jobs:
+            total += 1
+            done += j.get("status") in DEPOT_FINAL
+            url = ((j.get("attempts") or [{}])[-1]).get("view_url")
+            if url:
+                (failed_urls if j.get("status") == "failed" else urls).append(url)
+    times = (metrics or {}).get("run") or {}
+    return {
+        "final": final,
+        "label": " + ".join(names) or f"Depot CI {rid}",
+        "url": (failed_urls + urls or [None])[0],
+        "jobs_done": done,
+        "jobs_total": total,
+        "started_at": iso_epoch(times.get("started_at")),
+        "finished_at": iso_epoch(times.get("finished_at")),
+    }
+
+
+def sched_depot_run_ids():
+    """Biegi, które scheduler sam wysłał na Depot: karta pokazuje je jako jego joby."""
+    try:
+        with open(STATE_PATH) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return set()
+    ids = {(j.get("depot") or {}).get("run_id") for j in state.get("running") or []}
+    ids |= {r.get("depot_run_id") for r in state.get("recent") or []}
+    return ids - {None}
+
+
+def load_depot():
+    try:
+        with open(DEPOT_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_depot(data):
+    os.makedirs(SCHED_DIR, exist_ok=True)
+    tmp = f"{DEPOT_PATH}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(data, ensure_ascii=False, indent=1))
+    os.replace(tmp, DEPOT_PATH)
+
+
+def sync_depot(prev, cfg, now=None):
+    """Nowa zawartość depot.json: running w kształcie joba schedulera, recent w kształcie
+    jego `recent` (karta rysuje je tymi samymi wierszami), błąd CLI w `error`."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    now = now or time.time()
+    out = {
+        "version": VERSION,
+        "checked_at": now,
+        "error": None,
+        "running": [],
+        "recent": prev.get("recent") or [],
+        "_runs": prev.get("_runs") or {},
+    }
+    cli = depot_cli()
+    if not cli:
+        out["error"] = "no depot CLI (brew install depot/tap/depot)"
+        return out
+    org = cfg.get("depot_org") or None
+    args = ["ci", "run", "list", "-n", str(DEPOT_LIST_N)]
+    for status in DEPOT_STATUSES:
+        args += ["--status", status]
+    runs, err = depot_call(cli, args, org)
+    if runs is None:
+        out["error"] = err
+        return out
+    runs = [r for r in runs if r.get("run_id")]
+    cached = out["_runs"]
+    need = [r for r in runs if not (cached.get(r["run_id"]) or {}).get("final")]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fetched = dict(
+            zip(
+                [r["run_id"] for r in need],
+                pool.map(lambda r: depot_detail(cli, r, org), need),
+            )
+        )
+    # najpierw wszystkie szczegóły: lista idzie od najnowszego, a ETA biegnącego bierze się
+    # ze starszych zielonych biegów tej samej etykiety
+    runs_out = {}
+    for r in runs:
+        rid = r["run_id"]
+        d = fetched.get(rid) or cached.get(rid) or {}
+        if r.get("status") in DEPOT_FINAL:
+            started = d.get("started_at") or iso_epoch(r.get("created_at"))
+            finished = d.get("finished_at")
+            wall = round(finished - started, 1) if finished and started else None
+            d = dict(d, wall_s=wall, ok=r["status"] == "finished")
+        runs_out[rid] = d
+    own = sched_depot_run_ids()
+    running, recent = [], []
+    for r in runs:
+        rid = r["run_id"]
+        if rid in own:
+            continue
+        d = runs_out[rid]
+        created = iso_epoch(r.get("created_at"))
+        started = d.get("started_at") or created
+        label = d.get("label") or f"Depot CI {rid}"
+        depot = {
+            "target": "ci",
+            "job": label,
+            "cores": None,
+            "run_id": rid,
+            "url": d.get("url"),
+            "cost_usd": None,
+        }
+        if r.get("status") in DEPOT_FINAL:
+            if len(recent) < DEPOT_RECENT_N:
+                recent.append(
+                    {
+                        "id": f"depot-{rid}",
+                        "label": label,
+                        "where": "depot",
+                        "rc": DEPOT_FINAL[r["status"]],
+                        "finished_at": d.get("finished_at") or created,
+                        "wall_s": d.get("wall_s"),
+                        "cost_usd": None,
+                        "route_text": f"Depot CI run {rid}: {r['status']}",
+                        "url": d.get("url"),
+                    }
+                )
+            continue
+        elapsed = max(0.0, now - (started or now))
+        walls = sorted(
+            v["wall_s"]
+            for v in dict(cached, **runs_out).values()
+            if v.get("label") == label and v.get("ok") and v.get("wall_s")
+        )
+        p50 = walls[len(walls) // 2] if walls else None
+        total = d.get("jobs_total") or 0
+        if p50:
+            progress = min(0.99, elapsed / p50)
+        else:
+            progress = (d.get("jobs_done") or 0) / total if total else 0.0
+        if r.get("status") == "queued":
+            text = "Depot CI: queued"
+        else:
+            text = (
+                f"Depot CI: {d.get('jobs_done') or 0} of {total} jobs done"
+                if total > 1
+                else "Depot CI: running"
+            )
+        running.append(
+            {
+                "id": f"depot-{rid}",
+                "kind": "ci",
+                "label": label,
+                "repo": (r.get("repo") or "").rsplit("/", 1)[-1] or None,
+                "agent": None,
+                "where": "depot",
+                "route": {"choice": "depot", "why": "ci", "text": text},
+                "elapsed_s": round(elapsed, 1),
+                "eta_s": round(max(0.0, p50 - elapsed), 1) if p50 else None,
+                "progress": round(progress, 2),
+                "depot": depot,
+            }
+        )
+    out.update(running=running, recent=recent, _runs=runs_out)
+    return out
+
+
+def cmd_depot(args):
+    """Odświeża sched/depot.json; z --max-age S nie pyta Depot, gdy plik jest młodszy niż S."""
+    import fcntl
+
+    max_age = 0.0
+    if "--max-age" in args:
+        try:
+            max_age = float(args[args.index("--max-age") + 1])
+        except (IndexError, ValueError):
+            print("usage: sched.py depot [--max-age S] [--json]", file=sys.stderr)
+            return 2
+    data = load_depot()
+    if time.time() - float(data.get("checked_at") or 0) >= max_age:
+        os.makedirs(SCHED_DIR, exist_ok=True)
+        fd = os.open(DEPOT_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)  # inny proces właśnie pyta Depot; jego wynik wyląduje w pliku
+            fd = None
+        if fd is not None:
+            try:
+                data = sync_depot(data, load_config())
+                save_depot(data)
+            finally:
+                os.close(fd)
+    if "--json" in args:
+        print(json.dumps(public_state(data), ensure_ascii=False, indent=1))
+        return 0
+    if data.get("error"):
+        print(f"Depot: {data['error']}")
+    for j in data.get("running") or []:
+        print(
+            f"  biegnie  {j['label']}  {human_s(j.get('elapsed_s'))}  {j['route']['text']}  {j['depot'].get('url') or ''}"
+        )
+    for r in data.get("recent") or []:
+        ago = human_s(time.time() - r["finished_at"]) if r.get("finished_at") else "?"
+        wall = human_s(r["wall_s"]) if r.get("wall_s") else "?"
+        print(
+            f"  {'ok ' if r['rc'] == 0 else 'źle'}  {r['label']}  {wall}, {ago} temu  {r['route_text']}"
+        )
+    return 0 if not data.get("error") else 1
+
+
 def cmd_status(args):
     cfg = load_config()
     with Locked():
@@ -2202,7 +2492,7 @@ def cmd_classify(args):
     return 0 if job else 1
 
 
-COMMANDS = {"run": cmd_run, "status": cmd_status, "classify": cmd_classify}
+COMMANDS = {"run": cmd_run, "status": cmd_status, "classify": cmd_classify, "depot": cmd_depot}
 
 
 def main(argv):
