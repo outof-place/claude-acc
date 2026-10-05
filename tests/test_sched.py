@@ -494,6 +494,38 @@ class PlanTest(Paths):
         st["queue"] = [self.entry("tiny", 0.3, small=True)]
         self.assertEqual(S.plan(st, self.cfg, time.time()), {})
 
+    def test_quick_small_jobs_use_memory_free_now(self):
+        # długi job trzyma rezerwę na wzrost, którego jeszcze nie ma; krótki mały job (testy JS,
+        # jeden pakiet Go) startuje w pamięci dostępnej teraz, zamiast czekać minutami na cudzą prognozę
+        st = self.state()  # level 60: 28,8 GB dostępne
+        st["running"].append(
+            {"id": "big", "where": "local", "label": "go test ./...", "mem_predicted_gb": 20.0,
+             "mem_now_gb": 2.0, "predicted_wall_s": 1500, "started_at": time.time()}
+        )
+        S.refresh_memory(st, self.cfg)  # wolne 20,8 - 18 rezerwy = 2,8
+        st["queue"] = [self.entry("vitest", 3.0, small=True), self.entry("vet", 13.7, ago=1)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vitest": ("overtake", "vet")})
+        # głowa czeka ponad starve_s: mały wyprzedza, jeśli zostawia jej miejsce w pamięci teraz,
+        # a po 2 × starve_s już nikt (strumień testów JS nie zagłodzi dużego joba Go)
+        st["queue"] = [self.entry("vet", 13.7, ago=150), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vitest": ("overtake", "vet")})
+        st["queue"] = [self.entry("vet", 23.0, ago=150), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})  # 24,8 - 23 < 3
+        st["queue"] = [self.entry("vet", 13.7, ago=300), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        # świeżo wpuszczony mały job jeszcze nie zajął pamięci: liczy się jego prognoza
+        st["running"].append(
+            {"id": "q1", "where": "local", "label": "vitest", "mem_predicted_gb": 22.0,
+             "mem_now_gb": 0.0, "small": True, "predicted_wall_s": 60, "started_at": time.time()}
+        )
+        S.refresh_memory(st, self.cfg)
+        st["queue"] = [self.entry("vitest2", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})  # 24,8 - 22 = 2,8 < 3
+        self.set_memory(60, pressure="critical")
+        st = self.state()
+        st["queue"] = [self.entry("tiny", 0.5, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+
     def test_warn_pressure_admits_what_fits(self):
         # macOS trzyma „warn” godzinami przy połowie wolnej pamięci: przy nim startuje to, co
         # mieści się w wolnej pamięci, także kilka naraz; jeden naraz robił z kolejki stary zamek

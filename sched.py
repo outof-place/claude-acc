@@ -1235,20 +1235,33 @@ def plan(state, cfg, now):
 
     FIFO; głowa startuje, gdy się mieści, a gdy lokalnie nic nie biegnie: bez rezerwy na dev
     serwer, po 30 s czekania w ogóle. Za zablokowaną głową startują tylko małe joby, a gdy głowa
-    czeka dłużej niż starve_s, jej pamięć jest zarezerwowana i nikt jej nie wyprzedza."""
+    czeka dłużej niż starve_s, jej pamięć jest zarezerwowana i nikt jej nie wyprzedza.
+
+    Mały job (krótki i lekki: testy JS, jeden pakiet Go) wystarczy, że zmieści się w pamięci
+    dostępnej teraz: rezerwy długich jobów na wzrost, którego jeszcze nie ma, go nie blokują.
+    Liczą się tylko prognozy świeżo wpuszczonych małych jobów, bo te zajmą pamięć za chwilę.
+    Głowa czekająca dłużej niż starve_s zostawia sobie miejsce i w pamięci dostępnej teraz, a po
+    2 × starve_s rezerwacja jest twarda: strumień krótkich jobów nie zagłodzi dużego."""
     mem = state["memory"]
     free = mem["free_for_admission_gb"]
+    now_free = mem["available_gb"] - cfg["headroom_gb"] - sum(
+        max(0.0, (j.get("mem_predicted_gb") or 0) - (j.get("mem_now_gb") or 0))
+        for j in state["running"]
+        if j["where"] == "local" and j.get("small") and not j.get("paused")
+    )
     any_local = any(j["where"] == "local" for j in state["running"])
     pressure = mem.get("pressure", "normal")
     admitted = {}
     blocked = None
     reserve = 0.0
+    strict = False
     if pressure == "critical":
         return admitted
     for job in queue_order(state):
         if (job.get("route") or {}).get("choice") == "depot":
             continue
         need = job["mem_predicted_gb"]
+        quick = bool(job.get("small")) and not strict and need <= now_free - reserve
         if blocked is None:
             spare = mem["available_gb"] - cfg["headroom_gb"]
             alone = not any_local and not admitted
@@ -1257,18 +1270,21 @@ def plan(state, cfg, now):
             # Przy „warn” bez tego ostatniego: macOS trzyma go tu godzinami przy połowie wolnej
             # pamięci, więc startuje to, co się mieści, ale nic ponad dostępną pamięć.
             overcommit = pressure != "warn" and now - job["enqueued_at"] >= 30
-            if need <= free or (alone and (need <= spare or overcommit)):
+            if need <= free or quick or (alone and (need <= spare or overcommit)):
                 admitted[job["id"]] = ("fits", None)
                 free -= need
+                now_free -= need
                 any_local = True
                 continue
             blocked = job
             if now - job["enqueued_at"] > cfg["starve_s"]:
                 reserve = need
+                strict = now - job["enqueued_at"] > 2 * cfg["starve_s"]
             continue
-        if job.get("small") and need <= free - reserve:
+        if job.get("small") and (need <= free - reserve or quick):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
+            now_free -= need
     return admitted
 
 
