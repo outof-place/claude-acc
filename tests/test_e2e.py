@@ -630,6 +630,19 @@ class TokenTest(unittest.TestCase):
         self.assertEqual(got["token"], fresh["accessToken"])
         self.assertEqual(w.managed("a@x")["claudeAiOauth"], a["claudeAiOauth"])
 
+    def test_prefer_keeps_the_previous_account_while_it_carries(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=5)
+        w.account("c@x", weekly_used=40)
+        w.runtime(a)
+        w.write()
+
+        self.assertEqual(json.loads(w.run("token", "--json", "--prefer", "c@x").stdout)["email"], "c@x")
+        # konto, które odbiło proces, odpada od razu, mimo limitów z pamięci podręcznej
+        got = json.loads(w.run("token", "--json", "--prefer", "c@x", "--avoid", "c@x").stdout)
+        self.assertEqual(got["email"], "b@x")
+
     def test_unknown_flag_or_help_never_prints_a_token(self):
         w = Env()
         a = w.account("a@x")

@@ -1515,7 +1515,7 @@ def cmd_depot(cfg, args):
 
 # ---------- token dla procesów spoza sesji ----------
 
-def pick_token(accounts, cfg, active, min_valid):
+def pick_token(accounts, cfg, active, min_valid, prefer=None, avoid=()):
     """Token konta z największym zapasem poza lokalnym, jak sandboxy Depot.
 
     Konto sandboxów Depot bierzemy dopiero, gdy innego nie ma: dwie strony palące
@@ -1525,9 +1525,16 @@ def pick_token(accounts, cfg, active, min_valid):
     """
     now = time.time()
     rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
+    # konto, które właśnie odbiło proces limitem albo 401: limity w pamięci podręcznej
+    # (do 10 min) jeszcze tego nie widzą
+    rows = [r for r in rows if r["account"].email not in avoid]
     depot_email = load_state().get("depot_email")
     rows = [r for r in rows if r["account"].email != depot_email] + \
            [r for r in rows if r["account"].email == depot_email]
+    # konto poprzedniego tokenu, póki ma zapas: seria procesów na jednym koncie dzieli
+    # cache promptu, a przeskok na inne konto zaczyna go od zera
+    rows = [r for r in rows if r["account"].email == prefer] + \
+           [r for r in rows if r["account"].email != prefer]
     for row in rows:
         target = row["account"]
         expires = oauth_of(target.creds_json or "").get("expiresAt", 0) / 1000
@@ -1544,7 +1551,7 @@ def pick_token(accounts, cfg, active, min_valid):
 
 def cmd_token(cfg, args):
     """Token OAuth dla procesu spoza sesji; bez konta z zapasem token zapasowy."""
-    usage = "użycie: claude-acc token [--json] [--min-minutes N] | token --fallback"
+    usage = "użycie: claude-acc token [--json] [--min-minutes N] [--prefer EMAIL] [--avoid EMAIL] | token --fallback"
     if "--help" in args or "-h" in args:
         print(usage)
         return 0
@@ -1555,6 +1562,17 @@ def cmd_token(cfg, args):
             print(usage, file=sys.stderr)
             return 2
         del rest[i:i + 2]
+    picked_flags = {}
+    for flag in ("--prefer", "--avoid"):
+        while flag in rest:
+            i = rest.index(flag)
+            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                print(usage, file=sys.stderr)
+                return 2
+            picked_flags.setdefault(flag, []).append(rest[i + 1])
+            del rest[i:i + 2]
+    prefer = (picked_flags.get("--prefer") or [None])[-1]
+    avoid = tuple(picked_flags.get("--avoid", []))
     unknown = [a for a in rest if a not in ("--json", "--fallback")]
     if unknown:
         # nieznana flaga nigdy nie może skończyć się wypisaniem tokenu
@@ -1577,7 +1595,7 @@ def cmd_token(cfg, args):
         print("inny przebieg właśnie trwa, spróbuj za chwilę", file=sys.stderr)
         return 1
     accounts = load_accounts()
-    picked = pick_token(accounts, cfg, find_active(accounts, cfg), minutes * 60)
+    picked = pick_token(accounts, cfg, find_active(accounts, cfg), minutes * 60, prefer=prefer, avoid=avoid)
     if picked:
         email, token, expires = picked
         source = "rotation"
