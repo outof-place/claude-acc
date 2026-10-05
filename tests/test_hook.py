@@ -317,6 +317,27 @@ class InstallTest(Guarded):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((open(self.path).read(), stamp(self.path)), first)
 
+    def test_alarms_outlive_the_longest_pause_after_an_update(self):
+        # Claude Code ubija hook z asyncRewake po jego timeout, bez niego po 600 s:
+        # budziki ze starej instalacji umierały, zanim kończyła się pauza dłuższa niż 10 min
+        old = json.loads(json.dumps(ORIGINAL))
+        for event, group in hook.entries().items():
+            group = json.loads(json.dumps(group))
+            for h in group["hooks"]:
+                if h.get("asyncRewake"):
+                    h.pop("timeout", None)
+            old["hooks"].setdefault(event, []).append(group)
+        self.write(old)
+
+        r = self.run_hook("install")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for event in ("Stop", "StopFailure"):
+            [group] = self.ours(self.read()["hooks"][event])
+            [alarm] = group["hooks"]
+            self.assertTrue(alarm.get("asyncRewake"))
+            self.assertGreater(alarm.get("timeout", 600), hook.MAX_WAIT, event)
+
     def test_backup_keeps_settings_from_before_the_first_install(self):
         self.write(ORIGINAL)
         before = open(self.path).read()
