@@ -140,6 +140,13 @@ Trasa minimalizuje `czas do wyniku + λ × jednostki Depot`:
    lokalnie; `depot_eta_s` to p50 z `scripts/depot-cost.py eta --json` dla tej klasy Depot razem
    z przygotowaniem; `units = cores / 2 × minuty Depot`.
 
+Na Depot nigdy nie idzie komenda, która tam dałaby inny wynik niż tutaj. Depot dostaje drzewo repo
+(pliki śledzone i nieśledzone bez `.gitignore`) pod inną ścieżką, bez zmiennych z komendy, i odsyła
+tylko wyjście. Lokalnie zostaje więc komenda ze ścieżką bezwzględną, z `~` albo `$`, ze ścieżką
+względną poza repo albo ignorowaną, z flagą piszącą plik (`-o`, `-c`, `-coverprofile` i inne
+profile, `-trace`, `-outputdir`), ze zmienną w prefiksie albo z `GOFLAGS` innym niż `-p`/`-count`.
+Trasa mówi wtedy `local only (<powód>)`, także gdy job nie zmieści się na pustym Macu.
+
 | pole | znaczenie |
 |---|---|
 | `choice` | `local` albo `depot` |
