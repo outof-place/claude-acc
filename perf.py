@@ -2122,6 +2122,9 @@ def first_exec(count=8):
 
 
 DEVTOOLS_BEFORE_MS = 196.2  # pierwszy exec w terminalu Orki spoza Narzędzi deweloperskich
+# kara Gatekeepera poniżej tej wartości znaczy, że Orka już jest zwolniona (bez zwolnienia
+# 190 ms, kopia binarki o tym samym hashu 77 ms)
+GATEKEEPER_EXEMPT_MS = 30
 
 
 def record_gatekeeper(cfg, state, result):
@@ -2338,7 +2341,14 @@ def pending_manual(state):
     names = []
     # SIP nie wpuszcza nawet roota do TCC.db, więc Orkę na listę dodaje "+" w Ustawieniach
     devtools = state["applied"].get("devtools")
-    if os.path.isdir(ORCA_APP) and not devtools:
+    # Orka dodana ręcznie, bez perf-root: pomiar z jej terminala bez kary jest dowodem
+    gatekeeper = state["bench"].get("gatekeeper", {}).get("result", {})
+    exempt = (
+        gatekeeper.get("responsible") == "Orca"
+        and gatekeeper.get("penalty_ms") is not None
+        and gatekeeper["penalty_ms"] < GATEKEEPER_EXEMPT_MS
+    )
+    if os.path.isdir(ORCA_APP) and not devtools and not exempt:
         names.append("devtools")
     elif devtools:
         # zwolnienie z oceny Gatekeepera dostaje dopiero Orca uruchomiona po zmianie
