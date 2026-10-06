@@ -44,6 +44,9 @@ class FakeSystem:
     def rtk_hook(self):
         return self.rtk
 
+    def rtk_path(self):
+        return "/opt/homebrew/bin/rtk" if self.rtk else None
+
     def docker_running(self):
         return self.docker
 
@@ -643,10 +646,15 @@ class NativeHooksTest(Isolated):
         self.addCleanup(patcher.stop)
         self.native = os.path.join(self.state, "claude-acc-hook")
 
+    def program(self, path, head=b"#!/bin/sh\n"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(head)
+        os.chmod(path, 0o755)
+        return path
+
     def install_native(self):
-        with open(self.native, "w") as f:
-            f.write("#!/bin/sh\n")
-        os.chmod(self.native, 0o755)
+        self.program(self.native)
 
     def settings(self, *commands):
         data = claude_settings()
@@ -658,7 +666,9 @@ class NativeHooksTest(Isolated):
         return self.text(self.claude)
 
     def pre(self):
-        return [g["hooks"][0]["command"] for g in self.read(self.claude)["hooks"]["PreToolUse"]]
+        """Co Claude Code uruchomi: (program, argumenty) bez powłoki albo sam tekst dla sh -c."""
+        hooks = [g["hooks"][0] for g in self.read(self.claude)["hooks"]["PreToolUse"]]
+        return [(h["command"], h["args"]) if "args" in h else h["command"] for h in hooks]
 
     def test_bash_hooks_become_native_and_come_back_exactly(self):
         self.install_native()
@@ -667,15 +677,62 @@ class NativeHooksTest(Isolated):
         before = self.settings(RTK_SCRIPT, DEVGUARD_PY, DEVGUARD_ACC, mine, piped)
         item = perf.tweak("claude-hooks-native")
         record, changed = item.apply(self.cfg, FakeSystem({}, rtk=True))
-        self.assertEqual(self.pre(), ["rtk hook claude", self.native, self.native, mine, piped])
+        rtk = ("/opt/homebrew/bin/rtk", ["hook", "claude"])
+        guard = (self.native, ["admit"])
+        self.assertEqual(self.pre(), [rtk, guard, guard, mine, piped])
         self.assertIn("PreToolUse: rtk-rewrite.sh -> rtk hook", changed)
-        self.assertIn("PreToolUse: devguard -> claude-acc-hook", changed)
+        self.assertIn("PreToolUse: devguard -> claude-acc-hook admit", changed)
         # timeout i reszta wpisu zostają
         self.assertEqual(self.read(self.claude)["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"], 10)
         again, changed = item.apply(self.cfg, FakeSystem({}, rtk=True), record)
         self.assertEqual((again, changed), (record, []))
         item.undo(record, FakeSystem({}))
         self.assertEqual(self.text(self.claude), before)
+
+    def test_hooks_from_the_shell_version_move_out_of_the_shell_and_still_come_back(self):
+        """1.7 zostawiło natywne hooki w powłoce; zapis pamięta prawdziwe oryginały."""
+        self.install_native()
+        before = self.settings(RTK_SCRIPT, DEVGUARD_PY, DEVGUARD_ACC)
+        old = {"hooks": [
+            {"event": "PreToolUse", "original": RTK_SCRIPT, "native": "rtk hook claude"},
+            {"event": "PreToolUse", "original": DEVGUARD_PY, "native": self.native},
+            {"event": "PreToolUse", "original": DEVGUARD_ACC, "native": self.native},
+        ]}
+        self.settings("rtk hook claude", self.native, self.native)
+        item = perf.tweak("claude-hooks-native")
+        record, changed = item.apply(self.cfg, FakeSystem({}, rtk=True), old)
+        guard = (self.native, ["admit"])
+        self.assertEqual(self.pre(), [("/opt/homebrew/bin/rtk", ["hook", "claude"]), guard, guard])
+        self.assertEqual(len(changed), 3)
+        self.assertEqual([e["original"] for e in record["hooks"]], [RTK_SCRIPT, DEVGUARD_PY, DEVGUARD_ACC])
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), before)
+
+    def test_a_simple_hook_with_a_program_path_runs_without_a_shell(self):
+        home = os.path.expanduser("~")
+        with mock.patch.dict(os.environ, {"HOME": self.dir}):
+            go = self.program(os.path.join(self.dir, "bin/fasthooks"), b"\xcf\xfa\xed\xfe")
+            script = self.program(os.path.join(self.dir, "bin/guard.sh"))
+            plain = self.program(os.path.join(self.dir, "bin/plain"), b"echo bez shebangu\n")
+            cases = [
+                "$HOME/bin/fasthooks read-guard",
+                f"{script} --strict",
+                f"{plain} x",  # bez #! uruchomi go tylko powłoka
+                "fasthooks read-guard",  # nazwa z PATH: zamrożona ścieżka zmieniłaby wersję
+                "$HOME/bin/fasthooks $TMPDIR",  # zmienna w argumencie rozwija tylko powłoka
+                "/nie/ma/takiego read-guard",
+            ]
+            before = self.settings(*cases)
+            item = perf.tweak("claude-hooks-native")
+            record, changed = item.apply(self.cfg, FakeSystem({}))
+            self.assertEqual(
+                self.pre(),
+                [(go, ["read-guard"]), (script, ["--strict"])] + cases[2:],
+            )
+            self.assertEqual(len(changed), 2)
+            item.undo(record, FakeSystem({}))
+            self.assertEqual(self.text(self.claude), before)
+        self.assertEqual(os.path.expanduser("~"), home)
 
     def test_nothing_changes_without_the_native_programs(self):
         before = self.settings(RTK_SCRIPT, DEVGUARD_PY)
@@ -685,7 +742,7 @@ class NativeHooksTest(Isolated):
         # sam claude-acc-hook bez rtk z hookiem: zmienia się tylko devguard
         self.install_native()
         perf.tweak("claude-hooks-native").apply(self.cfg, FakeSystem({}, rtk=False))
-        self.assertEqual(self.pre(), [RTK_SCRIPT, self.native])
+        self.assertEqual(self.pre(), [RTK_SCRIPT, (self.native, ["admit"])])
 
     def test_a_hook_the_user_changed_after_us_survives_undo(self):
         self.install_native()
@@ -693,7 +750,7 @@ class NativeHooksTest(Isolated):
         item = perf.tweak("claude-hooks-native")
         record, _ = item.apply(self.cfg, FakeSystem({}))
         data = self.read(self.claude)
-        data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = "/x/own-guard"
+        data["hooks"]["PreToolUse"][0]["hooks"][0] = {"type": "command", "command": "/x/own-guard"}
         self.write(self.claude, data)
         item.undo(record, FakeSystem({}))
         self.assertEqual(self.pre(), ["/x/own-guard"])
@@ -713,6 +770,10 @@ class HookLabelTest(unittest.TestCase):
             RTK_SCRIPT: "rtk-rewrite.sh",
             f"{CAVE} stop --ide claude-code": "cavemem stop",
             'f="$HOME/.local/share/claude-acc/pause.json"; h="$HOME/.local/share/claude-acc/hook.py"': "pauza limitów",
+            # bez powłoki: tak zapisuje je transkrypt (program i argumenty po spacji)
+            "/u/.local/share/claude-acc/claude-acc-hook pause post": "pauza limitów",
+            "/u/.local/share/claude-acc/claude-acc-hook admit": "claude-acc-hook admit",
+            "/opt/homebrew/bin/rtk hook claude": "rtk hook",
         }
         for command, label in cases.items():
             with self.subTest(command=command):
@@ -1031,12 +1092,22 @@ class PauseHooksTest(Isolated):
     może zabrać drugiemu jego wpisów ani cofnąć ich przy swoim cofnięciu."""
 
     EVENTS = ("PostToolUse", "PreToolUse", "UserPromptSubmit", "Stop", "StopFailure")
+    native = False  # hook.py wpisuje hooki bez powłoki, gdy claude-acc-hook jest na miejscu
 
     def setUp(self):
         super().setUp()
         import hook
 
         self.hook = hook
+        program = os.path.join(self.dir, ".local/share/claude-acc/claude-acc-hook")
+        if self.native:
+            os.makedirs(os.path.dirname(program), exist_ok=True)
+            with open(program, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(program, 0o755)
+        patcher = mock.patch.object(hook, "NATIVE", program)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # jak w prawdziwej instalacji: wrapper szybkiego npx leży w ~/.local/share/claude-acc/hooks
         self.hooks_dir = os.path.join(self.dir, ".local/share/claude-acc/hooks")
         patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
@@ -1073,7 +1144,7 @@ class PauseHooksTest(Isolated):
         broad = dict(
             self.cfg,
             async_hooks=self.cfg["async_hooks"] + [{"event": e, "match": "claude-acc"} for e in self.EVENTS],
-            npx_fast_hooks=self.cfg["npx_fast_hooks"] + ["claude-acc/hook.py"],
+            npx_fast_hooks=self.cfg["npx_fast_hooks"] + ["claude-acc/hook.py", "claude-acc"],
         )
 
         self.ultra_on(broad)
@@ -1101,6 +1172,15 @@ class PauseHooksTest(Isolated):
         self.pause_hooks(False)
         self.assertEqual(self.text(self.claude), self.original)
 
+
+
+class NativePauseHooksTest(PauseHooksTest):
+    native = True
+
+    def test_pause_hooks_are_written_without_a_shell(self):
+        self.pause_hooks(True)
+        [group] = self.ours()["PostToolUse"]
+        self.assertEqual(group["hooks"][0]["args"], ["pause", "post"])
 
 class NpxShimTest(unittest.TestCase):
     """Atrapa npx na prawdziwych plikach: narzędzie z node_modules/.bin wyżej w drzewie,

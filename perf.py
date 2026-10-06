@@ -755,12 +755,20 @@ PLAIN_COMMAND = re.compile(r"[\w./~$@%+=:,-]+(\s+[\w./~$@%+=:,-]+)*")
 # hooki pauzy limitów (hook.py, ten sam znacznik co jego MARKER) zostają synchroniczne:
 # w tle ich polecenie dla sesji i odmowa dla nowych subagentów przepadają bez śladu
 PAUSE_HOOKS = "claude-acc/hook.py"
+# ...także wtedy, gdy hook.py wpisał je bez powłoki: claude-acc-hook z argumentami ["pause", tryb]
+NATIVE_HOOK = "claude-acc/claude-acc-hook"
 # hooki przed każdą komendą Bash, które mają natywny odpowiednik (claude-hooks-native):
 # devguard wprost albo przez acc.py, i skrypt rtk, którego instalator rtk sam uznaje za
 # przestarzały na rzecz `rtk hook claude`
 DEVGUARD_ADMIT = re.compile(r"(?:^|\s)\S*(?:devguard\.py|acc\.py devguard) admit$")
 RTK_SCRIPT = re.compile(r"^\S*/rtk-rewrite\.sh$")
 RTK_NATIVE = "rtk hook claude"
+# hook bez powłoki (exec form, pole `args`, Claude Code od 2.1.139): program podany ścieżką
+# bezwzględną albo od $HOME, z prostymi argumentami; bez zmiennych, cudzysłowów i operatorów
+EXEC_PROGRAM = re.compile(r"(?:/|\$HOME/|~/)[\w./@%+:,-]+")
+EXEC_ARG = re.compile(r"[\w./@%+=:,-]+")
+# początek pliku, który execve uruchomi sam: skrypt z #! albo binarka Mach-O
+EXEC_MAGIC = (b"#!", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xfe\xed\xfa\xcf")
 # w zapisie poprzedniej wartości: klucza wcześniej nie było
 MISSING = {"__missing__": True}
 # `change` w edit_json_file: plik ma zniknąć (powstał przez nas i znowu jest pusty)
@@ -869,6 +877,10 @@ class System:
     def git(self, repo, *args):
         """Wyjście gita albo None (brak klucza w configu to też None)."""
         return janitor.run(["git", "-C", repo, *args], timeout=120)
+
+    def rtk_path(self):
+        """Ścieżka rtk z wbudowanym hookiem Claude Code albo None."""
+        return janitor.which("rtk") if self.rtk_hook() else None
 
     def rtk_hook(self):
         """Czy rtk ma wbudowany hook Claude Code: `rtk hook claude` czyta zdarzenie ze stdin."""
@@ -1063,7 +1075,7 @@ class AsyncHooks:
             for group in (data.get("hooks") or {}).get(spec["event"], []) or []:
                 for hook in group.get("hooks", []) or []:
                     command = hook.get("command", "")
-                    if spec["match"] in command and PAUSE_HOOKS not in command:
+                    if spec["match"] in command and not pause_hook(hook):
                         found.append((spec["event"], hook))
         return found
 
@@ -1127,7 +1139,8 @@ def hook_label(command):
         return "cavemem " + command.split("hook run ")[-1].split()[0]
     if ".orca/agent-hooks/" in command:
         return "Orca"
-    if PAUSE_HOOKS in command:
+    # transkrypt zapisuje hook bez powłoki jako program i argumenty po spacji
+    if PAUSE_HOOKS in command or f"{NATIVE_HOOK} pause " in command:
         return "pauza limitów"
     parts = command.split()
     # program z podkomendą (`fasthooks read-guard`, `rtk hook claude`): nazwa i podkomenda
@@ -1462,6 +1475,9 @@ class HookWrap:
                 for group in groups or []:
                     for hook in group.get("hooks", []) or []:
                         command = hook.get("command", "")
+                        # hook bez powłoki (args) nie przyjmie wrappera przed komendą
+                        if "args" in hook or pause_hook(hook):
+                            continue
                         if command.startswith(prefix) or not PLAIN_COMMAND.fullmatch(
                             command
                         ):
@@ -1523,29 +1539,65 @@ class HookWrap:
         return ", ".join(names) or "brak hooków z listy `npx_fast_hooks`"
 
 
+def pause_hook(hook):
+    """Hook pauzy limitów: w powłoce ze znacznikiem hook.py albo bez niej (`claude-acc-hook pause`)."""
+    command = hook.get("command") or ""
+    args = hook.get("args")
+    native = command.endswith(NATIVE_HOOK) and isinstance(args, list) and args[:1] == ["pause"]
+    return PAUSE_HOOKS in command or native
+
+
+def exec_form(command):
+    """(program, argumenty) dla hooka, który da się uruchomić bez powłoki, albo None.
+
+    Tylko gdy powłoka nic by w nim nie zrobiła poza rozwinięciem $HOME na początku: program
+    podany ścieżką (nazwa z PATH zostaje w powłoce, bo zamrożenie ścieżki zmieniłoby wersję
+    po przełączeniu node czy pythona) i plik, który execve uruchomi sam (#! albo Mach-O)."""
+    parts = command.split()
+    if not parts or not EXEC_PROGRAM.fullmatch(parts[0]):
+        return None
+    if not all(EXEC_ARG.fullmatch(a) for a in parts[1:]):
+        return None
+    program = parts[0]
+    for prefix in ("$HOME/", "~/"):
+        if program.startswith(prefix):
+            program = os.path.join(os.path.expanduser("~"), program[len(prefix):])
+    try:
+        with open(program, "rb") as f:
+            head = f.read(4)
+    except OSError:
+        return None
+    if not os.access(program, os.X_OK) or not head.startswith(EXEC_MAGIC):
+        return None
+    return program, parts[1:]
+
+
 class NativeHooks:
-    """Hooki przed każdą komendą Bash na natywnych programach: ten sam wynik bez startu
-    powłoki, jq i Pythona przy każdej komendzie każdego agenta.
+    """Hooki na natywnych programach i bez powłoki: ten sam wynik bez startu `sh -c`, jq
+    i Pythona przy każdym narzędziu każdego agenta.
 
     - devguard: `python3 .../devguard.py admit` (także przez acc.py) zamienia się na
       claude-acc-hook, natywny front tego samego admit: zwykłe komendy przepuszcza sam,
-      komendę ze słowem od dev serwera albo od schedulera oddaje Pythonowi;
+      komendę z całym słowem od dev serwera albo od schedulera oddaje Pythonowi;
     - rtk: skrypt rtk-rewrite.sh zamienia się na `rtk hook claude`, hook wbudowany w rtk.
-      Skrypt zostaje nietknięty, bo rtk sprawdza jego sha256 i po zmianie odmawia pracy.
+      Skrypt zostaje nietknięty, bo rtk sprawdza jego sha256 i po zmianie odmawia pracy;
+    - każdy inny prosty hook z programem podanym ścieżką (np. własna binarka w Go) idzie
+      bez powłoki: exec form, czyli `command` to sam program, a `args` jego argumenty.
+      `sh -c` kosztuje 3-4 ms na każde wywołanie (6.10, Mac pod obciążeniem).
 
-    Zamiana tylko wtedy, gdy natywny program jest na miejscu; oryginał wraca przy cofnięciu.
+    Zamiana tylko wtedy, gdy program jest na miejscu; oryginał wraca przy cofnięciu.
     """
 
     name = "claude-hooks-native"
     group = "claude"
     root = False
     title = (
-        "hooki przed komendą Bash na natywnych programach: claude-acc-hook zamiast "
-        "devguard.py admit, `rtk hook claude` zamiast rtk-rewrite.sh"
+        "hooki na natywnych programach i bez powłoki: claude-acc-hook zamiast devguard.py "
+        "admit, `rtk hook claude` zamiast rtk-rewrite.sh, proste hooki bez `sh -c`"
     )
     effect = (
-        "na każdą komendę Bash: devguard 25-57 -> 5-8 ms, rtk 57-80 -> 12-14 ms "
-        "(6.10; decyzje identyczne na 10 i 18 przypadkach)"
+        "na każdą komendę Bash: devguard 25-57 -> 5-8 ms, rtk 57-80 -> 12-14 ms (6.10; "
+        "decyzje identyczne na 10 i 18 przypadkach); bez `sh -c` 3-4 ms mniej na hook"
     )
     path = None
 
@@ -1553,41 +1605,74 @@ class NativeHooks:
         return self.path or CLAUDE_SETTINGS
 
     def targets(self, system):
-        """[(wzorzec komendy, natywny zamiennik)] dla programów, które są zainstalowane."""
+        """[(wzorzec komendy, program, argumenty)] dla programów, które są zainstalowane."""
         found = []
         hook = os.path.join(STATE_DIR, "claude-acc-hook")
         if os.access(hook, os.X_OK):
-            found.append((DEVGUARD_ADMIT, shlex.quote(hook)))
-        if system.rtk_hook():
-            found.append((RTK_SCRIPT, RTK_NATIVE))
+            found.append((DEVGUARD_ADMIT, hook, ["admit"]))
+        rtk = system.rtk_path()
+        if rtk:
+            found.append((RTK_SCRIPT, rtk, ["hook", "claude"]))
         return found
 
     def apply(self, cfg, system, record=None):
         entries = list((record or {}).get("hooks", []))
         targets = self.targets(system)
-        if not targets or not os.path.exists(self.settings_path()):
+        if not os.path.exists(self.settings_path()):
             return {"hooks": entries}, []
         changed = []
+        # zamiany z 1.7, jeszcze w powłoce ("rtk hook claude", ścieżka claude-acc-hook); klucze
+        # liczone raz, bo edit_json_file może wołać change drugi raz po cudzym zapisie
+        upgrades = [((e["event"], e["native"]), e) for e in entries if "args" not in e]
+
+        def owned(event, command):
+            """Hook, który zmienia inna poprawka: async albo wrapper szybkiego npx."""
+            if any(t in command for t in cfg.get("npx_fast_hooks", [])):
+                return True
+            return any(
+                spec["event"] == event and spec["match"] in command
+                for spec in cfg.get("async_hooks", [])
+            )
 
         def change(data):
             del changed[:]
             known = {(e["event"], e["original"]) for e in entries}
+            older = {}
+            for key, e in upgrades:
+                older.setdefault(key, []).append(e)
             for event, groups in (data.get("hooks") or {}).items():
                 for group in groups or []:
                     for hook in group.get("hooks", []) or []:
                         command = hook.get("command", "")
-                        if not PLAIN_COMMAND.fullmatch(command):
+                        if "args" in hook or not PLAIN_COMMAND.fullmatch(command):
                             continue
-                        for pattern, native in targets:
-                            if command == native or not pattern.search(command):
+                        waiting = older.get((event, command))
+                        if waiting:
+                            entry = waiting.pop(0)
+                            # wpis zostaje ten sam: cofnięcie dalej przywraca prawdziwy oryginał
+                            target = next(
+                                (t for t in targets if t[0].search(entry["original"])), None
+                            )
+                            if not target:
                                 continue
-                            hook["command"] = native
-                            if (event, command) not in known:
-                                entries.append(
-                                    {"event": event, "original": command, "native": native}
-                                )
-                            changed.append(f"{event}: {hook_label(command)} -> {hook_label(native)}")
-                            break
+                            hook["command"], hook["args"] = target[1], list(target[2])
+                            entry.update(native=target[1], args=list(target[2]))
+                            changed.append(f"{event}: {hook_label(command)} bez powłoki")
+                            continue
+                        found = next(
+                            ((prog, args) for pattern, prog, args in targets if pattern.search(command)),
+                            None,
+                        ) or (None if owned(event, command) else exec_form(command))
+                        if not found:
+                            continue
+                        hook["command"], hook["args"] = found[0], list(found[1])
+                        if (event, command) not in known:
+                            entries.append(
+                                {"event": event, "original": command, "native": found[0],
+                                 "args": list(found[1])}
+                            )
+                        native = " ".join([found[0], *found[1]])
+                        changed.append(f"{event}: {hook_label(command)} -> {hook_label(native)}")
             return bool(changed)
 
         edit_json_file(self.settings_path(), change)
@@ -1602,13 +1687,17 @@ class NativeHooks:
             # dwa różne oryginały mogły dostać ten sam zamiennik: wracają w kolejności zapisu
             queue = {}
             for e in entries:
-                queue.setdefault((e["event"], e["native"]), []).append(e["original"])
+                key = (e["event"], e["native"], tuple(e["args"]) if "args" in e else None)
+                queue.setdefault(key, []).append(e["original"])
             for event, groups in (data.get("hooks") or {}).items():
                 for group in groups or []:
                     for hook in group.get("hooks", []) or []:
-                        waiting = queue.get((event, hook.get("command")))
+                        args = hook.get("args")
+                        key = (event, hook.get("command"), tuple(args) if isinstance(args, list) else None)
+                        waiting = queue.get(key)
                         if waiting:
                             hook["command"] = waiting.pop(0)
+                            hook.pop("args", None)
                             restored.append(f"{event}: {hook_label(hook['command'])}")
             return bool(restored)
 
@@ -1618,7 +1707,12 @@ class NativeHooks:
 
     def describe(self, record, system):
         hooks = (record or {}).get("hooks", [])
-        pairs = sorted({f"{hook_label(e['original'])} -> {hook_label(e['native'])}" for e in hooks})
+        pairs = sorted(
+            {
+                f"{hook_label(e['original'])} -> {hook_label(' '.join([e['native'], *e.get('args', [])]))}"
+                for e in hooks
+            }
+        )
         return ", ".join(pairs) or "brak hooków z natywnym odpowiednikiem"
 
 
