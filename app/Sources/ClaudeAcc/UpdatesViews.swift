@@ -1,7 +1,8 @@
+import AppKit
 import SwiftUI
 
-/// Homebrew, npm and Go kept current by updates.py: when it last worked, what each package
-/// manager did in that run, and a button to run it now.
+/// Homebrew, npm, Go, Python and Claude Code kept current by updates.py: when it last worked, what
+/// each package manager did in that run, and a button to run it now.
 struct UpdatesCard: View {
     let store: Store
     @Environment(\.now) private var now
@@ -34,7 +35,7 @@ struct UpdatesCard: View {
                 Button("Update", systemImage: "arrow.down.circle") { Task { await store.runUpdates() } }
                     .panelButton()
                     .controlSize(.small)
-                    .help("Upgrade Homebrew, npm and Go packages now")
+                    .help("Update Homebrew, npm, Go, Python and Claude Code now")
             }
         }
     }
@@ -70,7 +71,7 @@ struct UpdatesCard: View {
     }
 }
 
-/// One package manager: what the last run did, failures spelled out under it.
+/// One package manager: what the last run did, failures and what needs you spelled out under it.
 private struct UpdateStepRow: View {
     let step: UpdatesState.Step
 
@@ -97,8 +98,27 @@ private struct UpdateStepRow: View {
                     .padding(.leading, 21)
                     .help(line)
             }
+            ForEach(installers, id: \.self) { offer in
+                HStack(spacing: 6) {
+                    Text("\(offer.name) \(offer.to ?? "") is out")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Button("Install") {
+                        if let path = offer.installer { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+                    }
+                    .panelButton()
+                    .controlSize(.mini)
+                    .help("Opens the python.org installer, checked for its signature. It asks for your password.")
+                }
+                .padding(.leading, 21)
+            }
         }
     }
+
+    private var held: [UpdatesState.Package] { step.held ?? [] }
+
+    private var installers: [UpdatesState.Package] { held.filter { $0.why == "install" && $0.installer != nil } }
 
     private var symbol: String {
         if step.error != nil { return "xmark.octagon.fill" }
@@ -114,25 +134,40 @@ private struct UpdateStepRow: View {
         if step.error != nil { return "didn't run" }
         var parts = [step.updated.isEmpty ? "up to date" : "\(step.updated.count) updated"]
         if !step.failed.isEmpty { parts.append("\(step.failed.count) failed") }
-        // brew and npm hold what you pinned; pip holds what another package needs lower
-        if let held = step.held, !held.isEmpty { parts.append("\(held.count) \(step.name == "pip" ? "held back" : "pinned")") }
+        if !held.isEmpty { parts.append("\(held.count) held") }
         return parts.joined(separator: " · ")
     }
 
+    /// Failures, then what waits for a person: a plugin command to confirm.
     private var problems: [String] {
         if let error = step.error { return [error] }
-        return step.failed.prefix(3).map { failed in
+        let failed = step.failed.prefix(3).map { failed in
             if failed.admin == true, let retry = failed.retry {
                 return "\(failed.name) needs your admin password. In Terminal: \(retry)"
             }
             let retry = failed.retry.map { ". In Terminal: \($0)" } ?? ""
             return "\(failed.label): \(failed.error ?? "failed")\(retry)"
         }
+        let confirm = held.filter { $0.why == "confirm" }.map { held in
+            "\(held.name) wants to run a command. Review it in Terminal: \(held.retry ?? "claude plugin update")"
+        }
+        return failed + confirm
     }
 
     private var tooltip: String {
         var lines = step.updated.map { "\($0.label) \($0.from ?? "?") → \($0.to ?? "?")" }
-        lines += (step.held ?? []).map { "\($0.label) kept at \($0.from ?? "?") (\($0.to ?? "?") is out)" }
+        lines += held.map { held in
+            let newer = held.to.map { ", \($0) is out" } ?? ""
+            return switch held.why {
+            case "pin": "\(held.label) pinned at \(held.from ?? "?")\(newer)"
+            case "deps": "\(held.label) kept at \(held.from ?? "?") by other packages\(newer)"
+            case "edited": "\(held.label) edited by hand, not overwritten"
+            case "confirm": "\(held.label) waits for you to confirm its command"
+            case "install": "\(held.label) \(held.to ?? "") is ready to install"
+            case "packages": "\(held.label) holds your pip packages; a new patch is a new folder, so upgrade it by hand"
+            default: "\(held.label) kept at \(held.from ?? "?")\(newer)"
+            }
+        }
         return lines.isEmpty ? "Nothing to update last time" : lines.joined(separator: "\n")
     }
 }

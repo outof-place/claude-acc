@@ -1,0 +1,38 @@
+#!/usr/bin/python3
+"""Atrapa npx skills update -g -y [nazwy]: wgrywa nową treść skilla i zapisuje jej hash w blokadzie."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("npx", args)
+world = _world.load()
+home = os.environ["HOME"]
+lock_path = os.path.join(home, ".agents/.skill-lock.json")
+lock = json.load(open(lock_path))
+names = [a for a in args[args.index("update") + 1:] if not a.startswith("-")] or list(lock["skills"])
+
+
+def tree_hash(folder):
+    scratch = tempfile.mkdtemp()
+    env = dict(os.environ, GIT_DIR=f"{scratch}/repo", GIT_INDEX_FILE=f"{scratch}/index", GIT_WORK_TREE=folder)
+    subprocess.run(["git", "init", "-q", "--bare", f"{scratch}/repo"], check=True)
+    subprocess.run(["git", "add", "-A", "."], cwd=folder, env=env, check=True)
+    return subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, check=True).stdout.strip()
+
+
+for name in names:
+    remote = world.get("skills", {}).get(name)
+    if remote is None:
+        continue
+    folder = os.path.join(home, ".agents/skills", name)
+    with open(os.path.join(folder, "SKILL.md"), "w") as f:
+        f.write(remote)
+    lock["skills"][name]["skillFolderHash"] = tree_hash(folder)
+json.dump(lock, open(lock_path, "w"))
+print("Updated skills")

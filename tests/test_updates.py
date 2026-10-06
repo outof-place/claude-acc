@@ -1,8 +1,9 @@
-"""Testy updates.py na atrapach brew, npm, go i pip.
+"""Testy updates.py na atrapach brew, npm, go, pip, uv, claude, npx skills i pkgutil.
 
 Każdy test stawia osobny $HOME z plikiem świata (co jest zainstalowane, co najnowsze), a atrapy
-z tests/fakes-updates czytają go i zmieniają tak, jak prawdziwe narzędzia. Prawdziwe brew, npm
-ani go nie są wołane: skrypt dostaje PATH z samymi atrapami i /usr/bin:/bin.
+z tests/fakes-updates czytają go i zmieniają tak, jak prawdziwe narzędzia. Prawdziwe brew, npm,
+go, uv, pip ani claude nie są wołane: skrypt dostaje PATH z samymi atrapami i /usr/bin:/bin
+(stamtąd prawdziwe curl do plików file:// i git do hashy skilli).
 
 Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 """
@@ -45,8 +46,32 @@ WORLD = {
         "ent": {"path": "entgo.io/ent/cmd/ent", "module": "entgo.io/ent", "installed": "v0.14.6", "latest": "v0.14.6"},
     },
     "pip": {"attrs": {"installed": "25.4.0", "latest": "26.1.0"}},
+    "uv_pythons": [],
+    "claude": {
+        "version": "2.1.291",
+        "latest": "2.1.292",
+        "plugins": [{"id": "security-guidance@claude-plugins-official", "scope": "user",
+                     "version": "2.0.8", "latest": "2.0.10"}],
+    },
+    "skills": {},
     "fail": [],
 }
+# python.org: najnowsza 3.14 to 3.14.8, a 3.15 to inna wersja główna, której automat nie proponuje
+RELEASES = [{"name": "Python 3.14.7"}, {"name": "Python 3.14.8"}, {"name": "Python 3.15.0"}, {"name": "Python 3.14.9rc1"}]
+PYTHON_ORG = {"pip:version": "3.14", "pip:patch": "3.14.0", "pip:prefix": "/Library/Frameworks/Python.framework/Versions/3.14"}
+
+
+def tree_hash(folder):
+    scratch = tempfile.mkdtemp()
+    try:
+        env = dict(os.environ, GIT_DIR=f"{scratch}/repo", GIT_INDEX_FILE=f"{scratch}/index", GIT_WORK_TREE=folder)
+        subprocess.run(["git", "init", "-q", "--bare", f"{scratch}/repo"], check=True)
+        subprocess.run(["git", "add", "-A", "."], cwd=folder, env=env, check=True)
+        return subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, check=True).stdout.strip()
+    finally:
+        shutil.rmtree(scratch)
+
+
 
 
 class Env:
@@ -68,6 +93,9 @@ class Env:
             with open(path, "w") as f:
                 f.write("#!/bin/sh\n")
             os.chmod(path, 0o755)
+        self.write("python-releases.json", json.dumps(RELEASES))
+        self.write("ftp/3.14.8/python-3.14.8-macos11.pkg", "pkg")
+        os.makedirs(os.path.join(self.home, "ms-playwright/chromium-1243"))
         # globalne paczki npm z komendami: package.json z polem bin i komenda w npm-global/bin
         os.makedirs(os.path.join(self.home, "npm-global/bin"))
         for name, package in world["npm"].items():
@@ -92,9 +120,12 @@ class Env:
             "HOME": self.home,
             "PATH": "/usr/bin:/bin",
             "CLAUDE_ACC_TOOL_PATH": f"{FAKES}:/usr/bin:/bin",
+            "CLAUDE_ACC_PYTHON_RELEASES": f"file://{self.home}/python-releases.json",
+            "CLAUDE_ACC_PYTHON_FTP": f"file://{self.home}/ftp",
+            "PLAYWRIGHT_BROWSERS_PATH": os.path.join(self.home, "ms-playwright"),
         }
         return subprocess.run(
-            ["/usr/bin/python3", SCRIPT, *args], env=env, capture_output=True, text=True, timeout=60
+            ["/usr/bin/python3", SCRIPT, *args], env=env, capture_output=True, text=True, timeout=120
         )
 
     def world(self):
@@ -140,7 +171,7 @@ def names(items):
 
 class UpdatesTest(unittest.TestCase):
     def test_brings_every_manager_to_the_newest_version(self):
-        env = Env(self)
+        env = Env(self, uv_pythons=[{"installed": "3.13.13", "latest": "3.13.14"}])
         done = env.run("run", "--force")
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -151,16 +182,22 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(world["npm"]["vercel"]["installed"], "62.4.0")
         self.assertEqual(world["npm"]["npm"]["installed"], "12.2.0")
         self.assertEqual(world["go"]["air"]["installed"], "v1.67.4")
+        self.assertEqual(world["uv_pythons"][0]["installed"], "3.13.14")
+        self.assertEqual(world["claude"]["version"], "2.1.292")
+        self.assertEqual(world["claude"]["plugins"][0]["version"], "2.0.10")
 
         state = env.state()
         run = state["last_run"]
-        self.assertTrue(run["ok"])
+        self.assertTrue(run["ok"], state["steps"])
         self.assertEqual(state["last_success"], run["at"])
-        self.assertEqual(run["updated"], 7)  # railway, ngrok, vercel, pnpm, npm, air, attrs
+        # railway, ngrok, vercel, pnpm, npm, air, attrs, Python 3.13 (uv), Claude Code, wtyczka
+        self.assertEqual(run["updated"], 10)
         self.assertNotIn("running_since", state)
-        self.assertEqual(names(state["steps"]), ["brew", "npm", "go", "pip"])
+        self.assertEqual(names(state["steps"]), ["brew", "npm", "go", "pip", "claude"])
         self.assertEqual(names(step(state, "go")["updated"]), ["air"])
         self.assertEqual(step(state, "go")["failed"], [])  # notgo pominięty, nie błąd
+        self.assertEqual(names(step(state, "pip")["updated"]), ["attrs", "Python 3.13 (uv)"])
+        self.assertEqual(names(step(state, "claude")["updated"]), ["Claude Code", "security-guidance plugin"])
         self.assertEqual(env.notifications(), [])
 
     def test_pins_hold_a_brew_formula_and_an_npm_major(self):
@@ -171,8 +208,10 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(world["npm"]["pnpm"]["installed"], "11.28.5")
 
         state = env.state()
-        self.assertEqual(step(state, "brew")["held"], [{"name": "idb-companion", "from": "1.1.8", "to": "1.6.5"}])
-        self.assertEqual(step(state, "npm")["held"], [{"name": "pnpm", "from": "11.28.5", "to": "12.9.1", "pin": "11"}])
+        self.assertEqual(step(state, "brew")["held"],
+                         [{"name": "idb-companion", "from": "1.1.8", "to": "1.6.5", "why": "pin"}])
+        self.assertEqual(step(state, "npm")["held"],
+                         [{"name": "pnpm", "from": "11.28.5", "to": "12.9.1", "why": "pin", "pin": "11"}])
 
     def test_a_failing_package_leaves_the_rest_updated_and_is_named_once(self):
         env = Env(self, fail=["brew ngrok", "npm vercel"])
@@ -304,6 +343,7 @@ class UpdatesTest(unittest.TestCase):
         env = Env(self, **{
             "pip:python3-brew": {"numpy": {"installed": "2.4.3", "latest": "2.5.3"}},
             "pip:python3-brew:version": "3.14",
+            "pip:python3-brew:prefix": "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14",
         })
         fake = os.path.join(FAKES, "python3")
         brew = os.path.join(env.home, "fake/python3-brew")
@@ -311,9 +351,154 @@ class UpdatesTest(unittest.TestCase):
         env.config(python=[fake, brew, fake])  # ten sam Python drugi raz nie liczy się
         env.run("run", "--force")
         pip = step(env.state(), "pip")
-        self.assertEqual([(p["name"], p["python"]) for p in pip["updated"]], [("attrs", "3.13"), ("numpy", "3.14")])
+        self.assertEqual([(p["name"], p["python"]) for p in pip["updated"]], [("attrs", "3.13"), ("numpy", "3.14 Homebrew")])
         self.assertEqual(sum(c.startswith("python3 -m pip install") for c in env.calls()), 1)
         self.assertEqual(env.world()["pip:python3-brew"]["numpy"]["installed"], "2.5.3")
+
+    def test_a_pinned_python_package_stays_and_new_playwright_gets_its_browsers(self):
+        env = Env(self, pip={
+            "attrs": {"installed": "25.4.0", "latest": "26.1.0"},
+            "fb-idb": {"installed": "1.1.7", "latest": "1.2.0"},
+            # przypięta zależność: eager podbiłby ją razem z paczką, która jej wymaga
+            "grpclib": {"installed": "0.4.7", "latest": "0.4.9", "required": True},
+            "playwright": {"installed": "1.58.0", "latest": "1.63.0"},
+        })
+        env.config(pip_pins={"fb-idb": "==1.1.7", "grpclib": "==0.4.7"}, python=os.path.join(FAKES, "python3"))
+        env.run("run", "--force")
+        installed = {n: p["installed"] for n, p in env.world()["pip"].items()}
+        self.assertEqual(installed, {"attrs": "26.1.0", "fb-idb": "1.1.7", "grpclib": "0.4.7", "playwright": "1.63.0"})
+        [install] = [c for c in env.calls() if c.startswith("python3 -m pip install")]
+        self.assertTrue(install.endswith(" attrs fb-idb==1.1.7 grpclib==0.4.7 playwright"), install)
+        self.assertIn("python3 -m playwright install chromium", env.calls())
+
+        pip = step(env.state(), "pip")
+        self.assertEqual(names(pip["updated"]), ["attrs", "playwright"])
+        self.assertEqual(sorted((h["name"], h["why"]) for h in pip["held"]), [("fb-idb", "pin"), ("grpclib", "pin")])
+
+    def test_a_python_upgrade_that_breaks_an_import_is_rolled_back(self):
+        # pip check tego nie widzi: zależności się zgadzają, a biblioteka natywna nie wstaje
+        error = "ImportError: numpy.core.multiarray failed to import"
+        env = Env(self, pip={
+            "pandas": {"installed": "2.3.3", "latest": "3.0.6", "unimportable": error},
+            "playwright": {"installed": "1.58.0", "latest": "1.63.0"},
+        })
+        env.run("run", "--force")
+        installed = {n: p["installed"] for n, p in env.world()["pip"].items()}
+        self.assertEqual(installed, {"pandas": "2.3.3", "playwright": "1.58.0"})
+        state = env.state()
+        failed = step(state, "pip")["failed"]
+        self.assertEqual(sorted(names(failed)), ["pandas", "playwright"])
+        self.assertEqual(failed[0]["error"], f"rolled back, pandas stopped importing: pandas: {error}")
+        self.assertFalse(state["last_run"]["ok"])
+        self.assertNotIn("python3 -m playwright install chromium", env.calls())
+
+    def test_a_newer_python_org_patch_is_downloaded_and_offered(self):
+        env = Env(self, **PYTHON_ORG)
+        env.run("run", "--force")
+        [offer] = [h for h in step(env.state(), "pip")["held"] if h["name"] == "Python"]
+        self.assertEqual((offer["from"], offer["to"], offer["why"]), ("3.14.0", "3.14.8", "install"))
+        self.assertTrue(os.path.isfile(offer["installer"]))
+        self.assertTrue(any(c.startswith("pkgutil --check-signature") for c in env.calls()))
+
+        # Python z Homebrew też ma w ścieżce Python.framework, a aktualizuje go brew
+        brew = Env(self, **dict(PYTHON_ORG, **{
+            "pip:prefix": "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14"}))
+        brew.run("run", "--force")
+        self.assertFalse([h for h in step(brew.state(), "pip")["held"] if h["name"] == "Python"])
+        self.assertFalse([c for c in brew.calls() if c.startswith("pkgutil")])
+
+    def test_an_unsigned_python_installer_is_thrown_away(self):
+        env = Env(self, fail=["signature"], **PYTHON_ORG)
+        env.run("run", "--force")
+        pip = step(env.state(), "pip")
+        self.assertFalse([h for h in pip["held"] if h["name"] == "Python"])
+        [python] = pip["failed"]
+        self.assertIn("signature check failed", python["error"])
+        self.assertEqual(os.listdir(os.path.join(env.state_dir, "downloads")), [])
+
+    def test_a_uv_python_holding_pip_packages_is_not_moved_to_a_new_patch(self):
+        # nowa poprawka to nowy katalog: paczki w starym przestałyby być widoczne
+        env = Env(self, **{
+            "uv_pythons": [{"installed": "3.13.13", "latest": "3.13.14"}, {"installed": "3.11.15", "latest": "3.11.17"}],
+            "pip:prefix": "/fake/uv/cpython-3.13.13",
+        })
+        env.run("run", "--force")
+        self.assertIn("uv python upgrade 3.11", env.calls())
+        self.assertEqual([v["installed"] for v in env.world()["uv_pythons"]], ["3.13.13", "3.11.17"])
+        pip = step(env.state(), "pip")
+        self.assertIn("Python 3.11 (uv)", names(pip["updated"]))
+        self.assertIn(("Python 3.13 (uv)", "packages"), [(h["name"], h["why"]) for h in pip["held"]])
+
+    def test_plugins_update_in_their_own_project_and_wait_for_confirmation(self):
+        project = os.path.join(os.path.realpath(tempfile.gettempdir()), f"updates-proj-{os.getpid()}")
+        os.makedirs(project, exist_ok=True)
+        self.addCleanup(shutil.rmtree, project, True)
+        gone = project + "-gone"
+
+        def plugins(world):
+            world["claude"]["plugins"] += [
+                {"id": "vercel@claude-plugins-official", "scope": "local", "projectPath": project,
+                 "version": "0.49.2", "latest": "0.50.0"},
+                {"id": "vercel@claude-plugins-official", "scope": "local", "projectPath": gone,
+                 "version": "0.49.2", "latest": "0.50.0"},
+                {"id": "stripe@stripe", "scope": "project", "projectPath": project,
+                 "version": "0.11.10", "latest": "0.12.0", "confirm": True},
+            ]
+
+        env = Env(self, edit=plugins)
+        env.run("run", "--force")
+        updates = [c for c in env.calls() if c.startswith("claude plugin update")]
+        self.assertIn(f"claude plugin update vercel@claude-plugins-official -s local --json cwd={project}", updates)
+        self.assertFalse([c for c in updates if gone in c])
+        # polecenia z katalogu wtyczki nigdy nie potwierdza automat
+        self.assertFalse([c for c in env.calls() if c.startswith("claude") and " -y" in c])
+
+        claude = step(env.state(), "claude")
+        self.assertEqual(claude["failed"], [])  # skasowany projekt to nie błąd
+        self.assertIn("vercel plugin", names(claude["updated"]))
+        [stripe] = claude["held"]
+        self.assertEqual((stripe["name"], stripe["why"]), ("stripe plugin", "confirm"))
+
+    def test_a_skill_edited_by_hand_is_not_overwritten(self):
+        env = Env(self, skills={"kept": "v2 from GitHub", "mine": "v2 from GitHub"})
+        lock = {"version": 3, "skills": {}}
+        for name in ("kept", "mine"):
+            env.write(f".agents/skills/{name}/SKILL.md", "v1")
+            lock["skills"][name] = {"source": "someone/skills", "skillFolderHash": tree_hash(
+                os.path.join(env.home, ".agents/skills", name))}
+        env.write(".agents/.skill-lock.json", json.dumps(lock))
+        env.write(".agents/skills/mine/SKILL.md", "v1 with my own rules")
+
+        env.run("run", "--force")
+        [update] = [c for c in env.calls() if c.startswith("npx")]
+        self.assertTrue(update.endswith("update -g -y kept"), update)
+        with open(os.path.join(env.home, ".agents/skills/mine/SKILL.md")) as f:
+            self.assertEqual(f.read(), "v1 with my own rules")
+        claude = step(env.state(), "claude")
+        self.assertIn("kept skill", names(claude["updated"]))
+        self.assertEqual([(h["name"], h["why"]) for h in claude["held"]], [("mine skill", "edited")])
+
+    def test_native_claude_comes_before_stale_copies_on_the_path(self):
+        # 6.10: /usr/local/bin/claude 2.1.68 z npm zasłonił natywnego, a jego `claude update`
+        # przestawił installMethod w ~/.claude.json z native na global
+        home = os.path.realpath(tempfile.mkdtemp(prefix="updates-path-"))
+        self.addCleanup(shutil.rmtree, home, True)
+        os.makedirs(os.path.join(home, ".local/bin"))
+        done = subprocess.run(
+            ["/usr/bin/python3", "-c", "import updates; print(updates.tool_path())"],
+            cwd=os.path.dirname(SCRIPT), env={"HOME": home, "PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=30)
+        path = done.stdout.strip().split(":")
+        self.assertEqual(path[0], os.path.join(home, ".local/bin"), done.stderr)
+
+    def test_a_step_from_an_older_version_drops_out_of_the_state(self):
+        # do 6.10 krok Pythona nazywał się "python"; stan z tamtej wersji nie może wywrócić przebiegu
+        env = Env(self)
+        old = {"name": "python", "label": "Python", "ok": True, "updated": [], "failed": [], "held": []}
+        env.set_state({"steps": [old]})
+        done = env.run("run", "--force")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(names(env.state()["steps"]), ["brew", "npm", "go", "pip", "claude"])
 
     def test_dry_run_prints_the_plan_and_changes_nothing(self):
         env = Env(self)
