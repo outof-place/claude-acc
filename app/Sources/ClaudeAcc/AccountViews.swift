@@ -19,8 +19,15 @@ struct ActiveAccountCard: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if let on = snapshot.limitPause {
-                    LimitPauseRow(store: store, on: on)
+                if snapshot.drain != nil || snapshot.limitPause != nil {
+                    VStack(spacing: 9) {
+                        if let on = snapshot.drain {
+                            SettingSwitch(store: store, setting: .drain, on: on)
+                        }
+                        if let on = snapshot.limitPause {
+                            SettingSwitch(store: store, setting: .limitPause, on: on)
+                        }
+                    }
                 }
             } else if store.problem == nil {
                 ProgressView("Reading account limits…").controlSize(.small)
@@ -92,18 +99,43 @@ private struct ActiveAccount: View {
     }
 }
 
-/// The switch for the optional limit pause. Its explanation sits in the tooltip, so the card
-/// stays one row taller and no more.
-private struct LimitPauseRow: View {
+/// A watcher setting as one row of the card, in the order it acts when limits run out:
+/// first the last few percent of every account, then the pause. The explanation sits in
+/// the tooltip, so each switch costs the card one row.
+private struct SettingSwitch: View {
     let store: Store
+    let setting: Store.Setting
     let on: Bool
 
     var body: some View {
-        SettingRow("Pause at the limit", symbol: "pause.circle", isOn: Binding(
-            get: { store.limitPausePick ?? on },
-            set: { value in Task { await store.setLimitPause(value) } }))
-            .disabled(store.limitPauseBusy)
-            .help("When no account has headroom, sessions finish their step at a checkpoint and wake when limits return. Off: they work until the limit and Claude Code resumes them after the reset.")
+        SettingRow(title, symbol: symbol, isOn: Binding(
+            get: { store.settingPicks[setting] ?? on },
+            set: { value in Task { await store.set(setting, value) } }))
+            .disabled(store.settingBusy != nil)
+            .help(help)
+    }
+
+    private var title: String {
+        switch setting {
+        case .drain: "Use up every account"
+        case .limitPause: "Pause at the limit"
+        }
+    }
+
+    private var symbol: String {
+        switch setting {
+        case .drain: "battery.25percent"
+        case .limitPause: "pause.circle"
+        }
+    }
+
+    private var help: String {
+        switch setting {
+        case .drain:
+            "When no account has headroom, the active one works to its last percent, then sessions move through whatever is left on the others, one account after another."
+        case .limitPause:
+            "When no account has headroom, sessions finish their step at a checkpoint and wake when limits return. Off: they work until the limit and Claude Code resumes them after the reset."
+        }
     }
 }
 

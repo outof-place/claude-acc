@@ -1016,6 +1016,121 @@ class OptionalPauseTest(unittest.TestCase):
         self.assertEqual(w.run("pause", "maybe").returncode, 2)
 
 
+class DrainTest(unittest.TestCase):
+    """Tryb dobijania: gdy żadne konto nie ma zapasu, aktywne pracuje do ostatniego procenta,
+    a potem automat przełącza po kolei na resztki pozostałych kont."""
+
+    def world(self, active_used, drain=True, **accounts):
+        """Aktywne a@x z zużyciem sesji active_used; pozostałe konta: email -> (sesja, tydzień)."""
+        w = configure(Env(), drain=drain)
+        a = w.account("a@x", session_used=active_used, weekly_used=40)
+        for email, (session_used, weekly_used) in accounts.items():
+            w.account(email.replace("_", "@"), session_used=session_used, weekly_used=weekly_used)
+        w.runtime(a)
+        w.write()
+        return w
+
+    def tick(self, w):
+        w.forget_usage_cache()
+        return w.run("tick")
+
+    def active(self, w):
+        token = w.entry(BASE)["claudeAiOauth"]["accessToken"]
+        return next(e for e in w.ids if w.managed(e)["claudeAiOauth"]["accessToken"] == token)
+
+    def said(self, w, title):
+        return [n for n in w.notifications() if f'"{title}"' in n]
+
+    def test_active_account_works_to_its_last_percent(self):
+        # 3% sesji to poniżej progu porzucenia (5%), ale bez konta z zapasem szkoda go zostawiać
+        w = self.world(97, b_x=(10, 98))
+
+        self.tick(w)
+
+        self.assertEqual(self.active(w), "a@x")
+        self.assertIsNone(w.pause())
+        self.assertEqual(len(self.said(w, "Claude: dobijam resztki kont")), 1)
+
+    def test_empty_account_hands_over_to_the_biggest_scrap(self):
+        # b@x ma 2% tygodnia, c@x 3% sesji, d@x nic: pierwsze idzie c@x (słabsze okno 3% > 2%)
+        w = self.world(100, b_x=(10, 98), c_x=(97, 40), d_x=(100, 100))
+
+        self.tick(w)
+
+        self.assertEqual(self.active(w), "c@x")
+        self.assertIsNone(w.pause())
+
+    def test_scraps_are_used_one_after_another_with_one_notification(self):
+        w = self.world(100, b_x=(10, 98), c_x=(97, 40))
+        self.tick(w)
+        self.assertEqual(self.active(w), "c@x")
+
+        w.set_usage("c@x", session_used=100)
+        self.tick(w)
+        self.assertEqual(self.active(w), "b@x")
+
+        w.set_usage("b@x", weekly_used=100)
+        self.tick(w)
+        self.assertEqual(self.active(w), "b@x")  # nic już nie zostało: zostaje, ostrzeżenie zamiast skoku
+        self.assertEqual(len(self.said(w, "Claude: dobijam resztki kont")), 1)
+        self.assertEqual(len(self.said(w, "Claude: brak konta z zapasem")), 1)
+        self.assertFalse(self.said(w, "Claude: zmiana konta"))
+
+    def test_an_account_with_real_headroom_takes_over_from_scraps(self):
+        w = self.world(100, b_x=(10, 98), c_x=(100, 99))
+        self.tick(w)
+        self.assertEqual(self.active(w), "b@x")
+
+        w.set_usage("c@x", session_used=0, weekly_used=10)
+        self.tick(w)
+
+        self.assertEqual(self.active(w), "c@x")
+        self.assertEqual(len(self.said(w, "Claude: zmiana konta")), 1)
+        self.assertFalse(w.saved_state().get("draining"))  # zwykłe przełączenie kończy epizod
+
+    def test_company_account_scraps_come_last(self):
+        # c@x ma 5% sesji, b@x 2% tygodnia: bez last_resort wygrałoby c@x
+        w = configure(self.world(100, b_x=(10, 98), c_x=(95, 40)), last_resort=["c@x"])
+
+        self.tick(w)
+
+        self.assertEqual(self.active(w), "b@x")
+
+    def test_without_the_mode_scraps_stay_untouched(self):
+        w = self.world(100, drain=False, b_x=(10, 98))
+
+        self.tick(w)
+
+        self.assertEqual(self.active(w), "a@x")
+        self.assertEqual(len(self.said(w, "Claude: brak konta z zapasem")), 1)
+
+    def test_draining_wakes_a_pause_and_holds_it_off_while_scraps_last(self):
+        w = configure(self.world(97, drain=False, b_x=(10, 98)), limit_pause=True)
+        self.tick(w)
+        self.assertIsNotNone(w.pause())
+
+        self.assertEqual(w.run("drain", "on").returncode, 0)
+        self.tick(w)
+
+        self.assertIsNone(w.pause())
+        self.assertEqual(self.active(w), "a@x")
+        w.set_usage("a@x", session_used=100)
+        self.tick(w)
+        self.assertEqual(self.active(w), "b@x")
+        self.assertIsNone(w.pause())
+
+    def test_drain_command_and_status_field(self):
+        w = self.world(10, drain=False)
+        self.assertIn("wyłączone", w.run("drain").stdout)
+        self.assertIs(json.loads(w.run("status", "--json").stdout)["drain"], False)
+
+        self.assertEqual(w.run("drain", "on").returncode, 0)
+
+        self.assertIs(json.loads(w.run("status", "--json").stdout)["drain"], True)
+        self.assertTrue(json.load(open(os.path.join(w.state_dir, "config.json")))["drain"])
+        self.assertEqual(w.run("drain", "maybe").returncode, 2)
+
+
 class PauseTest(unittest.TestCase):
     """Pauza limitów: gdy aktywne konto się kończy, a żadne inne nie ma zapasu,
     sesje dostają czas na punkt kontrolny zamiast paść w połowie pracy agentów."""

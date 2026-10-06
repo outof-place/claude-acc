@@ -40,7 +40,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 
 | | |
 | --- | --- |
-| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. When no account is left, it tells you once; with the optional [limit pause](#how-the-pause-works) (`claude-acc pause on`) it also stops your sessions at a checkpoint instead of letting agents run into the wall, and wakes them when limits come back. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
+| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. When no account is left, it can [use up the last few percent of every account](#using-up-every-account) (`claude-acc drain on`), then tells you once; with the optional [limit pause](#how-the-pause-works) (`claude-acc pause on`) it also stops your sessions at a checkpoint instead of letting agents run into the wall, and wakes them when limits come back. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
 | **Dev server guard** | Agents in [Orca](https://github.com/stablyai/orca) each run their own `next dev` with a preview tab, and Turbopack grows to 6-9 GB per server under their edits. The guard watches every dev server's real memory (the number macOS kills by), knows who is looking at it, restarts a bloated one in its own Orca terminal in seconds, stops duplicates, orphans and loops, and turns away an agent about to start a second server of the same app. |
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
@@ -144,6 +144,17 @@ Each of these rules comes from an account that actually lost its login while the
 - A 429 from the usage endpoint means "unknown", never "dead". It backs off for 2 minutes, then 4, 8 and 15 while the endpoint keeps refusing, starts over after the first good answer, and doesn't refresh or flag anything in the meantime. Claude Code and Orca poll the same endpoint too, so it can throttle even while this tool is quiet. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled. Accounts with a canceled subscription get a 403 there, so they aren't asked at all.
 - Before overwriting the live entry it copies the token there back to its Orca copy, because the running session may have rotated it since the last switch.
 
+## Using up every account
+
+An account normally leaves the rotation at the switch threshold (`hard_session_left` / `hard_weekly_left`) and comes back once it has `min_session_left` / `min_weekly_left` again, so a few percent of each account go unused. With **Use up every account** in the panel's Claude Code card, or `claude-acc drain on`, the watcher spends them once no account has headroom:
+
+- The active account keeps working to its last percent instead of being given up at the switch threshold.
+- Once it is empty, the watcher switches to the account with the most left in its weaker window (at least 1% of both the 5-hour window and the week), then to the next one, and so on. Accounts in `last_resort` come last, `never` accounts are never used. Sessions that hit the wall in between wake on the switch through the `StopFailure` alarm.
+- An account with real headroom (after a reset) takes over from the scraps as soon as it shows up, like any switch.
+- One notification when this starts; the switches go to the switch log. When nothing is left anywhere, the usual warning or the limit pause follows. A pause running when the mode starts is lifted, because there is still something to work with.
+
+Depot sandboxes only ever get accounts with real headroom, so they never land on a scrap. The mode is off by default.
+
 ## How the pause works
 
 The pause is optional and off by default. **Pause at the limit** in the panel's Claude Code card switches it, and so do `claude-acc pause on` and `claude-acc pause off`: both write `limit_pause` to `config.json` and update the hooks in `settings.json` right away, and turning it off during a pause wakes the paused sessions. Open sessions keep the hooks they started with; new and resumed ones pick up the change. Without the pause, sessions keep working until the limit, Claude Code resumes them after the reset, the `StopFailure` alarm below wakes them earlier when the watcher switches to an account with headroom, and the watcher sends one notification per episode when no account has headroom.
@@ -180,6 +191,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc tick` | One watcher pass (what launchd runs) |
 | `claude-acc resume` | Lift the limit pause until limits recover (the panel's Resume Now) |
 | `claude-acc pause [on\|off]` | Show, turn on or turn off the optional limit pause |
+| `claude-acc drain [on\|off]` | Show, turn on or turn off using up every account |
 | `claude-acc depot [--force]` | Which account the Depot sandboxes run on; `--force` sends its token again |
 | `claude-acc depot --fallback` | Store a long-lived `claude setup-token` token for when no account has headroom |
 | `claude-acc clean [--dry-run]` | Clean up now: every janitor task, whatever its schedule |
@@ -218,6 +230,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `hard_weekly_left` | `3` | Switch when it has this % of the week left |
 | `min_session_left` / `min_weekly_left` | `15` / `8` | An account needs at least this much to be switched to, and the limit pause ends once an account has it again |
 | `limit_pause` | `false` | [Pause sessions at a checkpoint](#how-the-pause-works) when no account has headroom; **Pause at the limit** in the panel and `claude-acc pause on\|off` set it and update the hooks |
+| `drain` | `false` | [Use up the last few percent of every account](#using-up-every-account) once none has headroom; **Use up every account** in the panel and `claude-acc drain on\|off` set it |
 | `last_resort` | `[]` | Emails used only when nothing else has headroom |
 | `never` | `[]` | Emails never switched to |
 | `config_dir` | `~/.claude` | The config directory whose sessions get switched |
