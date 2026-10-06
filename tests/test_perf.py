@@ -1113,6 +1113,14 @@ class PauseHooksTest(Isolated):
             patcher = mock.patch.object(hook, attr, program)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # pauza włączona w config.json katalogu testu: bez tego install czytałby prawdziwy
+        os.makedirs(state, exist_ok=True)
+        config = os.path.join(state, "config.json")
+        with open(config, "w") as f:
+            json.dump({"limit_pause": True}, f)
+        patcher = mock.patch.object(hook, "CONFIG_PATH", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # jak w prawdziwej instalacji: wrapper szybkiego npx leży w ~/.local/share/claude-acc/hooks
         self.hooks_dir = os.path.join(self.dir, ".local/share/claude-acc/hooks")
         patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)

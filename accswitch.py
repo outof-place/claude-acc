@@ -21,6 +21,7 @@ Komendy:
   login <email>     zaloguj konto ponownie w przeglądarce, bez Orca i terminala
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
   resume            zdejmij pauzę limitów ręcznie (do czasu, aż limity wrócą)
+  pause [on|off]    pauza limitów: stan, włącz albo wyłącz (domyślnie wyłączona)
   depot [--force]   token sandboxów `depot claude`: konto i ważność, --force wysyła od nowa
   depot --fallback  zapisz długi token z `claude setup-token` na wypadek braku konta z zapasem
   token [--json] [--min-minutes N]
@@ -95,6 +96,10 @@ DEFAULT_CONFIG = {
     # konta całkiem wyłączone z rotacji
     "never": [],
     "history_keep_hours": 48,
+    # pauza limitów: gdy żadne konto nie ma zapasu, sesje kończą krok i czekają na budzik.
+    # Opcjonalna (`claude-acc pause on|off`): bez niej sesje pracują do ściany limitu, Claude
+    # Code wznawia je sam po resecie, a budzik watch-wall po przełączeniu konta
+    "limit_pause": False,
     # sandboxy Claude Code w Depot (`depot claude`) biorą CLAUDE_CODE_OAUTH_TOKEN z sekretu
     # organizacji; tick trzyma tam konto z największym zapasem poza kontem lokalnym
     "depot_sync": True,
@@ -1572,11 +1577,56 @@ def drop_pause():
 def end_pause(why):
     """Koniec epizodu: limity wróciły, automat przełączył konto albo przestał pilnować."""
     state = load_state()
-    if state.pop("pause_dismissed", None):
+    ended = [state.pop(key, None) for key in ("pause_dismissed", "out_of_headroom")]
+    if any(ended):
         save_state(state)
     if drop_pause():
         log(f"koniec pauzy limitów: {why}")
         notify("Claude: limity wróciły", "Wstrzymane sesje wznawiają pracę")
+
+
+def out_of_headroom(reason):
+    """Bez pauzy limitów: jedno ostrzeżenie na epizod zamiast pliku pauzy. Sesje pracują
+    dalej, a koniec epizodu (end_pause) kasuje znacznik."""
+    if load_state().get("out_of_headroom"):
+        return
+    update_state(out_of_headroom=True)
+    log(f"tick: {reason}, brak konta z zapasem (pauza limitów wyłączona)")
+    notify("Claude: brak konta z zapasem",
+           f"{reason}. Sesje pracują do limitu i wznowią się po resecie albo przełączeniu konta")
+
+
+def cmd_pause(cfg, args):
+    """Włącza albo wyłącza pauzę limitów: zapis `limit_pause` w config.json i od razu
+    hooki w settings.json. Wyłączenie w trakcie pauzy budzi wstrzymane sesje."""
+    if not args:
+        print(f"pauza limitów {'włączona' if cfg['limit_pause'] else 'wyłączona'} (claude-acc pause on|off)")
+        return 0
+    if args[0] not in ("on", "off"):
+        print("użycie: claude-acc pause [on|off]", file=sys.stderr)
+        return 2
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę")
+        return 1
+    on = args[0] == "on"
+    saved = load_json(CONFIG_PATH, {})
+    saved["limit_pause"] = on
+    write_json(CONFIG_PATH, saved)
+    state = load_state()
+    if state.pop("pause_dismissed", None):
+        save_state(state)  # ręczne zdjęcie dotyczyło starego ustawienia
+    if not on and drop_pause():
+        log("pauza limitów wyłączona w trakcie pauzy, sesje wznawiają pracę")
+        print("wstrzymane sesje wznawiają pracę")
+    log(f"pauza limitów {'włączona' if on else 'wyłączona'}")
+    hook = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hook.py")
+    settings = os.path.join(cfg["config_dir"], "settings.json")
+    if subprocess.run([sys.executable, hook, "install", settings]).returncode:
+        print(f"hooki w {settings} bez zmian, ustawienie zapisane", file=sys.stderr)
+        return 1
+    print(f"pauza limitów {'włączona' if on else 'wyłączona'}; hooki łapią nowe i wznowione sesje")
+    return 0
 
 
 def cmd_resume(cfg, _args):
@@ -1601,6 +1651,9 @@ def cmd_tick(cfg, _args):
     if not lock:
         return 0
     update_state(last_tick=int(time.time()))  # aplikacja w pasku menu po tym widzi, że automat żyje
+    if not cfg["limit_pause"] and drop_pause():
+        # pauza wyłączona w config.json w trakcie epizodu: sesje budzą się, gdy plik znika
+        log("pauza limitów wyłączona w konfiguracji, sesje wznawiają pracę")
     accounts = load_accounts()
     if not accounts:
         return 1
@@ -1670,6 +1723,9 @@ def cmd_tick(cfg, _args):
         end_pause(f"{candidates[0]['account'].email} ma znowu zapas")
         return 0
     if not candidates:
+        if not cfg["limit_pause"]:
+            out_of_headroom(reason)
+            return 1
         if not paused:
             log(f"tick: {reason}, brak konta z zapasem")
         # pauza ogłasza się raz na epizod (log i powiadomienie), kolejne przebiegi
@@ -1856,7 +1912,7 @@ def cmd_token(cfg, args):
 
 
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
-            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "resume": cmd_resume,
+            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "resume": cmd_resume, "pause": cmd_pause,
             "watch": cmd_watch, "depot": cmd_depot, "token": cmd_token}
 
 

@@ -288,6 +288,12 @@ class WakeTest(Guarded):
         w = World()
         json.dump({"switched_at": 100}, open(os.path.join(w.dir, "state.json"), "w"))
         p = w.spawn("StopFailure")
+        # przełączenie dopiero po starcie budzika: wolny start (load 40) czytał już nowy
+        # switched_at jako punkt wyjścia i czekał w nieskończoność
+        lock = os.path.join(w.dir, "pause-watchers", "s1.lock")
+        deadline = time.time() + 10
+        while not os.path.exists(lock) and time.time() < deadline and p.poll() is None:
+            time.sleep(0.05)
         time.sleep(0.4)
         self.assertIsNone(p.poll())
 
@@ -348,6 +354,14 @@ class InstallTest(Guarded):
         super().setUp()
         self.dir = tempfile.mkdtemp(prefix="claude-acc-settings-")
         self.path = os.path.join(self.dir, "settings.json")
+        self.limit_pause(True)
+
+    def limit_pause(self, on):
+        """`limit_pause` w config.json tego HOME, tak jak zapisuje go `claude-acc pause on|off`."""
+        state = os.path.join(self.dir, ".local/share/claude-acc")
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "config.json"), "w") as f:
+            json.dump({"limit_pause": on}, f)
 
     def write(self, data):
         with open(self.path, "w") as f:
@@ -370,7 +384,7 @@ class InstallTest(Guarded):
         before = open(self.path).read()
         self.run_hook("install")
         native = os.path.join(self.dir, ".local/share/claude-acc/claude-acc-hook")
-        os.makedirs(os.path.dirname(native))
+        os.makedirs(os.path.dirname(native), exist_ok=True)
         with open(native, "w") as f:
             f.write("#!/bin/sh\n")
         os.chmod(native, 0o755)
@@ -400,6 +414,41 @@ class InstallTest(Guarded):
             self.assertEqual((entry["command"], entry["args"]), (pause, [mode]), event)
         self.run_hook("uninstall")
         self.assertEqual(open(self.path).read(), before)
+
+    def test_without_the_pause_only_the_wall_alarm_is_installed(self):
+        # pauza jest opcjonalna i domyślnie wyłączona: config bez klucza to brak pauzy
+        os.remove(os.path.join(self.dir, ".local/share/claude-acc/config.json"))
+        self.write(ORIGINAL)
+        before = open(self.path).read()
+
+        r = self.run_hook("install")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = self.read()
+        self.assertEqual([e for e in data["hooks"] if self.ours(data["hooks"][e])], ["StopFailure"])
+        [wall] = self.ours(data["hooks"]["StopFailure"])
+        self.assertEqual(wall["matcher"], "rate_limit")
+        self.assertIn("watch-wall", wall["hooks"][0]["command"])
+        self.run_hook("uninstall")
+        self.assertEqual(open(self.path).read(), before)
+
+    def test_turning_the_pause_off_drops_its_hooks_and_keeps_the_wall_alarm(self):
+        self.write(ORIGINAL)
+        self.run_hook("install")
+        data = self.read()
+        self.assertEqual(sorted(e for e in data["hooks"] if self.ours(data["hooks"][e])), sorted(EVENTS))
+
+        self.limit_pause(False)
+        r = self.run_hook("install")
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = self.read()
+        self.assertEqual([e for e in data["hooks"] if self.ours(data["hooks"][e])], ["StopFailure"])
+        self.assertEqual(data["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "rtk-rewrite.sh")
+        self.limit_pause(True)
+        self.run_hook("install")
+        data = self.read()
+        self.assertEqual(sorted(e for e in data["hooks"] if self.ours(data["hooks"][e])), sorted(EVENTS))
 
     def test_only_the_pause_entries_of_the_native_program_are_ours(self):
         native = "/u/.local/share/claude-acc/claude-acc-hook"
