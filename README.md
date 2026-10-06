@@ -32,7 +32,7 @@ cd claude-acc
 ./install-fsguard.sh      # optional, root: restarts a bloated fseventsd
 ```
 
-Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads three launchd jobs (the account watcher, the janitor and the dev server guard) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. It also adds the [limit pause hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks, keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
+Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads its launchd jobs (the account watcher, the janitor, the dev server guard, Ultra's keeper and the updater) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. It also adds the [limit pause hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks, keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
 
 After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app, the command and the limit pause hooks and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
 
@@ -45,6 +45,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
 | **Load & heat** | CPU load split into performance and efficiency cores, GPU load, and P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
+| **Updates** | Homebrew formulae and casks, global npm packages and Go programs brought to their newest version every 3 days, with pins respected. The panel shows when it last worked, what each package manager did and why something failed, and an Update button runs it now. |
 | **Ultra** | One switch that tunes the Mac for agent work. Helpers no agent waits on move to the efficiency cores, memory hooks stop holding up every tool call, Node starts warm for everything sessions spawn, and the guard frees dev server memory sooner. Each change is measured before and after, and Off puts back exactly what was there. |
 
 <img src="docs/panel-details.png" width="900" alt="The same panel with one account opened: plan, subscription status and start, renewal date with a countdown, the 5-hour and weekly windows with their exact resets, place in the switching order, and buttons to switch or sign in again">
@@ -61,6 +62,7 @@ flowchart LR
         guard["devguard.py<br/>every 5 s"]
         janitor["janitor.py<br/>login + every 3 h"]
         perf["perf.py keep<br/>every 5 min"]
+        updates["updates.py<br/>04:30, every 3 days"]
     end
     subgraph root["launchd, root"]
         fans["fanctl<br/>every 2 s"]
@@ -74,12 +76,14 @@ flowchart LR
     disk[("build caches<br/>node_modules")]
     tuned[("helpers, settings.json<br/>Docker, devguard.json")]
     smc[("SMC<br/>fans, sensors")]
-    app -.-> tick & guard & janitor & perf & fans
+    pkgs[("Homebrew, npm,<br/>Go programs")]
+    app -.-> tick & guard & janitor & perf & fans & updates
     tick --> keychain & api & pause
     pausehooks --> pause
     guard --> orca
     janitor --> disk
     perf --> tuned
+    updates --> pkgs
     fans --> smc
     hook --> guard
 ```
@@ -174,6 +178,8 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc depot --fallback` | Store a long-lived `claude setup-token` token for when no account has headroom |
 | `claude-acc clean [--dry-run]` | Clean up now: every janitor task, whatever its schedule |
 | `claude-acc mac status` | Free space, the last cleanup and warnings |
+| `claude-acc update` | Update Homebrew, npm and Go packages now (the panel's Update) |
+| `claude-acc updates [status\|run --dry-run]` | The last update run per package manager, or what a run would update |
 | `claude-acc mac report` | What slows the Mac down: top processes, Spotlight, orphaned dev servers, data of uninstalled apps, broken launchd entries |
 | `claude-acc mac spotlight` | Projects whose `node_modules` Spotlight indexes, and the settings pane to exclude them |
 | `claude-acc mac optimize [--dry-run\|--undo]` | Faster Dock, window and Finder animations, and disabling launch agents whose app is gone. Reversible |
@@ -322,6 +328,27 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 
 `./install-fsguard.sh` installs `fsguard.py` as a root LaunchDaemon that runs every minute. When two readings in a row are over 4 GB, it stops `fseventsd` (SIGTERM, then SIGKILL after 10 seconds) and launchd starts it again at once. Watchers registered before the restart go deaf: a Node `fs.watch` gets nothing afterwards. So the guard then stops the `git fsmonitor--daemon` processes, and the next git command starts a fresh one with a full scan; the [dev server guard](#dev-server-guard) restarts, in their Orca terminal, the dev servers started before the restart, except protected ones; editors and language servers (tsserver, gopls) need a restart by hand, and a notification says so. That cost is why the limit sits at 4 GB, a hundred times the usual size and a tenth of the crash. Restarts are at least five minutes apart. The log at `/Library/Logs/claude-acc-fsguard.log` keeps the daemon's size every hour (every ten minutes above 512 MB) and notes any other process above 8 GB. `./install-fsguard.sh --uninstall` removes it.
 
+## Updates
+
+`updates.py` keeps the tools on the Mac at their newest version:
+
+- **Homebrew**: `brew update`, then every outdated formula and cask. Casks that update themselves (Chrome, Slack) are left to their own updater, as `brew upgrade` does without `--greedy`. Pinned formulae (`brew pin`) stay where they are.
+- **npm**: every global package to its latest version, major versions included (for global packages `npm outdated` reports `latest` as the wanted version). `npm_pins` keeps a package within one major version.
+- **Go**: every program `go install` put in `GOBIN` (or `GOPATH/bin`), read with `go version -m` and installed again at the module's latest version.
+- **Python** is only checked. Global pip packages share their dependencies, so upgrading them in bulk can quietly break another tool; the panel shows how many are outdated and leaves the upgrade to you.
+
+launchd starts `updates.py run` every day at 04:30 (a sleeping Mac catches up when it wakes), and the script goes ahead once 3 days have passed since the last run, or the next night after a run that failed. Each cask and npm package is upgraded on its own and every result is checked afterwards, so one failure doesn't stop the rest and the panel names it. A cask whose installer asks for an admin password can't be upgraded in the background, so the panel gives the command to run in Terminal. A notification comes for a new problem, not every night for the same one. The **Update** button and `claude-acc update` run it now; the full output of every command goes to `~/.local/share/claude-acc/updates.log`.
+
+Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is optional.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `every_days` | `3` | Days between runs |
+| `retry_hours` | `20` | After a failed run, try again once this many hours have passed (the next night) |
+| `skip` | `[]` | Steps to leave out: `brew`, `npm`, `go`, `pip` |
+| `npm_pins` | `{}` | Global npm packages held in a version range, e.g. `{"pnpm": "11"}` keeps pnpm on the newest 11.x |
+| `python` | python.org, then Homebrew | The Python whose packages are checked |
+
 ## Stay Awake
 
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
@@ -374,6 +401,8 @@ The janitor tests run the real script on a temporary `$HOME` with the real `lsof
 
 The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, a value someone changed after Ultra survives `ultra off`, and Ultra and the pause hooks come off in either order without taking each other's entries along.
 
+The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go` and `pip` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, the 3-day interval and the next-night retry, Python reported and never upgraded, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
+
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, and that the hook sends a second start to the running one.
 
 To see the panel without clicking the menu bar, render it to a PNG, from live data or from a JSON file:
@@ -382,7 +411,7 @@ To see the panel without clicking the menu bar, render it to a PNG, from live da
 "$HOME/Applications/Claude Acc.app/Contents/MacOS/ClaudeAcc" --render panel.png --snapshot docs/demo-snapshot.json
 ```
 
-With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json` and `demo-fans.json` next to it stand in for the guard, cleanup and fan state. `docs/demo-snapshot-pause.json` is the same panel during a limit pause. `--open <account id>` renders that account opened. `--hover <account id>` renders that row as if the pointer were over it. Lists that scroll in the panel come out in full.
+With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json`, `demo-fans.json` and `demo-updates.json` next to it stand in for the guard, cleanup, fan and update state. `docs/demo-snapshot-pause.json` is the same panel during a limit pause. `--open <account id>` renders that account opened. `--hover <account id>` renders that row as if the pointer were over it. Lists that scroll in the panel come out in full.
 
 ## Caveats
 

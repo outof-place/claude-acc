@@ -7,7 +7,7 @@ struct ClaudeAccApp: App {
     init() {
         // `ClaudeAcc --render panel.png [--snapshot accounts.json]`: the panel as a picture,
         // to look at without clicking. With --snapshot it uses that file instead of live data,
-        // and demo-guard.json / demo-janitor.json next to it, if they exist (README screenshots).
+        // and demo-guard.json / demo-janitor.json / demo-updates.json next to it, if they exist (README screenshots).
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--render"), i + 1 < args.count {
             let data = args.firstIndex(of: "--snapshot").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
@@ -35,6 +35,7 @@ struct ClaudeAccApp: App {
         var ultra: Ultra?
         var load: LoadReading?
         var sched: SchedState?
+        var updates: UpdatesState?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
             output = CLIResult(status: text.isEmpty ? 1 : 0, stdout: text, stderr: "no file \(snapshotFile)")
@@ -55,6 +56,9 @@ struct ClaudeAccApp: App {
             if let data = try? Data(contentsOf: folder.appending(path: "demo-sched.json")) {
                 sched = Store.decode(SchedState.self, from: data)
             }
+            if let data = try? Data(contentsOf: folder.appending(path: "demo-updates.json")) {
+                updates = Store.decode(UpdatesState.self, from: data)
+            }
             if let data = try? Data(contentsOf: folder.appending(path: "demo-perf.json")) {
                 ultra = Store.decode(PerfFile.self, from: data)?.ultra
             }
@@ -65,7 +69,7 @@ struct ClaudeAccApp: App {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, updates: updates)
         store.previewOpenAccount = open
         store.previewHoverAccount = hover
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }

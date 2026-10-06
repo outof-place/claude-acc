@@ -37,6 +37,7 @@ struct PanelView: View {
                     }
                     Column(width: 300) {
                         UltraCard(store: store)
+                        UpdatesCard(store: store).fixedSize(horizontal: false, vertical: true)
                     }
                 }
                 // live: fixed height, lists scroll inside their cards; PNG: as tall as the content
@@ -121,6 +122,7 @@ private struct FooterBar: View {
                 Button("Switch History", systemImage: "arrow.triangle.swap") { open(CLI.switchLog) }
                 Button("Cleanup Log", systemImage: "doc.text") { open(CLI.janitorLog) }
                 Button("Dev Server Guard Log", systemImage: "server.rack") { open(CLI.guardLog) }
+                Button("Updates Log", systemImage: "arrow.down.circle") { open(CLI.updatesLog) }
             }
             .menuStyle(.button)
             .buttonStyle(.plain)
