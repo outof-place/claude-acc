@@ -16,6 +16,9 @@ struct Snapshot: Decodable {
     let switchedAt: Double?
     /// Account selected in Orca's menu. Auto-switch then stands still and switching is blocked.
     let orcaSelected: String?
+    /// The limit pause: no account has headroom, so sessions wind down to a checkpoint.
+    /// Missing from older scripts, which decodes as no pause.
+    let pause: Pause?
     let accounts: [Account]
 
     var active: Account? { accounts.first { $0.active } }
@@ -25,6 +28,14 @@ struct Snapshot: Decodable {
         others.compactMap { account in account.queue.map { (account, $0) } }.min { $0.1 < $1.1 }?.0
     }
     var anyNeedsLogin: Bool { accounts.contains { $0.status == .needsLogin } }
+}
+
+/// `pause.json` as the script writes it; the hooks in Claude Code sessions read the same file.
+struct Pause: Decodable {
+    let since: Double
+    let account: String
+    /// When an account has headroom again, the earliest of their resets; nil when the API gave none.
+    let resumeAt: Double?
 }
 
 struct Thresholds: Decodable {
