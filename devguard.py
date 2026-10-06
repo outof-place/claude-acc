@@ -111,6 +111,8 @@ CONFIG_PATH = os.path.join(STATE_DIR, "devguard.json")
 STATE_PATH = os.path.join(STATE_DIR, "devguard-state.json")
 LOG_PATH = os.path.join(STATE_DIR, "devguard.log")
 LOCK_PATH = os.path.join(STATE_DIR, "devguard.lock")
+# stan strażnika fseventsd (fsguard.py, root): kiedy ostatnio zrestartował demona zdarzeń plików
+FSGUARD_STATE = os.environ.get("CLAUDE_ACC_FSGUARD_STATE", "/var/db/claude-acc-fsguard.json")
 
 GB = janitor.GB
 MB = 1024**2
@@ -278,10 +280,20 @@ class _SwapUsage(ctypes.Structure):
 _tb = _Timebase()
 _libc.mach_timebase_info(ctypes.byref(_tb))
 TICK_NS = _tb.numer / _tb.denom if _tb.denom else 1.0
+_libc.mach_absolute_time.restype = ctypes.c_uint64
 RUSAGE_INFO_V4 = 4
 PROC_PIDVNODEPATHINFO = 9
 VNODEPATHINFO_SIZE = 2352  # dwa vnode_info_path: 152 bajty vnode_info + MAXPATHLEN
 KERN_PROCARGS2 = 49
+
+
+def started_at(abstime, first_seen, now):
+    """Epoka startu procesu. Zegar jądra (mach_absolute_time) stoi w czasie snu, więc wynik
+    z niego wypada za późno; pierwsza obserwacja strażnika też, więc bierzemy wcześniejszy."""
+    if not abstime:
+        return first_seen
+    awake = (_libc.mach_absolute_time() - abstime) * TICK_NS / 1e9
+    return min(first_seen, now - awake)
 
 
 def usage(pid):
@@ -678,6 +690,7 @@ class Unit:
         self.protected = False
         # z historii
         self.age = 0
+        self.started = 0  # epoka startu komendy
         self.quiet = 0
         self.last_watched = 0
 
@@ -853,6 +866,7 @@ class World:
         if use_orca and self.units:
             orca.refresh(rows, now, cfg["orca_seconds"])
         self.orca = orca if orca.ok else None
+        self.fsevents_restart = (janitor.load_json(FSGUARD_STATE, {}) or {}).get("last_restart", 0)
         protect = [
             janitor.expand(p)
             for p in cfg["protect"]
@@ -904,6 +918,7 @@ class World:
             output = (unit.terminal or {}).get("lastOutputAt")
             busy = max(h["busy"], output / 1000 if output else 0)
             unit.age = now - h["first"]
+            unit.started = started_at(unit.start, h["first"], now)
             unit.quiet = now - busy
             unit.last_watched = h["watched"]
         for key in list(history):
@@ -1078,6 +1093,16 @@ def decide(cfg, world, state):
                 code, data = "budget", dict(total=total, budget=budget)
             plans.append(
                 Plan(top, action, 90 if pressure.level == 2 else 80, why, code, **data)
+            )
+
+    # strażnik fseventsd zrestartował demona zdarzeń plików: obserwatory sprzed restartu są
+    # głuche, więc serwer nie widzi edycji (HMR stoi), dopóki nie wstanie od nowa. Serwerów
+    # chronionych i bez terminala Orki nie ruszamy
+    restart = world.fsevents_restart
+    for unit in units:
+        if restart and unit.recyclable and not unit.protected and unit.started < restart:
+            plans.append(
+                Plan(unit, "recycle", 95, "po restarcie fseventsd nie widzi zmian plików", "fsevents")
             )
 
     for plan in plans:

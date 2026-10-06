@@ -57,6 +57,7 @@ def unit(key, fp_gb=1.0, cwd=None, **attrs):
         watched=False,
         agent_working=False,
         start=0,
+        started=NOW - 3600,
         ports=[],
     )
     for name, value in attrs.items():
@@ -65,9 +66,11 @@ def unit(key, fp_gb=1.0, cwd=None, **attrs):
     return u
 
 
-def world(*units, level=0, reasons=()):
+def world(*units, level=0, reasons=(), fsevents_restart=0):
     pressure = types.SimpleNamespace(level=level, ram=48 * GB, reasons=list(reasons))
-    return types.SimpleNamespace(now=NOW, pressure=pressure, units=list(units))
+    return types.SimpleNamespace(
+        now=NOW, pressure=pressure, units=list(units), fsevents_restart=fsevents_restart
+    )
 
 
 def plans(world_, state=None, **extra):
@@ -166,6 +169,29 @@ class DecideTest(unittest.TestCase):
     def test_one_plan_per_unit_the_most_urgent(self):
         u = unit("a", 7, watched=False, recyclable=False, host="orphan")
         self.assertEqual(plans(world(u, level=2)), [("a", "stop")])
+
+
+class FseventsRestartTest(unittest.TestCase):
+    """Po restarcie fseventsd obserwatory plików sprzed niego są głuche: serwer bez restartu
+    nie widzi edycji agenta. Pomyłki, które ten test łapie: restart serwera postawionego już
+    po restarcie demona (pętla bez końca) i ruszanie serwera chronionego."""
+
+    def test_servers_started_before_the_restart_are_recycled(self):
+        old = unit("old", started=NOW - 600, quiet=0)
+        fresh = unit("fresh", started=NOW - 30, quiet=0)
+
+        got = plans(world(old, fresh, fsevents_restart=NOW - 60))
+
+        self.assertEqual(got, [("old", "recycle")])
+
+    def test_protected_and_unmanaged_servers_stay(self):
+        mine = unit("mine", started=NOW - 600, quiet=0, protected=True)
+        agents = unit("agents", started=NOW - 600, quiet=0, recyclable=False)
+
+        self.assertEqual(plans(world(mine, agents, fsevents_restart=NOW - 60)), [])
+
+    def test_no_restart_no_recycle(self):
+        self.assertEqual(plans(world(unit("old", started=NOW - 600, quiet=0))), [])
 
 
 class PressureTest(unittest.TestCase):
@@ -394,7 +420,8 @@ class GuardTest(unittest.TestCase):
         self.assertEqual([c["pid"] for c in snap["units"][0]["clients"]], [os.getpid()])
 
     def run_guard(self, *args, stdin=None):
-        env = dict(os.environ, HOME=self.home, DEVGUARD_ORCA="")
+        env = dict(os.environ, HOME=self.home, DEVGUARD_ORCA="",
+                   CLAUDE_ACC_FSGUARD_STATE=os.path.join(self.home, "fsguard.json"))
         done = subprocess.run(
             ["/usr/bin/python3", SCRIPT, *args],
             input=stdin,
