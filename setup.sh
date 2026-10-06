@@ -55,6 +55,11 @@ cp "$SRC"/*.py "$STATE/"
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
 [ -n "$HOOK" ] && cp "$HOOK" "$STATE/claude-acc-hook.new" && mv -f "$STATE/claude-acc-hook.new" "$STATE/claude-acc-hook"
+# hooki pauzy w C leżą obok claude-acc-hook (install.sh: katalog builda, formuła: libexec);
+# bez niego hook.py wpisuje `claude-acc-hook pause`, a bez obu krótki skrypt w powłoce
+PAUSE_BIN="$(dirname "${HOOK:-.}")/claude-acc-pause"
+[ -n "$HOOK" ] && [ -x "$PAUSE_BIN" ] && cp "$PAUSE_BIN" "$STATE/claude-acc-pause.new" \
+  && mv -f "$STATE/claude-acc-pause.new" "$STATE/claude-acc-pause"
 
 # interpreter: uv's CPython 3.14 (PGO and LTO, starts in 26 ms where Xcode's 3.9 takes 37),
 # linked as $STATE/python, so launchd jobs, the app, the hook and the command share one;

@@ -15,8 +15,9 @@ Ten skrypt go tylko czyta i robi z niego punkt kontrolny w każdej sesji:
   install / uninstall [settings.json]   dopisuje albo usuwa te hooki
 
 Poza pauzą hook kosztuje dwa sprawdzenia plików: Python startuje tylko w trakcie
-pauzy. Robi je natywny claude-acc-hook, który Claude Code uruchamia bez powłoki
-(exec form), a bez niego krótki skrypt w powłoce. Ścieżkę pliku pauzy można nadpisać zmienną
+pauzy. Robi je claude-acc-pause (C), który Claude Code uruchamia bez powłoki
+(exec form); bez niego `claude-acc-hook pause` (Swift), a bez obu krótki skrypt
+w powłoce. Ścieżkę pliku pauzy można nadpisać zmienną
 CLAUDE_ACC_PAUSE_FILE (sesja testowa nie wstrzymuje wtedy pozostałych).
 """
 
@@ -38,7 +39,10 @@ MAX_WAIT = 8 * 86400  # pauza tygodniowa trwa najwyżej kilka dni
 # dostaje limit dłuższy niż własne czekanie. Bez tego pauza dłuższa niż 10 min nikogo nie budziła.
 WATCH_TIMEOUT = MAX_WAIT + 60
 MARKER = "claude-acc/hook.py"  # po tym poznajemy własne wpisy w settings.json (perf.py też)
-# natywny front: wpis bez powłoki to ten program z argumentami ["pause", tryb]
+# wpisy bez powłoki: claude-acc-pause z argumentem [tryb] albo (starsze, bez programu w C)
+# claude-acc-hook z argumentami ["pause", tryb]
+PAUSE_MARKER = "claude-acc/claude-acc-pause"
+PAUSE_NATIVE = os.path.join(HOME, ".local/share", PAUSE_MARKER)
 NATIVE_MARKER = "claude-acc/claude-acc-hook"
 NATIVE = os.path.join(HOME, ".local/share", NATIVE_MARKER)
 BACKUP_SUFFIX = ".bak-claude-acc"
@@ -249,10 +253,13 @@ def guard(mode):
 
 
 def checked(mode, **extra):
-    """Hook, który poza pauzą nic nie robi. Z natywnym claude-acc-hook Claude Code uruchamia go
-    wprost (exec form, `args`), bez `sh -c`: to 3-4 ms mniej na każde narzędzie każdej sesji.
+    """Hook, który poza pauzą nic nie robi. Z natywnym programem Claude Code uruchamia go
+    wprost (exec form, `args`), bez `sh -c`: 7,6 ms w powłoce, 5,0 przez claude-acc-hook
+    (Swift), 3,1 przez claude-acc-pause (C) na każde narzędzie każdej sesji (6.10).
     Ścieżka bezwzględna, bo bez powłoki nikt nie rozwinie $HOME."""
-    if os.access(NATIVE, os.X_OK):
+    if os.access(PAUSE_NATIVE, os.X_OK):
+        hook = {"type": "command", "command": PAUSE_NATIVE, "args": [mode]}
+    elif os.access(NATIVE, os.X_OK):
         hook = {"type": "command", "command": NATIVE, "args": ["pause", mode]}
     else:
         hook = {"type": "command", "command": guard(mode)}
@@ -276,7 +283,7 @@ def ours(hook):
     command = hook.get("command") or ""
     args = hook.get("args")
     native = command.endswith(NATIVE_MARKER) and isinstance(args, list) and args[:1] == ["pause"]
-    return MARKER in command or native
+    return MARKER in command or native or command.endswith(PAUSE_MARKER)
 
 
 def strip(settings):

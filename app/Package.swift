@@ -18,6 +18,8 @@ let package = Package(
         .executableTarget(name: "fanctl", path: "Sources/fanctl", swiftSettings: settings),
         // the PreToolUse hook's native front: answers most Bash commands without starting Python
         .executableTarget(name: "claude-acc-hook", path: "Sources/hook", swiftSettings: settings),
+        // the limit pause hooks after every tool call; plain C, so it starts without a runtime
+        .executableTarget(name: "claude-acc-pause", path: "Sources/pause"),
     ],
     swiftLanguageModes: [.v6]
 )
