@@ -14,8 +14,9 @@ Ten skrypt go tylko czyta i robi z niego punkt kontrolny w każdej sesji:
                już sam Claude Code)
   install / uninstall [settings.json]   dopisuje albo usuwa te hooki
 
-Poza pauzą hook kosztuje dwa sprawdzenia plików w powłoce: Python startuje
-tylko w trakcie pauzy. Ścieżkę pliku pauzy można nadpisać zmienną
+Poza pauzą hook kosztuje dwa sprawdzenia plików: Python startuje tylko w trakcie
+pauzy. Robi je natywny claude-acc-hook, który Claude Code uruchamia bez powłoki
+(exec form), a bez niego krótki skrypt w powłoce. Ścieżkę pliku pauzy można nadpisać zmienną
 CLAUDE_ACC_PAUSE_FILE (sesja testowa nie wstrzymuje wtedy pozostałych).
 """
 
@@ -37,6 +38,9 @@ MAX_WAIT = 8 * 86400  # pauza tygodniowa trwa najwyżej kilka dni
 # dostaje limit dłuższy niż własne czekanie. Bez tego pauza dłuższa niż 10 min nikogo nie budziła.
 WATCH_TIMEOUT = MAX_WAIT + 60
 MARKER = "claude-acc/hook.py"  # po tym poznajemy własne wpisy w settings.json (perf.py też)
+# natywny front: wpis bez powłoki to ten program z argumentami ["pause", tryb]
+NATIVE_MARKER = "claude-acc/claude-acc-hook"
+NATIVE = os.path.join(HOME, ".local/share", NATIVE_MARKER)
 BACKUP_SUFFIX = ".bak-claude-acc"
 
 
@@ -244,21 +248,35 @@ def guard(mode):
             'cat >/dev/null')
 
 
+def checked(mode, **extra):
+    """Hook, który poza pauzą nic nie robi. Z natywnym claude-acc-hook Claude Code uruchamia go
+    wprost (exec form, `args`), bez `sh -c`: to 3-4 ms mniej na każde narzędzie każdej sesji.
+    Ścieżka bezwzględna, bo bez powłoki nikt nie rozwinie $HOME."""
+    if os.access(NATIVE, os.X_OK):
+        hook = {"type": "command", "command": NATIVE, "args": ["pause", mode]}
+    else:
+        hook = {"type": "command", "command": guard(mode)}
+    hook.update(extra)
+    return hook
+
+
 def entries():
     always = f'h="{SCRIPT}"; if [ -e "$h" ]; then exec /usr/bin/python3 "$h" watch-wall; fi; cat >/dev/null'
     return {
-        "PostToolUse": {"matcher": "*", "hooks": [{"type": "command", "command": guard("post"), "timeout": 10}]},
-        "PreToolUse": {"matcher": "Agent|Task", "hooks": [{"type": "command", "command": guard("agent"), "timeout": 10}]},
-        "UserPromptSubmit": {"hooks": [{"type": "command", "command": guard("prompt"), "timeout": 10}]},
-        "Stop": {"hooks": [{"type": "command", "command": guard("watch"), "asyncRewake": True,
-                            "timeout": WATCH_TIMEOUT}]},
+        "PostToolUse": {"matcher": "*", "hooks": [checked("post", timeout=10)]},
+        "PreToolUse": {"matcher": "Agent|Task", "hooks": [checked("agent", timeout=10)]},
+        "UserPromptSubmit": {"hooks": [checked("prompt", timeout=10)]},
+        "Stop": {"hooks": [checked("watch", asyncRewake=True, timeout=WATCH_TIMEOUT)]},
         "StopFailure": {"matcher": "rate_limit", "hooks": [{"type": "command", "command": always, "asyncRewake": True,
                                                             "timeout": WATCH_TIMEOUT}]},
     }
 
 
 def ours(hook):
-    return MARKER in (hook.get("command") or "")
+    command = hook.get("command") or ""
+    args = hook.get("args")
+    native = command.endswith(NATIVE_MARKER) and isinstance(args, list) and args[:1] == ["pause"]
+    return MARKER in command or native
 
 
 def strip(settings):

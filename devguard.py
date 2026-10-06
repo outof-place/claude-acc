@@ -43,7 +43,8 @@ Komendy:
   pins                  przypięcia, ich powody i terminy
   admit                 hook PreToolUse (Bash) dla Claude Code; zdarzenie czyta z stdin
   words                 słowa, od których komenda idzie do `admit` dalej niż szybka ścieżka,
-                        jako JSON {"dev": [...], "sched": [...]} dla natywnego claude-acc-hook
+                        i bramka całych słów, jako JSON {"dev": [...], "sched": [...],
+                        "gate": [wzorzec]} dla natywnego claude-acc-hook
 """
 
 # Ten plik to tylko wejście. Hook `admit` idzie przy każdym poleceniu Bash każdego agenta, a
@@ -62,6 +63,22 @@ SCHED_WORDS = (
     "go ", "golangci-lint", "make", "govulncheck", "vitest", "jest", "playwright", "next ",
     "tsc", "eslint", "turbo", "pnpm", "npm ", "npx ", "yarn", "bun ", "bunx", "node_modules/.bin/",
 )  # fmt: skip
+# Bramka natywnego frontu (claude-acc-hook): komenda idzie do Pythona tylko wtedy, gdy słowo
+# stoi w niej jako całe słowo, a nie kawałek ścieżki albo innego słowa. Scheduler rozpoznaje
+# program po nazwie tokenu (shlex, basename pierwszego słowa członu), a START widzi dev, serve
+# i resztę tylko za białym znakiem, więc `2>/dev/null`, `export`, `main_test.go` czy
+# `tsconfig.json` Pythona już nie budzą (6.10, doba komend: 16% do Pythona zamiast 45%, żadna
+# z komend, przy których Python coś robi, nie odpadła). Ten sam wzorzec czyta `re` i ICU
+# (NSRegularExpression w Swifcie), więc tylko klasy znaków, \w i lookaroundy. Program dodany
+# do schedulera (NODE_TOOLS, go, make...) albo do START musi trafić i tutaj; pilnują tego testy.
+GATE_PROGRAMS = (
+    "go", "golangci-lint", "make", "govulncheck", "npx", "bunx", "pnpm", "yarn", "npm", "bun",
+    "vitest", "jest", "playwright", "next", "tsc", "vue-tsc", "eslint", "turbo", "vite", "expo",
+)  # fmt: skip
+HOOK_GATE = (
+    r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
+    r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
+)
 
 # komenda stawiająca dev serwer, po zdjęciu opakowań (zmienne, rtk proxy, npx, pnpm exec).
 # Wzorce to tekst: `re` kompiluje je przy pierwszym użyciu, więc komenda bez słowa od dev
@@ -187,10 +204,15 @@ def main(argv):
         except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
             return 0
     if argv[:1] == ["words"]:
-        # jedno źródło list dla obu frontów: setup.sh zapisuje to do hook-words.json
+        # jedno źródło list dla obu frontów: setup.sh zapisuje to do hook-words.json; bramka
+        # jako lista, bo starszy claude-acc-hook czyta plik jako {klucz: [tekst]}
         import json
 
-        print(json.dumps({"dev": list(DEV_WORDS), "sched": list(SCHED_WORDS)}))
+        print(
+            json.dumps(
+                {"dev": list(DEV_WORDS), "sched": list(SCHED_WORDS), "gate": [HOOK_GATE]}
+            )
+        )
         return 0
     return core().main(argv)
 

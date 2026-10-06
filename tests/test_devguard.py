@@ -412,6 +412,146 @@ class AdmitParserTest(unittest.TestCase):
         self.assertEqual(self.starts("vite dev"), [("/w/mono", None, False)])
 
 
+BUILT_HOOK = os.path.join(ROOT, "app/.build/release/claude-acc-hook")
+# komendy, przy których Python coś robi: stawiają dev serwer...
+DEV_STARTS = (
+    "pnpm dev",
+    "npm run dev:landing",
+    "pnpm --filter landing-page dev",
+    "(cd apps/web && pnpm dev)",
+    'orca terminal create --worktree active --command "cd apps/web && pnpm exec next dev"',
+    "bash -c 'pnpm dev'",
+    "npx vite --port 5173",
+    "vite dev",
+    "nohup pnpm exec next dev > /tmp/log 2>&1 &",
+    "PORT=3001 npx next dev",
+    "turbo run dev",
+    "npx expo start",
+    "npx webpack serve",
+    "npx astro dev",
+)
+# ...albo idą do schedulera (w katalogu z go.mod i package.json)
+SCHEDULED = (
+    "go test -count=1 ./... 2>&1 | tail -5",
+    "/usr/local/go/bin/go build ./...",
+    "make test",
+    "golangci-lint run",
+    "pnpm test 2>&1 | tail -5",
+    "npx vitest run",
+    "./node_modules/.bin/vitest run",
+    "pnpm exec tsc --noEmit",
+    "npx vue-tsc --noEmit",
+    "yarn lint",
+    "bunx eslint .",
+    "npx playwright test",
+    "npx next build",
+    "npx turbo run build",
+    "npm test",
+    "bun test",
+    "npx jest",
+    "vite build",
+    # każde narzędzie z NODE_TOOLS wołane wprost
+    "vitest run",
+    "jest",
+    "playwright test",
+    "next build",
+    "tsc --noEmit",
+    "vue-tsc --noEmit",
+    "eslint .",
+    "turbo run build",
+    "govulncheck ./...",
+)
+# słowa w ścieżkach i innych słowach: Python nic tu nie robi, więc nie ma po co startować
+QUIET = (
+    "ls -la 2>/dev/null",
+    "export FOO=1; echo $FOO",
+    "rg -n Foo main_test.go internal/x.go",
+    "cat tsconfig.json playwright.config.ts vite.config.ts jest.config.js .eslintrc",
+    "./devguard.py status",
+    "echo observe the server",
+    "cat ~/dev/notes.md",
+    "sed -n 1,20p cmd/server/main.go",
+    "git log --oneline | head",
+)
+
+
+class HookGateTest(unittest.TestCase):
+    """Bramka natywnego frontu: Python startuje na całe słowa, a żadna komenda, przy której coś
+    robi (dev serwer, scheduler), nie odpada po drodze."""
+
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="devguard-gate-"))
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.state = os.path.join(self.home, ".local/share/claude-acc")
+        os.makedirs(self.state)
+        self.project = os.path.join(self.home, "shop")
+        os.makedirs(os.path.join(self.project, ".git"))
+        with open(os.path.join(self.project, "go.mod"), "w") as f:
+            f.write("module shop\n")
+        with open(os.path.join(self.project, "package.json"), "w") as f:
+            f.write('{"name": "shop"}')
+        self.gate = __import__("re").compile(entry.HOOK_GATE)
+
+    def admit(self, command):
+        """Wyjście prawdziwego `devguard.py admit` na tym HOME, jak w sesji."""
+        event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": self.project}
+        done = subprocess.run(
+            ["/usr/bin/python3", SCRIPT, "admit"],
+            input=json.dumps(event),
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, HOME=self.home, DEVGUARD_ORCA=""),
+            timeout=60,
+        )
+        return done.stdout.strip()
+
+    def test_every_dev_server_start_passes(self):
+        for command in DEV_STARTS:
+            self.assertTrue(entry.dev_starts(command, "/w/mono"), command)
+            self.assertTrue(self.gate.search(command), command)
+
+    def test_every_scheduled_command_passes(self):
+        for command in SCHEDULED:
+            self.assertTrue(self.admit(command), command)
+            self.assertTrue(self.gate.search(command), command)
+
+    def test_words_inside_paths_and_other_words_stay_quiet(self):
+        for command in QUIET:
+            self.assertEqual(self.admit(command), "", command)
+            self.assertIsNone(self.gate.search(command), command)
+
+    def test_every_program_the_scheduler_knows_is_in_the_gate(self):
+        import sched as scheduler
+
+        self.assertLessEqual(set(scheduler.NODE_TOOLS), set(entry.GATE_PROGRAMS))
+
+    @unittest.skipUnless(os.access(BUILT_HOOK, os.X_OK), "brak app/.build/release/claude-acc-hook")
+    def test_native_front_reads_the_gate_like_python(self):
+        """Ten sam wzorzec czyta ICU w Swifcie: Python udaje skrypt, który mówi, że wystartował."""
+        words = os.path.join(self.state, "hook-words.json")
+        with open(words, "w") as f:
+            f.write(subprocess.run(["/usr/bin/python3", SCRIPT, "words"], capture_output=True,
+                                   text=True, check=True).stdout)
+        python = os.path.join(self.state, "python")
+        with open(python, "w") as f:
+            f.write("#!/bin/sh\ncat >/dev/null\necho python\n")
+        os.chmod(python, 0o755)
+
+        def front(command):
+            event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": self.project}
+            return subprocess.run([BUILT_HOOK], input=json.dumps(event), capture_output=True,
+                                  text=True, env={"HOME": self.home}, timeout=30).stdout.strip()
+
+        for command in DEV_STARTS + SCHEDULED:
+            self.assertEqual(front(command), "python", command)
+        for command in QUIET:
+            self.assertEqual(front(command), "", command)
+        # plik słów sprzed bramki: dawne podciągi, więc /dev/null znowu budzi Pythona
+        with open(words, "w") as f:
+            json.dump({"dev": list(entry.DEV_WORDS), "sched": list(entry.SCHED_WORDS)}, f)
+        self.assertEqual(front("ls -la 2>/dev/null"), "python")
+
+
 FAKE_SERVER = """\
 import socket, sys, time
 port = int(sys.argv[sys.argv.index("-p") + 1])
@@ -699,7 +839,12 @@ class GuardTest(unittest.TestCase):
     def test_words_are_the_fast_path_lists(self):
         words = json.loads(self.run_guard("words"))
         self.assertEqual(
-            words, {"dev": list(entry.DEV_WORDS), "sched": list(entry.SCHED_WORDS)}
+            words,
+            {
+                "dev": list(entry.DEV_WORDS),
+                "sched": list(entry.SCHED_WORDS),
+                "gate": [entry.HOOK_GATE],
+            },
         )
 
 
