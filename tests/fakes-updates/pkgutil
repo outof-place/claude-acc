@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""Atrapa pkgutil --check-signature: podpis PSF, chyba że świat mówi inaczej."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+_world.record("pkgutil", sys.argv[1:])
+if _world.fails(_world.load(), "signature"):
+    print("Status: no signature")
+    sys.exit(1)
+print("Package \"python.pkg\":\n   Status: signed by a developer certificate issued by Apple for distribution\n"
+      "   Certificate Chain:\n    1. Developer ID Installer: Python Software Foundation (BMM5U3QVKW)")

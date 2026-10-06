@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""Komenda globalnej paczki npm w atrapie: --version działa, chyba że zainstalowana wersja się psuje."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _world
+
+name = os.environ.get("FAKE_NPM_PACKAGE") or open(sys.argv[0] + ".package").read().strip()
+package = _world.load()["npm"][name]
+if package.get("breaks") == package["installed"]:
+    print("Error: native binary not installed", file=sys.stderr)
+    sys.exit(1)
+print(package["installed"])

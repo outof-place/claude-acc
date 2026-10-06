@@ -1,0 +1,29 @@
+#!/usr/bin/python3
+"""Atrapa uv python list/upgrade. world["uv_pythons"]: [{"installed", "latest"}], każdy w
+/fake/uv/cpython-<wersja>; upgrade bez argumentów podbija wszystkie, z argumentami tylko te wersje."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("uv", args)
+world = _world.load()
+minor = lambda v: ".".join(v.split(".")[:2])
+
+if args[:2] == ["python", "list"]:
+    print(json.dumps([{"key": f"cpython-{v['installed']}-macos-aarch64-none", "version": v["installed"],
+                       "path": f"/fake/uv/cpython-{v['installed']}/bin/python3"} for v in world.get("uv_pythons", [])]))
+    sys.exit(0)
+
+if args[:2] == ["python", "upgrade"]:
+    targets = args[2:]
+    for v in world.get("uv_pythons", []):
+        if not targets or minor(v["installed"]) in targets:
+            v["installed"] = v["latest"]
+    _world.save(world)
+    sys.exit(0)
+
+sys.exit(2)
