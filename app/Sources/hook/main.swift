@@ -1,9 +1,9 @@
 // claude-acc-hook: the native front of the `devguard.py admit` PreToolUse hook.
 //
 // The hook runs before every Bash command of every agent on the Mac. Most commands neither
-// start a dev server nor run Go, and for those the answer is "nothing to say": this binary
-// gives it in about a millisecond, where starting Python alone takes 25-40 ms (and hundreds
-// under load). A command with one of the words goes to `devguard.py admit` with the same
+// start a dev server nor bring Go or JS work for the scheduler, and for those the answer is
+// "nothing to say": this binary gives it in about a millisecond, where starting Python alone
+// takes 25-40 ms (and hundreds under load). A command with one of the words goes to `devguard.py admit` with the same
 // bytes on stdin, so every decision stays in Python. The words come from
 // `devguard.py words`, written to hook-words.json at install: one source for both lists.
 //
@@ -41,7 +41,7 @@ func handOver() -> Never {
 
 guard let data = FileManager.default.contents(atPath: state + "/hook-words.json"),
       let words = try? JSONSerialization.jsonObject(with: data) as? [String: [String]],
-      let dev = words["dev"], let go = words["go"], !dev.isEmpty, !go.isEmpty
+      let dev = words["dev"], let sched = words["sched"], !dev.isEmpty, !sched.isEmpty
 else { handOver() }
 
 guard let parsed = try? JSONSerialization.jsonObject(with: event) as? [String: Any] else { exit(0) }
@@ -57,5 +57,5 @@ func contains(_ word: String) -> Bool {
     }
 }
 
-if (dev + go).contains(where: contains) { handOver() }
+if (dev + sched).contains(where: contains) { handOver() }
 exit(0)

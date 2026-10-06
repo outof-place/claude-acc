@@ -22,11 +22,15 @@ final class Store {
     private(set) var panelOpen = false
     private(set) var problem: String?
     private(set) var busy: Busy?
+    /// `claude-acc resume` is running: the pause notice keeps its button disabled.
+    private(set) var resuming = false
     var notice: Notice?
     private(set) var launchAtLogin = false
     private(set) var janitor: JanitorState?
     private(set) var disk: DiskSpace?
     private(set) var sweeping = false
+    private(set) var updates: UpdatesState?
+    private(set) var updating = false
     private(set) var guardState: GuardState?
     /// Unit the panel is restarting or stopping right now.
     private(set) var guardBusy: String?
@@ -51,6 +55,8 @@ final class Store {
     private var guardModeOverride: String?
     /// Rendering only: the account whose details start open.
     @ObservationIgnored var previewOpenAccount: String?
+    /// Rendering only: the account drawn as if the pointer were over it.
+    @ObservationIgnored var previewHoverAccount: String?
     /// Stay Awake lives as long as the app: power assertions and the hotspot watch.
     let awake: Awake
 
@@ -72,7 +78,8 @@ final class Store {
     /// Rendering the panel to a file: fixed data, no timers, no login item.
     init(
         preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
-        ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil, depot: DepotRuns? = nil
+        ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil, depot: DepotRuns? = nil,
+        updates: UpdatesState? = nil
     ) {
         awake = Awake(preview: true)
         snapshot = preview
@@ -84,6 +91,7 @@ final class Store {
         if let load { self.load = load }
         if let sched { self.sched = sched }
         if let depot { self.depot = depot }
+        if let updates { self.updates = updates }
     }
 
     init() {
@@ -152,6 +160,9 @@ final class Store {
         }
         if let data = changedFile(CLI.depotState) {
             depot = Self.decode(DepotRuns.self, from: data)
+        }
+        if let data = changedFile(CLI.updatesState) {
+            updates = Self.decode(UpdatesState.self, from: data)
         }
         let level = Self.kernelMemoryLevel()
         if level != memoryLevel { memoryLevel = level }
@@ -267,6 +278,19 @@ final class Store {
         kill(pid, SIGTERM)  // on SIGTERM the script also closes `claude auth login`
     }
 
+    /// Lifts the limit pause until limits recover: paused sessions wake up right away.
+    func resumePaused() async {
+        guard !resuming else { return }
+        resuming = true
+        notice = nil
+        let result = await CLI.run(["resume"])
+        resuming = false
+        notice = result.status == 0
+            ? Notice(text: "Pause lifted, sessions are resuming")
+            : Notice(text: result.message.isEmpty ? "Couldn't lift the pause" : result.message, isError: true)
+        await refresh()
+    }
+
     // MARK: Cleanup
 
     /// Clean up now instead of waiting for launchd: every task, whatever its schedule.
@@ -283,6 +307,28 @@ final class Store {
             notice = Notice(text: "A cleanup is already running")
         } else if let last = janitor?.lastSweep {
             notice = Notice(text: "Cleanup freed \(Format.bytes(last.freed))")
+        }
+    }
+
+    // MARK: Updates
+
+    /// Upgrade Homebrew, npm and Go packages now instead of waiting for the 4:30 run.
+    func runUpdates() async {
+        guard !updating else { return }
+        updating = true
+        notice = nil
+        let result = await CLI.run(["run", "--force"], script: CLI.updates)
+        updating = false
+        readLocal()
+        if result.status != 0 {
+            notice = Notice(text: result.message.isEmpty ? "Update failed" : result.message, isError: true)
+        } else if result.message == "aktualizacja już trwa" {
+            notice = Notice(text: "An update is already running")
+        } else if let run = updates?.lastRun {
+            let packages = { (n: Int) in n == 1 ? "1 package" : "\(n) packages" }
+            notice = run.ok
+                ? Notice(text: run.updated == 0 ? "Everything was already up to date" : "Updated \(packages(run.updated))")
+                : Notice(text: "Updated \(packages(run.updated)), \(run.failed) failed: see the Updates card", isError: true)
         }
     }
 

@@ -24,6 +24,7 @@ enum CLI {
     static let devguard = directory + "/devguard.py"
     static let perf = directory + "/perf.py"
     static let sched = directory + "/sched.py"
+    static let updates = directory + "/updates.py"
     static let janitorState = directory + "/janitor-state.json"
     static let guardState = directory + "/devguard-state.json"
     static let guardConfig = directory + "/devguard.json"
@@ -32,9 +33,11 @@ enum CLI {
     static let perfState = directory + "/perf-state.json"
     static let schedState = directory + "/sched/state.json"
     static let depotState = directory + "/sched/depot.json"
+    static let updatesState = directory + "/updates-state.json"
     static let switchLog = directory + "/switch.log"
     static let janitorLog = directory + "/janitor.log"
     static let guardLog = directory + "/devguard.log"
+    static let updatesLog = directory + "/updates.log"
 
     /// The interpreter setup.sh links (uv's CPython), or the system one.
     static let python: String = {

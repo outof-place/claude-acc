@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Scheduler komend Go agentów: wpuszcza joby po pamięci zamiast jednego zamka na wszystko.
+"""Scheduler komend Go i JS agentów: wpuszcza joby po pamięci zamiast jednego zamka na wszystko.
 
   sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli]
                (--shell 'KOMENDA' | -- ARGV...)
   sched.py status [--json]
   sched.py classify (--shell 'KOMENDA' | -- ARGV...)
   sched.py depot [--max-age S] [--json]
+  sched.py wait [--max S] [--every S] -- 'WARUNEK'
+  sched.py rtk-excludes
 
 `run` klasyfikuje komendę (moduł, czasownik, zakres pakietów), przewiduje jej szczyt pamięci i
 czas z historii, a potem:
@@ -21,8 +23,11 @@ Hook PreToolUse (devguard.py admit) owija komendy agentów przez hook_rewrite().
 `depot` zapisuje do sched/depot.json biegi Depot CI całej organizacji, także te, które
 wystartowały poza schedulerem (bramka pushu, scripts/depot-ci.sh agentów); aplikacja woła go,
 dopóki panel jest otwarty.
+`wait` czeka na warunek najwyżej --max sekund (domyślnie 270), żeby subagent z 5-minutowym
+cache wołał go w kółko zamiast blokować się dłużej, niż żyje jego cache.
 """
 
+import functools  # bez kosztu: `re` i tak go ładuje
 import json
 import os
 import re
@@ -68,6 +73,7 @@ DEFAULTS = {
     "idle_floor_pct": 65,
     # organizacja Depot dla `depot` (pusta: domyślna organizacja CLI; potrzebna przy kilku)
     "depot_org": "",
+    "node": True,  # testy, buildy i typecheck JS w kolejce; false wyłącza
 }
 PUBLIC_CONFIG = (
     "headroom_gb",
@@ -118,6 +124,7 @@ GENERIC = {
     ("script", None): (8.0, 300),
 }
 SMALL_MODULES = ("auth-service",)  # cały moduł nigdy nie przekroczył 1,8 GB
+HANDLERS = "internal/handlers"  # jeden pakiet, a pamięci i czasu tyle co cały charter-service
 RACE_FACTOR = 1.4
 # klasy, które stary hak depot-heavy-go.sh wysyłał na Depot, i ich job Depot CI:
 # (moduł, rodzaj, zakres, tylko kompilacja) -> (job, rdzenie, p50 s)
@@ -466,11 +473,37 @@ def parse_go(argv):
     return verb, flags, pkgs, cdir
 
 
+def pattern_rel(pattern, module_dir, here):
+    """Ścieżka wzorca względem modułu, bez końcowego /... ("." = cały moduł); None, gdy wzorzec
+    ma ... w środku albo wychodzi poza moduł."""
+    if pattern.endswith("/..."):
+        base = pattern[:-4]
+    elif "..." in pattern:
+        return None
+    else:
+        base = pattern
+    if base.startswith((".", "/")):
+        rel = os.path.relpath(os.path.normpath(os.path.join(here, base)), module_dir)
+    else:
+        mod = module_path(module_dir)
+        if not mod or not (base == mod or base.startswith(mod + "/")):
+            return None
+        rel = base[len(mod) + 1 :] or "."
+    return None if rel == ".." or rel.startswith("../") else rel
+
+
 def scope_of(pkgs, module_dir, here):
+    """(zakres, szczegół). tree: cały moduł (`./...` w jego katalogu); subtree: wzorce z ... na
+    części modułu, szczegół to ich ścieżki względem modułu (wzorzec nierozwiązany zostaje jak
+    jest); pkgs: kilka pakietów; pkg albo handlers: jeden. Bez chodzenia po katalogach, bo
+    klasyfikacja idzie też w hooku."""
     if not pkgs:
         pkgs = ["."]
-    if any(p.endswith("...") for p in pkgs):
-        return "tree", "./..."
+    if any("..." in p for p in pkgs):
+        rels = [pattern_rel(p, module_dir, here) for p in pkgs]
+        if "." in rels:
+            return "tree", "./..."
+        return "subtree", " ".join(r if r is not None else p for r, p in zip(rels, pkgs))
     if len(pkgs) > 1:
         return "pkgs", " ".join(pkgs)
     p = pkgs[0]
@@ -480,11 +513,188 @@ def scope_of(pkgs, module_dir, here):
         rel = p.split("/", 1)[1] if "/" in p else p  # ścieżka importu: bez nazwy modułu
     rel = rel.strip("/")
     rel = "." if rel in ("", ".") else rel
-    return ("handlers" if rel == "internal/handlers" else "pkg"), rel
+    return ("handlers" if rel == HANDLERS else "pkg"), rel
+
+
+# ---------- JS: testy, buildy, typecheck ----------
+
+# narzędzie -> rodzaj joba (turbo: z nazwy zadania)
+NODE_TOOLS = {
+    "vitest": "test", "jest": "test", "playwright": "e2e", "next": "build", "tsc": "typecheck",
+    "vue-tsc": "typecheck", "eslint": "lint", "turbo": None, "vite": "build",
+}  # fmt: skip
+NODE_VERBS = {"playwright": ("test",), "next": ("build", "lint"), "vite": ("build",)}
+NODE_SCRIPTS = (
+    (re.compile(r"^(e2e|integration|playwright|test[:_-](e2e|integration|playwright))([:_-].*)?$"), "e2e"),
+    (re.compile(r"^(test|tests|unit|t|tst)([:_-].*)?$"), "test"),
+    (re.compile(r"^(typecheck|type-check|check-types|types|tsc)([:_-].*)?$"), "typecheck"),
+    (re.compile(r"^build([:_-].*)?$"), "build"),
+    (re.compile(r"^lint([:_-].*)?$"), "lint"),
+    (re.compile(r"^(check|verify|validate)([:_-].*)?$"), "check"),
+)  # fmt: skip
+# skrypty i flagi, które się nie kończą albo czekają na człowieka: nigdy w kolejce
+NODE_NEVER = re.compile(r"watch|dev|serve|start|preview|storybook|(^|[:_-])ui($|[:_-])")
+NODE_STOP_FLAGS = {"--watch", "--watchAll", "--ui", "--debug", "--version", "-v", "--help", "-h", "--init", "--print-config"}
+NODE_WATCH_SHORT = {"tsc": "-w", "vue-tsc": "-w", "vitest": "-w"}
+NODE_FILTER_FLAGS = {"-t", "--testNamePattern", "-g", "--grep", "--project"}
+NODE_PRIORS = {
+    "test": (3.0, 90), "e2e": (3.5, 180), "build": (4.0, 180),
+    "typecheck": (2.5, 60), "lint": (2.0, 60), "check": (3.0, 120),
+}  # fmt: skip
+TURBO_COMMANDS = {"prune", "login", "logout", "link", "unlink", "gen", "generate", "daemon", "ls", "info", "query", "telemetry", "bin", "scan", "watch"}
+# wyjątki dla hooka rtk ([hooks] exclude_commands): wszystko, co scheduler owija, i nic więcej
+# (test pilnuje obu stron); bez ^ rtk dopasowuje słowo, z ^ to wyrażenie na członie komendy
+RTK_EXCLUDES = (
+    "go",
+    "make",
+    "golangci-lint",
+    "govulncheck",
+    r"^(npx( -y| --yes)? |bunx |(pnpm|yarn|bun) (exec |dlx |x )?|npm exec (-- )?|\S*node_modules/\.bin/)?(vitest|jest|playwright|next|tsc|vue-tsc|eslint|turbo|vite)(\s|$)",
+    r"^(pnpm|yarn|npm|bun)( (-r|--recursive|-ws|--workspaces|-s|--silent|--if-present|--\S+=\S+|(-C|--dir|--prefix|--cwd|-F|--filter|--workspace|-w) \S+|-w))* ((run|run-script) )?(t|tst|test|tests|unit|e2e|integration|playwright|build|lint|typecheck|type-check|check-types|types|tsc|check|verify|validate)([:_-]\S*)?(\s|$)",
+)
+
+
+def script_kind(name):
+    if not name or NODE_NEVER.search(name):
+        return None
+    return next((kind for rx, kind in NODE_SCRIPTS if rx.match(name)), None)
+
+
+def node_filtered(args, verb_words=()):
+    """Czy bieg testów jest zawężony (pliki, -t, --grep): wtedy lżejszy niż cały pakiet."""
+    positional = [a for a in args if not a.startswith("-") and a not in verb_words]
+    return bool(positional) or any(a.split("=", 1)[0] in NODE_FILTER_FLAGS for a in args)
+
+
+def node_tool(words, base):
+    """Wywołanie narzędzia JS (vitest, jest, playwright test...): surowy job albo None."""
+    if not words:
+        return None
+    tool, args = os.path.basename(words[0]), words[1:]
+    if tool not in NODE_TOOLS or any(a.split("=", 1)[0] in NODE_STOP_FLAGS for a in args):
+        return None
+    if NODE_WATCH_SHORT.get(tool) in args:
+        return None
+    first = next((a for a in args if not a.startswith("-")), None)
+    if tool == "turbo":
+        tasks = [a for a in args if not a.startswith("-") and a != "run"]
+        if not tasks or tasks[0] in TURBO_COMMANDS:
+            return None
+        kind = script_kind(tasks[0])
+        return kind and dict(base, kind=kind, tool="turbo", all=True, filtered=False)
+    if tool == "vitest" and first in ("dev", "watch", "list", "init"):
+        return None
+    if tool in NODE_VERBS and first not in NODE_VERBS[tool]:
+        return None
+    kind = "lint" if (tool == "next" and first == "lint") else NODE_TOOLS[tool]
+    filtered = kind in ("test", "e2e") and node_filtered(args, ("run", "related", "bench", "test"))
+    return dict(base, kind=kind, tool=tool, filtered=filtered)
+
+
+def parse_node(words, here):
+    """Człon komendy z pracą JS: surowy job {kind, tool, dir, filtered, all, filter} albo None."""
+    prog = os.path.basename(words[0])
+    base = {"dir": here, "filtered": False, "all": False, "filter": None, "lang": "node"}
+    if prog in ("npx", "bunx"):
+        rest = words[1:]
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in ("-p", "--package") else rest[1:]
+        return node_tool(rest, base)
+    if prog not in ("pnpm", "yarn", "npm", "bun"):
+        return node_tool(words, base) if (prog in NODE_TOOLS or "node_modules/.bin/" in words[0]) else None
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        opt, _, val = words[i].partition("=")
+        valued = opt in ("-C", "--dir", "--prefix", "--cwd", "--filter", "-F", "--workspace") or (
+            opt == "-w" and prog == "npm"
+        )
+        if valued and not val and i + 1 < len(words):
+            val = words[i + 1]
+            i += 1
+        if opt in ("-C", "--dir", "--prefix", "--cwd") and val:
+            base["dir"] = os.path.normpath(os.path.join(here, os.path.expanduser(val)))
+        elif opt in ("--filter", "-F", "--workspace", "-w") and val:
+            base["filter"] = val
+        elif opt in ("-r", "--recursive", "--workspaces", "-ws"):
+            base["all"] = True
+        i += 1
+    rest = words[i:]
+    if not rest:
+        return None
+    cmd, args = rest[0], rest[1:]
+    if cmd in ("exec", "dlx", "x") or (prog == "npm" and cmd == "exec"):
+        return node_tool([a for a in args if a != "--"], base)
+    if prog == "bun" and cmd == "test":
+        if any(a.split("=", 1)[0] in NODE_STOP_FLAGS for a in args):
+            return None
+        return dict(base, kind="test", tool="bun", filtered=node_filtered(args))
+    if cmd in ("run", "run-script"):
+        script, args = (args[0], args[1:]) if args else (None, [])
+    elif prog == "npm":
+        if cmd not in ("test", "t", "tst"):
+            return None
+        script = "test"
+    elif cmd in NODE_TOOLS:
+        return node_tool(rest, base)
+    else:
+        script = cmd
+    kind = script_kind(script)
+    if not kind or any(a.split("=", 1)[0] in NODE_STOP_FLAGS for a in args):
+        return None
+    filtered = kind in ("test", "e2e") and node_filtered([a for a in args if a != "--"])
+    return dict(base, kind=kind, tool=script, filtered=filtered)
+
+
+def finish_node(raw):
+    pkg_dir = find_up(raw["dir"], "package.json", stop_at_git=True) if os.path.isdir(raw["dir"]) else None
+    if not pkg_dir:
+        return None
+    repo = find_repo(pkg_dir) or pkg_dir
+    rel = os.path.relpath(pkg_dir, repo)
+    detail = f"filter={raw['filter']}" if raw["filter"] else rel
+    cls = f"{os.path.basename(repo)}:{raw['kind']}:{detail}:{raw['tool']}"
+    cls += ":all" if raw["all"] else ""
+    cls += ":filtered" if raw["filtered"] else ""
+    label = " ".join(
+        shlex.quote(a) if re.search(r"[\s'\"$^*|&;]", a) else a for a in raw["argv"]
+    )
+    return {
+        "lang": "node",
+        "kind": raw["kind"],
+        "tool": raw["tool"],
+        "class": cls,
+        "module_name": os.path.basename(pkg_dir),
+        "module": rel,
+        "module_dir": pkg_dir,
+        "repo_dir": repo,
+        "repo": os.path.basename(repo),
+        "scope": "node",
+        "scope_detail": detail,
+        "compile": False,
+        "filtered": raw["filtered"],
+        "all": raw["all"],
+        "race": False,
+        "p_explicit": None,
+        "count1": False,
+        "flags": {},
+        "pkgs": [],
+        "argv": raw["argv"],
+        "go_dir": pkg_dir,
+        "label": label,
+    }
+
+
+def node_prior(job):
+    gb, s = NODE_PRIORS.get(job["kind"], (3.0, 120))
+    if job.get("all"):
+        gb, s = gb * 1.5, s * 2
+    if job.get("filtered"):
+        gb, s = max(1.0, gb * 0.5), s * 0.4
+    return round(gb, 2), round(s)
 
 
 def classify(command, cwd, argv=None):
-    """Job z komendy powłoki albo argv; None, gdy nie ma w niej pracy Go dla schedulera."""
+    """Job z komendy powłoki albo argv; None, gdy nie ma w niej pracy Go ani JS dla schedulera."""
     if argv is not None:
         if (
             len(argv) >= 3
@@ -502,6 +712,7 @@ def classify(command, cwd, argv=None):
             return None
     here = cwd
     found = []
+    node_on = bool(load_config().get("node", True))
     for words, _sep in segments:
         if not words:
             continue
@@ -550,11 +761,13 @@ def classify(command, cwd, argv=None):
                 "pkgs": [w for w in words[1:] if not w.startswith("-")],
                 "dir": here,
             }
+        elif node_on:
+            job = parse_node(words, here)
         if job:
             job["argv"] = words
             job["env"] = env
             found.append(job)
-    jobs = [j for j in (finish_job(j) for j in found) if j]
+    jobs = [j for j in ((finish_node if j.get("lang") == "node" else finish_job)(j) for j in found) if j]
     if not jobs:
         return None
     main = max(jobs, key=lambda j: prior(j, 4)[0])
@@ -614,6 +827,8 @@ def finish_job(raw):
         cls = f"{name}:make:{detail}"
     elif scope in ("pkg", "handlers"):
         cls = f"{name}:{kind}:pkg:{detail}"
+    elif scope == "subtree":
+        cls = f"{name}:{kind}:subtree:{detail}"
     else:
         cls = f"{name}:{kind}:{scope}"
     if race:
@@ -644,6 +859,7 @@ def finish_job(raw):
         "pkgs": raw["pkgs"],
         "argv": raw["argv"],
         "go_dir": raw["dir"],
+        "env": raw["env"],
         "label": label,
     }
 
@@ -690,14 +906,66 @@ def p_sensitive(job):
     )
 
 
+@functools.lru_cache(maxsize=16)
+def go_packages(root):
+    """Katalogi pakietów Go pod root, jak dla wzorca root/...: bez testdata, vendor, katalogów
+    zaczętych od . albo _ i zagnieżdżonych modułów (node_modules pominięte dla szybkości)."""
+    found = []
+    for d, subdirs, files in os.walk(root):
+        subdirs[:] = [
+            s for s in subdirs
+            if not s.startswith((".", "_"))
+            and s not in ("testdata", "vendor", "node_modules")
+            and not os.path.isfile(os.path.join(d, s, "go.mod"))
+        ]  # fmt: skip
+        if any(f.endswith(".go") for f in files):
+            found.append(d)
+    return tuple(found)
+
+
+def subtree_share(job):
+    """Część pakietów modułu objęta poddrzewem joba; 1.0, gdy wzorca nie da się rozwiązać."""
+    total = go_packages(job["module_dir"])
+    dirs = set()
+    for rel in job["scope_detail"].split():
+        root = os.path.join(job["module_dir"], rel)
+        if "..." in rel or not os.path.isdir(root):
+            return 1.0
+        dirs.update(go_packages(root))
+    return min(1.0, len(dirs) / len(total)) if total else 1.0
+
+
 def prior(job, p):
     """(GB, s) z pomiarów albo ostrożne wartości ogólne."""
+    if job.get("lang") == "node":
+        return node_prior(job)
     name, kind, scope, comp = (
         job["module_name"],
         job["kind"],
         job["scope"],
         job["compile"] or job.get("filtered", False),
     )
+    if scope == "subtree":
+        # między jednym pakietem a całym modułem, w proporcji do liczby pakietów; poddrzewo
+        # z internal/handlers (sam waży tyle co cały moduł) nie jest lżejsze od niego
+        share = subtree_share(job)
+        lo_gb, lo_s = base_prior(name, kind, "pkg", comp, p)
+        hi_gb, hi_s = base_prior(name, kind, "tree", comp, p)
+        gb = lo_gb + (hi_gb - lo_gb) * share
+        s = round(lo_s + (hi_s - lo_s) * share)
+        if any(r == HANDLERS or HANDLERS.startswith(r + "/") for r in job["scope_detail"].split()):
+            h_gb, h_s = base_prior(name, kind, "handlers", comp, p)
+            gb, s = max(gb, h_gb), max(s, h_s)
+    else:
+        gb, s = base_prior(name, kind, scope, comp, p)
+    if job.get("filtered"):
+        gb, s = gb * 1.2, s * 1.5  # kompilacja jak przy -run '^$' i kilka testów w procesie
+    if job["race"]:
+        gb, s = gb * RACE_FACTOR, s * 1.5
+    return round(gb, 2), s
+
+
+def base_prior(name, kind, scope, comp, p):
     if name in SMALL_MODULES and kind != "script":
         val = (
             (2.0, 90)
@@ -724,12 +992,7 @@ def prior(job, p):
             nearest = min(val, key=lambda k: abs(k - p))
             gb, s = val[nearest]
             val = (gb * p / nearest if p > nearest else gb, s)
-    gb, s = val
-    if job.get("filtered"):
-        gb, s = gb * 1.2, s * 1.5  # kompilacja jak przy -run '^$' i kilka testów w procesie
-    if job["race"]:
-        gb, s = gb * RACE_FACTOR, s * 1.5
-    return round(gb, 2), s
+    return val
 
 
 def read_history(limit_bytes=8 * 1024 * 1024):
@@ -810,8 +1073,84 @@ def depot_key(job):
     return (job["module_name"], job["kind"], job["scope"], comp)
 
 
+# flagi, które piszą plik u agenta: na Depot powstałby na zdalnej maszynie i nie wrócił
+OUTPUT_FLAGS = (
+    "-o", "-c", "-coverprofile", "-cpuprofile", "-memprofile", "-blockprofile", "-mutexprofile",
+    "-trace", "-outputdir",
+)  # fmt: skip
+# GOFLAGS z samymi tymi flagami nic nie zmienia na Depot (depot-exec i tak ustawia -p)
+DEPOT_SAFE_GOFLAGS = ("-p", "-count")
+
+
+def depot_blocker(job):
+    """Dlaczego job musi zostać na tym Macu, albo None. Depot dostaje drzewo repo (śledzone i
+    nieśledzone pliki bez .gitignore) pod inną ścieżką, bez zmiennych z komendy, i odsyła tylko
+    wyjście: ścieżka bezwzględna, z ~ albo $, względna poza repo albo ignorowana, zmienna
+    środowiska i plik zapisany przez -o czy -coverprofile dałyby tam inny wynik niż tutaj."""
+    if "depot_blocker" in job:
+        return job["depot_blocker"]
+    reason = None
+    flags = job.get("flags") or {}
+    env = job.get("env") or {}
+    written = [f for f in OUTPUT_FLAGS if f in flags]
+    goflags = (env.get("GOFLAGS") or "").split()
+    if written:
+        reason = f"{written[0]} writes a file on this Mac"
+    elif any(k != "GOFLAGS" for k in env):
+        name = next(k for k in env if k != "GOFLAGS")
+        reason = f"{name}=… does not reach Depot"
+    elif any(f.partition("=")[0] not in DEPOT_SAFE_GOFLAGS for f in goflags):
+        reason = "GOFLAGS does not reach Depot"
+    else:
+        reason = local_path_in(job)
+    job["depot_blocker"] = reason
+    return reason
+
+
+def local_path_in(job):
+    """Pierwszy argument komendy, który wskazuje plik spoza tego, co jedzie na Depot, albo None."""
+    repo, here = job["repo_dir"], job.get("go_dir") or job["repo_dir"]
+    inside = []
+    for word in list(job.get("argv") or [])[1:]:
+        for piece in re.split(r"[=,]", word):
+            if not piece or piece.startswith("-"):
+                continue
+            if piece.startswith(("/", "~", "$")):
+                return f"{word} is a path on this Mac"
+            if "/" not in piece and not piece.startswith(".."):
+                continue
+            path = os.path.normpath(os.path.join(here, piece.removesuffix("/...")))
+            rel = os.path.relpath(path, repo)
+            if rel == ".." or rel.startswith("../"):
+                return f"{word} points outside the repo"
+            if os.path.exists(path):
+                inside.append((rel, word))
+    if inside:
+        import subprocess
+
+        try:
+            r = subprocess.run(
+                ["git", "-C", repo, "check-ignore", "--stdin"],
+                input="\n".join(rel for rel, _ in inside),
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            ignored = set(r.stdout.split()) if r.returncode == 0 else set()
+        except (OSError, subprocess.SubprocessError):
+            ignored = set()
+        for rel, word in inside:
+            if rel in ignored:
+                return f"{word} is gitignored, so it stays on this Mac"
+    return None
+
+
 def depot_target(job, gb, wall, cfg, cache):
     """Dokąd na Depot i za ile: {target, job, cores, eta_s, units, cost_usd, argv, cwd} albo None."""
+    if job.get("lang") == "node":
+        return None  # Depot tu to tylko joby Go portivo
+    if depot_blocker(job):
+        return None
     repo = job["repo_dir"]
     etas = (cache.get("depot_eta") or {}).get("jobs") or {}
     ci = DEPOT_CI_JOBS.get(depot_key(job))
@@ -1065,7 +1404,7 @@ def count1_safe(job, cache):
 
 def uses_pg(job, cache):
     """Czy testy joba sięgają po Postgresa (dla depot-exec --with pg)."""
-    if job["kind"] != "test":
+    if job["kind"] != "test" or job.get("lang") == "node":
         return False
     if job["scope"] == "tree":
         return os.path.isdir(os.path.join(job["module_dir"], "internal/testhelpers"))
@@ -1284,40 +1623,56 @@ def plan(state, cfg, now):
 
     FIFO; głowa startuje, gdy się mieści, a gdy lokalnie nic nie biegnie: bez rezerwy na dev
     serwer, po 30 s czekania w ogóle. Za zablokowaną głową startują tylko małe joby, a gdy głowa
-    czeka dłużej niż starve_s, jej pamięć jest zarezerwowana i nikt jej nie wyprzedza."""
+    czeka dłużej niż starve_s, jej pamięć jest zarezerwowana i nikt jej nie wyprzedza.
+
+    Mały job (krótki i lekki: testy JS, jeden pakiet Go) wystarczy, że zmieści się w pamięci
+    dostępnej teraz: rezerwy długich jobów na wzrost, którego jeszcze nie ma, go nie blokują.
+    Liczą się tylko prognozy świeżo wpuszczonych małych jobów, bo te zajmą pamięć za chwilę.
+    Głowa czekająca dłużej niż starve_s zostawia sobie miejsce i w pamięci dostępnej teraz, a po
+    2 × starve_s rezerwacja jest twarda: strumień krótkich jobów nie zagłodzi dużego."""
     mem = state["memory"]
     free = mem["free_for_admission_gb"]
+    now_free = mem["available_gb"] - cfg["headroom_gb"] - sum(
+        max(0.0, (j.get("mem_predicted_gb") or 0) - (j.get("mem_now_gb") or 0))
+        for j in state["running"]
+        if j["where"] == "local" and j.get("small") and not j.get("paused")
+    )
     any_local = any(j["where"] == "local" for j in state["running"])
     pressure = mem.get("pressure", "normal")
     admitted = {}
     blocked = None
     reserve = 0.0
+    strict = False
     if pressure == "critical":
         return admitted
     for job in queue_order(state):
         if (job.get("route") or {}).get("choice") == "depot":
             continue
         need = job["mem_predicted_gb"]
-        if pressure == "warn" and need > 2.0:
-            blocked = blocked or job
-            continue
+        quick = bool(job.get("small")) and not strict and need <= now_free - reserve
         if blocked is None:
             spare = mem["available_gb"] - cfg["headroom_gb"]
             alone = not any_local and not admitted
             # sam na Macu: bez rezerwy na dev serwer, a po 30 s czekania nawet ponad pamięć
-            # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP)
-            if need <= free or (alone and (need <= spare or now - job["enqueued_at"] >= 30)):
+            # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP).
+            # Przy „warn” bez tego ostatniego: macOS trzyma go tu godzinami przy połowie wolnej
+            # pamięci, więc startuje to, co się mieści, ale nic ponad dostępną pamięć.
+            overcommit = pressure != "warn" and now - job["enqueued_at"] >= 30
+            if need <= free or quick or (alone and (need <= spare or overcommit)):
                 admitted[job["id"]] = ("fits", None)
                 free -= need
+                now_free -= need
                 any_local = True
                 continue
             blocked = job
             if now - job["enqueued_at"] > cfg["starve_s"]:
                 reserve = need
+                strict = now - job["enqueued_at"] > 2 * cfg["starve_s"]
             continue
-        if job.get("small") and need <= free - reserve:
+        if job.get("small") and (need <= free - reserve or quick):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
+            now_free -= need
     return admitted
 
 
@@ -1393,12 +1748,17 @@ def decide_route(state, job, gb, wall, cfg, cache):
                 text=f"Depot: needs {gb:.0f} GB, Mac max ~{max(0, mem['idle_max_gb']):.0f}",
             )
             return route, target
-        text = f"local: needs {gb:.0f} GB, no Depot route, runs when the Mac is free"
+        why_not = f"local only ({depot_blocker(job)})" if depot_blocker(job) else "local: no Depot route"
+        text = f"{why_not}: needs {gb:.0f} GB, runs when the Mac is free"
         return dict(base, choice="local", why="no_depot", text=text), None
     wait, _ = blockers_eta(state, {"mem_predicted_gb": gb})
     local_eta = wait + wall
     if not target:
-        text = f"local: waits {human_s(wait)}, no Depot route"
+        text = (
+            f"local only ({depot_blocker(job)}): waits {human_s(wait)}"
+            if depot_blocker(job)
+            else f"local: waits {human_s(wait)}, no Depot route"
+        )
         return dict(
             base,
             choice="local",
@@ -1440,8 +1800,6 @@ def update_queue_view(state, cfg):
         free = max(0.0, mem["free_for_admission_gb"])
         if mem.get("pressure") == "critical":
             code, text = "pressure", "paused: memory pressure is critical"
-        elif mem.get("pressure") == "warn" and job["mem_predicted_gb"] > 2:
-            code, text = "pressure", "waiting: memory pressure, only small jobs start"
         elif (
             head_blocked is not None
             and now - head_blocked["enqueued_at"] > cfg["starve_s"]
@@ -1635,7 +1993,7 @@ def cmd_run(args):
             )
     if job["kind"] == "test" and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
         job["uses_pg"] = uses_pg(job, cache)
-    if likely_heavy(job):
+    if likely_heavy(job) and job.get("lang") != "node":
         refresh_depot_eta(cache, job["repo_dir"])
     save_cache(cache)
     return schedule(entry, job, command, argv, opts, cfg, history, cache)
@@ -1820,7 +2178,7 @@ def run_local(entry, job, command, argv, cfg):
         and job["kind"] == "build"
         and "-o" not in job["flags"]
         and "-ldflags" not in job["flags"]
-        and job["scope"] in ("tree", "pkgs")
+        and job["scope"] in ("tree", "subtree", "pkgs")
     ):
         extra.append(
             "-ldflags=-w"
@@ -2100,7 +2458,43 @@ def requeue_local(entry, job, command, argv, opts, cfg, history, cache):
 # ---------- hook i status ----------
 
 
+def which(name):
+    """shutil.which bez importu shutil, który na Pythonie 3.9 ciągnie bz2 i threading: hook
+    pyta o rtk przy każdej owijanej komendzie."""
+    for folder in os.get_exec_path():
+        path = os.path.join(folder, name)
+        if os.access(path, os.X_OK) and not os.path.isdir(path):
+            return path
+    return None
+
+
 RECURSIVE_GREP = re.compile(r"(^|[\s;&|(])grep\s+(-[A-Za-z]*[rR][A-Za-z]*|--recursive)")
+
+def with_rtk(command):
+    """Komenda tak, jak przepisałby ją hook rtk bez naszych wyjątków: komendy schedulera są w jego
+    exclude_commands (dwa hooki z updatedInput na tej samej komendzie dają losowy wynik), więc
+    `rtk` dokładamy tu, w środku opakowania. `rtk rewrite` to jedno źródło jego reguł; config
+    z wyjątkami czyta z HOME, więc pytamy go z pustym HOME. Kod 3 („przepisz, ale zapytaj”,
+    bo tam nie widzi ustawień Claude) to dla nas zwykłe przepisanie."""
+    rtk = which("rtk")
+    if not rtk:
+        return command
+    import subprocess  # dopiero z rtk: bez niego hook nie płaci za ten import
+
+    home = os.path.join(STATE_DIR, "rtk-home")
+    try:
+        os.makedirs(home, exist_ok=True)
+        r = subprocess.run(
+            [rtk, "rewrite", command],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env=dict(os.environ, HOME=home, RTK_TELEMETRY_DISABLED="1"),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return command
+    out = (r.stdout or "").strip()
+    return out if r.returncode in (0, 3) and out else command
 
 
 def runner():
@@ -2142,7 +2536,7 @@ def hook_rewrite(event):
         parts += ["--agent", str(agent)]
     updated = dict(tool_input)
     updated["command"] = (
-        " ".join(shlex.quote(p) for p in parts) + " --shell " + shlex.quote(command)
+        " ".join(shlex.quote(p) for p in parts) + " --shell " + shlex.quote(with_rtk(command))
     )
     return {
         "hookSpecificOutput": {
@@ -2492,7 +2886,58 @@ def cmd_classify(args):
     return 0 if job else 1
 
 
-COMMANDS = {"run": cmd_run, "status": cmd_status, "classify": cmd_classify, "depot": cmd_depot}
+WAIT_MAX_S = 270  # krócej niż 5-minutowy cache subagenta, z zapasem na samo wywołanie
+
+
+def cmd_wait(args):
+    """Czeka, aż WARUNEK (komenda powłoki) skończy się kodem 0, najwyżej --max sekund. Kod 0:
+    spełniony; 75: jeszcze nie, zawołaj ponownie (każde wywołanie odświeża cache agenta)."""
+    if "--" not in args or not args[args.index("--") + 1 :]:
+        log("użycie: sched.py wait [--max S] [--every S] -- 'WARUNEK'")
+        return 64
+    opts, condition = args[: args.index("--")], args[args.index("--") + 1 :]
+    limit, every = float(WAIT_MAX_S), 5.0
+    try:
+        for flag, value in zip(opts[::2], opts[1::2]):
+            if flag == "--max":
+                limit = float(value)
+            elif flag == "--every":
+                every = float(value)
+    except ValueError:
+        log("--max i --every to liczby sekund")
+        return 64
+    import subprocess
+
+    command = condition[0] if len(condition) == 1 else " ".join(shlex.quote(a) for a in condition)
+    start = time.time()
+    while True:
+        done = subprocess.run(
+            ["/bin/sh", "-c", command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ).returncode == 0
+        waited = time.time() - start
+        if done:
+            print(f"gotowe po {human_s(waited)}")
+            return 0
+        if waited >= limit:
+            print(f"jeszcze nie po {human_s(waited)}: zawołaj ponownie (każde wywołanie odświeża cache agenta)")
+            return EXIT_TIMEOUT
+        time.sleep(max(0.05, min(every, limit - waited)))
+
+
+def cmd_rtk_excludes(_args):
+    """Linia `exclude_commands` do [hooks] w configu rtk: komendy, które owija scheduler."""
+    print("exclude_commands = [" + ", ".join(f"'{p}'" for p in RTK_EXCLUDES) + "]")
+    return 0
+
+
+COMMANDS = {
+    "run": cmd_run,
+    "status": cmd_status,
+    "classify": cmd_classify,
+    "wait": cmd_wait,
+    "rtk-excludes": cmd_rtk_excludes,
+    "depot": cmd_depot,
+}
 
 
 def main(argv):

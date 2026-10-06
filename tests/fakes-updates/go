@@ -1,0 +1,46 @@
+#!/usr/bin/python3
+"""Atrapa go: env GOBIN GOPATH, version -m, list -m -json mod@latest, install path@version."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("go", args)
+world = _world.load()
+bins = world["go"]
+
+if args[:1] == ["env"]:
+    print("")  # GOBIN pusty, jak domyślnie
+    print(os.path.join(os.environ["HOME"], "go"))
+    sys.exit(0)
+
+if args[:2] == ["version", "-m"]:
+    path = args[2]
+    b = bins.get(os.path.basename(path))
+    if not b:
+        print(f"{path}: could not read Go build info from {path}: unrecognized file format", file=sys.stderr)
+        sys.exit(1)
+    print(f"{path}: go1.26.0\n\tpath\t{b['path']}\n\tmod\t{b['module']}\t{b['installed']}\th1:abc=\n"
+          f"\tdep\tgolang.org/x/sys\tv0.30.0\th1:def=\n\tbuild\t-buildmode=exe")
+    sys.exit(0)
+
+if args[:3] == ["list", "-m", "-json"]:
+    module = args[3].rsplit("@", 1)[0]
+    b = next(b for b in bins.values() if b["module"] == module)
+    print(json.dumps({"Path": module, "Version": b["latest"], "Query": "latest"}, indent="\t"))
+    sys.exit(0)
+
+if args[:1] == ["install"]:
+    path, version = args[1].rsplit("@", 1)
+    name, b = next((n, b) for n, b in bins.items() if b["path"] == path)
+    if _world.fails(world, f"go {name}"):
+        print(f"go: {path}@{version}: verifying module: checksum mismatch", file=sys.stderr)
+        sys.exit(1)
+    b["installed"] = version
+    _world.save(world)
+    sys.exit(0)
+
+sys.exit(2)

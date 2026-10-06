@@ -8,15 +8,19 @@ pliku (SCHED_FAKE_MEMORY), więc wynik nie zależy od tego Maca. Nic nie dotyka 
 Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -220,6 +224,116 @@ class ClassifyTest(Paths):
         self.assertEqual(S.prior(opaque, 4), (8.0, 300))
 
 
+class SubtreeTest(Paths):
+    """`./x/...` obejmuje część modułu. Pomyłka, którą ten test łapie: wzorzec na jeden mały
+    pakiet przewidziany jak cały moduł (24 GB, 25 min) i wysłany na Depot do joba `full`, który
+    za ~$1,7 testuje cały moduł zamiast komendy agenta (portivo, 2026-10-05: 4 takie biegi)."""
+
+    PACKAGES = (
+        "cmd",
+        "internal/handlers",
+        "internal/handlers/e2e",
+        "internal/money",
+        "internal/moneyfmt",
+        "internal/worker/emailsend",
+        "internal/worker/emailsend/tmpl",
+    )
+    EMAILSEND = "internal/worker/emailsend"
+
+    def setUp(self):
+        super().setUp()
+        for pkg in self.PACKAGES:
+            write(os.path.join(self.charter, pkg, "x.go"), "package x\n")
+        write(os.path.join(self.charter, "internal/money/testdata/fixture.go"), "package fixture\n")
+
+    def test_part_of_the_module_is_a_subtree(self):
+        subtree = ("subtree", self.EMAILSEND)
+        cases = {
+            "cd apps/charter-service && go test -count=1 ./internal/worker/emailsend/...": subtree,
+            "cd apps/charter-service/internal/worker && go test ./emailsend/...": subtree,
+            "cd apps/charter-service/internal/worker/emailsend && go test ./...": subtree,
+            "cd apps/charter-service && go test charter-service/internal/worker/emailsend/...": subtree,
+            "cd apps/charter-service && go test ./internal/money/... ./internal/moneyfmt/...": (
+                "subtree",
+                "internal/money internal/moneyfmt",
+            ),
+            "cd apps/charter-service && go test ./...": ("tree", "./..."),
+            "cd apps/charter-service && go test charter-service/...": ("tree", "./..."),
+            "cd apps/charter-service && go test ./internal/money/... ./...": ("tree", "./..."),
+        }
+        for command, expected in cases.items():
+            j = self.job(command)
+            self.assertEqual((j["scope"], j["scope_detail"]), expected, command)
+        self.assertEqual(
+            self.job("cd apps/charter-service && go test ./internal/worker/emailsend/...")["class"],
+            "charter-service:test:subtree:internal/worker/emailsend",
+        )
+
+    def test_prior_grows_with_the_share_of_packages(self):
+        # 2 z 7 pakietów (testdata się nie liczy): między jednym pakietem (3 GB, 40 s) a całym
+        # modułem (24 GB, 1500 s), w proporcji
+        small = self.job("cd apps/charter-service && go test ./internal/worker/emailsend/...")
+        self.assertEqual(S.prior(small, 4), (9.0, 457))
+        # internal/handlers to sam w sobie 24 GB i 25 min: poddrzewo z nim nie może być lżejsze
+        for command in (
+            "cd apps/charter-service && go test ./internal/handlers/...",
+            "cd apps/charter-service && go test ./internal/...",
+        ):
+            self.assertEqual(S.prior(self.job(command), 4), (24.0, 1500), command)
+        # wzorca z ... w środku nie rozwiązujemy: ostrożnie, jak cały moduł
+        odd = self.job("cd apps/charter-service && go test ./internal/.../tmpl")
+        self.assertEqual(S.prior(odd, 4), (24.0, 1500))
+
+    def test_depot_runs_the_agents_command_not_the_full_suite(self):
+        command = "cd apps/charter-service && go test -count=1 ./internal/worker/emailsend/..."
+        small = self.job(command)
+        gb, wall = S.prior(small, 4)
+        target = S.depot_target(small, gb, wall, self.cfg, {})
+        self.assertEqual(target["target"], "depot-exec")
+        self.assertEqual(
+            target["argv"][-5:],
+            ["--", "go", "test", "-count=1", "./internal/worker/emailsend/..."],
+        )
+        st = self.state()
+        self.assertEqual(S.decide_route(st, small, gb, wall, self.cfg, {})[0]["choice"], "local")
+        tree = self.job("cd apps/charter-service && go test ./...")
+        self.assertEqual(S.depot_target(tree, 24.0, 1500, self.cfg, {})["job"], "full")
+
+
+class WaitTest(Paths):
+    """Subagent z 5-minutowym cache czeka na długą pracę krótkimi wywołaniami. Pomyłki, które ten
+    test łapie: czekanie dłuższe niż żyje cache (następne wywołanie zapisuje cały kontekst od
+    nowa), sukces przed spełnieniem warunku i wyjście, po którym agent nie wie, że ma wołać dalej."""
+
+    def wait(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = S.cmd_wait(list(args))
+        return rc, out.getvalue()
+
+    def test_returns_as_soon_as_the_condition_holds(self):
+        flag = os.path.join(self.dir, "done")
+        timer = threading.Timer(0.3, lambda: open(flag, "w").close())
+        timer.start()
+        self.addCleanup(timer.cancel)
+        start = time.time()
+        rc, out = self.wait("--max", "5", "--every", "0.1", "--", f"test -e {shlex.quote(flag)}")
+        self.assertEqual(rc, 0, out)
+        self.assertLess(time.time() - start, 3)
+
+    def test_stops_at_the_cap_and_says_to_call_again(self):
+        start = time.time()
+        rc, out = self.wait("--max", "0.5", "--every", "0.1", "--", "false")
+        self.assertEqual(rc, S.EXIT_TIMEOUT)
+        self.assertLess(time.time() - start, 2)
+        self.assertIn("ponownie", out)
+
+    def test_default_cap_fits_a_five_minute_cache(self):
+        rc, out = self.wait("--max", "x", "--", "true")
+        self.assertEqual(rc, 64)  # zły limit to błąd, nie czekanie bez końca
+        self.assertLess(S.WAIT_MAX_S, 300)
+
+
 class PredictTest(Paths):
     def test_priors_from_measurements(self):
         tree = self.job("cd apps/charter-service && go test -run '^$' ./...")
@@ -393,6 +507,35 @@ class RouteTest(Paths):
             S.decide_route(st, small, 5.3, 38, dear, {})[0]["choice"], "local"
         )
 
+    def test_local_files_keep_the_job_off_depot(self):
+        # Depot dostaje drzewo repo pod inną ścieżką, bez zmiennych z komendy, i nie odsyła plików:
+        # nakładka ze scratchpadu dawała tam exit 1 bez testów, czyli fałszywy czerwony wynik
+        st = self.state()
+        self.running(st, 18.0, wall=300)  # moneyfmt bez tego poszedłby na Depot (test wyżej)
+        here = "cd apps/charter-service && "
+        for command in (
+            "go test -overlay=/tmp/o.json ./internal/moneyfmt/",
+            "go test -overlay /tmp/o.json ./internal/moneyfmt/",
+            "go test -coverprofile=c.out ./internal/moneyfmt/",
+            "go test -modfile=../../../alt.mod ./internal/moneyfmt/",
+            "GOFLAGS=-overlay=$TMPDIR/o.json go test ./internal/moneyfmt/",
+            "FIXTURES=~/fx go test ./internal/moneyfmt/",
+            "go test ./internal/moneyfmt/ -args -golden=/tmp/g",
+        ):
+            job = self.job(here + command)
+            self.assertIsNone(S.depot_target(job, 3.0, 40, self.cfg, {}), command)
+            route, target = S.decide_route(st, job, 3.0, 40, self.cfg, {})
+            self.assertEqual((route["choice"], target), ("local", None), command)
+            self.assertIn("local only", route["text"], command)
+        # wzorzec -run ze slashem i samo -count w GOFLAGS to nie pliki: dalej Depot
+        clean = self.job(here + "GOFLAGS=-count=1 go test -run 'TestA/b' ./internal/moneyfmt/")
+        self.assertEqual(S.decide_route(st, clean, 3.0, 40, self.cfg, {})[0]["choice"], "depot")
+        # nie zmieści się nigdy: zamiast Depot zostaje lokalnie i mówi dlaczego
+        race = self.job(here + "go test -race -coverprofile=/tmp/c.out ./...")
+        route, target = S.decide_route(st, race, 33.6, 2250, self.cfg, {})
+        self.assertEqual((route["choice"], target), ("local", None))
+        self.assertIn("-coverprofile", route["text"])
+
     def test_no_depot_route(self):
         shutil.rmtree(os.path.join(self.repo, "scripts"))
         st = self.state()
@@ -492,19 +635,75 @@ class PlanTest(Paths):
         st = self.state()
         st["queue"] = [self.entry("vet", 13.7)]
         self.assertEqual(S.plan(st, self.cfg, time.time()), {"vet": ("fits", None)})
-        self.set_memory(60, pressure="warn")
-        st = self.state()
-        st["queue"] = [
-            self.entry("vet", 13.7, ago=3),
-            self.entry("tiny", 0.3, small=True),
-        ]
-        self.assertEqual(
-            S.plan(st, self.cfg, time.time()), {"tiny": ("overtake", "vet")}
-        )
         self.set_memory(60, pressure="critical")
         st = self.state()
         st["queue"] = [self.entry("tiny", 0.3, small=True)]
         self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+
+    def test_quick_small_jobs_use_memory_free_now(self):
+        # długi job trzyma rezerwę na wzrost, którego jeszcze nie ma; krótki mały job (testy JS,
+        # jeden pakiet Go) startuje w pamięci dostępnej teraz, zamiast czekać minutami na cudzą prognozę
+        st = self.state()  # level 60: 28,8 GB dostępne
+        st["running"].append(
+            {"id": "big", "where": "local", "label": "go test ./...", "mem_predicted_gb": 20.0,
+             "mem_now_gb": 2.0, "predicted_wall_s": 1500, "started_at": time.time()}
+        )
+        S.refresh_memory(st, self.cfg)  # wolne 20,8 - 18 rezerwy = 2,8
+        st["queue"] = [self.entry("vitest", 3.0, small=True), self.entry("vet", 13.7, ago=1)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vitest": ("overtake", "vet")})
+        # głowa czeka ponad starve_s: mały wyprzedza, jeśli zostawia jej miejsce w pamięci teraz,
+        # a po 2 × starve_s już nikt (strumień testów JS nie zagłodzi dużego joba Go)
+        st["queue"] = [self.entry("vet", 13.7, ago=150), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vitest": ("overtake", "vet")})
+        st["queue"] = [self.entry("vet", 23.0, ago=150), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})  # 24,8 - 23 < 3
+        st["queue"] = [self.entry("vet", 13.7, ago=300), self.entry("vitest", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        # świeżo wpuszczony mały job jeszcze nie zajął pamięci: liczy się jego prognoza
+        st["running"].append(
+            {"id": "q1", "where": "local", "label": "vitest", "mem_predicted_gb": 22.0,
+             "mem_now_gb": 0.0, "small": True, "predicted_wall_s": 60, "started_at": time.time()}
+        )
+        S.refresh_memory(st, self.cfg)
+        st["queue"] = [self.entry("vitest2", 3.0, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})  # 24,8 - 22 = 2,8 < 3
+        self.set_memory(60, pressure="critical")
+        st = self.state()
+        st["queue"] = [self.entry("tiny", 0.5, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+
+    def test_warn_pressure_admits_what_fits(self):
+        # macOS trzyma „warn” godzinami przy połowie wolnej pamięci: przy nim startuje to, co
+        # mieści się w wolnej pamięci, także kilka naraz; jeden naraz robił z kolejki stary zamek
+        self.set_memory(60, pressure="warn")  # 28,8 GB dostępne, wolne 20,8
+        st = self.state()
+        st["queue"] = [
+            self.entry("vet", 13.7, ago=3),
+            self.entry("build", 6.6, ago=2),
+            self.entry("tiny", 0.3, small=True),
+        ]
+        self.assertEqual(
+            S.plan(st, self.cfg, time.time()),
+            {"vet": ("fits", None), "build": ("fits", None), "tiny": ("fits", None)},
+        )
+        st["running"].append(
+            {"id": "vet", "where": "local", "mem_predicted_gb": 13.7, "mem_now_gb": 2.0}
+        )
+        st["queue"] = [self.entry("build", 6.6, ago=2)]
+        S.refresh_memory(st, self.cfg)  # wolne 20,8 - 11,7 rezerwy vet = 9,1
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"build": ("fits", None)})
+        self.set_memory(40, pressure="warn")  # 19,2 GB: vet nie mieści się z rezerwą na dev serwer
+        st = self.state()
+        st["queue"] = [self.entry("vet", 13.7, ago=3)]
+        self.assertEqual(
+            S.plan(st, self.cfg, time.time()), {"vet": ("fits", None)}
+        )  # sam na Macu: bez rezerwy na dev serwer
+        self.set_memory(50, pressure="warn")
+        st = self.state()
+        st["queue"] = [self.entry("huge", 24.0, ago=600)]
+        self.assertEqual(
+            S.plan(st, self.cfg, time.time()), {}
+        )  # przy presji nic ponad dostępną pamięć, nawet po długim czekaniu
 
 
 class Count1Test(Paths):
@@ -640,7 +839,7 @@ class HookTest(Paths):
         updated = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
         argv = shlex.split(updated["command"])
         self.assertEqual(argv[:6], [python, launcher, "sched", "run", "--via", "hook"])
-        self.assertEqual(argv[-2:], ["--shell", original])
+        self.assertEqual(argv[-2:], ["--shell", S.with_rtk(original)])
         self.assertIsNone(
             S.hook_rewrite(dict(event, tool_input=updated))
         )  # już owinięte
@@ -728,28 +927,233 @@ class HookTest(Paths):
         )
 
     def test_hook_loads_nothing_it_does_not_use(self):
-        """Hook idzie przy każdej komendzie Go: ctypes, subprocess i reszta czekają na `run`."""
+        """Hook idzie przy każdej komendzie Go: ctypes, subprocess i reszta czekają na `run`;
+        subprocess (z tym, co sam ładuje) dochodzi tylko po to, żeby zapytać rtk, gdy jest."""
         event = {
             "tool_name": "Bash",
             "cwd": self.repo,
             "tool_input": {"command": "cd apps/charter-service && go test ./..."},
         }
+        report = (
+            "heavy = ('ctypes', 'subprocess', 'hashlib', 'random', 'threading', 'signal', 'fcntl')\n"
+            "print(bool(out), [h for h in heavy if h in sys.modules])\n"
+        )
         code = (
             "import json, sys\n"
             "from importlib.machinery import SourceFileLoader\n"
             "m = type(sys)('acc_sched')\n"
             f"SourceFileLoader('acc_sched', {SCRIPT!r}).exec_module(m)\n"
-            f"out = m.hook_rewrite(json.loads({json.dumps(event)!r}))\n"
-            "heavy = ('ctypes', 'subprocess', 'hashlib', 'random', 'threading', 'signal', 'fcntl')\n"
-            "print(bool(out), [h for h in heavy if h in sys.modules])\n"
+            f"out = m.hook_rewrite(json.loads({json.dumps(event)!r}))\n" + report
+        )
+        path = os.environ.get("PATH", "")
+        no_rtk = os.pathsep.join(
+            d for d in path.split(os.pathsep) if not os.path.exists(os.path.join(d, "rtk"))
         )
         done = subprocess.run(
             [sys.executable, "-I", "-S", "-c", code],
             capture_output=True,
             text=True,
             check=True,
+            env=dict(os.environ, PATH=no_rtk),
         )
         self.assertEqual(done.stdout.strip(), "True []")
+        if shutil.which("rtk"):
+            # z rtk dochodzi sam subprocess z tym, co on ładuje w tej wersji Pythona
+            alone = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", "import subprocess, sys\nout = True\n" + report],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            done = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", code],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(done.stdout.strip(), alone.stdout.strip())
+            self.assertIn("subprocess", done.stdout)
+
+
+class RtkTest(Paths):
+    """Hook rtk ma komendy schedulera w exclude_commands, więc `rtk` dokłada scheduler, pytając
+    `rtk rewrite` z pustym HOME (bez naszych wyjątków): jedno źródło reguł rtk. Pomyłki, które ten
+    test łapie: nasze wyjątki wpadające do zapytania (wtedy rtk nic nie przepisuje), wynik z kodem
+    1 albo błędem wzięty za przepisanie, i hook bez rtk w środku."""
+
+    def fake_rtk(self, rc, out):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw))
+            return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+        return calls, run
+
+    def test_asks_rtk_without_our_exclusions(self):
+        calls, run = self.fake_rtk(3, "rtk go test ./...\n")
+        with mock.patch.object(S, "which", return_value="/opt/homebrew/bin/rtk"), \
+                mock.patch("subprocess.run", side_effect=run):
+            self.assertEqual(S.with_rtk("go test ./..."), "rtk go test ./...")
+        argv, kw = calls[0]
+        self.assertEqual(argv, ["/opt/homebrew/bin/rtk", "rewrite", "go test ./..."])
+        self.assertNotEqual(kw["env"]["HOME"], os.environ.get("HOME"))
+        self.assertTrue(kw["env"]["HOME"].startswith(S.STATE_DIR))
+
+    def test_keeps_the_command_when_rtk_has_nothing(self):
+        for rc, out in ((1, ""), (0, ""), (2, "garbage")):
+            calls, run = self.fake_rtk(rc, out)
+            with mock.patch.object(S, "which", return_value="/x/rtk"), \
+                    mock.patch("subprocess.run", side_effect=run):
+                self.assertEqual(S.with_rtk("go run ./cmd/x"), "go run ./cmd/x", rc)
+        with mock.patch.object(S, "which", return_value=None):
+            self.assertEqual(S.with_rtk("go test ./..."), "go test ./...")
+        with mock.patch.object(S, "which", return_value="/x/rtk"), mock.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired("rtk", 3)
+        ):
+            self.assertEqual(S.with_rtk("go test ./..."), "go test ./...")
+
+    @unittest.skipUnless(shutil.which("rtk"), "rtk nie jest zainstalowane")
+    def test_real_rtk_rewrites_go_and_node(self):
+        self.assertEqual(S.with_rtk("go test ./..."), "rtk go test ./...")
+        self.assertEqual(
+            S.with_rtk("cd apps/web && npx vitest run src/a.test.ts"),
+            "cd apps/web && rtk vitest src/a.test.ts",
+        )
+        self.assertEqual(S.with_rtk("go run ./cmd/x"), "go run ./cmd/x")
+
+    def test_hook_runs_rtk_inside_the_wrapper(self):
+        original = "cd apps/charter-service && go test ./internal/money/ 2>&1 | tail -5"
+        event = {"tool_name": "Bash", "cwd": self.repo, "tool_input": {"command": original}}
+        inner = "cd apps/charter-service && rtk go test ./internal/money/ 2>&1 | tail -5"
+        with mock.patch.object(S, "with_rtk", return_value=inner):
+            updated = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+        argv = shlex.split(updated["command"])
+        self.assertEqual(argv[-2:], ["--shell", inner])
+        # wnętrze z rtk klasyfikuje się tak samo jak komenda agenta
+        self.assertEqual(
+            S.classify(argv[-1], self.repo)["class"], S.classify(original, self.repo)["class"]
+        )
+
+
+def make_node_repo(root, depot_exec=True):
+    os.makedirs(os.path.join(root, ".git"))
+    write(os.path.join(root, "package.json"), '{"name": "shop", "private": true}')
+    write(os.path.join(root, "pnpm-workspace.yaml"), "packages:\n  - apps/*\n")
+    write(os.path.join(root, "apps/web/package.json"), '{"name": "web"}')
+    write(os.path.join(root, "apps/web/src/a.test.ts"), "")
+    if depot_exec:
+        write(os.path.join(root, "scripts/depot-exec.sh"), FAKE_DEPOT_EXEC, 0o755)
+
+
+class NodeTest(Paths):
+    """Testy, buildy i typecheck JS idą przez tę samą kolejkę co Go, w każdym projekcie z
+    package.json. Pomyłki, które ten test łapie: dev serwer, tryb watch albo instalacja w kolejce
+    (agent czekałby na coś, co się nie kończy), job JS na Depot, wyjątek rtk, który nie pokrywa
+    owiniętej komendy (dwa hooki z updatedInput, losowy wynik), i wyjątek, który zabiera rtk
+    komendzie spoza kolejki."""
+
+    WRAPPED = {
+        "cd apps/web && npx vitest run": "shop:test:apps/web:vitest",
+        "cd apps/web && pnpm vitest run src/a.test.ts": "shop:test:apps/web:vitest:filtered",
+        "cd apps/web && pnpm exec playwright test --grep login 2>&1 | tail -20": "shop:e2e:apps/web:playwright:filtered",
+        "cd apps/web && npm run build": "shop:build:apps/web:build",
+        "cd apps/web && next build": "shop:build:apps/web:next",
+        "pnpm -C apps/web test": "shop:test:apps/web:test",
+        "pnpm --filter web test:unit": "shop:test:filter=web:test:unit",
+        "pnpm typecheck": "shop:typecheck:.:typecheck",
+        "pnpm -r lint": "shop:lint:.:lint:all",
+        "turbo run build test": "shop:build:.:turbo:all",
+        "cd apps/web && tsc --noEmit -p tsconfig.json": "shop:typecheck:apps/web:tsc",
+        "cd apps/web && ./node_modules/.bin/jest": "shop:test:apps/web:jest",
+        "cd apps/web && bun test": "shop:test:apps/web:bun",
+        "cd apps/web && CI=1 npm test": "shop:test:apps/web:test",
+        "cd apps/web && yarn e2e": "shop:e2e:apps/web:e2e",
+    }
+    LEFT_ALONE = (
+        "pnpm dev",
+        "pnpm install",
+        "pnpm add -D vitest",
+        "cd apps/web && npx vitest --watch",
+        "cd apps/web && pnpm test:watch",
+        "cd apps/web && npx playwright show-report",
+        "npx playwright install chromium",
+        "cd apps/web && next dev",
+        "tsc --version",
+        "cd apps/web && npx tsc -w",
+        "echo 'pnpm test'",
+        "SCHED_OFF=1 pnpm test",
+        "npx prettier --check .",
+        "git status",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.shop = os.path.join(self.dir, "shop")
+        make_node_repo(self.shop)
+
+    def test_node_work_is_classified(self):
+        for command, cls in self.WRAPPED.items():
+            j = S.classify(command, self.shop)
+            self.assertIsNotNone(j, command)
+            self.assertEqual(j["class"], cls, command)
+            self.assertEqual(j["lang"], "node", command)
+
+    def test_dev_watch_and_installs_stay_out(self):
+        for command in self.LEFT_ALONE:
+            self.assertIsNone(S.classify(command, self.shop), command)
+        outside = os.path.join(self.dir, "no-package")
+        os.makedirs(outside)
+        self.assertIsNone(S.classify("npx vitest run", outside))  # bez package.json
+
+    def test_switch_off_in_config(self):
+        with open(S.CONFIG_PATH, "w") as f:
+            json.dump({"node": False}, f)
+        self.assertIsNone(S.classify("cd apps/web && npx vitest run", self.shop))
+        self.assertIsNotNone(S.classify("cd apps/charter-service && go vet ./...", self.repo))
+
+    def test_priors_and_learning(self):
+        full = S.classify("cd apps/web && npx vitest run", self.shop)
+        one = S.classify("cd apps/web && pnpm vitest run src/a.test.ts", self.shop)
+        gb, s = S.prior(full, 4)
+        self.assertLess(S.prior(one, 4)[0], gb)  # jeden plik testów lżejszy niż cały pakiet
+        self.assertLess(gb, self.cfg["small_gb"])  # pakiet testów JS to mały job: wyprzedza Go
+        rows = [{"where": "local", "class": full["class"], "peak_gb": 0.5, "wall_s": 3.0, "p": None}] * 3
+        self.assertEqual(S.predict(full, 4, rows)[2], "history:3")
+
+    def test_never_routed_to_depot(self):
+        job = S.classify("cd apps/web && npx vitest run", self.shop)
+        self.assertIsNone(S.depot_target(job, 30.0, 3000, self.cfg, {}))
+        with mock.patch.object(S, "go_list", side_effect=AssertionError("go list dla JS")):
+            self.assertFalse(S.uses_pg(job, {}))
+            self.assertFalse(S.count1_safe(job, {}))
+        self.assertFalse(S.likely_heavy(job))
+
+    def rtk_excluded(self, segment):
+        pats = []
+        for p in S.RTK_EXCLUDES:
+            pats.append(re.compile(p if p.startswith("^") else r"^" + re.escape(p) + r"($|\s)"))
+        return any(r.search(segment) for r in pats)
+
+    def test_rtk_exclusions_cover_what_we_wrap_and_nothing_else(self):
+        for command in self.WRAPPED:
+            words = [S.strip_prefix(w)[1] for w, _ in S.split_segments(command) if w]
+            wrapped = [" ".join(w) for w in words if w and S.parse_node(w, self.shop)]
+            self.assertTrue(wrapped, command)
+            for g in wrapped:
+                self.assertTrue(self.rtk_excluded(g), g)
+        for command in ("pnpm install", "pnpm add -D vitest", "npx prettier --check .",
+                        "git status", "npm ls", "yarn why react", "pnpm list"):
+            self.assertFalse(self.rtk_excluded(command), command)
+
+    def test_hook_wraps_node_commands(self):
+        event = {"tool_name": "Bash", "cwd": self.shop,
+                 "tool_input": {"command": "cd apps/web && pnpm test 2>&1 | tail -5"}}
+        with mock.patch.object(S, "with_rtk", side_effect=lambda c: c):
+            out = S.hook_rewrite(event)
+        argv = shlex.split(out["hookSpecificOutput"]["updatedInput"]["command"])
+        self.assertEqual(argv[:4], ["/usr/bin/python3", S.SELF, "run", "--via"])
+        self.assertEqual(argv[-1], "cd apps/web && pnpm test 2>&1 | tail -5")
 
 
 class StateTest(Paths):

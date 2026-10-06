@@ -1,0 +1,52 @@
+#!/usr/bin/python3
+"""Atrapa brew: update, outdated --json=v2, upgrade --formula/--cask w formacie Homebrew 7."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("brew", args)
+world = _world.load()
+brew = world["brew"]
+
+if args[:1] == ["update"]:
+    if _world.fails(world, "brew update"):
+        print("Error: Failed to download https://formulae.brew.sh/api/formula.jws.json", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+
+if args[:1] == ["outdated"]:
+    out = {"formulae": [], "casks": []}
+    for name, f in brew["formulae"].items():
+        if f["installed"] != f["latest"]:
+            out["formulae"].append({
+                "name": name, "installed_versions": [f["installed"]], "current_version": f["latest"],
+                "pinned": bool(f.get("pinned")), "pinned_version": f["installed"] if f.get("pinned") else None})
+    for name, c in brew["casks"].items():
+        if c["installed"] != c["latest"]:
+            out["casks"].append({"name": name, "installed_versions": [c["installed"]], "current_version": c["latest"]})
+    print(json.dumps(out, indent=2))
+    sys.exit(0)
+
+if args[:1] == ["upgrade"]:
+    kind = "casks" if "--cask" in args else "formulae"
+    rc = 0
+    for name in [a for a in args[1:] if not a.startswith("--")]:
+        item = brew[kind][name]
+        if item.get("pinned"):
+            continue
+        if _world.fails(world, f"brew {name}"):
+            print("==> Upgrading " + name)
+            print("Error: Failure while executing; `/usr/bin/sudo -u root -E -- /bin/rm -rf /Applications/x.app` exited with 1.\n"
+                  "sudo: a terminal is required to read the password", file=sys.stderr)
+            rc = 1
+            continue
+        print(f"==> Upgrading {name}\n  {item['installed']} -> {item['latest']}")
+        item["installed"] = item["latest"]
+    _world.save(world)
+    sys.exit(rc)
+
+sys.exit(2)

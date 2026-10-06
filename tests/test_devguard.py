@@ -60,6 +60,7 @@ def unit(key, fp_gb=1.0, cwd=None, **attrs):
         watched=False,
         agent_working=False,
         start=0,
+        started=NOW - 3600,
         ports=[],
     )
     for name, value in attrs.items():
@@ -68,9 +69,11 @@ def unit(key, fp_gb=1.0, cwd=None, **attrs):
     return u
 
 
-def world(*units, level=0, reasons=()):
+def world(*units, level=0, reasons=(), fsevents_restart=0):
     pressure = types.SimpleNamespace(level=level, ram=48 * GB, reasons=list(reasons))
-    return types.SimpleNamespace(now=NOW, pressure=pressure, units=list(units))
+    return types.SimpleNamespace(
+        now=NOW, pressure=pressure, units=list(units), fsevents_restart=fsevents_restart
+    )
 
 
 def plans(world_, state=None, **extra):
@@ -280,6 +283,36 @@ class PinCommandTest(unittest.TestCase):
     def test_bad_arguments(self):
         self.assertEqual(dg.cmd_pin({}, []), 2)
         self.assertEqual(dg.cmd_pin({}, [":3747", "--soon"]), 2)
+
+
+class FseventsRestartTest(unittest.TestCase):
+    """Po restarcie fseventsd obserwatory plików sprzed niego są głuche: serwer bez restartu
+    nie widzi edycji agenta. Pomyłki, które ten test łapie: restart serwera postawionego już
+    po restarcie demona (pętla bez końca) i ruszanie serwera chronionego."""
+
+    def test_servers_started_before_the_restart_are_recycled(self):
+        old = unit("old", started=NOW - 600, quiet=0)
+        fresh = unit("fresh", started=NOW - 30, quiet=0)
+
+        got = plans(world(old, fresh, fsevents_restart=NOW - 60))
+
+        self.assertEqual(got, [("old", "recycle")])
+
+    def test_protected_and_unmanaged_servers_stay(self):
+        mine = unit("mine", started=NOW - 600, quiet=0, protected=True)
+        agents = unit("agents", started=NOW - 600, quiet=0, recyclable=False)
+
+        self.assertEqual(plans(world(mine, agents, fsevents_restart=NOW - 60)), [])
+
+    def test_pinned_is_recycled_unless_no_restart(self):
+        # przypięcie chroni przed zatrzymaniem, nie przed restartem; --no-restart przed obydwoma
+        held = unit("held", started=NOW - 600, quiet=0, protected=True, pin=PIN_HOLD, ports=[3747])
+        kept = unit("kept", started=NOW - 600, quiet=0, protected=True, pin=PIN_KEEP, ports=[3748])
+
+        self.assertEqual(plans(world(held, kept, fsevents_restart=NOW - 60)), [("kept", "recycle")])
+
+    def test_no_restart_no_recycle(self):
+        self.assertEqual(plans(world(unit("old", started=NOW - 600, quiet=0))), [])
 
 
 class PressureTest(unittest.TestCase):
@@ -510,7 +543,8 @@ class GuardTest(unittest.TestCase):
         self.assertEqual([c["pid"] for c in snap["units"][0]["clients"]], [os.getpid()])
 
     def run_guard(self, *args, stdin=None):
-        env = dict(os.environ, HOME=self.home, DEVGUARD_ORCA="")
+        env = dict(os.environ, HOME=self.home, DEVGUARD_ORCA="",
+                   CLAUDE_ACC_FSGUARD_STATE=os.path.join(self.home, "fsguard.json"))
         done = subprocess.run(
             ["/usr/bin/python3", SCRIPT, *args],
             input=stdin,
@@ -621,9 +655,26 @@ class GuardTest(unittest.TestCase):
             argv = shlex.split(updated["command"])
             self.assertIn("run", argv)
             self.assertEqual(argv[argv.index("--via") + 1], "hook")
-            self.assertEqual(argv[-2:], ["--shell", command])
+            # z rtk na PATH scheduler sam wstawia rtk w środku (hook rtk ma Go w wyjątkach)
+            inner = ("rtk " + command) if shutil.which("rtk") else command
+            self.assertEqual(argv[-2:], ["--shell", inner])
         self.assertIsNone(self.admit("go version", self.go_module("svc")))
         self.assertIsNone(self.admit("rtk git status", self.go_module("svc")))
+
+    def test_admit_wraps_node_commands_in_the_scheduler(self):
+        # testy JS w każdym projekcie z package.json; pnpm idzie szybką ścieżką, vitest (ma w sobie
+        # "vite") pełną; dev serwer i instalacja zostają poza kolejką
+        root = os.path.join(self.home, "shop")
+        os.makedirs(os.path.join(root, ".git"), exist_ok=True)
+        with open(os.path.join(root, "package.json"), "w") as f:
+            f.write('{"name": "shop"}')
+        for command in ("pnpm test 2>&1 | tail -5", "npx vitest run"):
+            out = self.admit(command, root)
+            self.assertIsNotNone(out, command)
+            argv = shlex.split(out["updatedInput"]["command"])
+            self.assertEqual(argv[argv.index("--via") + 1], "hook", command)
+            self.assertIn("vitest" if "vitest" in command else "pnpm test", argv[-1])
+        self.assertIsNone(self.admit("pnpm install", root))
 
     @unittest.skipUnless(os.path.exists(os.path.join(ROOT, "acc.py")), "brak acc.py")
     def test_running_guard_is_found_by_its_lock_under_the_launcher(self):
@@ -648,7 +699,7 @@ class GuardTest(unittest.TestCase):
     def test_words_are_the_fast_path_lists(self):
         words = json.loads(self.run_guard("words"))
         self.assertEqual(
-            words, {"dev": list(entry.DEV_WORDS), "go": list(entry.GO_WORDS)}
+            words, {"dev": list(entry.DEV_WORDS), "sched": list(entry.SCHED_WORDS)}
         )
 
 
@@ -892,7 +943,7 @@ class AdmitFastPathTest(unittest.TestCase):
             {"tool_name": "Bash", "cwd": cwd, "tool_input": {"command": command}}
         )
 
-    def admit_in_clean_python(self, command, cwd="/w/mono"):
+    def admit_in_clean_python(self, command, cwd="/w/mono", env=None):
         """(wyjście hooka, ciężkie moduły, które załadował) w czystym interpreterze (-I -S)."""
         code = (
             "import io, sys\n"
@@ -908,6 +959,7 @@ class AdmitFastPathTest(unittest.TestCase):
             capture_output=True,
             text=True,
             check=True,
+            env=env,
         )
         *out, loaded = done.stdout.splitlines()
         return "\n".join(out), [m for m in loaded.split(",") if m]
@@ -926,9 +978,19 @@ class AdmitFastPathTest(unittest.TestCase):
             os.makedirs(os.path.join(root, ".git"))
             with open(os.path.join(root, "go.mod"), "w") as f:
                 f.write("module x\n")
-            out, loaded = self.admit_in_clean_python("go test ./...", cwd=root)
-        self.assertIn("updatedInput", json.loads(out)["hookSpecificOutput"])
-        self.assertEqual(loaded, ["json", "re"])
+            path = os.environ.get("PATH", "")
+            no_rtk = os.pathsep.join(
+                d for d in path.split(os.pathsep) if not os.path.exists(os.path.join(d, "rtk"))
+            )
+            out, loaded = self.admit_in_clean_python(
+                "go test ./...", cwd=root, env=dict(os.environ, PATH=no_rtk)
+            )
+            self.assertIn("updatedInput", json.loads(out)["hookSpecificOutput"])
+            self.assertEqual(loaded, ["json", "re"])
+            if shutil.which("rtk"):
+                # scheduler pyta rtk o przepisanie, więc dochodzi tylko subprocess
+                _, loaded = self.admit_in_clean_python("go test ./...", cwd=root)
+                self.assertEqual(loaded, ["json", "re", "subprocess"])
 
     def test_escaped_json_still_reaches_the_dev_server_check(self):
         raw = self.event("pnpm dev").replace("dev", "\\u0064ev")

@@ -16,6 +16,9 @@ struct Snapshot: Decodable {
     let switchedAt: Double?
     /// Account selected in Orca's menu. Auto-switch then stands still and switching is blocked.
     let orcaSelected: String?
+    /// The limit pause: no account has headroom, so sessions wind down to a checkpoint.
+    /// Missing from older scripts, which decodes as no pause.
+    let pause: Pause?
     let accounts: [Account]
 
     var active: Account? { accounts.first { $0.active } }
@@ -25,6 +28,14 @@ struct Snapshot: Decodable {
         others.compactMap { account in account.queue.map { (account, $0) } }.min { $0.1 < $1.1 }?.0
     }
     var anyNeedsLogin: Bool { accounts.contains { $0.status == .needsLogin } }
+}
+
+/// `pause.json` as the script writes it; the hooks in Claude Code sessions read the same file.
+struct Pause: Decodable {
+    let since: Double
+    let account: String
+    /// When an account has headroom again, the earliest of their resets; nil when the API gave none.
+    let resumeAt: Double?
 }
 
 struct Thresholds: Decodable {
@@ -103,6 +114,51 @@ struct JanitorState: Decodable {
     /// A sweep in progress; a crashed script can leave the mark, so only a fresh one counts.
     let runningSince: Double?
     let alerts: [Alert]?
+}
+
+// MARK: - Updates (`updates-state.json`, written by updates.py)
+
+struct UpdatesState: Decodable {
+    struct Package: Decodable, Hashable {
+        let name: String
+        let from: String?
+        let to: String?
+        let error: String?
+        /// The installer wanted an admin password, which a background run can't type.
+        let admin: Bool?
+        /// The command that retries it by hand, in Terminal.
+        let retry: String?
+    }
+
+    /// One package manager in the last run: Homebrew, npm, Go, or Python, which is only checked.
+    struct Step: Decodable, Identifiable {
+        let name: String
+        let label: String
+        let ok: Bool
+        let updated: [Package]
+        let failed: [Package]
+        let held: [Package]?
+        let outdated: [Package]?
+        let error: String?
+        let reportOnly: Bool?
+
+        var id: String { name }
+    }
+
+    struct Run: Decodable {
+        let at: Double
+        let ok: Bool
+        let updated: Int
+        let failed: Int
+    }
+
+    let lastRun: Run?
+    let lastSuccess: Double?
+    /// The 4:30 launchd run that will be due next.
+    let nextRun: Double?
+    /// A run in progress; a crashed script can leave the mark, so only a fresh one counts.
+    let runningSince: Double?
+    let steps: [Step]?
 }
 
 struct DiskSpace {

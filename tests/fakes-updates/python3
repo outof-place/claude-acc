@@ -1,0 +1,15 @@
+#!/usr/bin/python3
+"""Atrapa Pythona z pip: list --outdated --format=json; każde inne polecenie tylko zapisane."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("python3", args)
+if args[:3] == ["-m", "pip", "list"] and "--outdated" in args:
+    print(json.dumps(_world.load()["pip"]))
+    sys.exit(0)
+sys.exit(0)

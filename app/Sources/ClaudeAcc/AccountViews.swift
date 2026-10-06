@@ -8,6 +8,9 @@ struct ActiveAccountCard: View {
     var body: some View {
         Card("Claude Code", symbol: "terminal.fill") {
             if let snapshot = store.snapshot {
+                if let pause = snapshot.pause {
+                    PauseNotice(store: store, pause: pause)
+                }
                 if let active = snapshot.active {
                     ActiveAccount(store: store, snapshot: snapshot, account: active)
                 } else {
@@ -83,6 +86,54 @@ private struct ActiveAccount: View {
             }
         }
         .animation(.smooth(duration: 0.32), value: showDetails)
+    }
+}
+
+/// The limit pause: every account is out of headroom, so the hooks told the running sessions
+/// to finish their step, save their state and wait. They wake on their own when limits recover;
+/// the button lifts the pause sooner, until limits recover and run out again.
+private struct PauseNotice: View {
+    let store: Store
+    let pause: Pause
+    @Environment(\.now) private var now
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "pause.circle.fill")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Sessions paused at a checkpoint").font(.callout.weight(.semibold))
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack {
+                Text("Since \(Format.moment(pause.since, now: now))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Resume Now", systemImage: "play.fill") { Task { await store.resumePaused() } }
+                    .panelButton()
+                    .controlSize(.small)
+                    .disabled(store.resuming)
+                    .help("Wake the paused sessions now. The pause comes back only after limits recover and run out again.")
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: .rect(cornerRadius: 16, style: .continuous))
+    }
+
+    private var detail: String {
+        let wake = pause.resumeAt.map {
+            "They wake up on their own around \(Format.moment($0, now: now)) (\(Format.until($0, now: now)))."
+        } ?? "They wake up on their own once an account has headroom again."
+        return "No account has headroom. Sessions finish their current step, save their state to TASKS.md and wait, and new subagents are held. "
+            + wake
     }
 }
 
@@ -350,6 +401,8 @@ private struct AccountRow: View {
     let isOpen: Bool
     let toggle: () -> Void
     @State private var hovering = false
+    /// Measured once the button shows; the guess keeps the first fade close.
+    @State private var switchWidth: CGFloat = 34
     @Environment(\.now) private var now
 
     var body: some View {
@@ -360,6 +413,10 @@ private struct AccountRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Switch sits over the end of the address, not in place of the usage: the bars
+                // stay readable under the pointer and the row keeps its height
+                .mask(alignment: .trailing) { fade }
+                .overlay(alignment: .trailing) { switchButton }
             if isNext { Chip("Next", tint: Format.violet) }
             if account.lastResort { Chip("Backup") }
             trailing
@@ -368,7 +425,7 @@ private struct AccountRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .help(isOpen ? "" : caption)
-        .background(hovering || isOpen ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .rect(cornerRadius: 14, style: .continuous))
+        .background(isHovered || isOpen ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear), in: .rect(cornerRadius: 14, style: .continuous))
         .contentShape(.rect(cornerRadius: 14, style: .continuous))
         .onTapGesture(perform: toggle)
         .onHover { hovering = $0 }
@@ -380,6 +437,45 @@ private struct AccountRow: View {
             .disabled(store.busy != nil || account.status == .needsLogin || switchBlocked)
             Button("Sign In Again", systemImage: "person.badge.key") { Task { await store.login(account) } }
                 .disabled(store.busy != nil)
+        }
+    }
+
+    private var isHovered: Bool {
+        hovering || store.previewHoverAccount == account.id
+    }
+
+    private var offersSwitch: Bool {
+        guard isHovered, !switchBlocked, account.status != .needsLogin else { return false }
+        switch store.busy {
+        case .switching(let email), .loggingIn(let email): return email != account.email
+        case nil: return true
+        }
+    }
+
+    /// The address fades out where the button covers it; without the button it's fully drawn.
+    private var fade: some View {
+        HStack(spacing: 0) {
+            Rectangle()
+            LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
+                .frame(width: offersSwitch ? 14 : 0)
+            Color.clear
+                .frame(width: offersSwitch ? switchWidth : 0)
+        }
+    }
+
+    @ViewBuilder private var switchButton: some View {
+        if offersSwitch {
+            // icon only: the address is narrow, and it should still say which account this is
+            Button { Task { await store.switchTo(account) } } label: {
+                Label("Switch", systemImage: "arrow.triangle.swap").labelStyle(.iconOnly)
+            }
+                .panelButton()
+                .controlSize(.small)
+                .disabled(store.busy != nil)
+                .help("Switch to this account")
+                .fixedSize()
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { switchWidth = $0 }
+                .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .trailing)))
         }
     }
 
@@ -423,18 +519,12 @@ private struct AccountRow: View {
                     .panelButton(prominent: true)
                     .controlSize(.small)
                     .disabled(store.busy != nil)
-            } else if hovering && !switchBlocked {
-                Button("Switch", systemImage: "arrow.triangle.swap") { Task { await store.switchTo(account) } }
-                    .panelButton()
-                    .controlSize(.small)
-                    .disabled(store.busy != nil)
-                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
             } else if account.session == nil && account.weekly == nil {
                 Text("No data").font(.caption).foregroundStyle(.secondary)
             } else {
                 HStack(spacing: 10) {
-                    MiniUsage(label: "5h", used: account.session?.used, stale: account.status != .ok)
-                    MiniUsage(label: "wk", used: account.weekly?.used, stale: account.status != .ok)
+                    MiniUsage(label: "5h", window: account.session, stale: account.status != .ok)
+                    MiniUsage(label: "wk", window: account.weekly, stale: account.status != .ok)
                 }
                 .transition(.opacity)
             }
@@ -444,10 +534,12 @@ private struct AccountRow: View {
 
 private struct MiniUsage: View {
     let label: String
-    let used: Double?
+    let window: UsageWindow?
     let stale: Bool
+    @Environment(\.now) private var now
 
     var body: some View {
+        let used = window?.used
         let tint = stale || (used ?? 0) < 1 ? Color.secondary : Format.tint(used)
         VStack(alignment: .trailing, spacing: 3) {
             HStack(spacing: 3) {
@@ -459,6 +551,20 @@ private struct MiniUsage: View {
             .font(.caption2.weight(.semibold))
             UsageBar(fraction: (used ?? 0) / 100, tint: stale ? .secondary : Format.tint(used), height: 4)
                 .frame(width: 64)
+            // time to the reset; an unused 5h window has none (it starts on first use), but the
+            // line keeps its height so the bars of all rows stay aligned
+            HStack(spacing: 2) {
+                if let reset = window?.resetsAt {
+                    Image(systemName: "arrow.clockwise")
+                        .imageScale(.small)
+                    Text(Format.left(reset, now: now))
+                        .monospacedDigit()
+                } else {
+                    Text(" ")
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
         }
     }
 }

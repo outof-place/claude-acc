@@ -14,7 +14,7 @@ import os
 import sys
 from importlib.machinery import SourceFileLoader
 
-SCRIPTS = ("accswitch", "devguard", "janitor", "perf", "sched")
+SCRIPTS = ("accswitch", "devguard", "janitor", "perf", "sched", "updates")
 
 
 def main():

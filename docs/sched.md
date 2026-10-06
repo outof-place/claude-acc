@@ -1,9 +1,29 @@
-# Scheduler Go: stan dla panelu i historia biegów
+# Scheduler Go i JS: stan dla panelu i historia biegów
 
-`sched.py` wpuszcza komendy Go agentów (build, vet, test, lint, cele make) po pamięci zamiast
-jednego zamka na wszystko. Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse
-(`devguard.py admit`) sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje.
-Pomiary, z których wzięły się liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
+`sched.py` wpuszcza ciężkie komendy agentów po pamięci zamiast jednego zamka na wszystko: Go
+(build, vet, test, lint, cele make) i JS (testy, e2e, buildy, typecheck, lint, w każdym projekcie z
+`package.json`). Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse (`devguard.py admit`)
+sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje. Pomiary, z których wzięły się
+liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
+
+Presja pamięci jądra (`kern.memorystatus_vm_pressure_level`): przy `critical` nic nie startuje,
+przy `warn` startuje to, co mieści się w wolnej pamięci (także kilka jobów naraz), ale bez furtki
+„sam na Macu po 30 s ponad pamięć”. macOS potrafi trzymać `warn` godzinami przy połowie wolnej
+pamięci, a jeden job naraz robił z kolejki stary zamek: czekanie dłuższe niż 5 minut kasuje też
+cache promptu subagenta.
+
+Zakres joba: `tree` to cały moduł (`./...` w jego katalogu), `subtree` to wzorce z `...` na części
+modułu (`./internal/push/...` albo `./...` w podkatalogu), `pkg` i `handlers` to jeden pakiet, a `pkgs`
+kilka. Przewidywanie dla `subtree` leży między jednym pakietem a całym modułem, w proporcji do liczby
+pakietów (bez `testdata`, `vendor` i zagnieżdżonych modułów); poddrzewo z `internal/handlers` waży co
+najmniej tyle co on. Na Depot `subtree` idzie przez `depot-exec` z komendą agenta, bo joby CI
+(`full`, `handlers`) testują stały zestaw pakietów.
+
+Mały job (`small`, niżej) startuje, gdy mieści się w pamięci dostępnej teraz, nawet jeśli
+`free_for_admission_gb` jest zjedzone przez rezerwy długich jobów na wzrost, którego jeszcze nie ma.
+Od tej pamięci odejmują się tylko prognozy świeżo wpuszczonych małych jobów. Głowa kolejki czekająca
+dłużej niż `starve_s` zostawia sobie miejsce i tutaj, a po `2 × starve_s` jej rezerwacja jest twarda:
+żaden mały job jej już nie wyprzedza, więc strumień krótkich testów nie zagłodzi dużego.
 
 Pliki w `~/.local/share/claude-acc/sched/`:
 
@@ -72,7 +92,7 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | pole | znaczenie |
 |---|---|
 | `id` | `j-<epoch>-<4 hex>` |
-| `class` | `<moduł>:<czasownik>:<zakres>[:race][:compile]`, np. `charter-service:vet:tree`, `charter-service:test:pkg:internal/handlers:compile` |
+| `class` | Go: `<moduł>:<czasownik>:<zakres>[:race][:compile]`, np. `charter-service:vet:tree`, `charter-service:test:pkg:internal/handlers:compile`; JS: patrz sekcja JS |
 | `kind` | `build`, `vet`, `test`, `lint`, `make`, `generate`, `run`, `other` |
 | `label` | komenda Go bez otoczki (`cd`, `rtk proxy`, potoki), do wyświetlenia |
 | `module` | katalog modułu Go względem repo, np. `apps/charter-service` |
@@ -120,6 +140,13 @@ Trasa minimalizuje `czas do wyniku + λ × jednostki Depot`:
    `local_eta_s` to czekanie (aż przewidywany koniec blokujących jobów zwolni pamięć) plus bieg
    lokalnie; `depot_eta_s` to p50 z `scripts/depot-cost.py eta --json` dla tej klasy Depot razem
    z przygotowaniem; `units = cores / 2 × minuty Depot`.
+
+Na Depot nigdy nie idzie komenda, która tam dałaby inny wynik niż tutaj. Depot dostaje drzewo repo
+(pliki śledzone i nieśledzone bez `.gitignore`) pod inną ścieżką, bez zmiennych z komendy, i odsyła
+tylko wyjście. Lokalnie zostaje więc komenda ze ścieżką bezwzględną, z `~` albo `$`, ze ścieżką
+względną poza repo albo ignorowaną, z flagą piszącą plik (`-o`, `-c`, `-coverprofile` i inne
+profile, `-trace`, `-outputdir`), ze zmienną w prefiksie albo z `GOFLAGS` innym niż `-p`/`-count`.
+Trasa mówi wtedy `local only (<powód>)`, także gdy job nie zmieści się na pustym Macu.
 
 | pole | znaczenie |
 |---|---|
@@ -212,4 +239,45 @@ pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ci�
 depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)
 count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
 depot_org            ""     organizacja Depot dla `sched.py depot`; pusta: domyślna organizacja CLI
+node                 true   testy, buildy i typecheck JS w kolejce
 ```
+
+## JS
+
+Hook owija komendy, które kończą się same i zjadają pamięć: `vitest`, `jest`, `playwright test`,
+`next build`, `vite build`, `tsc`, `vue-tsc`, `eslint`, `turbo run`, także przez `npx`, `bunx`,
+`pnpm|yarn|bun exec|dlx`, `npm exec` i `node_modules/.bin/`, oraz skrypty menedżera pakietów
+(`pnpm test`, `npm run test:unit`, `yarn build`, `bun run typecheck`, `pnpm -r --filter web test`),
+których nazwa pasuje do rodzaju: `test`, `e2e`, `build`, `typecheck`, `lint`, `check`. Nigdy:
+skrypty i flagi, które się nie kończą albo czekają na człowieka (`dev`, `watch`, `serve`, `start`,
+`preview`, `storybook`, `--ui`, `-w` w `tsc` i `vitest`), instalacje i wszystko poza katalogiem z
+`package.json` (szukanym w górę, do `.git`).
+
+Klasa: `<repo>:<rodzaj>:<pakiet albo filter=X>:<narzędzie>[:all][:filtered]`, np.
+`shop:test:apps/web:vitest`. `all` to bieg na całym monorepo (`-r`, `--workspaces`, każde
+`turbo run`), `filtered` to wybrane testy (`-t`, `--grep`, `--project`, pliki w argumentach). Do pierwszych
+biegów klasy przewidywanie bierze się z tabeli (GB, sekundy): `test` 3,0/90, `e2e` 3,5/180, `build`
+4,0/180, `typecheck` 2,5/60, `lint` 2,0/60, `check` 3,0/120; `all` razy 1,5 GB i 2 czasu, `filtered`
+połowa GB (najmniej 1) i 0,4 czasu. Potem p90 z historii, jak w Go. Joby JS biegną tylko lokalnie:
+nie idą na Depot i nie dostają Postgresa. `"node": false` w `config.json` wyłącza całą tę część.
+
+## `sched.py wait`
+
+`sched.py wait [--max S] [--every S] -- 'WARUNEK'` sprawdza WARUNEK (komendę powłoki) co `--every`
+sekund (5) i kończy się kodem 0, gdy WARUNEK zwróci 0, albo kodem 75 po `--max` sekundach (270).
+Domyślny limit jest krótszy niż 5-minutowy cache promptu subagenta Claude Code: agent, który czeka
+w pętli wywołań `wait`, odświeża cache przy każdym, zamiast pisać cały kontekst od nowa po jednym
+długim `sleep`. Agent z cache godzinnym podaje większe `--max`. Zły argument: kod 64.
+
+## rtk
+
+Hook rtk (`rtk-rewrite.sh`) też przepisuje komendy, które owija scheduler. Dwa hooki PreToolUse z
+`updatedInput` na tej samej komendzie dają losowy wynik, więc na Macu z rtk te komendy idą w jego
+wyjątki, w `~/Library/Application Support/rtk/config.toml`, w sekcji `[hooks]`. Linię
+`exclude_commands` drukuje `sched.py rtk-excludes`; test pilnuje, żeby wyjątki obejmowały wszystko,
+co scheduler owija, i nic więcej (rtk dalej skraca `pnpm install` czy `git`).
+
+W środku opakowania `with_rtk` pyta `rtk rewrite` o tę samą komendę z pustym `HOME`, czyli bez
+naszych wyjątków, więc reguły rtk mają jedno źródło i agent dalej dostaje krótkie wyjście. Gdy rtk
+nie ma albo nic nie przepisuje, komenda zostaje bez zmian. Na Depot idzie komenda bez opakowań,
+czyli bez rtk.

@@ -1,0 +1,143 @@
+{
+ "generated_at": 1790432097.435127,
+ "active_email": "main@example.com",
+ "foreign_runtime": false,
+ "thresholds": {
+  "session_left": 5,
+  "weekly_left": 3
+ },
+ "forecast": {
+  "session": null,
+  "weekly": {
+   "rate": 1.1,
+   "at_reset": 71.0,
+   "switch_at": null
+  }
+ },
+ "api_backoff_until": null,
+ "last_tick": 1790432047.435127,
+ "switched_at": 1790421297.435127,
+ "pause": {
+  "episode": "1790431317",
+  "since": 1790431317,
+  "account": "main@example.com",
+  "reason": "main@example.com: tydzie\u0144 52%, sesja 3%",
+  "resume_at": 1790439657
+ },
+ "accounts": [
+  {
+   "id": "demo-1",
+   "email": "main@example.com",
+   "real_email": "main@example.com",
+   "tier": "Max 20x",
+   "active": true,
+   "last_resort": false,
+   "status": "ok",
+   "note": "",
+   "usable": false,
+   "queue": null,
+   "session": {
+    "used": 97,
+    "resets_at": 1790439657.435127
+   },
+   "weekly": {
+    "used": 48,
+    "resets_at": 1790795697.435127
+   },
+   "data_age": 40,
+   "renews_at": 1792073697.435127,
+   "subscription_status": "active",
+   "subscription_since": "2025-03-15"
+  },
+  {
+   "id": "demo-2",
+   "email": "side-project@example.com",
+   "real_email": "side-project@example.com",
+   "tier": "Max 20x",
+   "active": false,
+   "last_resort": false,
+   "status": "ok",
+   "note": "",
+   "usable": false,
+   "queue": null,
+   "session": {
+    "used": 0,
+    "resets_at": null
+   },
+   "weekly": {
+    "used": 99,
+    "resets_at": 1790615697.435127
+   },
+   "data_age": 40,
+   "renews_at": 1791382497.435127,
+   "subscription_status": "active",
+   "subscription_since": "2025-06-07"
+  },
+  {
+   "id": "demo-3",
+   "email": "work@example.com",
+   "real_email": "work@example.com",
+   "tier": "Max 5x",
+   "active": false,
+   "last_resort": true,
+   "status": "ok",
+   "note": "",
+   "usable": false,
+   "queue": null,
+   "session": {
+    "used": 0,
+    "resets_at": null
+   },
+   "weekly": {
+    "used": 97,
+    "resets_at": 1790867697.435127
+   },
+   "data_age": 40,
+   "renews_at": 1790950497.435127,
+   "subscription_status": "active",
+   "subscription_since": "2024-11-20"
+  },
+  {
+   "id": "demo-4",
+   "email": "spare@example.com",
+   "real_email": "spare@example.com",
+   "tier": "Max 20x",
+   "active": false,
+   "last_resort": false,
+   "status": "ok",
+   "note": "",
+   "usable": false,
+   "queue": null,
+   "session": {
+    "used": 0,
+    "resets_at": null
+   },
+   "weekly": {
+    "used": 99,
+    "resets_at": 1790478897.435127
+   },
+   "data_age": 40,
+   "renews_at": 1790604897.435127,
+   "subscription_status": "active",
+   "subscription_since": "2025-08-01"
+  },
+  {
+   "id": "demo-5",
+   "email": "old-laptop@example.com",
+   "real_email": "old-laptop@example.com",
+   "tier": "Max 20x",
+   "active": false,
+   "last_resort": false,
+   "status": "needs_login",
+   "note": "",
+   "usable": false,
+   "queue": null,
+   "session": null,
+   "weekly": null,
+   "data_age": 40,
+   "renews_at": 1792505697.435127,
+   "subscription_status": "active",
+   "subscription_since": "2025-01-09"
+  }
+ ]
+}

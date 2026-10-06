@@ -903,6 +903,82 @@ class HookWrapTest(Isolated):
         )
 
 
+class PauseHooksTest(Isolated):
+    """hook.py (pauza limitów) i Ultra piszą do tego samego settings.json: żadne nie
+    może zabrać drugiemu jego wpisów ani cofnąć ich przy swoim cofnięciu."""
+
+    EVENTS = ("PostToolUse", "PreToolUse", "UserPromptSubmit", "Stop", "StopFailure")
+
+    def setUp(self):
+        super().setUp()
+        import hook
+
+        self.hook = hook
+        # jak w prawdziwej instalacji: wrapper szybkiego npx leży w ~/.local/share/claude-acc/hooks
+        self.hooks_dir = os.path.join(self.dir, ".local/share/claude-acc/hooks")
+        patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.write(self.claude, claude_settings())
+        with open(self.claude, "a") as f:
+            f.write("\n")
+        self.original = self.text(self.claude)
+        self.tweaks = [perf.tweak(n) for n in ("claude-hooks-async", "fast-npx-hooks", "node-compile-cache")]
+
+    def pause_hooks(self, install):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.hook.run_install([self.claude], install), 0)
+
+    def ours(self):
+        data = self.read(self.claude)
+        return {
+            e: [g for g in data["hooks"][e] if any(self.hook.ours(h) for h in g["hooks"])]
+            for e in self.EVENTS
+        }
+
+    def ultra_on(self, cfg=None):
+        return [t.apply(cfg or self.cfg, FakeSystem({}))[0] for t in self.tweaks]
+
+    def ultra_off(self, records):
+        for t, record in reversed(list(zip(self.tweaks, records))):
+            t.undo(record, FakeSystem({}))
+
+    def test_ultra_never_makes_pause_hooks_async_or_wrapped(self):
+        # hook w tle (async) nie dostarcza additionalContext ani odmowy: pauza by
+        # ucichła, a sesje pracowałyby do ściany
+        self.pause_hooks(True)
+        broad = dict(
+            self.cfg,
+            async_hooks=self.cfg["async_hooks"] + [{"event": e, "match": "claude-acc"} for e in self.EVENTS],
+            npx_fast_hooks=self.cfg["npx_fast_hooks"] + ["claude-acc/hook.py"],
+        )
+
+        self.ultra_on(broad)
+
+        expected = {e: [g] for e, g in self.hook.entries().items()}
+        self.assertEqual(self.ours(), expected)
+        post = self.read(self.claude)["hooks"]["PostToolUse"][1]["hooks"]
+        self.assertIs(post[0]["async"], True)  # cavemem: Ultra zadziałało obok
+
+    def test_pause_hooks_and_ultra_come_off_in_any_order(self):
+        self.pause_hooks(True)
+        records = self.ultra_on()
+        self.pause_hooks(False)
+        data = self.read(self.claude)
+        self.assertIs(data["hooks"]["Stop"][0]["hooks"][0]["async"], True)
+        self.assertIn("NODE_COMPILE_CACHE", data["env"])
+        self.assertTrue(data["hooks"]["PostToolUse"][0]["hooks"][0]["command"].startswith(self.hooks_dir))
+        self.ultra_off(records)
+        self.assertEqual(self.text(self.claude), self.original)
+
+        records = self.ultra_on()
+        self.pause_hooks(True)
+        self.ultra_off(records)
+        self.assertEqual({e: len(g) for e, g in self.ours().items()}, dict.fromkeys(self.EVENTS, 1))
+        self.pause_hooks(False)
+        self.assertEqual(self.text(self.claude), self.original)
+
+
 class NpxShimTest(unittest.TestCase):
     """Atrapa npx na prawdziwych plikach: narzędzie z node_modules/.bin wyżej w drzewie,
     brak narzędzia, inne wywołania przekazane prawdziwemu npx."""

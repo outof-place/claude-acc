@@ -1,0 +1,42 @@
+#!/usr/bin/python3
+"""Atrapa npm: outdated -g --json (kod 1, gdy jest co aktualizować), view name@range, install -g."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("npm", args)
+world = _world.load()
+packages = world["npm"]
+
+if args[:3] == ["outdated", "-g", "--json"]:
+    out = {
+        name: {"current": p["installed"], "wanted": p["latest"], "latest": p["latest"], "dependent": "global",
+               "location": f"/opt/homebrew/lib/node_modules/{name}"}
+        for name, p in packages.items() if p["installed"] != p["latest"]
+    }
+    print(json.dumps(out, indent=2))
+    sys.exit(1 if out else 0)
+
+if args[:1] == ["view"]:
+    name, wanted = args[1].rsplit("@", 1)
+    # kolejność z rejestru, nie posortowana
+    matching = [v for v in packages[name]["versions"] if v.split(".")[0] == wanted]
+    print(json.dumps(matching[0] if len(matching) == 1 else matching, indent=2))
+    sys.exit(0)
+
+if args[:2] == ["install", "-g"]:
+    name, version = args[2].rsplit("@", 1)
+    if _world.fails(world, f"npm {name}"):
+        print("npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/" + name + "\n"
+              "npm error A complete log of this run can be found in: /tmp/npm.log", file=sys.stderr)
+        sys.exit(1)
+    packages[name]["installed"] = version
+    _world.save(world)
+    print(f"changed 1 package in 2s")
+    sys.exit(0)
+
+sys.exit(2)

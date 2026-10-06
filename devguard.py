@@ -43,7 +43,7 @@ Komendy:
   pins                  przypięcia, ich powody i terminy
   admit                 hook PreToolUse (Bash) dla Claude Code; zdarzenie czyta z stdin
   words                 słowa, od których komenda idzie do `admit` dalej niż szybka ścieżka,
-                        jako JSON {"dev": [...], "go": [...]} dla natywnego claude-acc-hook
+                        jako JSON {"dev": [...], "sched": [...]} dla natywnego claude-acc-hook
 """
 
 # Ten plik to tylko wejście. Hook `admit` idzie przy każdym poleceniu Bash każdego agenta, a
@@ -56,7 +56,12 @@ import os
 import sys
 
 DEV_WORDS = ("dev", "vite", "expo", "serve")
-GO_WORDS = ("go ", "golangci-lint", "make", "govulncheck")
+# słowa, bez których komenda nie ma pracy dla schedulera (Go i JS); fałszywy alarm to tylko
+# klasyfikacja w sched.py, która odpowie None
+SCHED_WORDS = (
+    "go ", "golangci-lint", "make", "govulncheck", "vitest", "jest", "playwright", "next ",
+    "tsc", "eslint", "turbo", "pnpm", "npm ", "npx ", "yarn", "bun ", "bunx", "node_modules/.bin/",
+)  # fmt: skip
 
 # komenda stawiająca dev serwer, po zdjęciu opakowań (zmienne, rtk proxy, npx, pnpm exec).
 # Wzorce to tekst: `re` kompiluje je przy pierwszym użyciu, więc komenda bez słowa od dev
@@ -78,7 +83,7 @@ NESTED = r"""(?:--command|\b(?:ba|z)?sh\s+-c)[\s=](?:"((?:[^"\\]|\\.)*)"|'([^']*
 
 
 def sched_rewrite(event):
-    """Komenda Go agenta owinięta w scheduler (sched.py obok tego pliku): wyjście hooka z
+    """Komenda Go albo JS agenta owinięta w scheduler (sched.py obok tego pliku): wyjście hooka z
     updatedInput albo None. Jedyny hook, który przepisuje komendy Bash; nigdy nie blokuje."""
     try:
         from importlib.machinery import SourceFileLoader
@@ -133,14 +138,14 @@ def admit(raw):
 
     Idzie przy każdym poleceniu każdego agenta, więc kończy się jak najwcześniej. Słowa to
     minimum, które ma każda komenda pasująca do START (dev, vite, expo, webpack serve), i
-    każda praca Go dla schedulera. Najpierw szuka ich w surowym JSON-ie: kodowanie JSON
+    każda praca Go i JS dla schedulera. Najpierw szuka ich w surowym JSON-ie: kodowanie JSON
     zmienia tylko znaki z odwrotnym ukośnikiem, a żadne z tych słów go nie ma, więc słowo
     nieobecne w tekście zdarzenia (bez ucieczek \\u) nie ma się skąd wziąć w komendzie, a
     `json` z `re` w ogóle się nie ładują. Fałszywy alarm (słowo w ścieżce, w /dev/null) idzie
     dalej i odpada na wzorcach; do strażnika (devguard_core) trafia tylko komenda, która
     naprawdę stawia dev serwer.
     """
-    if "\\u" not in raw and not any(w in raw for w in DEV_WORDS + GO_WORDS):
+    if "\\u" not in raw and not any(w in raw for w in DEV_WORDS + SCHED_WORDS):
         return 0
     import json
 
@@ -158,10 +163,10 @@ def admit(raw):
 
             sys.stdin = io.StringIO(raw)
             return core().main(["admit"])
-    elif not any(word in command for word in GO_WORDS):
+    elif not any(word in command for word in SCHED_WORDS):
         return 0
     # bez dev serwera komenda idzie do schedulera, bez strażnika; ta ze słowem od dev serwera
-    # także bez słowa od Go, jak dotąd po pełnej ścieżce
+    # także bez słowa od schedulera, jak dotąd po pełnej ścieżce
     out = sched_rewrite(event)
     if out:
         print(json.dumps(out))
@@ -185,7 +190,7 @@ def main(argv):
         # jedno źródło list dla obu frontów: setup.sh zapisuje to do hook-words.json
         import json
 
-        print(json.dumps({"dev": list(DEV_WORDS), "go": list(GO_WORDS)}))
+        print(json.dumps({"dev": list(DEV_WORDS), "sched": list(SCHED_WORDS)}))
         return 0
     return core().main(argv)
 
