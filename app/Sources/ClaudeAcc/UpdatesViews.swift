@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// Homebrew, npm, Go, Python and Claude Code kept current by updates.py: when it last worked, what each package
-/// manager did in that run, and a button to run it now.
+/// Homebrew, npm, Go, Python and Claude Code kept current by updates.py: when it last worked, what
+/// each package manager did in that run, and a button to run it now.
 struct UpdatesCard: View {
     let store: Store
     @Environment(\.now) private var now
@@ -131,7 +131,7 @@ private struct UpdateStepRow: View {
     }
 
     private var detail: String {
-        if step.error != nil { return "didn't update" }
+        if step.error != nil { return "didn't run" }
         var parts = [step.updated.isEmpty ? "up to date" : "\(step.updated.count) updated"]
         if !step.failed.isEmpty { parts.append("\(step.failed.count) failed") }
         if !held.isEmpty { parts.append("\(held.count) held") }
@@ -146,7 +146,7 @@ private struct UpdateStepRow: View {
                 return "\(failed.name) needs your admin password. In Terminal: \(retry)"
             }
             let retry = failed.retry.map { ". In Terminal: \($0)" } ?? ""
-            return "\(failed.name): \(failed.error ?? "failed")\(retry)"
+            return "\(failed.label): \(failed.error ?? "failed")\(retry)"
         }
         let confirm = held.filter { $0.why == "confirm" }.map { held in
             "\(held.name) wants to run a command. Review it in Terminal: \(held.retry ?? "claude plugin update")"
@@ -155,16 +155,17 @@ private struct UpdateStepRow: View {
     }
 
     private var tooltip: String {
-        var lines = step.updated.map { "\($0.name) \($0.from ?? "?") → \($0.to ?? "?")" }
+        var lines = step.updated.map { "\($0.label) \($0.from ?? "?") → \($0.to ?? "?")" }
         lines += held.map { held in
             let newer = held.to.map { ", \($0) is out" } ?? ""
             return switch held.why {
-            case "pin": "\(held.name) pinned at \(held.from ?? "?")\(newer)"
-            case "deps": "\(held.name) kept at \(held.from ?? "?") by other packages\(newer)"
-            case "edited": "\(held.name) edited by hand, not overwritten"
-            case "confirm": "\(held.name) waits for you to confirm its command"
-            case "install": "\(held.name) \(held.to ?? "") is ready to install"
-            default: "\(held.name) kept at \(held.from ?? "?")\(newer)"
+            case "pin": "\(held.label) pinned at \(held.from ?? "?")\(newer)"
+            case "deps": "\(held.label) kept at \(held.from ?? "?") by other packages\(newer)"
+            case "edited": "\(held.label) edited by hand, not overwritten"
+            case "confirm": "\(held.label) waits for you to confirm its command"
+            case "install": "\(held.label) \(held.to ?? "") is ready to install"
+            case "packages": "\(held.label) holds your pip packages; a new patch is a new folder, so upgrade it by hand"
+            default: "\(held.label) kept at \(held.from ?? "?")\(newer)"
             }
         }
         return lines.isEmpty ? "Nothing to update last time" : lines.joined(separator: "\n")

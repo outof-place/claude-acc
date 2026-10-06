@@ -23,6 +23,12 @@ Komendy:
   resume            zdejmij pauzę limitów ręcznie (do czasu, aż limity wrócą)
   depot [--force]   token sandboxów `depot claude`: konto i ważność, --force wysyła od nowa
   depot --fallback  zapisz długi token z `claude setup-token` na wypadek braku konta z zapasem
+  token [--json] [--min-minutes N]
+                    token OAuth dla procesów spoza sesji (evale `claude -p`): konto z
+                    największym zapasem poza lokalnym, w miarę możliwości inne niż Depot
+  token --active    token konta aktywnego w zarządzanym katalogu (tylko odczyt, bez
+                    odświeżania: token aktywnego rotują sesje); idzie za przełączeniem konta
+  token --fallback  zapisz długi token z `claude setup-token` dla `token` bez konta z zapasem
   watch [sekundy]   pętla ticków na pierwszym planie
 """
 
@@ -69,6 +75,8 @@ TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 USER_AGENT = "claude-code/2.1.0"
 LOG_MAX_BYTES = 512 * 1024
+# o ile najstarsza próbka historii może wyjść poza history_keep_hours, zanim przytniemy plik
+HISTORY_TRIM_SLACK = 3600
 
 DEFAULT_CONFIG = {
     # katalog konfiguracji, którym zarządzamy (ten, w którym pracujesz na co dzień)
@@ -98,6 +106,7 @@ DEFAULT_CONFIG = {
 
 DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
 DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
+TOKEN_FALLBACK_SERVICE = "Claude Acc token fallback"
 
 
 # ---------- drobne narzędzia ----------
@@ -156,8 +165,11 @@ def write_json(path, data, **kwargs):
     """Zapis przez plik tymczasowy: przerwany proces nie zostawi uciętego JSON-a."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
+    # json.dumps i jeden zapis: te same bajty co json.dump, ale bez kodera w czystym Pythonie
+    # (zmierzone na 27 KB stanu: 0,86 -> 0,24 ms na 3.9, 0,79 -> 0,26 ms na 3.14)
+    text = json.dumps(data, **kwargs)
     with open(tmp, "w") as f:
-        json.dump(data, f, **kwargs)
+        f.write(text)
     os.replace(tmp, path)
 
 
@@ -201,24 +213,84 @@ def take_lock(wait=0):
             time.sleep(0.5)
 
 
+_TOOLS = {}
+
+
+def tool(name):
+    """Pełna ścieżka narzędzia z PATH, szukana raz na przebieg. Z pełną ścieżką i bez
+    close_fds subprocess startuje proces przez posix_spawn zamiast forka interpretera:
+    około 2 ms mniej na wywołanie (zmierzone 10,8 -> 8,9 ms). Deskryptorów Pythona dziecko
+    i tak nie dziedziczy (PEP 446), więc blokada przebiegu zostaje w tym procesie."""
+    if name not in _TOOLS:
+        _TOOLS[name] = shutil.which(name) or name
+    return _TOOLS[name]
+
+
+def spawn(argv, **kwargs):
+    return subprocess.run([tool(argv[0])] + argv[1:], capture_output=True, text=True, close_fds=False,
+                          check=False, **kwargs)
+
+
 # ---------- Pęk kluczy ----------
 
+# Ostatnio widziana zawartość wpisów w tym przebiegu: (usługa, konto) -> blob albo None.
+# Czyta z niej tylko kc_peek, czyli rozpoznawanie kont; każda decyzja, która coś zapisuje
+# albo odświeża token, czyta przez kc_read na świeżo, tak jak przedtem.
+_KC_SEEN = {}
+
+
 def kc_read(service, account):
-    r = subprocess.run(["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-                       capture_output=True, text=True, timeout=30)
-    return r.stdout.strip() if r.returncode == 0 else None
+    r = spawn(["security", "find-generic-password", "-s", service, "-a", account, "-w"], timeout=30)
+    value = r.stdout.strip() if r.returncode == 0 else None
+    _KC_SEEN[(service, account)] = value
+    return value
+
+
+def kc_peek(service, account):
+    """Wpis taki, jakim widział go ten przebieg, a gdy go jeszcze nie czytał, świeży odczyt.
+
+    Panel czytał Pęk kluczy 32 razy na odświeżenie (po ~20 ms); 13 z tych odczytów to wpisy
+    przeczytane chwilę wcześniej przez ten sam przebieg, potrzebne tylko do rozpoznania konta:
+    które jest aktywne, czyj token trzymają sesje, które jest odstawione. Do tego wystarcza to,
+    co już widzieliśmy; zapisy i odświeżenia tokenów dalej czytają przez kc_read.
+    """
+    key = (service, account)
+    return _KC_SEEN[key] if key in _KC_SEEN else kc_read(service, account)
+
+
+def kc_read_many(keys, batch=8):
+    """Kilka wpisów naraz: `security` czeka głównie na securityd, więc 12 odczytów równolegle
+    trwa ~100 ms zamiast ~250 ms po kolei. Wyniki lądują w _KC_SEEN tak jak z kc_read."""
+    keys = list(keys)
+    for start in range(0, len(keys), batch):
+        procs = []
+        try:
+            for service, account in keys[start:start + batch]:
+                argv = [tool("security"), "find-generic-password", "-s", service, "-a", account, "-w"]
+                procs.append(((service, account), subprocess.Popen(
+                    argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, close_fds=False)))
+            deadline = time.time() + 30
+            for key, proc in procs:
+                out, _ = proc.communicate(timeout=max(deadline - time.time(), 0.1))
+                _KC_SEEN[key] = out.strip() if proc.returncode == 0 else None
+        finally:
+            for _, proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
 
 
 def kc_write(service, account, contents):
-    r = subprocess.run(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents],
-                       capture_output=True, text=True, timeout=30)
+    _KC_SEEN.pop((service, account), None)  # po nieudanym albo przerwanym zapisie nie wiadomo, co tam leży
+    r = spawn(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], timeout=30)
     if r.returncode != 0:
         raise RuntimeError(f"zapis do Keychain nieudany ({service}): {r.stderr.strip()}")
+    _KC_SEEN[(service, account)] = contents
 
 
 def kc_delete(service, account):
-    subprocess.run(["security", "delete-generic-password", "-s", service, "-a", account],
-                   capture_output=True, text=True, timeout=30)
+    _KC_SEEN.pop((service, account), None)
+    spawn(["security", "delete-generic-password", "-s", service, "-a", account], timeout=30)
 
 
 def scoped_service(config_dir):
@@ -310,7 +382,7 @@ def http(url, data=None, headers=None):
     lines += [f'header = "{k}: {v}"' for k, v in (headers or {}).items()]
     if data is not None:
         lines.append(f'data = "{data}"')
-    r = subprocess.run(["curl", "-K", "-"], input="\n".join(lines), capture_output=True, text=True, timeout=40)
+    r = spawn(["curl", "-K", "-"], input="\n".join(lines), timeout=40)
     body, _, code = r.stdout.rpartition("\n")
     try:
         return int(code), json.loads(body)
@@ -334,20 +406,25 @@ class Account:
     def oauth(self):
         return oauth_of(self.creds_json)
 
+    @property
+    def seen_oauth(self):
+        """Konto z odczytu, który ten przebieg już zrobił: tylko do rozpoznawania, patrz kc_peek."""
+        return oauth_of(kc_peek(MANAGED_SERVICE, self.id))
+
     def __repr__(self):
         return f"<{self.email}>"
 
 
 def load_accounts():
-    out = []
     if not os.path.isdir(ACCOUNTS_DIR):
-        return out
-    for acct_id in sorted(os.listdir(ACCOUNTS_DIR)):
-        info = os.path.join(ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json")
-        if not os.path.exists(info) or not kc_read(MANAGED_SERVICE, acct_id):
-            continue
-        out.append(Account(acct_id, json.load(open(info)).get("emailAddress")))
-    return out
+        return []
+    found = [(acct_id, os.path.join(ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json"))
+             for acct_id in sorted(os.listdir(ACCOUNTS_DIR))]
+    found = [(acct_id, info) for acct_id, info in found if os.path.exists(info)]
+    # wpisy wszystkich kont naraz: i tak zaraz są potrzebne do ustalenia aktywnego konta
+    kc_read_many((MANAGED_SERVICE, acct_id) for acct_id, _ in found)
+    return [Account(acct_id, json.load(open(info)).get("emailAddress"))
+            for acct_id, info in found if _KC_SEEN.get((MANAGED_SERVICE, acct_id))]
 
 
 def propagate(old_refresh, new_creds_json, cfg):
@@ -402,15 +479,20 @@ def clear_needs_login(account):
     save_state(state)
 
 
-def needs_login(account, retry_after_hours=6):
+def needs_login(account, retry_after_hours=6, seen=False):
     """Czy konto jest odstawione. Nowe dane logowania (z Orca albo z `login`)
-    zdejmują blokadę od razu, a co kilka godzin i tak dajemy mu jeszcze jedną szansę."""
+    zdejmują blokadę od razu, a co kilka godzin i tak dajemy mu jeszcze jedną szansę.
+
+    seen=True porównuje z wpisem, który ten przebieg już czytał (kolejka i panel: najwyżej
+    pominą konto zalogowane w trakcie przebiegu); tick przed przełączeniem czyta na świeżo.
+    """
     state = load_state()
     stamp = state.get("needs_login", {}).get(account.email)
     if not stamp or time.time() - stamp >= retry_after_hours * 3600:
         return False
     dead = state.get("needs_login_token", {}).get(account.email)
-    return dead is not None and dead == token_mark(account.creds_json)
+    creds = kc_peek(MANAGED_SERVICE, account.id) if seen else account.creds_json
+    return dead is not None and dead == token_mark(creds)
 
 
 def ensure_fresh(account, cfg, force=False):
@@ -620,26 +702,55 @@ def record_history(email, data):
 
 
 def read_history(email, minutes, keep_hours):
-    """Próbki konta z ostatnich minut, przy okazji przycina plik."""
+    """Próbki konta z ostatnich minut, przy okazji przycina plik.
+
+    Tick dopisuje próbki po kolei, więc ostatnie minuty leżą na końcu pliku: czytamy od
+    końca do pierwszej próbki starszej od okna o godzinę (zapas na przestawiony zegar),
+    zamiast parsować dwie doby próbek przy każdym odczycie panelu.
+    """
     if not os.path.exists(HISTORY_PATH):
         return []
-    now, kept, rows, dropped = time.time(), [], [], False
-    for line in open(HISTORY_PATH):
+    with open(HISTORY_PATH) as f:
+        lines = f.read().splitlines(keepends=True)
+    now = time.time()
+    since = now - minutes * 60
+    rows = []
+    for line in reversed(lines):
         try:
             row = json.loads(line)
         except ValueError:
-            dropped = True
             continue
-        if row["ts"] < now - keep_hours * 3600:
-            dropped = True
-            continue
-        kept.append(line)
-        if row["email"] == email and row["ts"] >= now - minutes * 60:
+        if row["ts"] < since - 3600:
+            break
+        if row["email"] == email and row["ts"] >= since:
             rows.append(row)
-    if dropped:
-        with open(HISTORY_PATH, "w") as f:
-            f.writelines(kept)
+    rows.reverse()
+    trim_history(lines, now - keep_hours * 3600)
     return rows
+
+
+def trim_history(lines, cutoff):
+    """Przycina plik, gdy najstarsza próbka wypadła z okna o ponad HISTORY_TRIM_SLACK.
+
+    Przycinanie przy każdym odczycie przepisywało cały plik (~130 KB) co dwie minuty, bo
+    tyle trwa, zanim kolejna próbka się zestarzeje: ~94 MB zapisów dziennie. Teraz raz na
+    godzinę. Próbki starsze od okna, a jeszcze nieucięte, i tak nie wchodzą do wyników.
+    """
+    try:
+        oldest = json.loads(lines[0])["ts"] if lines else cutoff
+    except ValueError:
+        oldest = 0  # uszkodzony początek: przycinamy od razu
+    if oldest >= cutoff - HISTORY_TRIM_SLACK:
+        return
+    kept = []
+    for line in lines:
+        try:
+            if json.loads(line)["ts"] >= cutoff:
+                kept.append(line)
+        except ValueError:
+            continue
+    with open(HISTORY_PATH, "w") as f:
+        f.writelines(kept)
 
 
 def burn_rate(rows, field):
@@ -683,11 +794,11 @@ def find_active(accounts, cfg):
     prowadziło do wpisania danych jednego konta pod uuid drugiego.
     """
     for service in live_services(cfg):
-        live = oauth_of(kc_read(service, KEYCHAIN_USER))
+        live = oauth_of(kc_peek(service, KEYCHAIN_USER))
         if not live.get("accessToken"):
             continue
         for a in accounts:
-            stored = a.oauth
+            stored = a.seen_oauth
             if stored.get("refreshToken") == live.get("refreshToken") or stored.get("accessToken") == live.get("accessToken"):
                 return a
     # sesja odświeżyła token po ostatniej kopii: tokeny nie pasują do żadnej kopii,
@@ -899,7 +1010,7 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
     for a in accounts:
         if a.id == exclude_id or a.email in cfg["never"]:
             continue
-        if needs_login(a):
+        if needs_login(a, seen=True):
             rows.append({"account": a, "data": None, "why": "wymaga ponownego logowania",
                          "usable": False, "error": True})
             continue
@@ -1088,7 +1199,7 @@ def snapshot(cfg):
     # token leży tylko w kopii Orca, odświeżamy: nikt inny go nie używa, a bez
     # tego panel pokazywał dane sprzed kilkunastu godzin.
     held = {oauth_of(kc_read(s, KEYCHAIN_USER)).get("refreshToken") for s in runtime_services(cfg)}
-    idle = lambda a: not orca and a.oauth.get("refreshToken") not in held
+    idle = lambda a: not orca and a.seen_oauth.get("refreshToken") not in held
     rows = survey(accounts, cfg, max_age=1800, refresh=idle)
     if active and all(r["account"].id != active.id for r in rows):
         # konto z listy "never" też bywa aktywne (np. wybrane ręcznie): pokazujemy je,
@@ -1103,7 +1214,7 @@ def snapshot(cfg):
         a = r["account"]
         who = identity(a, cfg, refresh=False) or {}
         # pominięte konto to nie błąd: ma ostatnie znane limity, a panel mówi dlaczego stoi
-        status = "needs_login" if needs_login(a) else ("error" if r["error"] and not r.get("skipped") else "ok")
+        status = "needs_login" if needs_login(a, seen=True) else ("error" if r["error"] and not r.get("skipped") else "ok")
         # przy błędzie odczytu pokazujemy ostatnie znane limity z ich wiekiem
         hit = cache.get(a.email)
         data = r["data"] or (settled(hit["data"]) if hit else None)
@@ -1583,6 +1694,7 @@ def cmd_watch(cfg, args):
     interval = int(args[0]) if args else 120
     print(f"pilnuję limitów co {interval}s, Ctrl+C przerywa")
     while True:
+        _KC_SEEN.clear()  # rozpoznanie kont w ticku opiera się na odczytach tego ticku, nie poprzedniego
         try:
             cmd_tick(cfg, [])
         except Exception as err:  # pętla ma przeżyć chwilowy błąd sieci
@@ -1619,9 +1731,133 @@ def cmd_depot(cfg, args):
     return 0
 
 
+# ---------- token dla procesów spoza sesji ----------
+
+def pick_token(accounts, cfg, active, min_valid, prefer=None, avoid=()):
+    """Token konta z największym zapasem poza lokalnym, jak sandboxy Depot.
+
+    Konto sandboxów Depot bierzemy dopiero, gdy innego nie ma: dwie strony palące
+    jedno konto wyczerpują je dwa razy szybciej. Odświeżamy wyłącznie konta
+    nieaktywne, bo token aktywnego rotują sesje Claude Code. Zwraca (email, token,
+    expires_at) albo None.
+    """
+    now = time.time()
+    rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
+    # konto, które właśnie odbiło proces limitem albo 401: limity w pamięci podręcznej
+    # (do 10 min) jeszcze tego nie widzą
+    rows = [r for r in rows if r["account"].email not in avoid]
+    depot_email = load_state().get("depot_email")
+    rows = [r for r in rows if r["account"].email != depot_email] + \
+           [r for r in rows if r["account"].email == depot_email]
+    # konto poprzedniego tokenu, póki ma zapas: seria procesów na jednym koncie dzieli
+    # cache promptu, a przeskok na inne konto zaczyna go od zera
+    rows = [r for r in rows if r["account"].email == prefer] + \
+           [r for r in rows if r["account"].email != prefer]
+    for row in rows:
+        target = row["account"]
+        expires = oauth_of(target.creds_json or "").get("expiresAt", 0) / 1000
+        creds_json, note = ensure_fresh(target, cfg, force=expires - now < min_valid)
+        if not creds_json:
+            log(f"token: {target.email}: {note}")
+            continue
+        oauth = oauth_of(creds_json)
+        token, expires = oauth.get("accessToken"), oauth.get("expiresAt", 0) / 1000
+        if token and expires - now >= min_valid:
+            return target.email, token, int(expires)
+    return None
+
+
+def cmd_token(cfg, args):
+    """Token OAuth dla procesu spoza sesji; bez konta z zapasem token zapasowy."""
+    usage = ("użycie: claude-acc token [--json] [--min-minutes N] [--prefer EMAIL] [--avoid EMAIL]"
+             " | token --active [--json] [--min-minutes N] | token --fallback")
+    if "--help" in args or "-h" in args:
+        print(usage)
+        return 0
+    rest = list(args)
+    if "--min-minutes" in rest:
+        i = rest.index("--min-minutes")
+        if i + 1 >= len(rest) or not rest[i + 1].isdigit():
+            print(usage, file=sys.stderr)
+            return 2
+        del rest[i:i + 2]
+    picked_flags = {}
+    for flag in ("--prefer", "--avoid"):
+        while flag in rest:
+            i = rest.index(flag)
+            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                print(usage, file=sys.stderr)
+                return 2
+            picked_flags.setdefault(flag, []).append(rest[i + 1])
+            del rest[i:i + 2]
+    prefer = (picked_flags.get("--prefer") or [None])[-1]
+    avoid = tuple(picked_flags.get("--avoid", []))
+    unknown = [a for a in rest if a not in ("--json", "--fallback", "--active")]
+    if unknown:
+        # nieznana flaga nigdy nie może skończyć się wypisaniem tokenu
+        print(f"nieznany argument {' '.join(unknown)}; {usage}", file=sys.stderr)
+        return 2
+    if "--fallback" in args:
+        import getpass
+        token = getpass.getpass("token z `claude setup-token` (nie pokazuje się): ").strip()
+        if not token.startswith("sk-ant-"):
+            print("to nie wygląda na token Claude Code")
+            return 1
+        kc_write(TOKEN_FALLBACK_SERVICE, KEYCHAIN_USER, token)
+        print("token zapasowy zapisany w Pęku kluczy")
+        return 0
+    minutes = 30
+    if "--min-minutes" in args:
+        minutes = int(args[args.index("--min-minutes") + 1])
+    if "--active" in args:
+        # Konto, na którym pracuje użytkownik: token z wpisu runtime, który sesje odświeżyły
+        # ostatnio. Tylko odczyt: odświeżenie tokenu aktywnego konta zabija sesje, które go
+        # trzymają, więc przy krótkiej ważności odmawiamy i zostawiamy to sesjom.
+        accounts = load_accounts()
+        active = find_active(accounts, cfg)
+        oauth = oauth_of(freshest_runtime(cfg) or "")
+        token, expires = oauth.get("accessToken"), oauth.get("expiresAt", 0) / 1000
+        if not token:
+            print("brak tokenu w zarządzanym katalogu", file=sys.stderr)
+            return 1
+        if expires - time.time() < minutes * 60:
+            print(f"token aktywnego konta ważny krócej niż {minutes} min; odświeżą go sesje Claude Code",
+                  file=sys.stderr)
+            return 1
+        email = active.email if active else "nieznane"
+        log(f"token: wydany dla {email} (active)")
+        if "--json" in args:
+            print(json.dumps({"email": email, "token": token, "expiresAt": int(expires), "source": "active"}))
+        else:
+            print(token)
+        return 0
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę", file=sys.stderr)
+        return 1
+    accounts = load_accounts()
+    picked = pick_token(accounts, cfg, find_active(accounts, cfg), minutes * 60, prefer=prefer, avoid=avoid)
+    if picked:
+        email, token, expires = picked
+        source = "rotation"
+    else:
+        token = kc_read(TOKEN_FALLBACK_SERVICE, KEYCHAIN_USER)
+        if not token:
+            print("brak konta z zapasem poza lokalnym i brak tokenu zapasowego (`claude-acc token --fallback`)",
+                  file=sys.stderr)
+            return 1
+        email, expires, source = "fallback", 0, "fallback"
+    log(f"token: wydany dla {email} ({source})")
+    if "--json" in args:
+        print(json.dumps({"email": email, "token": token, "expiresAt": expires, "source": source}))
+    else:
+        print(token)
+    return 0
+
+
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
             "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "resume": cmd_resume,
-            "watch": cmd_watch, "depot": cmd_depot}
+            "watch": cmd_watch, "depot": cmd_depot, "token": cmd_token}
 
 
 def main(argv):

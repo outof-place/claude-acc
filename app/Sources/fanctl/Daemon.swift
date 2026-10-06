@@ -13,6 +13,11 @@ import Foundation
 /// - on SIGTERM/SIGINT (launchd unload, uninstall) fans we set go back to macOS before exiting;
 /// - the state file is written atomically by rename, so a symlink planted in the user's folder
 ///   can't make root write anywhere else.
+///
+/// Readings go to the state file with each chart sample (every 6 s); what the panel reacts to
+/// (mode, boost, conflict, error, a fan going manual) goes out on the tick it happens. Writing
+/// the whole history every 2 s cost ~890 MB of writes a day. Between samples only a fixed
+/// setting below 100% reads the temperature sensors (the 95 °C rule); the rest only checks the fans.
 final class Daemon {
     private let fans: Fans
     private let configPath: String
@@ -22,8 +27,16 @@ final class Daemon {
     private var boosting = false
     private var conflict = false
     private var history: [[Double]] = []
+    /// Last temperatures read, carried into readings taken without the sensors.
+    private var sensors: (all: [String: Double], cpu: Double?, gpu: Double?) = ([:], nil, nil)
+    /// Uptime of the last sample: a wall clock set back must not stop the writes.
+    private var sampledAt = -Double.infinity
+    /// What the state file holds, to tell a change the panel shows from new numbers.
+    private var saved: Reading?
     private var signals: [DispatchSourceSignal] = []
     private var timer: DispatchSourceTimer?
+    /// Seconds between chart samples; with the 2 s tick a sample lands every 6 s.
+    private static let sample: Double = 5
 
     init(fans: Fans, config: String, state: String) {
         self.fans = fans
@@ -65,15 +78,28 @@ final class Daemon {
     }
 
     private func tick() {
-        var reading = fans.reading()
         let mode = wanted()
+        let uptime = ProcessInfo.processInfo.systemUptime
+        let sampling = uptime - sampledAt >= Self.sample
+        // a fixed setting below full speed needs the temperatures every tick for the 95 °C rule;
+        // at 100% the boost changes nothing but its label, which can wait for the next sample
+        var measured = sampling
+        if case .fixed(let percent)? = mode, percent < 100 { measured = true }
+        var reading = fans.reading(sensors: measured)
+        if measured {
+            sensors = (reading.sensors, reading.cpu, reading.gpu)
+        } else {
+            (reading.sensors, reading.cpu, reading.gpu) = sensors
+        }
         if mode != picked {
             picked = mode
             conflict = false  // a new pick in the panel takes the fans back
         }
         if let mode {
-            let hottest = max(reading.cpu ?? 0, reading.gpu ?? 0)
-            if hottest >= 95 { boosting = true } else if hottest < 85 { boosting = false }
+            if measured {
+                let hottest = max(reading.cpu ?? 0, reading.gpu ?? 0)
+                if hottest >= 95 { boosting = true } else if hottest < 85 { boosting = false }
+            }
             let target: Fans.Mode = mode != .auto && boosting ? .fixed(percent: 100) : mode
             if target != applied {
                 write(target, &reading)
@@ -95,13 +121,24 @@ final class Daemon {
             reading.boosting = boosting && mode != .auto
         }
         reading.conflict = conflict
-        if (history.last?.first).map({ reading.at - $0 >= 5 }) ?? true {
+        if sampling {
+            sampledAt = uptime
             let rpm = reading.fans.isEmpty ? 0 : reading.fans.map(\.rpm).reduce(0, +) / Double(reading.fans.count)
-            history.append([reading.at.rounded(), reading.cpu ?? 0, reading.gpu ?? 0, rpm.rounded()])
+            let tenth = { (value: Double?) in ((value ?? 0) * 10).rounded() / 10 }
+            history.append([reading.at.rounded(), tenth(reading.cpu), tenth(reading.gpu), rpm.rounded()])
             if history.count > 240 { history.removeFirst(history.count - 240) }
         }
         reading.history = history
-        save(reading)
+        if sampling || shows(reading) { save(reading) }
+    }
+
+    /// Does the panel show something new beyond the numbers: mode, the boost, a conflict, an
+    /// error, a fan taken manual or given back.
+    private func shows(_ reading: Reading) -> Bool {
+        guard let saved else { return true }
+        return reading.mode != saved.mode || reading.percent != saved.percent
+            || reading.boosting != saved.boosting || reading.conflict != saved.conflict
+            || reading.error != saved.error || reading.fans.map(\.manual) != saved.fans.map(\.manual)
     }
 
     private func write(_ target: Fans.Mode, _ reading: inout Reading) {
@@ -117,9 +154,12 @@ final class Daemon {
     }
 
     private func save(_ reading: Reading) {
-        guard let data = try? JSONEncoder.pretty.encode(reading) else { return }
-        try? data.write(to: URL(fileURLWithPath: statePath), options: .atomic)
+        // compact: the history is 240 rows, pretty printing tripled the file to ~20 KB
+        guard let data = try? JSONEncoder.compact.encode(reading),
+              (try? data.write(to: URL(fileURLWithPath: statePath), options: .atomic)) != nil
+        else { return }
         chmod(statePath, 0o644)
+        saved = reading
     }
 }
 
@@ -129,4 +169,10 @@ extension JSONEncoder {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder
     }
+
+    static let compact: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
 }

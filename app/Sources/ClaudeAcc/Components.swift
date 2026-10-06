@@ -211,31 +211,67 @@ extension ToggleStyle where Self == PillToggleStyle {
 }
 
 /// Rounded usage bar; `marker` is where auto-switch kicks in.
+///
+/// The fill is one animatable shape: a change redraws its path, while a frame that grows
+/// would lay the card out again on every frame of the animation. It glides only when it
+/// moves by a step you can see. `live` bars follow a reading taken every few seconds and
+/// move in place: while any animation runs, SwiftUI updates the whole panel on every frame,
+/// and gliding live readings kept it animating most of the time (40% CPU with the panel open).
 struct UsageBar: View {
     let fraction: Double
     let tint: Color
     var marker: Double?
     var height: CGFloat = 7
+    var live = false
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                Capsule().fill(.quaternary)
-                if fraction > 0 {
-                    Capsule()
-                        .fill(tint.gradient)
-                        .frame(width: max(height, geo.size.width * min(fraction, 1)))
-                }
+        Capsule()
+            .fill(.quaternary)
+            .overlay {
+                BarFill(fraction: fraction)
+                    .fill(tint.gradient)
+                    .opacity(fraction > 0 ? 1 : 0)
+            }
+            .overlay {
                 if let marker {
-                    Capsule()
-                        .fill(.secondary)
-                        .frame(width: 2, height: height + 5)
-                        .offset(x: geo.size.width * marker - 1)
+                    BarMarker(at: marker, overhang: 2.5).fill(.secondary)
                 }
             }
-        }
-        .frame(height: height)
-        .animation(.smooth, value: fraction)
+            .frame(height: height)
+            .animation(live ? nil : .smooth, value: UsageBar.step(fraction))
+    }
+
+    /// Half a percent: on the widest bar about a point and a half.
+    static func step(_ fraction: Double) -> Int {
+        Int((min(max(fraction, 0), 1) * 200).rounded())
+    }
+}
+
+/// The filled part of a usage bar: a capsule from the left edge, never narrower than round.
+private nonisolated struct BarFill: Shape {
+    var fraction: Double
+
+    var animatableData: Double {
+        get { fraction }
+        set { fraction = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let width = max(rect.height, rect.width * min(max(fraction, 0), 1))
+        return Path(roundedRect: CGRect(x: rect.minX, y: rect.minY, width: width, height: rect.height),
+                    cornerRadius: rect.height / 2)
+    }
+}
+
+/// The auto-switch line across a usage bar, a little taller than the bar.
+private nonisolated struct BarMarker: Shape {
+    let at: Double
+    let overhang: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let line = CGRect(x: rect.minX + rect.width * at - 1, y: rect.minY - overhang,
+                          width: 2, height: rect.height + overhang * 2)
+        return Path(roundedRect: line, cornerRadius: 1)
     }
 }
 
@@ -285,5 +321,91 @@ struct Banner: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(tint.opacity(0.12), in: .rect(cornerRadius: 16, style: .continuous))
         .transition(.move(edge: .top).combined(with: .opacity))
+    }
+}
+
+/// An SF Symbol turning clockwise. Core Animation runs the turn in the render server, so the
+/// app does no work per frame, and a new speed carries on from the angle already reached.
+struct TurningSymbol: NSViewRepresentable {
+    let name: String
+    let tint: NSColor
+    var textStyle: NSFont.TextStyle = .callout
+    let turnsPerSecond: Double
+
+    func makeNSView(context: Context) -> TurningSymbolView {
+        TurningSymbolView()
+    }
+
+    func updateNSView(_ view: TurningSymbolView, context: Context) {
+        view.show(name, tint: tint, textStyle: textStyle)
+        view.turnsPerSecond = turnsPerSecond
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: TurningSymbolView, context: Context) -> CGSize? {
+        nsView.intrinsicContentSize
+    }
+}
+
+final class TurningSymbolView: NSView {
+    private let glyph = CALayer()
+    private var image: NSImage?
+    private var shown: (name: String, tint: NSColor, style: NSFont.TextStyle)?
+
+    var turnsPerSecond = 0.0 {
+        didSet { if turnsPerSecond != oldValue { retime() } }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.addSublayer(glyph)
+        glyph.contentsGravity = .center
+        let turn = CABasicAnimation(keyPath: "transform.rotation.z")
+        turn.fromValue = 0
+        turn.toValue = -2 * Double.pi  // AppKit layers count angles counterclockwise
+        turn.duration = 1
+        turn.repeatCount = .infinity
+        turn.isRemovedOnCompletion = false
+        glyph.add(turn, forKey: "turn")
+        glyph.speed = 0
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var intrinsicContentSize: NSSize { image?.size ?? .zero }
+
+    func show(_ name: String, tint: NSColor, textStyle: NSFont.TextStyle) {
+        if let shown, shown.name == name, shown.tint == tint, shown.style == textStyle { return }
+        shown = (name, tint, textStyle)
+        let config = NSImage.SymbolConfiguration(textStyle: textStyle)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [tint]))
+        image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+        glyph.contents = image
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        glyph.bounds = CGRect(origin: .zero, size: bounds.size)
+        glyph.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        CATransaction.commit()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        glyph.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    /// Freezes the layer's clock at the angle it reached, then runs it on from there at the
+    /// new rate; zero holds the glyph still.
+    private func retime() {
+        let now = CACurrentMediaTime()
+        glyph.timeOffset = glyph.convertTime(now, from: nil)
+        glyph.beginTime = now
+        glyph.speed = Float(turnsPerSecond)
     }
 }

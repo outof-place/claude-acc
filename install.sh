@@ -14,5 +14,5 @@ cp "$BIN/ClaudeAcc" "$BUNDLE/Contents/MacOS/ClaudeAcc"
 cp app/Info.plist "$BUNDLE/Contents/Info.plist"
 codesign --force --sign - "$BUNDLE"
 
-./setup.sh --app "$BUNDLE" --fanctl "$BIN/fanctl"
+./setup.sh --app "$BUNDLE" --fanctl "$BIN/fanctl" --hook "$BIN/claude-acc-hook"
 rm -rf "$(dirname "$BUNDLE")"

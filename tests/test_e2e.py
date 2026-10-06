@@ -11,12 +11,15 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "accswitch.py")
+ACC = os.path.join(os.path.dirname(HERE), "acc.py")
 FAKES = os.path.join(HERE, "fakes")
 USER = "tester"
 MANAGED = "Orca Claude Code Managed Credentials"
@@ -174,6 +177,19 @@ class Env:
     def calls(self, suffix):
         log = json.load(open(os.path.join(self.fake, "server.json")))["log"]
         return [u for u in log if u.endswith(suffix)]
+
+    def keychain_calls(self):
+        """[(polecenie, "usługa|konto")] wszystkich wywołań `security` w kolejności."""
+        path = os.path.join(self.fake, "security.log")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [tuple(line.rstrip("\n").split(" ", 1)) for line in f]
+
+    def forget_keychain_calls(self):
+        path = os.path.join(self.fake, "security.log")
+        if os.path.exists(path):
+            os.remove(path)
 
     def saved_state(self):
         return json.load(open(os.path.join(self.state_dir, "state.json")))
@@ -607,6 +623,302 @@ class DepotTest(unittest.TestCase):
         w.run("tick", PATH=f"{os.path.dirname(FAKE_DEPOT)}:{FAKES}:/usr/bin:/bin")
 
         self.assertEqual(depot_store(w)["calls"], [])
+
+
+TOKEN_FALLBACK = "Claude Acc token fallback"
+
+
+class TokenTest(unittest.TestCase):
+    def test_token_comes_from_account_with_most_headroom_other_than_local(self):
+        w = Env()
+        a = w.account("a@x", weekly_used=5)
+        w.account("b@x", weekly_used=60)
+        w.account("c@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+
+        out = w.run("token", "--json")
+
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["email"], "c@x")
+        self.assertEqual(got["source"], "rotation")
+        self.assertEqual(got["token"], w.managed("c@x")["claudeAiOauth"]["accessToken"])
+
+    def test_token_avoids_the_depot_account_while_another_carries(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=5)
+        w.account("c@x", weekly_used=30)
+        w.runtime(a)
+        w.state(depot_email="b@x")
+        w.write()
+
+        got = json.loads(w.run("token", "--json").stdout)
+
+        self.assertEqual(got["email"], "c@x")
+
+    def test_short_lived_idle_token_is_refreshed_and_active_is_never_touched(self):
+        w = Env()
+        a = w.account("a@x", expires_in=3 * 60)
+        b = w.account("b@x", expires_in=10 * 60)
+        w.runtime(a)
+        w.write()
+
+        got = json.loads(w.run("token", "--json", "--min-minutes", "30").stdout)
+
+        fresh = w.managed("b@x")["claudeAiOauth"]
+        self.assertNotEqual(fresh["accessToken"], b["claudeAiOauth"]["accessToken"])
+        self.assertEqual(got["token"], fresh["accessToken"])
+        self.assertEqual(w.managed("a@x")["claudeAiOauth"], a["claudeAiOauth"])
+
+    def test_prefer_keeps_the_previous_account_while_it_carries(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=5)
+        w.account("c@x", weekly_used=40)
+        w.runtime(a)
+        w.write()
+
+        self.assertEqual(json.loads(w.run("token", "--json", "--prefer", "c@x").stdout)["email"], "c@x")
+        # konto, które odbiło proces, odpada od razu, mimo limitów z pamięci podręcznej
+        got = json.loads(w.run("token", "--json", "--prefer", "c@x", "--avoid", "c@x").stdout)
+        self.assertEqual(got["email"], "b@x")
+
+    def test_active_returns_the_live_token_of_the_local_account_without_refresh(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=5)
+        w.runtime(a)
+        w.write()
+        live = w.session_refresh("a@x")
+
+        got = json.loads(w.run("token", "--active", "--json").stdout)
+
+        self.assertEqual((got["email"], got["source"]), ("a@x", "active"))
+        self.assertEqual(got["token"], live["claudeAiOauth"]["accessToken"])
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+
+    def test_active_refuses_a_short_lived_token_instead_of_refreshing_it(self):
+        w = Env()
+        a = w.account("a@x", expires_in=5 * 60)
+        w.runtime(a)
+        w.write()
+
+        out = w.run("token", "--active", "--json", "--min-minutes", "30")
+
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "")
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+
+    def test_unknown_flag_or_help_never_prints_a_token(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        for args in (["--help"], ["-h"], ["--jsn"], ["--min-minutes"], ["--min-minutes", "x"]):
+            out = w.run("token", *args)
+            self.assertNotIn("at-", out.stdout + out.stderr, args)
+            self.assertEqual(out.returncode, 0 if args[0] in ("--help", "-h") else 2, args)
+
+    def test_fallback_token_without_headroom_and_error_without_either(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=99)
+        w.runtime(a)
+        w.write()
+
+        out = w.run("token", "--json")
+        self.assertEqual(out.returncode, 1)
+        self.assertEqual(out.stdout, "")
+
+        w.keychain[f"{TOKEN_FALLBACK}|{USER}"] = "sk-ant-oat01-fallback"
+        w.write()
+        got = json.loads(w.run("token", "--json").stdout)
+        self.assertEqual((got["token"], got["source"]), ("sk-ant-oat01-fallback", "fallback"))
+
+
+@unittest.skipUnless(os.path.exists(ACC), "brak acc.py")
+class LauncherTest(unittest.TestCase):
+    """Po setup.sh aplikacja i launchd startują `<python> acc.py accswitch ...`."""
+
+    def test_status_json_and_tick_through_launcher(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=50)
+        w.runtime(a)
+        w.write()
+        direct = json.loads(w.run("status", "--json").stdout)
+
+        def launch(*args):
+            return subprocess.run([sys.executable, ACC, "accswitch", *args], env=w.env(),
+                                  capture_output=True, text=True, timeout=60, check=False)
+
+        via = launch("status", "--json")
+        self.assertEqual(via.returncode, 0, via.stderr)
+        snap = json.loads(via.stdout)
+        for d in (direct, snap):
+            d.pop("generated_at")
+            for row in d["accounts"]:
+                row.pop("data_age")
+        self.assertEqual(snap, direct)
+        self.assertEqual(launch("tick").returncode, 0)
+        self.assertIn("last_tick", w.saved_state())
+
+
+class KeychainReadsTest(unittest.TestCase):
+    """Jeden przebieg czyta wpis konta raz do rozpoznania; zapisy i odświeżenia czytają na świeżo."""
+
+    def test_status_json_reads_each_idle_account_entry_once(self):
+        w = Env()
+        a = w.account("a@x")
+        for email in ("b@x", "c@x", "d@x"):
+            w.account(email)
+        w.runtime(a)
+        w.write()
+        w.run("status", "--json")  # pierwszy przebieg napełnia pamięć limitów
+        w.forget_keychain_calls()
+
+        r = w.run("status", "--json")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        reads = [key for cmd, key in w.keychain_calls() if cmd == "find-generic-password"]
+        for email in ("b@x", "c@x", "d@x"):
+            self.assertEqual(reads.count(f"{MANAGED}|{w.ids[email]}"), 1, (email, reads))
+        # aktywne: rozpoznanie i świeży odczyt przed read-back, jak zawsze
+        self.assertLessEqual(reads.count(f"{MANAGED}|{w.ids['a@x']}"), 3, reads)
+
+
+class KeychainMemoTest(unittest.TestCase):
+    """kc_peek, kc_read_many i kc_write w procesie testu, na atrapie `security`."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(HERE))
+        import accswitch
+        self.acc = accswitch
+        self.w = Env()
+        self.w.keychain["svc|u"] = "A"
+        self.w.write()
+        patcher = mock.patch.dict(os.environ, self.w.env())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for cache in (accswitch._KC_SEEN, accswitch._TOOLS):
+            cache.clear()
+            self.addCleanup(cache.clear)
+
+    def behind_our_back(self, value):
+        """Inny proces (sesja Claude Code, Orca) zapisuje wpis."""
+        path = os.path.join(self.w.fake, "keychain.json")
+        with open(path) as f:
+            keychain = json.load(f)
+        keychain["svc|u"] = value
+        with open(path, "w") as f:
+            json.dump(keychain, f)
+
+    def test_peek_reuses_what_the_run_read_and_read_is_always_fresh(self):
+        acc = self.acc
+        self.assertEqual(acc.kc_peek("svc", "u"), "A")
+        self.behind_our_back("B")
+        self.assertEqual(acc.kc_peek("svc", "u"), "A")
+        self.assertEqual(acc.kc_read("svc", "u"), "B")
+        self.assertEqual(acc.kc_peek("svc", "u"), "B")
+        self.assertEqual(acc.tool("security"), os.path.join(FAKES, "security"))
+
+    def test_write_is_remembered_and_a_failed_write_forgets_the_entry(self):
+        acc = self.acc
+        acc.kc_write("svc", "u", "C")
+        self.behind_our_back("D")
+        self.assertEqual(acc.kc_peek("svc", "u"), "C")
+
+        os.environ["FAKE_FAIL_WRITE_SERVICE"] = "svc"
+        with self.assertRaises(RuntimeError):
+            acc.kc_write("svc", "u", "E")
+        self.assertEqual(acc.kc_peek("svc", "u"), "D")  # po nieudanym zapisie czytamy od nowa
+
+    def test_watch_starts_every_tick_without_the_previous_ticks_reads(self):
+        acc = self.acc
+        seen_at_start = []
+
+        def tick(cfg, args):
+            seen_at_start.append(dict(acc._KC_SEEN))
+            acc._KC_SEEN[("svc", "u")] = "z poprzedniego ticku"
+
+        with mock.patch.object(acc, "cmd_tick", side_effect=tick), mock.patch.object(
+                acc.time, "sleep", side_effect=[None, KeyboardInterrupt]), mock.patch("builtins.print"), \
+                self.assertRaises(KeyboardInterrupt):
+            acc.cmd_watch({}, ["1"])
+        self.assertEqual(seen_at_start, [{}, {}])
+
+    def test_read_many_gives_what_reads_one_by_one_give(self):
+        acc = self.acc
+        self.w.keychain.update({f"s{i}|u": f"blob-{i}" for i in range(11)})
+        self.w.write()
+        keys = [(f"s{i}", "u") for i in range(12)]  # s11 nie istnieje
+
+        acc.kc_read_many(keys, batch=5)
+        many = {key: acc._KC_SEEN[key] for key in keys}
+        acc._KC_SEEN.clear()
+
+        self.assertEqual(many, {key: acc.kc_read(*key) for key in keys})
+        self.assertIsNone(many[("s11", "u")])
+
+
+class HistoryTrimTest(unittest.TestCase):
+    """history.jsonl: wyniki jak przy pełnym odczycie, przepisanie pliku raz na godzinę, nie co odczyt."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(HERE))
+        import accswitch
+        self.acc = accswitch
+        self.path = os.path.join(tempfile.mkdtemp(prefix="claude-acc-history-"), "history.jsonl")
+        patcher = mock.patch.object(accswitch, "HISTORY_PATH", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def text(self):
+        with open(self.path) as f:
+            return f.read()
+
+    def write(self, ages_minutes, email="a@x"):
+        now = int(time.time())
+        rows = [{"ts": now - age * 60, "email": email, "session_used": 10.0, "weekly_used": float(age)}
+                for age in ages_minutes]
+        with open(self.path, "w") as f:
+            f.writelines(json.dumps(row) + "\n" for row in rows)
+
+    def test_recent_rows_in_file_order_without_rewriting_inside_the_slack(self):
+        keep_hours = 48
+        # najstarsza próbka 30 min poza oknem 48 h: jeszcze w zapasie, plik zostaje
+        ages = list(range(48 * 60 + 30, 0, -2))
+        self.write(ages)
+        with open(self.path, "a") as f:
+            f.write(json.dumps({"ts": int(time.time()) - 60, "email": "b@x",
+                                "session_used": 1.0, "weekly_used": 1.0}) + "\n")
+        before = self.text()
+
+        rows = self.acc.read_history("a@x", 60, keep_hours)
+
+        self.assertEqual(self.text(), before)
+        # próbka sprzed równo 60 min leży na granicy okna: zostawiamy ją poza porównaniem
+        self.assertEqual([r["weekly_used"] for r in rows if r["weekly_used"] < 60], [float(a) for a in ages if a < 60])
+        self.assertTrue(all(r["email"] == "a@x" for r in rows))
+
+    def test_trims_once_the_oldest_row_leaves_the_slack(self):
+        ages = [48 * 60 + 90, 48 * 60 + 70, 48 * 60 - 10, 30, 10]
+        self.write(ages)
+        with open(self.path) as f:
+            lines = f.readlines()
+        lines.insert(3, "{uszkodzona linia\n")
+        with open(self.path, "w") as f:
+            f.writelines(lines)
+
+        rows = self.acc.read_history("a@x", 60, 48)
+
+        self.assertEqual([r["weekly_used"] for r in rows], [30.0, 10.0])
+        kept = [json.loads(line)["weekly_used"] for line in self.text().splitlines()]
+        self.assertEqual(kept, [float(48 * 60 - 10), 30.0, 10.0])
 
 
 class PauseTest(unittest.TestCase):

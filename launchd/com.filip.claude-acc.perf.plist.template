@@ -5,8 +5,9 @@
   <key>Label</key><string>com.filip.claude-acc.perf</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
-    <string>__HOME__/.local/share/claude-acc/perf.py</string>
+    <string>__HOME__/.local/share/claude-acc/python</string>
+    <string>__HOME__/.local/share/claude-acc/acc.py</string>
+    <string>perf</string>
     <string>keep</string>
   </array>
   <key>StartInterval</key><integer>300</integer>

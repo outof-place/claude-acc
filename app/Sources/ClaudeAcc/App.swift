@@ -35,6 +35,7 @@ struct ClaudeAccApp: App {
         var ultra: Ultra?
         var load: LoadReading?
         var sched: SchedState?
+        var depot: DepotRuns?
         var updates: UpdatesState?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
@@ -56,6 +57,9 @@ struct ClaudeAccApp: App {
             if let data = try? Data(contentsOf: folder.appending(path: "demo-sched.json")) {
                 sched = Store.decode(SchedState.self, from: data)
             }
+            if let data = try? Data(contentsOf: folder.appending(path: "demo-depot.json")) {
+                depot = Store.decode(DepotRuns.self, from: data)
+            }
             if let data = try? Data(contentsOf: folder.appending(path: "demo-updates.json")) {
                 updates = Store.decode(UpdatesState.self, from: data)
             }
@@ -69,7 +73,7 @@ struct ClaudeAccApp: App {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, updates: updates)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, depot: depot, updates: updates)
         store.previewOpenAccount = open
         store.previewHoverAccount = hover
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }

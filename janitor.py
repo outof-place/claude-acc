@@ -27,7 +27,6 @@ import fcntl
 import glob
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -152,8 +151,11 @@ def write_json(path, data, **kwargs):
     """Zapis przez plik tymczasowy: przerwany proces nie zostawi uciętego JSON-a."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = f"{path}.{os.getpid()}.tmp"
+    # json.dumps i jeden zapis: te same bajty co json.dump, ale bez kodera w czystym Pythonie
+    # (zmierzone na 27 KB stanu: 0,86 -> 0,24 ms na 3.9, 0,79 -> 0,26 ms na 3.14)
+    text = json.dumps(data, **kwargs)
     with open(tmp, "w") as f:
-        json.dump(data, f, **kwargs)
+        f.write(text)
     os.replace(tmp, path)
 
 
@@ -1153,6 +1155,8 @@ def cmd_status(cfg, args):
 
 def installed_apps():
     """Nazwy i identyfikatory zainstalowanych aplikacji, małymi literami."""
+    import plistlib  # tylko raport; perf.py i devguard.py importują janitor przy każdym starcie
+
     names, bundles = set(), set()
     roots = [
         "/Applications",
@@ -1221,6 +1225,8 @@ def leftovers(min_bytes=300 * 1024**2):
 
 def broken_launch_items():
     """Wpisy launchd, których program zniknął razem z aplikacją: [(plik plist, program)]."""
+    import plistlib
+
     found = []
     for folder in (
         os.path.join(HOME, "Library/LaunchAgents"),

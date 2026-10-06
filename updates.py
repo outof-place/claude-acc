@@ -11,12 +11,15 @@ Co aktualizuje, do najnowszej wersji:
 - npm: globalne paczki, także o wersję główną wyżej. `npm_pins` w updates.json trzyma
   paczkę w jednej wersji głównej, np. {"pnpm": "11"};
 - Go: programy postawione przez `go install` w GOBIN;
-- Python: globalne pakiety (python.org) jednym rozwiązaniem zależności uv, z kodem bajtowym
-  skompilowanym od razu; po aktualizacji `uv pip check` i import każdego pakietu, a gdy coś
-  przestało działać, wracają poprzednie wersje. `pip_pins` trzyma pakiet ({"fb-idb": "==1.1.7"}).
-  Nowy playwright dostaje swoje przeglądarki. Nowszą wersję poprawkową Pythona z python.org
-  automat pobiera i sprawdza podpis, a instaluje człowiek przyciskiem w panelu (hasło
-  administratora). Pythony z uv idą `uv python upgrade`;
+- Python: paczki pip w każdym Pythonie z PYTHONS (domyślny od uv, python.org, Homebrew). Dzielą
+  zależności, więc idą razem: jedno `pip install -U --upgrade-strategy eager` po paczkach, których
+  nic nie wymaga, i tylko z wheeli (paczka bez wheela, np. llama-cpp-python, zostaje, jaka jest).
+  Przed i po: `pip check` i import każdej paczki, której nic nie wymaga. Nowa niezgodność albo paczka,
+  która przestała się importować, cofa tego Pythona do wersji sprzed przebiegu. Paczka, której
+  resolver nie podbił, bo inna trzyma ją niżej, jest przytrzymana, nie nieudana; `pip_pins` trzyma
+  paczkę przy specyfikatorze ({"fb-idb": "==1.1.7"}). Nowy playwright dostaje swoje przeglądarki.
+  Nowszą wersję poprawkową Pythona z python.org automat pobiera i sprawdza podpis, a instaluje
+  człowiek przyciskiem w panelu (hasło administratora). Pythony z uv idą `uv python upgrade`;
 - Claude Code: `claude update`, katalogi wtyczek, wtyczki w każdym zakresie (user, project,
   local; projekty, których już nie ma, są pomijane), skille z `npx skills`. Skill poprawiony
   ręcznie zostaje, a wtyczka, której aktualizacja chce uruchomić polecenie z katalogu, czeka
@@ -27,7 +30,7 @@ która chce hasła administratora) nie zatrzymuje reszty i w panelu widać, któ
 Stan dla panelu: updates-state.json; pełne wyjście poleceń: updates.log.
 
 Komendy:
-  run [--force] [--dry-run] [--only brew,npm,go,python,claude]
+  run [--force] [--dry-run] [--only brew,npm,go,pip,claude]
         --force pomija odstęp 3 dni (przycisk w panelu), --dry-run tylko wypisuje plan,
         --only zawęża przebieg i nie przesuwa terminu następnego
   status [--json]
@@ -62,13 +65,13 @@ DEFAULT_CONFIG = {
     "every_days": 3,
     # po nieudanym przebiegu: następnej nocy, nie za 3 dni
     "retry_hours": 20,
-    # kroki do pominięcia: brew, npm, go, python, claude
+    # kroki do pominięcia: brew, npm, go, pip, claude
     "skip": [],
     # paczka npm -> zakres, w którym ma zostać ("11" to każda 11.x)
     "npm_pins": {},
-    # pakiet Pythona -> specyfikator, przy którym ma zostać ("==1.1.7", "<2")
+    # paczka pip -> specyfikator, przy którym ma zostać ("==1.1.7", "<2")
     "pip_pins": {},
-    # Python, którego pakiety aktualizować; domyślnie python.org, potem Homebrew
+    # Python (ścieżka albo lista), którego paczki aktualizować; domyślnie PYTHONS
     "python": None,
 }
 
@@ -93,6 +96,11 @@ ENV = dict(
     npm_config_update_notifier="false",
     npm_config_fund="false",
     npm_config_audit="false",
+    # Homebrew i uv znaczą swoje Pythony jako zarządzane z zewnątrz (PEP 668), a paczki w nich i tak
+    # stawia człowiek. Zmienna, nie flaga: pip sprzed 23.0 nie zna flagi, a nieznaną zmienną pominie.
+    PIP_BREAK_SYSTEM_PACKAGES="1",
+    PIP_DISABLE_PIP_VERSION_CHECK="1",
+    PIP_NO_INPUT="1",
 )
 
 
@@ -158,7 +166,7 @@ def error_line(text):
     return (lines[-1] if lines else "unknown error")[:300]
 
 
-def call(cmd, timeout=600, codes=(0,), quiet=False, cwd=HOME, merge=False):
+def call(cmd, timeout=600, codes=(0,), quiet=False, merge=False, cwd=HOME):
     """(udało się, stdout, opis błędu); z merge=True drugie pole to stdout i stderr razem.
     Polecenia, które coś zmieniają, trafiają do logu w całości."""
     try:
@@ -465,6 +473,25 @@ def step_go(st, cfg, dry):
 
 # ---------- Python ----------
 
+# Pythony z paczkami stawianymi ręcznie: domyślny python3 od uv (`uv python install --default`),
+# python.org i Homebrew. Nie /usr/bin/python3: bez narzędzi Xcode wyskakuje okno instalatora.
+PYTHONS = (
+    os.path.join(HOME, ".local/bin/python3"),
+    "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+    "/opt/homebrew/bin/python3",
+)
+
+# Wersja, prefiks (po nim odpada drugi link do tego samego Pythona), user site i paczki spoza indeksu
+# (katalog, git, -e): `pip install -U nazwa` podmieniłby je obcą paczką o tej nazwie z PyPI.
+PYTHON_INFO = """
+import json, site, sys
+from importlib import metadata
+local = [d.metadata["Name"] for d in metadata.distributions() if d.read_text("direct_url.json")]
+print(json.dumps({"version": "%d.%d" % sys.version_info[:2], "patch": "%d.%d.%d" % sys.version_info[:3],
+                  "prefix": sys.prefix,
+                  "user_site": site.getusersitepackages(), "local": [n for n in local if n]}))
+"""
+
 # uruchamiane w docelowym Pythonie: moduły dystrybucji z argv[1] i te, których nie da się zaimportować
 IMPORT_CHECK = r"""
 import importlib, importlib.metadata as md, json, re, sys
@@ -489,37 +516,55 @@ PYTHON_FTP = os.environ.get("CLAUDE_ACC_PYTHON_FTP", "https://www.python.org/ftp
 DOWNLOADS = os.path.join(STATE_DIR, "downloads")
 
 
-def norm(name):
+# "a 1.0 has requirement b<2, but you have b 2.1." albo "a 1.0 requires b, which is not installed."
+PIP_CHECK = re.compile(r"^(\S+) \S+ (?:has requirement|requires) ([A-Za-z0-9._-]+)")
+
+
+def canonical(name):
+    """Nazwa paczki według PEP 503: typing_extensions i typing-extensions to jedna paczka."""
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def python_for_pip(cfg):
-    if cfg.get("python"):
-        return cfg["python"]
-    # nie /usr/bin/python3: bez narzędzi Xcode wyskakuje okno instalatora
-    for path in ("/Library/Frameworks/Python.framework/Versions/Current/bin/python3", "/opt/homebrew/bin/python3"):
-        if os.access(path, os.X_OK):
-            return path
-    return None
-
-
-def pip_versions(python):
-    ok, out, err = call(["uv", "pip", "list", "--python", python, "--format", "json"], timeout=120, quiet=True)
+def pip_list(python, *flags):
+    """Paczki po nazwie kanonicznej; -v dokłada katalog, w którym każda leży."""
+    ok, out, err = call([python, "-m", "pip", "list", "-v", "--format=json", *flags], timeout=600, quiet=True)
+    # -v kładzie na stdout także log pip („Link requires a different Python”); JSON to jedna linia
+    lines = [line for line in out.splitlines() if line.startswith("[")]
     try:
-        return {norm(p["name"]): (p["name"], p["version"]) for p in json.loads(out)} if ok else None
+        items = json.loads(lines[-1]) if ok and lines else None
     except ValueError:
-        return None
-
-
-def pip_outdated(python):
-    ok, out, err = call(["uv", "pip", "list", "--python", python, "--outdated", "--format", "json"], timeout=300, quiet=True)
-    try:
-        items = json.loads(out) if ok else None
-    except ValueError:
-        items = None
+        items, err = None, "unreadable pip output"
     if items is None:
-        raise StepError(f"uv pip list: {err or 'unreadable output'}")
-    return {norm(i["name"]): (i["name"], i["version"], i["latest_version"]) for i in items}
+        raise StepError(f"pip list: {err}")
+    return {canonical(i["name"]): i for i in items}
+
+
+def pip_check(python):
+    """Niezgodności jako pary (paczka, zależność), bo tekst zmienia się razem z wersjami."""
+    _, out, _ = call([python, "-m", "pip", "check"], timeout=300, codes=(0, 1), quiet=True)
+    found = {}
+    for line in out.splitlines():
+        match = PIP_CHECK.match(line.strip())
+        if match:
+            found[(canonical(match.group(1)), canonical(match.group(2)))] = line.strip()
+    return found
+
+
+def pip_install(python, args, user):
+    flags = ["--progress-bar", "off"] + (["--user"] if user else [])
+    return call([python, "-m", "pip", "install", *flags, *args], timeout=2 * HOUR)
+
+
+def pip_restore(python, before, after, in_user):
+    """Stan sprzed przebiegu: nowe paczki i kopie postawione w user site znikają, podbite wracają."""
+    added = {n for n in after if n not in before or after[n]["location"] != before[n]["location"]}
+    if added:
+        call([python, "-m", "pip", "uninstall", "-y", *(after[n]["name"] for n in sorted(added))], timeout=HOUR)
+    back = [n for n in before if n not in added and (n not in after or after[n]["version"] != before[n]["version"])]
+    for user in (False, True):
+        pins = [f"{before[n]['name']}=={before[n]['version']}" for n in back if in_user(n) == user]
+        if pins:
+            pip_install(python, ["--no-deps", *pins], user)
 
 
 def import_failures(python, dists):
@@ -544,73 +589,69 @@ def import_failures(python, dists):
         return {d: why for d, why in pool.map(check, dists) if why}
 
 
-def python_packages(st, cfg, python, dry):
-    """Wszystkie pakiety naraz, jednym rozwiązaniem zależności uv, a po nim dowód, że nic nie padło:
-    `uv pip check` i import każdego pakietu instalowanego wprost. Gdy coś przestało działać,
-    wracają wersje sprzed aktualizacji."""
-    pins = {norm(k): v for k, v in (cfg.get("pip_pins") or {}).items()}
-    outdated = pip_outdated(python)
-    st.held += [pkg(n, v, latest, why="pin") for k, (n, v, latest) in outdated.items() if k in pins]
-    todo = {k: o for k, o in outdated.items() if k not in pins}
-    if not todo:
-        return
+def upgrade_python(st, python, info, pins, dry):
+    label = info["label"]
+    local = {canonical(n) for n in info["local"]}
+    outdated = {n: i for n, i in pip_list(python, "--outdated").items() if n not in local}
+    pinned = lambda n, now: pkg(outdated[n]["name"], now, outdated[n]["latest_version"], python=label, why="pin")
     if dry:
-        st.updated += [pkg(n, v, latest) for n, v, latest in todo.values()]
+        st.updated += [pkg(i["name"], i["version"], i["latest_version"], python=label)
+                       for n, i in outdated.items() if n not in pins]
+        st.held += [pinned(n, i["version"]) for n, i in outdated.items() if n in pins]
         return
-    ok, out, _ = call([python, "-m", "pip", "list", "--not-required", "--format=json", "--disable-pip-version-check"],
-                      timeout=120, quiet=True)
-    try:
-        top = [p["name"] for p in json.loads(out)] if ok else []
-    except ValueError:
-        top = []
-    if not top:
-        raise StepError("pip list --not-required: unreadable output")
-    before = pip_versions(python)
-    ok, snapshot, err = call(["uv", "pip", "freeze", "--python", python], timeout=120, quiet=True)
-    if not ok or before is None:
-        raise StepError(f"uv pip freeze: {err}")
-    snapshot_path = os.path.join(STATE_DIR, "python-before-update.txt")
-    with open(snapshot_path, "w") as f:
-        f.write(snapshot)
-    checked_before, _, _ = call(["uv", "pip", "check", "--python", python], timeout=120, quiet=True)
-    broken_before = import_failures(python, top)
-
-    wanted = [n for n in top if norm(n) not in pins] + [f"{n}{spec}" for n, spec in (cfg.get("pip_pins") or {}).items()]
-    ok, _, err = call(["uv", "pip", "install", "--python", python, "--upgrade", "--compile-bytecode", *wanted],
-                      timeout=HOUR)
-    if not ok:
-        st.error = f"uv pip install: {err}"
+    if not set(outdated) - set(pins):
+        st.held += [pinned(n, i["version"]) for n, i in outdated.items()]
         return
-    checked, check_out, check_err = call(["uv", "pip", "check", "--python", python], timeout=120, quiet=True)
-    broken = {d: why for d, why in import_failures(python, top).items() if d not in broken_before}
-    problem = None
-    if checked_before and not checked:
-        problem = f"dependency conflict: {check_err}"
-    elif broken:
-        dist, why = next(iter(broken.items()))
-        problem = f"{dist} stopped importing: {why}"
-    if problem:
-        ok, _, err = call(["uv", "pip", "install", "--python", python, "--compile-bytecode", "-r", snapshot_path],
-                          timeout=HOUR)
-        st.error = f"{problem}; rolled back" if ok else f"{problem}; rollback failed: {err}"
-        if not ok:
-            st.failed.append(pkg("Python packages", None, None, error=st.error,
-                                 retry=f"uv pip install --python {python} -r {snapshot_path}"))
+    before = pip_list(python)
+    user_site = os.path.realpath(info["user_site"])
+    in_user = lambda n: os.path.realpath(before[n]["location"]) == user_site
+    # paczki, których nic nie wymaga, ciągną resztę: resolver widzi wtedy wszystkie ograniczenia naraz;
+    # przypięta idzie ze specyfikatorem, także jako zależność innej, bo inaczej eager by ją podbił
+    top = set(pip_list(python, "--not-required"))
+    todo = sorted((top | set(outdated)) - local)
+    broken = pip_check(python)
+    # zepsuta biblioteka natywna przechodzi pip check, a nie daje się zaimportować
+    importable = sorted(before[n]["name"] for n in top if n in before)
+    unimportable = import_failures(python, importable)
+    errors = {}
+    # najpierw katalog Pythona, potem user site, do którego --user kładzie też nowsze zależności z dołu
+    for user in (False, True):
+        names = [before[n]["name"] + pins.get(n, "") for n in todo if n in before and in_user(n) == user]
+        if names:
+            upgrade = ["--upgrade", "--upgrade-strategy", "eager", "--only-binary", ":all:", *names]
+            ok, _, err = pip_install(python, upgrade, user)
+            if not ok:
+                errors[user] = err
+    after = pip_list(python)
+    bumped = [n for n in before if n in after and after[n]["version"] != before[n]["version"]]
+    new = [line for key, line in pip_check(python).items() if key not in broken]
+    stopped = sorted((d, why) for d, why in import_failures(python, importable).items() if d not in unimportable)
+    if new or stopped:
+        pip_restore(python, before, after, in_user)
+        error = f"rolled back, pip check: {new[0]}" if new else f"rolled back, {stopped[0][0]} stopped importing: {stopped[0][1]}"
+        st.failed += [
+            pkg(before[n]["name"], before[n]["version"], after[n]["version"], python=label, error=error) for n in bumped
+        ] or [pkg(f"Python {label}", "?", "?", error=error)]
         return
-    after = pip_versions(python) or {}
-    st.updated += [pkg(name, before[k][1], v) for k, (name, v) in sorted(after.items())
-                   if k in before and before[k][1] != v]
-    try:
-        left = pip_outdated(python)
-    except StepError:
-        left = {}
-    st.held += [pkg(n, v, latest, why="deps") for k, (n, v, latest) in left.items() if k not in pins]
-    playwright_browsers(st, python, before.get("playwright"), after.get("playwright"))
+    st.updated += [pkg(after[n]["name"], before[n]["version"], after[n]["version"], python=label) for n in bumped]
+    for n, item in outdated.items():
+        now = after[n]["version"] if n in after else item["version"]
+        if n not in before or now == item["latest_version"]:
+            continue
+        entry = pkg(item["name"], now, item["latest_version"], python=label)
+        if n in pins:
+            st.held.append(dict(entry, why="pin"))
+        elif in_user(n) in errors:
+            st.failed.append(dict(entry, error=errors[in_user(n)]))
+        else:  # resolver trzyma ją niżej dla innej paczki albo nowsza nie ma wheela
+            st.held.append(dict(entry, why="deps"))
+    if "playwright" in bumped:
+        playwright_browsers(st, python, label, before["playwright"]["version"], after["playwright"]["version"])
 
 
-def playwright_browsers(st, python, before, after):
+def playwright_browsers(st, python, label, old, new):
     """Nowy playwright szuka przeglądarek w nowych wersjach: bez ich pobrania skrypty padają."""
-    if not before or not after or before[1] == after[1] or not os.path.isdir(PLAYWRIGHT_CACHE):
+    if not os.path.isdir(PLAYWRIGHT_CACHE):
         return
     present = os.listdir(PLAYWRIGHT_CACHE)
     browsers = [b for b in ("chromium", "firefox", "webkit") if any(d.startswith(b) for d in present)]
@@ -618,7 +659,7 @@ def playwright_browsers(st, python, before, after):
         return
     ok, _, err = call([python, "-m", "playwright", "install", *browsers], timeout=1800)
     if not ok:
-        st.failed.append(pkg("Playwright browsers", before[1], after[1], error=err,
+        st.failed.append(pkg("Playwright browsers", old, new, python=label, error=err,
                              retry=f"{python} -m playwright install {' '.join(browsers)}"))
 
 
@@ -629,14 +670,12 @@ def fetch(url, timeout=60):
     return out
 
 
-def python_org(st, python, dry):
+def python_org(st, info, dry):
     """python.org nie aktualizuje się bez hasła administratora: automat pobiera i sprawdza instalator
     nowszej wersji poprawkowej, a panel daje przycisk, który go otwiera."""
-    ok, out, _ = call([python, "-c", "import sys; print(sys.version.split()[0], sys.base_prefix)"], quiet=True)
-    if not ok or "/Python.framework/" not in out:
+    if not info["prefix"].startswith("/Library/Frameworks/Python.framework/"):
         return
-    current = out.split()[0]
-    minor = ".".join(current.split(".")[:2])
+    current, minor = info["patch"], info["version"]
     try:
         releases = json.loads(fetch(PYTHON_RELEASES))
     except (StepError, ValueError) as err:
@@ -670,45 +709,71 @@ def python_org(st, python, dry):
 
 
 def uv_pythons():
+    """Pythony z uv: wersja minor -> (najnowsza poprawka, katalogi jej instalacji)."""
     ok, out, _ = call(["uv", "python", "list", "--only-installed", "--managed-python", "--output-format", "json"],
                       timeout=60, quiet=True)
-    newest = {}
+    found = {}
     try:
         for p in json.loads(out) if ok else []:
             minor = ".".join(p["version"].split(".")[:2])
-            if version_key(p["version"]) > version_key(newest.get(minor, "0")):
-                newest[minor] = p["version"]
-    except (ValueError, KeyError):
+            newest, homes = found.get(minor, ("0", set()))
+            homes.add(os.path.dirname(os.path.dirname(os.path.realpath(p["path"]))))
+            found[minor] = (max(newest, p["version"], key=version_key), homes)
+    except (ValueError, KeyError, TypeError):
         pass
-    return newest
+    return found
 
 
-def uv_python_upgrade(st, dry):
-    """Pythony z uv (projekty, uvx) do najnowszej wersji poprawkowej."""
+def uv_python_upgrade(st, used, dry):
+    """Pythony z uv (projekty, uvx) do najnowszej wersji poprawkowej. Nowa poprawka to nowy katalog,
+    a paczki pip postawione w starym zostałyby w nim, więc Pythona, którego paczki aktualizuje ten
+    krok (np. domyślny python3 od uv), automat nie przestawia."""
     before = uv_pythons()
-    if not before or dry:
+    kept = sorted(m for m, (_, homes) in before.items() if homes & used)
+    st.held += [pkg(f"Python {m} (uv)", before[m][0], None, why="packages") for m in kept]
+    todo = sorted(m for m in before if m not in kept)
+    if not todo or dry:
         return
-    ok, _, err = call(["uv", "python", "upgrade"], timeout=1200)
+    ok, _, err = call(["uv", "python", "upgrade", *todo], timeout=1200)
     after = uv_pythons()
-    for minor, old in sorted(before.items()):
-        new = after.get(minor, old)
+    for minor in todo:
+        old, new = before[minor][0], after.get(minor, before[minor])[0]
         if new != old:
             st.updated.append(pkg(f"Python {minor} (uv)", old, new))
     if not ok:
         st.failed.append(pkg("uv Pythons", None, None, error=err))
 
 
-def step_python(st, cfg, dry):
-    python = python_for_pip(cfg)
-    if not which("uv"):
-        if python:
-            st.error = "uv is missing: brew install uv"
-        return bool(python)
-    if python:
-        python_packages(st, cfg, python, dry)
-        python_org(st, python, dry)
-    uv_python_upgrade(st, dry)
-    return True
+def step_pip(st, cfg, dry):
+    pythons = cfg.get("python") or PYTHONS
+    pins = {canonical(n): spec for n, spec in (cfg.get("pip_pins") or {}).items()}
+    seen = set()
+    for python in [pythons] if isinstance(pythons, str) else pythons:
+        if not os.access(python, os.X_OK):
+            continue
+        ok, out, err = call([python, "-c", PYTHON_INFO], timeout=120, quiet=True)
+        try:
+            info = json.loads(out) if ok else None
+        except ValueError:
+            info, err = None, "unreadable output"
+        if info is None:
+            st.failed.append(pkg(python, "?", "?", error=f"couldn't start: {err}"))
+            continue
+        if info["prefix"] in seen:
+            continue
+        seen.add(info["prefix"])
+        # python.org i Homebrew bywają w tej samej wersji: w panelu pypdf (3.14) byłby dwa razy
+        where = " Homebrew" if info["prefix"].startswith("/opt/homebrew/") else " uv" if "/uv/python/" in info["prefix"] else ""
+        info["label"] = info["version"] + where
+        # jeden zepsuty Python nie zatrzymuje pozostałych
+        try:
+            upgrade_python(st, python, info, pins, dry)
+        except StepError as err:
+            st.failed.append(pkg(f"Python {info['label']}", "?", "?", error=str(err)))
+        python_org(st, info, dry)
+    if which("uv"):
+        uv_python_upgrade(st, {os.path.realpath(p) for p in seen}, dry)
+    return bool(seen or st.failed or st.updated or st.held)
 
 
 # ---------- Claude Code ----------
@@ -829,7 +894,7 @@ STEPS = [
     ("brew", "Homebrew", step_brew),
     ("npm", "npm", step_npm),
     ("go", "Go", step_go),
-    ("python", "Python", step_python),
+    ("pip", "Python", step_pip),
     ("claude", "Claude Code", step_claude),
 ]
 
@@ -912,15 +977,14 @@ def cmd_run(cfg, args):
             write_json(STATE_PATH, current)
 
     state = load_json(STATE_PATH, {})
-    order = [n for n, _, _ in STEPS]
     done = {s["name"] for s in steps}
+    order = [n for n, _, _ in STEPS]
     # kroki z poprzednich przebiegów zostają, a tych, których skrypt już nie zna, nie ma
     state["steps"] = steps + [s for s in state.get("steps", []) if s["name"] not in done and s["name"] in order]
     state["steps"].sort(key=lambda s: order.index(s["name"]))
-    counted = steps
-    updated = sum(len(s["updated"]) for s in counted)
-    failures = [f"{f['name']} ({s['label']})" for s in counted for f in s["failed"]]
-    failures += [s["label"] for s in counted if s.get("error")]
+    updated = sum(len(s["updated"]) for s in steps)
+    failures = [f"{f['name']} ({s['label']})" for s in steps for f in s["failed"]]
+    failures += [s["label"] for s in steps if s.get("error")]
     ok = not failures
     if not only:  # przebieg zawężony nie przesuwa terminu dla reszty
         state["last_run"] = {
@@ -946,19 +1010,22 @@ def cmd_run(cfg, args):
 
 
 WHY = {"pin": "przypięte", "deps": "trzymane przez zależności", "edited": "poprawione ręcznie",
-       "confirm": "czeka na potwierdzenie", "install": "instalator do uruchomienia"}
+       "confirm": "czeka na potwierdzenie", "install": "instalator do uruchomienia",
+       "packages": "ma paczki pip, nowa poprawka ręcznie"}
 
 
 def print_plan(steps):
+    # paczka pip mówi, w którym Pythonie leży: numpy bywa w dwóch
+    named = lambda p: p["name"] + (f" ({p['python']})" if p.get("python") else "")
     for st in steps:
         line = f"{st.label}: "
         if st.error:
             line += f"błąd: {st.error}"
         else:
-            line += ", ".join(f"{p['name']} {p['from']} → {p['to']}" for p in st.updated) or "aktualne"
+            line += ", ".join(f"{named(p)} {p['from']} → {p['to']}" for p in st.updated) or "aktualne"
         if st.held:
             line += "; przytrzymane: " + ", ".join(
-                f"{p['name']} ({WHY.get(p.get('why'), p.get('why'))}" + (f", jest {p['to']})" if p.get("to") else ")")
+                f"{named(p)} ({WHY.get(p.get('why'), p.get('why'))}" + (f", jest {p['to']})" if p.get("to") else ")")
                 for p in st.held)
         if st.failed:
             line += "; nie do sprawdzenia: " + ", ".join(f"{p['name']}: {p['error']}" for p in st.failed)

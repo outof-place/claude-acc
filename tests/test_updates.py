@@ -1,4 +1,4 @@
-"""Testy updates.py na atrapach brew, npm, go, uv, Pythona, claude i npx skills.
+"""Testy updates.py na atrapach brew, npm, go, pip, uv, claude, npx skills i pkgutil.
 
 Każdy test stawia osobny $HOME z plikiem świata (co jest zainstalowane, co najnowsze), a atrapy
 z tests/fakes-updates czytają go i zmieniają tak, jak prawdziwe narzędzia. Prawdziwe brew, npm,
@@ -45,17 +45,8 @@ WORLD = {
                 "installed": "v1.61.7", "latest": "v1.67.4"},
         "ent": {"path": "entgo.io/ent/cmd/ent", "module": "entgo.io/ent", "installed": "v0.14.6", "latest": "v0.14.6"},
     },
-    "python": {
-        "version": "3.14.8",
-        "top": ["pandas", "playwright", "fb-idb"],
-        "packages": {
-            "pandas": {"installed": "2.3.3", "latest": "3.0.6"},
-            "numpy": {"installed": "2.3.4", "latest": "2.5.3"},
-            "playwright": {"installed": "1.58.0", "latest": "1.63.0"},
-            "fb-idb": {"installed": "1.1.7", "latest": "1.2.0"},
-        },
-    },
-    "uv_pythons": [{"installed": "3.13.13", "latest": "3.13.14"}],
+    "pip": {"attrs": {"installed": "25.4.0", "latest": "26.1.0"}},
+    "uv_pythons": [],
     "claude": {
         "version": "2.1.291",
         "latest": "2.1.292",
@@ -67,6 +58,7 @@ WORLD = {
 }
 # python.org: najnowsza 3.14 to 3.14.8, a 3.15 to inna wersja główna, której automat nie proponuje
 RELEASES = [{"name": "Python 3.14.7"}, {"name": "Python 3.14.8"}, {"name": "Python 3.15.0"}, {"name": "Python 3.14.9rc1"}]
+PYTHON_ORG = {"pip:version": "3.14", "pip:patch": "3.14.0", "pip:prefix": "/Library/Frameworks/Python.framework/Versions/3.14"}
 
 
 def tree_hash(folder):
@@ -78,6 +70,8 @@ def tree_hash(folder):
         return subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, check=True).stdout.strip()
     finally:
         shutil.rmtree(scratch)
+
+
 
 
 class Env:
@@ -107,10 +101,9 @@ class Env:
         for name, package in world["npm"].items():
             if "bin" in package:
                 self.write(f"npm-global/lib/node_modules/{name}/package.json", json.dumps({"bin": {package["bin"]: "cli.js"}}))
-                command = os.path.join(self.home, "npm-global/bin", package["bin"])
-                os.symlink(os.path.join(FAKES, "npm-bin"), command)
+                os.symlink(os.path.join(FAKES, "npm-bin"), os.path.join(self.home, "npm-global/bin", package["bin"]))
                 self.write(f"npm-global/bin/{package['bin']}.package", name)
-        self.config(npm_pins={"pnpm": "11"}, pip_pins={"fb-idb": "==1.1.7"}, python=os.path.join(FAKES, "python3"))
+        self.config(npm_pins={"pnpm": "11"}, python=os.path.join(FAKES, "python3"))
 
     def write(self, name, text):
         path = os.path.join(self.home, name)
@@ -176,13 +169,9 @@ def names(items):
     return [i["name"] for i in items]
 
 
-def versions(world):
-    return {n: p["installed"] for n, p in world["python"]["packages"].items()}
-
-
 class UpdatesTest(unittest.TestCase):
     def test_brings_every_manager_to_the_newest_version(self):
-        env = Env(self)
+        env = Env(self, uv_pythons=[{"installed": "3.13.13", "latest": "3.13.14"}])
         done = env.run("run", "--force")
         self.assertEqual(done.returncode, 0, done.stderr)
 
@@ -193,7 +182,6 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(world["npm"]["vercel"]["installed"], "62.4.0")
         self.assertEqual(world["npm"]["npm"]["installed"], "12.2.0")
         self.assertEqual(world["go"]["air"]["installed"], "v1.67.4")
-        self.assertEqual(world["python"]["packages"]["pandas"]["installed"], "3.0.6")
         self.assertEqual(world["uv_pythons"][0]["installed"], "3.13.14")
         self.assertEqual(world["claude"]["version"], "2.1.292")
         self.assertEqual(world["claude"]["plugins"][0]["version"], "2.0.10")
@@ -202,10 +190,13 @@ class UpdatesTest(unittest.TestCase):
         run = state["last_run"]
         self.assertTrue(run["ok"], state["steps"])
         self.assertEqual(state["last_success"], run["at"])
+        # railway, ngrok, vercel, pnpm, npm, air, attrs, Python 3.13 (uv), Claude Code, wtyczka
+        self.assertEqual(run["updated"], 10)
         self.assertNotIn("running_since", state)
-        self.assertEqual(names(state["steps"]), ["brew", "npm", "go", "python", "claude"])
+        self.assertEqual(names(state["steps"]), ["brew", "npm", "go", "pip", "claude"])
         self.assertEqual(names(step(state, "go")["updated"]), ["air"])
         self.assertEqual(step(state, "go")["failed"], [])  # notgo pominięty, nie błąd
+        self.assertEqual(names(step(state, "pip")["updated"]), ["attrs", "Python 3.13 (uv)"])
         self.assertEqual(names(step(state, "claude")["updated"]), ["Claude Code", "security-guidance plugin"])
         self.assertEqual(env.notifications(), [])
 
@@ -286,57 +277,157 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual((upcoming.hour, upcoming.minute), (4, 30))
         self.assertTrue(3 * DAY - 3600 <= upcoming.timestamp() - run["at"] < 4 * DAY)
 
-    def test_python_packages_move_together_keep_pins_and_get_browsers(self):
-        env = Env(self)
+    def test_python_packages_are_upgraded_together_from_wheels(self):
+        env = Env(self, pip={
+            "attrs": {"installed": "25.4.0", "latest": "26.1.0"},
+            # pydantic trzyma ją niżej; llama-cpp-python ma nowszą tylko w źródłach
+            "pydantic-core": {"installed": "2.46.5", "latest": "2.49.0", "required": True, "held": True},
+            "llama-cpp-python": {"installed": "0.3.16", "latest": "0.3.36", "nowheel": True},
+            "openpyxl": {"installed": "3.1.2", "latest": "3.1.5", "user": True},
+            # postawiona z katalogu: pod tą nazwą na PyPI jest coś innego
+            "mytool": {"installed": "0.1.0", "latest": "9.9.9", "local": True},
+        })
         env.run("run", "--force")
-        self.assertEqual(versions(env.world()),
-                         {"pandas": "3.0.6", "numpy": "2.5.3", "playwright": "1.63.0", "fb-idb": "1.1.7"})
-        # jedno rozwiązanie zależności dla wszystkich pakietów, z kodem bajtowym i przypięciem
-        [install] = [c for c in env.calls() if c.startswith("uv pip install")]
-        self.assertIn("--upgrade --compile-bytecode pandas playwright fb-idb==1.1.7", install)
+        installed = {n: p["installed"] for n, p in env.world()["pip"].items()}
+        self.assertEqual(installed, {
+            "attrs": "26.1.0", "pydantic-core": "2.46.5", "llama-cpp-python": "0.3.16",
+            "openpyxl": "3.1.5", "mytool": "0.1.0",
+        })
+
+        state = env.state()
+        pip = step(state, "pip")
+        self.assertEqual(pip["updated"], [
+            {"name": "attrs", "from": "25.4.0", "to": "26.1.0", "python": "3.13"},
+            {"name": "openpyxl", "from": "3.1.2", "to": "3.1.5", "python": "3.13"},
+        ])
+        self.assertEqual(sorted(names(pip["held"])), ["llama-cpp-python", "pydantic-core"])
+        self.assertEqual(pip["failed"], [])
+        self.assertTrue(state["last_run"]["ok"])
+
+        # jedno polecenie na katalog: resolver widzi wszystkie paczki naraz; user site osobno
+        base, user = [c for c in env.calls() if c.startswith("python3 -m pip install")]
+        self.assertIn("--upgrade-strategy eager --only-binary :all:", base)
+        self.assertTrue(base.endswith(" attrs llama-cpp-python pydantic-core"), base)
+        self.assertNotIn("--user", base)
+        self.assertTrue(user.endswith(" openpyxl") and "--user" in user, user)
+
+    def test_a_python_upgrade_that_breaks_a_dependency_is_rolled_back(self):
+        broken = "cattrs 24.1.0 has requirement attrs<26, but you have attrs 26.1.0."
+        env = Env(self, pip={"attrs": {"installed": "25.4.0", "latest": "26.1.0", "breaks": broken}})
+        env.run("run")
+        self.assertEqual(env.world()["pip"]["attrs"]["installed"], "25.4.0")
+        state = env.state()
+        [attrs] = step(state, "pip")["failed"]
+        self.assertEqual((attrs["from"], attrs["to"]), ("25.4.0", "26.1.0"))
+        self.assertEqual(attrs["error"], f"rolled back, pip check: {broken}")
+        self.assertFalse(state["last_run"]["ok"])
+        [note] = env.notifications()
+        self.assertIn("attrs (Python)", note)
+
+    def test_a_dependency_problem_from_before_the_run_is_not_rolled_back(self):
+        env = Env(self, pip_broken=["cattrs 24.1.0 requires exceptiongroup, which is not installed."])
+        env.run("run", "--force")
+        self.assertEqual(env.world()["pip"]["attrs"]["installed"], "26.1.0")
+        self.assertTrue(env.state()["last_run"]["ok"])
+
+    def test_a_failed_pip_install_is_named_and_the_rest_goes_on(self):
+        env = Env(self, fail=["pip install"])
+        env.run("run", "--force")
+        state = env.state()
+        [attrs] = step(state, "pip")["failed"]
+        self.assertEqual(attrs["error"], "ERROR: ResolutionImpossible: fake conflict")
+        self.assertEqual(env.world()["npm"]["vercel"]["installed"], "62.4.0")
+        self.assertFalse(state["last_run"]["ok"])
+
+    def test_every_python_is_upgraded_once_and_named(self):
+        env = Env(self, **{
+            "pip:python3-brew": {"numpy": {"installed": "2.4.3", "latest": "2.5.3"}},
+            "pip:python3-brew:version": "3.14",
+            "pip:python3-brew:prefix": "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14",
+        })
+        fake = os.path.join(FAKES, "python3")
+        brew = os.path.join(env.home, "fake/python3-brew")
+        os.symlink(fake, brew)
+        env.config(python=[fake, brew, fake])  # ten sam Python drugi raz nie liczy się
+        env.run("run", "--force")
+        pip = step(env.state(), "pip")
+        self.assertEqual([(p["name"], p["python"]) for p in pip["updated"]], [("attrs", "3.13"), ("numpy", "3.14 Homebrew")])
+        self.assertEqual(sum(c.startswith("python3 -m pip install") for c in env.calls()), 1)
+        self.assertEqual(env.world()["pip:python3-brew"]["numpy"]["installed"], "2.5.3")
+
+    def test_a_pinned_python_package_stays_and_new_playwright_gets_its_browsers(self):
+        env = Env(self, pip={
+            "attrs": {"installed": "25.4.0", "latest": "26.1.0"},
+            "fb-idb": {"installed": "1.1.7", "latest": "1.2.0"},
+            # przypięta zależność: eager podbiłby ją razem z paczką, która jej wymaga
+            "grpclib": {"installed": "0.4.7", "latest": "0.4.9", "required": True},
+            "playwright": {"installed": "1.58.0", "latest": "1.63.0"},
+        })
+        env.config(pip_pins={"fb-idb": "==1.1.7", "grpclib": "==0.4.7"}, python=os.path.join(FAKES, "python3"))
+        env.run("run", "--force")
+        installed = {n: p["installed"] for n, p in env.world()["pip"].items()}
+        self.assertEqual(installed, {"attrs": "26.1.0", "fb-idb": "1.1.7", "grpclib": "0.4.7", "playwright": "1.63.0"})
+        [install] = [c for c in env.calls() if c.startswith("python3 -m pip install")]
+        self.assertTrue(install.endswith(" attrs fb-idb==1.1.7 grpclib==0.4.7 playwright"), install)
         self.assertIn("python3 -m playwright install chromium", env.calls())
 
-        python = step(env.state(), "python")
-        self.assertEqual(names(python["updated"]), ["numpy", "pandas", "playwright", "Python 3.13 (uv)"])
-        self.assertEqual(python["held"], [{"name": "fb-idb", "from": "1.1.7", "to": "1.2.0", "why": "pin"}])
-        with open(os.path.join(env.state_dir, "python-before-update.txt")) as f:
-            self.assertIn("pandas==2.3.3", f.read())
+        pip = step(env.state(), "pip")
+        self.assertEqual(names(pip["updated"]), ["attrs", "playwright"])
+        self.assertEqual(sorted((h["name"], h["why"]) for h in pip["held"]), [("fb-idb", "pin"), ("grpclib", "pin")])
 
-    def test_an_upgrade_that_breaks_an_import_is_rolled_back(self):
-        env = Env(self, edit=lambda w: w["python"].update(breaks={"pandas": "3.0.6"}))
+    def test_a_python_upgrade_that_breaks_an_import_is_rolled_back(self):
+        # pip check tego nie widzi: zależności się zgadzają, a biblioteka natywna nie wstaje
+        error = "ImportError: numpy.core.multiarray failed to import"
+        env = Env(self, pip={
+            "pandas": {"installed": "2.3.3", "latest": "3.0.6", "unimportable": error},
+            "playwright": {"installed": "1.58.0", "latest": "1.63.0"},
+        })
         env.run("run", "--force")
-        self.assertEqual(versions(env.world()),
-                         {"pandas": "2.3.3", "numpy": "2.3.4", "playwright": "1.58.0", "fb-idb": "1.1.7"})
+        installed = {n: p["installed"] for n, p in env.world()["pip"].items()}
+        self.assertEqual(installed, {"pandas": "2.3.3", "playwright": "1.58.0"})
         state = env.state()
-        error = step(state, "python")["error"]
-        self.assertIn("pandas stopped importing", error)
-        self.assertIn("rolled back", error)
+        failed = step(state, "pip")["failed"]
+        self.assertEqual(sorted(names(failed)), ["pandas", "playwright"])
+        self.assertEqual(failed[0]["error"], f"rolled back, pandas stopped importing: pandas: {error}")
         self.assertFalse(state["last_run"]["ok"])
         self.assertNotIn("python3 -m playwright install chromium", env.calls())
 
-    def test_a_dependency_conflict_after_the_upgrade_is_rolled_back(self):
-        env = Env(self, edit=lambda w: w["python"].update(conflict_after_upgrade=True))
-        env.run("run", "--force")
-        self.assertEqual(env.world()["python"]["packages"]["numpy"]["installed"], "2.3.4")
-        error = step(env.state(), "python")["error"]
-        self.assertIn("requires `numpy<2.5`", error)
-        self.assertIn("rolled back", error)
-
     def test_a_newer_python_org_patch_is_downloaded_and_offered(self):
-        env = Env(self, edit=lambda w: w["python"].update(version="3.14.0"))
+        env = Env(self, **PYTHON_ORG)
         env.run("run", "--force")
-        [offer] = [h for h in step(env.state(), "python")["held"] if h["name"] == "Python"]
+        [offer] = [h for h in step(env.state(), "pip")["held"] if h["name"] == "Python"]
         self.assertEqual((offer["from"], offer["to"], offer["why"]), ("3.14.0", "3.14.8", "install"))
         self.assertTrue(os.path.isfile(offer["installer"]))
         self.assertTrue(any(c.startswith("pkgutil --check-signature") for c in env.calls()))
 
+        # Python z Homebrew też ma w ścieżce Python.framework, a aktualizuje go brew
+        brew = Env(self, **dict(PYTHON_ORG, **{
+            "pip:prefix": "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14"}))
+        brew.run("run", "--force")
+        self.assertFalse([h for h in step(brew.state(), "pip")["held"] if h["name"] == "Python"])
+        self.assertFalse([c for c in brew.calls() if c.startswith("pkgutil")])
+
     def test_an_unsigned_python_installer_is_thrown_away(self):
-        env = Env(self, fail=["signature"], edit=lambda w: w["python"].update(version="3.14.0"))
+        env = Env(self, fail=["signature"], **PYTHON_ORG)
         env.run("run", "--force")
-        python = step(env.state(), "python")
-        self.assertFalse([h for h in python["held"] if h["name"] == "Python"])
-        self.assertIn("signature check failed", python["failed"][0]["error"])
+        pip = step(env.state(), "pip")
+        self.assertFalse([h for h in pip["held"] if h["name"] == "Python"])
+        [python] = pip["failed"]
+        self.assertIn("signature check failed", python["error"])
         self.assertEqual(os.listdir(os.path.join(env.state_dir, "downloads")), [])
+
+    def test_a_uv_python_holding_pip_packages_is_not_moved_to_a_new_patch(self):
+        # nowa poprawka to nowy katalog: paczki w starym przestałyby być widoczne
+        env = Env(self, **{
+            "uv_pythons": [{"installed": "3.13.13", "latest": "3.13.14"}, {"installed": "3.11.15", "latest": "3.11.17"}],
+            "pip:prefix": "/fake/uv/cpython-3.13.13",
+        })
+        env.run("run", "--force")
+        self.assertIn("uv python upgrade 3.11", env.calls())
+        self.assertEqual([v["installed"] for v in env.world()["uv_pythons"]], ["3.13.13", "3.11.17"])
+        pip = step(env.state(), "pip")
+        self.assertIn("Python 3.11 (uv)", names(pip["updated"]))
+        self.assertIn(("Python 3.13 (uv)", "packages"), [(h["name"], h["why"]) for h in pip["held"]])
 
     def test_plugins_update_in_their_own_project_and_wait_for_confirmation(self):
         project = os.path.join(os.path.realpath(tempfile.gettempdir()), f"updates-proj-{os.getpid()}")
@@ -400,14 +491,23 @@ class UpdatesTest(unittest.TestCase):
         path = done.stdout.strip().split(":")
         self.assertEqual(path[0], os.path.join(home, ".local/bin"), done.stderr)
 
+    def test_a_step_from_an_older_version_drops_out_of_the_state(self):
+        # do 6.10 krok Pythona nazywał się "python"; stan z tamtej wersji nie może wywrócić przebiegu
+        env = Env(self)
+        old = {"name": "python", "label": "Python", "ok": True, "updated": [], "failed": [], "held": []}
+        env.set_state({"steps": [old]})
+        done = env.run("run", "--force")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(names(env.state()["steps"]), ["brew", "npm", "go", "pip", "claude"])
+
     def test_dry_run_prints_the_plan_and_changes_nothing(self):
         env = Env(self)
         done = env.run("run", "--dry-run")
         self.assertIn("railway 5.63.1 → 5.63.3", done.stdout)
         self.assertIn("pnpm 11.8.0 → 11.28.5", done.stdout)
         self.assertIn("air v1.61.7 → v1.67.4", done.stdout)
-        self.assertIn("pandas 2.3.3 → 3.0.6", done.stdout)
-        self.assertEqual(env.world(), copy.deepcopy(WORLD))
+        self.assertIn("attrs (3.13) 25.4.0 → 26.1.0", done.stdout)
+        self.assertEqual(env.world(), {**copy.deepcopy(WORLD)})
         self.assertIsNone(env.state())
 
     def test_brew_update_failure_skips_brew_but_not_the_others(self):

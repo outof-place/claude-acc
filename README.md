@@ -45,7 +45,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
 | **Load & heat** | CPU load split into performance and efficiency cores, GPU load, and P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
-| **Updates** | Everything on the Mac brought to its newest version every 3 days: Homebrew formulae and casks, global npm packages, Go programs, Python packages (rolled back if anything stops importing), Python itself, Claude Code with its plugins and skills. Pins are respected and hand-edited skills are left alone. The panel shows when it last worked, what each part did and why something failed, and an Update button runs it now. |
+| **Updates** | Everything on the Mac brought to its newest version every 3 days: Homebrew formulae and casks, global npm packages, Go programs, Python packages (rolled back if anything conflicts or stops importing), Python itself, Claude Code with its plugins and skills. Pins are respected and hand-edited skills are left alone. The panel shows when it last worked, what each part did and why something failed, and an Update button runs it now. |
 | **Ultra** | One switch that tunes the Mac for agent work. Helpers no agent waits on move to the efficiency cores, memory hooks stop holding up every tool call, Node starts warm for everything sessions spawn, and the guard frees dev server memory sooner. Each change is measured before and after, and Off puts back exactly what was there. |
 
 <img src="docs/panel-details.png" width="900" alt="The same panel with one account opened: plan, subscription status and start, renewal date with a countdown, the 5-hour and weekly windows with their exact resets, place in the switching order, and buttons to switch or sign in again">
@@ -72,7 +72,7 @@ flowchart LR
     pause[("pause.json")]
     keychain[("Keychain<br/>Claude + Orca entries")]
     api[("Anthropic API<br/>usage, profile")]
-    orca["Orca CLI<br/>tabs, terminals, agents"]
+    orca["Orca<br/>tabs, terminals, agents"]
     disk[("build caches<br/>node_modules")]
     tuned[("helpers, settings.json<br/>Docker, devguard.json")]
     smc[("SMC<br/>fans, sensors")]
@@ -89,8 +89,8 @@ flowchart LR
 ```
 
 - Every piece runs without the app. Each job writes its state to `~/.local/share/claude-acc`, and the app (dotted lines) only reads those files, calls the scripts and writes the fan mode. CPU and GPU load it reads from the kernel itself. Close it and the switching, cleanup, guard and fans keep working.
-- The scripts are Python 3.9 standard library only (the `/usr/bin/python3` that ships with the command line tools). Kernel numbers come through `ctypes`: `proc_pid_rusage` for memory, `sysctl` for swap and pressure, `KERN_PROCARGS2` for exact command lines.
-- The app is Swift 6 with main-actor default isolation (SE-0466) and `@concurrent` for process work, Swift Charts for the charts, and SF Rounded throughout.
+- The scripts are standard library only and still run on Python 3.9. Setup links uv's CPython 3.14 as `~/.local/share/claude-acc/python` when [uv](https://docs.astral.sh/uv/) is installed (it starts in 26 ms where the command line tools' 3.9 takes 37), the system `/usr/bin/python3` otherwise. Everything starts its script through `acc.py`, which runs it from cached bytecode: Python compiles the file it is given on every start, which was a third of a short run. Kernel numbers come through `ctypes`: `proc_pid_rusage` for memory, `sysctl` for swap and pressure, `KERN_PROCARGS2` for exact command lines.
+- The app is Swift 6 with main-actor default isolation (SE-0466) and `@concurrent` for process work, Swift Charts for the charts, and SF Rounded throughout. It stays near idle with the panel open (1-2% CPU, from 40%): a state file that didn't change costs one `stat` and wakes no view, live readings (load, heat, fans, memory, build progress) change in place, since while any animation runs SwiftUI updates the whole panel on every frame, and the spinning fan is a Core Animation layer the render server turns.
 - `fanctl` talks to the SMC through IOKit's `AppleSMC` user client. Reading needs no root; the daemon that writes runs as root, reads only a mode from your folder, and writes its readings back atomically.
 
 ### Accounts under the hood
@@ -158,7 +158,7 @@ To try the pause in one real session without pausing the others, start that sess
 ## Requirements
 
 - macOS 26 or newer on Apple silicon, with Swift 6.2 or newer (Xcode or the command line tools) to build the app. Homebrew builds it for you.
-- `/usr/bin/python3` (ships with the command line tools).
+- `/usr/bin/python3` (ships with the command line tools). With [uv](https://docs.astral.sh/uv/) installed, setup uses its CPython 3.14 instead.
 - Claude Code. Tested with 2.1.284.
 - Orca with your Claude accounts added as managed accounts, and **System default** selected as the active Claude account in Orca. With a managed account selected, Orca puts its own account back whenever a terminal starts and every 15 minutes, undoing every switch, and it refreshes that account's token itself. claude-acc reads Orca's settings, and while an account is selected there the watcher stands down, switching is blocked and the panel tells you to pick System default.
 
@@ -187,6 +187,8 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc guard once [--dry-run]` | One guard pass, at most one action |
 | `claude-acc guard stop <pid\|:port>` | Stop a dev server the way the guard does |
 | `claude-acc guard recycle <pid\|:port>` | Restart a dev server in its own Orca terminal |
+| `claude-acc guard pin <:port\|dir> [--for 12h \| --forever] [--reason TEXT] [--no-restart]` | An exception for a while: the guard never stops that server |
+| `claude-acc guard unpin <:port\|dir\|all>` / `claude-acc guard pins` | Drop a pin / list pins with their reasons and expiry |
 | `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
 | `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
 | `claude-acc fans install\|uninstall` | Install the fan daemon, or remove it and give the fans back to macOS |
@@ -275,12 +277,12 @@ With a few worktrees open in Orca, every agent starts its own `next dev` and ope
 - the OS never gives it. With 12.7 of 13.3 GB of swap used, `kern.memorystatus_vm_pressure_level` still said normal, right until jetsam started killing processes with reason `low-swap`;
 - an open preview keeps an HMR websocket, so every file an agent saves is a recompile and a page reload: one `tokens.css` edit cost the server with a preview 10 s of CPU, the six servers without one 0.1 s.
 
-`devguard.py` runs from launchd all the time (`KeepAlive`, standard priority, so it gets the CPU exactly when the Mac is choking) and looks every 5 seconds:
+`devguard.py` runs from launchd all the time (`KeepAlive`, standard priority, so it gets the CPU exactly when the Mac is choking) and looks every 5 seconds without starting a single process: the process table from `sysctl` (`KERN_PROC_ALL`, `KERN_PROCARGS2`), sockets from `proc_pidfdinfo`, and Orca over its own unix socket. A pass used to spawn `ps`, `lsof` and four `orca` CLI calls, 3.9 s of CPU a minute in child processes; now it takes about 0.2 s. It reads:
 
 - memory the way jetsam counts it: `phys_footprint` from `proc_pid_rusage`, plus CPU time and disk writes, read through `ctypes` without forking anything per process;
-- who watches each server: TCP clients from one `lsof` (an Orca tab, a browser, a headless Chrome), Orca's preview tabs, and whether the tab is the one you are looking at (active tab of the worktree selected in Orca);
+- who watches each server: TCP clients of its ports (an Orca tab, a browser, a headless Chrome), Orca's preview tabs, and whether the tab is the one you are looking at (active tab of the worktree selected in Orca);
 - memory pressure from swap growth and the compressor's `vm.compressor.compactor.swapouts_queued_pressure` counter. Swap that stays full after memory was freed is only a warning; full and still growing is critical;
-- Orca's worktrees, agents and terminals through the `orca` CLI, so it knows which terminal a server runs in and whether an agent is working there. It never starts Orca.
+- Orca's worktrees, agents and terminals, so it knows which terminal a server runs in and whether an agent is working there. Reads go over Orca's runtime socket with the request its CLI sends, and fall back to the `orca` CLI when that fails; actions (restarting a server in its terminal) always use the CLI. It never starts Orca.
 
 What it does, gentlest first:
 
@@ -293,13 +295,28 @@ What it does, gentlest first:
 
 One action at a time, then `cooldown_seconds` to let memory settle, and the swap growth window starts over so an old trend can't trigger the next one. A server younger than `grace_minutes` is left alone. After a stop the guard closes the server's background preview tabs in Orca (they would only keep reloading), writes a `devguard: ...` comment on the worktree card when the card has no comment of someone else's, sends a notification, and logs the command to bring the server back.
 
-`devguard.py admit` is a `PreToolUse` hook for Claude Code. When an agent is about to start a dev server (also through `orca terminal create --command`, `cd`, `pnpm -C`, `--filter`), it refuses a second server of an app that already runs and gives the agent its URL instead, and refuses a new one when memory is critical or the servers are over budget. It denies even under `--dangerously-skip-permissions`. `DEVGUARD_ALLOW=1` in front of the command lets it through. Add it to `~/.claude/settings.json`:
+### Pins: exceptions for a while
+
+Some servers have to stay up even when nobody watches them: a server a film pipeline captures from every few minutes, a demo you are about to show. `protect` in the config is permanent; a pin is the same promise for a while, set from the terminal (by you or by an agent) without editing JSON:
+
+```sh
+claude-acc guard pin :3747 --for 24h --reason "hero film captures"
+claude-acc guard pin ~/code/site/apps/web          # a directory: every server in or below it
+claude-acc guard pins
+claude-acc guard unpin :3747
+```
+
+A pinned server is never stopped: not as idle, a duplicate, an orphan, over budget or under pressure. When it bloats over `max_server_gb` it is still restarted in its terminal (it is back in seconds), and a restart loop only warns. `--no-restart` holds even that, until memory is critical: then the biggest pinned server is restarted, never stopped, and only when nothing unpinned is left to free. Pins last 12 hours unless you say `--for 90m`, `--for 2d` or `--forever`, live in `~/.local/share/claude-acc/devguard-pins.json`, take effect on the next pass without restarting the guard, and show up in `guard status` with their reason and expiry. Expired ones are ignored.
+
+`claude-acc-hook` is a `PreToolUse` hook for Claude Code. When an agent is about to start a dev server (also through `orca terminal create --command`, `cd`, `pnpm -C`, `--filter`), it refuses a second server of an app that already runs and gives the agent its URL instead, and refuses a new one when memory is critical or the servers are over budget. It denies even under `--dangerously-skip-permissions`. `DEVGUARD_ALLOW=1` in front of the command lets it through. Add it to `~/.claude/settings.json`:
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
-  { "type": "command", "command": "/usr/bin/python3 $HOME/.local/share/claude-acc/devguard.py admit", "timeout": 10 }
+  { "type": "command", "command": "$HOME/.local/share/claude-acc/claude-acc-hook", "timeout": 10 }
 ] } ] } }
 ```
+
+The hook runs before every Bash command of every agent, and most commands neither start a dev server nor bring Go or JS work for the scheduler. `claude-acc-hook` is a small native binary that answers those in about 5 ms; a command with one of the words that matter (`devguard.py words`, written to `hook-words.json` at setup) goes on to `devguard.py admit` with the same input, which decides everything. Before, Python started for every command: 44 ms each, and hundreds when the Mac is loaded. `python3 devguard.py admit` still works as the hook on its own.
 
 Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is optional.
 
@@ -310,6 +327,7 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `max_server_gb` | `5` | A single server above this is bloated |
 | `swap_warn_percent` / `swap_critical_percent` | `12` / `20` | Swap as % of RAM for a warning and, while it grows, for critical |
 | `available_critical_percent` | `10` | `kern.memorystatus_level` at or below this is critical |
+| `kernel_pressure` | `true` | Take the kernel's pressure level (`kern.memorystatus_vm_pressure_level`) into account; `false` relies on swap and `memorystatus_level` alone |
 | `quiet_seconds` | `30` | No CPU and no terminal output for this long before a watched server is restarted (10 times that for the one you watch) |
 | `grace_minutes` | `3` | A new server is left alone this long |
 | `duplicate_minutes` / `orphan_minutes` / `idle_minutes` | `5` / `10` / `45` | When a duplicate, an orphan and an idle server go |
@@ -317,7 +335,7 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `max_recycles_per_hour` | `2` | More restarts of one app than this is a loop: stop instead |
 | `background_unattended` | `true` | Background QoS for servers you don't watch |
 | `close_tabs` / `orca_comment` / `notify` | `true` | What happens around a stop |
-| `protect` | `[]` | Server paths (or anything above them) and ports like `":3000"` the guard never touches |
+| `protect` | `[]` | Server paths (or anything above them) and ports like `":3000"` the guard never touches; for a while, use `guard pin` |
 | `scope` | `[]` | When set, the guard only sees servers under these paths |
 | `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
 | `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |
@@ -335,8 +353,8 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 - **Homebrew**: `brew update`, then every outdated formula and cask. Casks that update themselves (Chrome, Slack) are left to their own updater, as `brew upgrade` does without `--greedy`. Pinned formulae (`brew pin`) stay where they are.
 - **npm**: every global package to its latest version, major versions included (for global packages `npm outdated` reports `latest` as the wanted version). `npm_pins` keeps a package within one major version. npm 12 doesn't run the install scripts of packages outside `allowScripts`, so a package that downloads its binary in one installs fine and then doesn't run. Each command a package puts on the `PATH` is run with `--version` before and after its upgrade; one that stopped answering brings the old version back, and the panel names the blocked scripts with the `--allow-scripts` command to allow them on purpose.
 - **Go**: every program `go install` put in `GOBIN` (or `GOPATH/bin`), read with `go version -m` and installed again at the module's latest version.
-- **Python packages** (python.org, else Homebrew's Python): every package in one dependency resolution by `uv`, with bytecode compiled right away so the first import stays fast. Global packages share their dependencies, so a bulk upgrade can quietly break a tool; before upgrading, the script saves a `pip freeze` and imports every package you installed directly, and afterwards it runs `uv pip check` and the imports again. A new dependency conflict or a package that stopped importing puts every version back. A new Playwright gets its browsers. `pip_pins` keeps a package where it is.
-- **Python itself**: a newer patch release of the python.org Python is downloaded and its signature checked (Developer ID Installer: Python Software Foundation); it needs an admin password, so the panel offers an **Install** button that opens it. A new minor version (3.14 to 3.15) is never offered, since every package would need installing again. Pythons managed by `uv` go up with `uv python upgrade`.
+- **Python**: the pip packages of every Python people install into: the default `python3` from uv (`uv python install --default`), python.org and Homebrew. The packages share their dependencies, so they go up together: one `pip install -U --upgrade-strategy eager` over the packages nothing else requires, so the resolver sees every constraint at once, from wheels only (a package whose new release is source only, like `llama-cpp-python`, stays where it is). Packages in the user site get their own run with `--user`; packages installed from a folder or git are left alone, because the PyPI package of the same name is someone else's. `pip check` runs before and after, and so does an import of every package nothing else requires: a new conflict, or a package that stopped importing (a native library `pip check` can't see), puts that Python back to the versions it had. A package the resolver kept lower because another needs it is shown as held back, not failed. `pip_pins` keeps a package at a specifier, even when it is only a dependency of another. A new Playwright gets its browsers.
+- **Python itself**: a newer patch release of the python.org Python is downloaded and its signature checked (Developer ID Installer: Python Software Foundation); it needs an admin password, so the panel offers an **Install** button that opens it. A new minor version (3.14 to 3.15) is never offered, since every package would need installing again. Pythons managed by `uv` go up with `uv python upgrade`, except one whose packages this step upgrades (uv's default `python3`): a new patch is a new folder, and the packages would stay behind in the old one.
 - **Claude Code**: `claude update`, then the plugin marketplaces and every installed plugin in its own scope (user, project and local, each run from its project; installs whose project is gone are skipped). A plugin whose update wants to run a command from its marketplace is never confirmed by the script: the panel gives the command to review in Terminal. Skills installed with `npx skills add -g` are updated too, except one whose folder no longer matches the hash in `~/.agents/.skill-lock.json`: you edited it, and an update would overwrite it.
 
 launchd starts `updates.py run` every day at 04:30 (a sleeping Mac catches up when it wakes), and the script goes ahead once 3 days have passed since the last run, or the next night after a run that failed. Each cask and npm package is upgraded on its own and every result is checked afterwards, so one failure doesn't stop the rest and the panel names it. A cask whose installer asks for an admin password can't be upgraded in the background, so the panel gives the command to run in Terminal. A notification comes for a new problem, not every night for the same one. The **Update** button and `claude-acc update` run it now; the full output of every command goes to `~/.local/share/claude-acc/updates.log`.
@@ -347,10 +365,10 @@ Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is op
 | --- | --- | --- |
 | `every_days` | `3` | Days between runs |
 | `retry_hours` | `20` | After a failed run, try again once this many hours have passed (the next night) |
-| `skip` | `[]` | Steps to leave out: `brew`, `npm`, `go`, `python`, `claude` |
+| `skip` | `[]` | Steps to leave out: `brew`, `npm`, `go`, `pip`, `claude` |
 | `npm_pins` | `{}` | Global npm packages held in a version range, e.g. `{"pnpm": "11"}` keeps pnpm on the newest 11.x |
-| `pip_pins` | `{}` | Python packages held by a specifier, e.g. `{"fb-idb": "==1.1.7"}` |
-| `python` | python.org, then Homebrew | The Python whose packages are updated |
+| `pip_pins` | `{}` | Python packages held at a specifier, e.g. `{"fb-idb": "==1.1.7"}` |
+| `python` | uv's default, python.org, Homebrew | The Python (a path or a list) whose packages are upgraded |
 
 ## Stay Awake
 
@@ -404,7 +422,7 @@ The janitor tests run the real script on a temporary `$HOME` with the real `lsof
 
 The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, a value someone changed after Ultra survives `ultra off`, and Ultra and the pause hooks come off in either order without taking each other's entries along.
 
-The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go`, `uv`, Python, `claude`, `npx` and `pkgutil` that keep the installed and newest versions in a JSON file: everything brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, the 3-day interval and the next-night retry, Python packages resolved together with bytecode, pins and Playwright browsers, an upgrade rolled back when a package stops importing or a dependency conflict appears, an npm package rolled back when its command stops working after npm blocked its install scripts, a newer python.org patch offered (and not a new minor) and an unsigned installer thrown away, plugins updated from their own project and never auto-confirmed, a hand-edited skill left alone, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
+The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go`, `pip`, `uv`, `claude`, `npx` and `pkgutil` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, an npm package rolled back when its command stops working after npm blocked its install scripts, the 3-day interval and the next-night retry, Python packages upgraded together from wheels (with the user site on its own, a package installed from a folder left alone, a source-only release and one held lower by another package reported as held back), an upgrade that breaks `pip check` rolled back while a conflict from before the run is not, an upgrade that stops a package importing rolled back, a pinned package and a pinned dependency held, a new Playwright given its browsers, a failed `pip install`, every Python upgraded once and named, a newer python.org patch offered (and not a new minor, nor Homebrew's Python) and an unsigned installer thrown away, a uv Python that holds pip packages left on its patch, Claude Code and its plugins updated, plugins updated from their own project and never auto-confirmed, a hand-edited skill left alone, the native `claude` first on the `PATH`, a step from an older version dropped from the state, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
 
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, and that the hook sends a second start to the running one.
 
@@ -414,7 +432,7 @@ To see the panel without clicking the menu bar, render it to a PNG, from live da
 "$HOME/Applications/Claude Acc.app/Contents/MacOS/ClaudeAcc" --render panel.png --snapshot docs/demo-snapshot.json
 ```
 
-With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json`, `demo-fans.json` and `demo-updates.json` next to it stand in for the guard, cleanup, fan and update state. `docs/demo-snapshot-pause.json` is the same panel during a limit pause. `--open <account id>` renders that account opened. `--hover <account id>` renders that row as if the pointer were over it. Lists that scroll in the panel come out in full.
+With `--snapshot` the clock stops at the moment the snapshot was taken, and `demo-guard.json`, `demo-janitor.json`, `demo-fans.json`, `demo-sched.json`, `demo-depot.json` and `demo-updates.json` next to it stand in for the guard, cleanup, fan, build scheduler, Depot CI and update state. `docs/demo-snapshot-pause.json` is the same panel during a limit pause. `--open <account id>` renders that account opened. `--hover <account id>` renders that row as if the pointer were over it. Lists that scroll in the panel come out in full.
 
 ## Caveats
 

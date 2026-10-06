@@ -148,10 +148,9 @@ struct FansCard: View {
                         Text(Format.rpm(fan.rpm))
                             .font(.title3.weight(.semibold))
                             .monospacedDigit()
-                            .contentTransition(.numericText(value: fan.rpm))
                         Text("rpm").font(.caption2).foregroundStyle(.secondary)
                     }
-                    UsageBar(fraction: fan.share, tint: Format.violet, height: 5)
+                    UsageBar(fraction: fan.share, tint: Format.violet, height: 5, live: true)
                     Text(state.fans.count == 2 ? (fan.index == 0 ? "Left" : "Right") : "Fan \(fan.index + 1)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -216,13 +215,12 @@ private struct LoadMeters: View {
     private func meter(_ value: Double?, label: String) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline, spacing: 2) {
-                Text(value.map { "\(Int($0.rounded()))" } ?? "–")
+                Text(value.map { "\(Int($0.rounded()))" } ?? "-")
                     .font(.title3.weight(.semibold))
                     .monospacedDigit()
-                    .contentTransition(.numericText(value: value ?? 0))
                 Text("%").font(.caption2).foregroundStyle(.secondary)
             }
-            UsageBar(fraction: (value ?? 0) / 100, tint: Self.tint(value), height: 5)
+            UsageBar(fraction: (value ?? 0) / 100, tint: Self.tint(value), height: 5, live: true)
             Text(label)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -230,7 +228,6 @@ private struct LoadMeters: View {
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .animation(.smooth, value: value)
     }
 
     private static func tint(_ value: Double?) -> Color {
@@ -248,17 +245,15 @@ private struct Temperature: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
-            Text(value.map { "\(Int($0.rounded()))°" } ?? "–")
+            Text(value.map { "\(Int($0.rounded()))°" } ?? "-")
                 .font(.headline)
                 .monospacedDigit()
                 .foregroundStyle(Self.tint(value))
-                .contentTransition(.numericText(value: value ?? 0))
             Text(label)
                 .font(.caption2.weight(.medium))
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .animation(.smooth, value: value)
     }
 
     static func tint(_ value: Double?) -> Color {
@@ -276,17 +271,22 @@ private struct ThermalChart: View {
     let history: [[Double]]
 
     private struct Point: Identifiable {
+        let id: Int
         let date: Date
         let part: String
         let celsius: Double
-        var id: String { "\(part)\(date.timeIntervalSince1970)" }
     }
 
     var body: some View {
-        let points = history.flatMap { row -> [Point] in
+        let points = history.enumerated().flatMap { index, row -> [Point] in
             guard row.count >= 3 else { return [] }
             let date = Date(timeIntervalSince1970: row[0])
-            return [Point(date: date, part: "CPU", celsius: row[1]), Point(date: date, part: "GPU", celsius: row[2])]
+            // a row's time in tenths of a second names its point: cheap, and stable as rows scroll
+            let key = Int(row[0] * 10) * 2
+            return [
+                Point(id: key, date: date, part: "CPU", celsius: row[1]),
+                Point(id: key + 1, date: date, part: "GPU", celsius: row[2]),
+            ]
         }
         Chart {
             ForEach(points) { point in
@@ -316,17 +316,33 @@ private struct ThermalChart: View {
     }
 }
 
-/// The fan glyph turns, faster as the fans do.
+/// The fan glyph turns, faster as the fans do. Core Animation turns it in the render server:
+/// a symbol effect made SwiftUI redraw the whole panel on every frame while the fans ran.
 private struct SpinningFan: View {
     let rpm: Double
     @Environment(\.animating) private var animating
+    @Environment(\.renderingToFile) private var renderingToFile
 
     var body: some View {
-        Image(systemName: "fanblades.fill")
-            .font(.callout)
-            .foregroundStyle(Format.violet)
-            .symbolEffect(.rotate.clockwise, options: .repeat(.continuous).speed(max(rpm / 2500, 0.2)), isActive: animating && rpm > 0)
-            .help("\(Int(rpm)) rpm")
+        Group {
+            if renderingToFile {
+                // ImageRenderer draws no AppKit views
+                Image(systemName: "fanblades.fill")
+                    .font(.callout)
+                    .foregroundStyle(Format.violet)
+            } else {
+                TurningSymbol(
+                    name: "fanblades.fill", tint: NSColor(Format.violet),
+                    turnsPerSecond: animating ? Self.turns(rpm) : 0)
+            }
+        }
+        .help("\(Int(rpm)) rpm")
+    }
+
+    /// One turn a second at 2,500 rpm, in quarter steps: the few rpm the fans wobble by
+    /// between readings never retime the turn.
+    static func turns(_ rpm: Double) -> Double {
+        rpm > 0 ? (max(rpm / 2500, 0.2) * 4).rounded() / 4 : 0
     }
 }
 

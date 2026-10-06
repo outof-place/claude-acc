@@ -27,6 +27,9 @@ final class SMC {
     }
 
     private let connection: io_connect_t
+    /// A key's type and size never change while the SMC is open, so each key is asked once:
+    /// a reading then costs one call instead of two (~170 keys every 2 s on an M4 Max).
+    private var infos: [String: Info] = [:]
     private static let size = 80
     private enum Command: UInt8 { case read = 5, write = 6, keyAtIndex = 8, info = 9 }
 
@@ -53,11 +56,14 @@ final class SMC {
     }
 
     func info(_ key: String) throws -> Info {
+        if let known = infos[key] { return known }
         var input = [UInt8](repeating: 0, count: Self.size)
         Self.put(Self.code(key), at: 0, in: &input)
         input[42] = Command.info.rawValue
         let output = try call(key, input)
-        return Info(size: Int(Self.get(output, at: 28)), type: Self.name(Self.get(output, at: 32)))
+        let info = Info(size: Int(Self.get(output, at: 28)), type: Self.name(Self.get(output, at: 32)))
+        infos[key] = info
+        return info
     }
 
     func read(_ key: String) throws -> (info: Info, bytes: [UInt8]) {

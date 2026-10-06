@@ -37,23 +37,22 @@ Komendy:
   list                                poprawki z opisem i zmierzonym efektem
 """
 
-import calendar
 import ctypes
 import ctypes.util
 import glob
 import hashlib
 import json
 import os
-import plistlib
 import re
 import shlex
 import shutil
-import statistics
 import subprocess
 import sys
-import tempfile
 import time
-from xml.parsers.expat import ExpatError
+
+# calendar, plistlib, statistics, tempfile i expat są importowane w funkcjach pomiarów:
+# `keep` co 5 minut ich nie używa, a ładowały się przy każdym starcie (~13 ms na 3.9 i
+# na 3.14, głównie statistics z decimal, fractions i random)
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import janitor
@@ -205,6 +204,8 @@ def percentile(values, q):
 
 
 def median(values):
+    import statistics
+
     return statistics.median(values) if values else None
 
 
@@ -224,6 +225,14 @@ def load_state():
 
 
 def save_state(state):
+    """Zapis tylko zmienionego stanu: `keep` co 5 minut zwykle niczego nie zmienia, a i tak
+    przepisywał ~17 KB (zmierzone: trzy przebiegi pod rząd, ten sam plik co do bajtu)."""
+    try:
+        with open(STATE_PATH) as f:
+            if f.read() == json.dumps(state, indent=1):
+                return
+    except OSError:
+        pass
     janitor.write_json(STATE_PATH, state, indent=1)
 
 
@@ -291,15 +300,29 @@ def spawn_tasks(count, work_mb=CPU_WORK_MB):
     return results, time.monotonic() - started
 
 
+# ostatnia odpowiedź ps: (chwila z time.monotonic(), {pid: linia poleceń})
+_OWN_PROCESSES = [None, {}]
+OWN_PROCESSES_FRESH = 2  # sekundy
+
+
 def own_processes():
-    """{pid: linia poleceń} procesów tego użytkownika."""
+    """{pid: linia poleceń} procesów tego użytkownika.
+
+    `keep` pytał ps dwa razy w odstępie milisekund (procesy do tła i start Orki), po ~30 ms;
+    lista sprzed dwóch sekund jest równie dobra. Pomiary, które czekają dłużej, pytają od nowa.
+    """
+    at, cached = _OWN_PROCESSES
+    if at is not None and time.monotonic() - at < OWN_PROCESSES_FRESH:
+        return dict(cached)
     out = janitor.run(["ps", "-U", str(os.getuid()), "-o", "pid=,command="]) or ""
     procs = {}
     for line in out.splitlines():
         pid, _, command = line.strip().partition(" ")
         if pid.isdigit():
             procs[int(pid)] = command.strip()
-    return procs
+    if out:
+        _OWN_PROCESSES[:] = [time.monotonic(), procs]
+    return dict(procs)
 
 
 def cpu_hogs(seconds=10, top=6):
@@ -373,6 +396,9 @@ def bench_cpu(runs=3):
 
 def gpu_clients():
     """Czas GPU (ns) każdego klienta Metalu od jego startu: {"pid 415, WindowServer": ns}."""
+    import plistlib
+    from xml.parsers.expat import ExpatError
+
     out = subprocess.run(
         ["ioreg", "-a", "-r", "-c", "AGXDeviceUserClient"],
         capture_output=True,
@@ -1560,10 +1586,21 @@ def tweak(name):
     return None
 
 
+# skrypty claude-acc: wprost (`/usr/bin/python3 <STATE>/devguard.py run`) albo przez
+# launcher z bajtkodem w cache (`<STATE>/python <STATE>/acc.py devguard run`)
+ACC_SCRIPTS = ("accswitch", "devguard", "janitor", "perf", "sched", "updates")
+
+
 def short_command(command):
-    """Czytelna nazwa procesu: plik skryptu albo program, bez ścieżek."""
+    """Czytelna nazwa procesu: plik skryptu albo program, bez ścieżek. Skrypt claude-acc
+    ma tę samą nazwę w obu formach uruchomienia (wprost i przez acc.py)."""
     parts = command.split()
-    for part in parts[1:]:
+    for i, part in enumerate(parts[1:], 1):
+        name = os.path.basename(part)
+        if name == "acc.py" and i + 1 < len(parts) and parts[i + 1] in ACC_SCRIPTS:
+            return parts[i + 1]
+        if name[:-3] in ACC_SCRIPTS and name.endswith(".py"):
+            return name[:-3]
         if part.endswith((".js", ".py", ".mjs", ".ts")):
             return os.path.basename(os.path.dirname(os.path.dirname(part))) or part
     return os.path.basename(parts[0]) if parts else command
@@ -1627,6 +1664,8 @@ def bench_fs(cfg, passes=2):
 
 
 def iso_epoch(stamp):
+    import calendar
+
     try:
         return calendar.timegm(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
     except (TypeError, ValueError):
@@ -1894,6 +1933,8 @@ def first_exec(count=8):
 
     Każda wersja ma inną stałą, więc inny hash: tak jak test Go po każdej zmianie. Różnica
     między pierwszym a drugim uruchomieniem to ocena Gatekeepera przy pierwszym exec."""
+    import tempfile
+
     go = janitor.which("go")
     if not go:
         return None

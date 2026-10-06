@@ -2,7 +2,7 @@
 # Instaluje claude-acc na koncie użytkownika z gotowych plików: skrypty, komenda `claude-acc`,
 # automaty w launchd i aplikacja w pasku menu.
 #
-#   setup.sh --app "<ścieżka do Claude Acc.app>" [--fanctl <ścieżka do fanctl>]
+#   setup.sh --app "<ścieżka do Claude Acc.app>" [--fanctl <ścieżka do fanctl>] [--hook <ścieżka do claude-acc-hook>]
 #   setup.sh --uninstall   zdejmuje automaty, aplikację, komendę i hooki pauzy limitów;
 #                          stan i konfiguracja zostają
 #
@@ -19,10 +19,12 @@ JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.dev
 
 APP_SRC=""
 FANCTL=""
+HOOK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --app) APP_SRC="$2"; shift 2 ;;
     --fanctl) FANCTL="$2"; shift 2 ;;
+    --hook) HOOK="$2"; shift 2 ;;
     --uninstall)
       for job in $JOBS; do
         launchctl bootout "gui/$(id -u)" "$AGENTS/$job.plist" 2>/dev/null || true
@@ -48,20 +50,38 @@ done
 [ -d "$APP_SRC" ] || { echo "brak aplikacji: --app \"<Claude Acc.app>\"" >&2; exit 2; }
 
 mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
-cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$SRC/sched.py" "$SRC/updates.py" "$STATE/"
+cp "$SRC"/*.py "$STATE/"
 # hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
+[ -n "$HOOK" ] && cp "$HOOK" "$STATE/claude-acc-hook.new" && mv -f "$STATE/claude-acc-hook.new" "$STATE/claude-acc-hook"
+
+# interpreter: uv's CPython 3.14 (PGO and LTO, starts in 26 ms where Xcode's 3.9 takes 37),
+# linked as $STATE/python, so launchd jobs, the app, the hook and the command share one;
+# without uv the system one. The scripts stay Python 3.9, so either runs them
+PY=/usr/bin/python3
+UV="$(command -v uv || true)"
+[ -z "$UV" ] && [ -x /opt/homebrew/bin/uv ] && UV=/opt/homebrew/bin/uv
+if [ -n "$UV" ]; then
+  "$UV" python install 3.14 >/dev/null 2>&1 || true
+  found="$("$UV" python find --managed-python 3.14 2>/dev/null || true)"
+  [ -x "$found" ] && PY="$found"
+fi
+ln -sfn "$PY" "$STATE/python"
+# bytecode up front: acc.py runs every script from it, so no start compiles one
+"$STATE/python" -m compileall -q "$STATE"/*.py >/dev/null 2>&1 || true
+# the hook's native front reads the words that send a command to Python from here
+"$STATE/python" "$STATE/acc.py" devguard words > "$STATE/hook-words.json.new" 2>/dev/null \
+  && mv -f "$STATE/hook-words.json.new" "$STATE/hook-words.json" || rm -f "$STATE/hook-words.json.new"
 
 # pauza limitów: hooki w sesjach Claude Code dopisane do settings.json obok Twoich
 # (kopia sprzed pierwszej zmiany: settings.json.bak-claude-acc). Paczka bez hook.py
 # (starsza formuła Homebrew) albo zepsuty settings.json nie zatrzymują reszty instalacji.
 if [ -f "$SRC/hook.py" ]; then
-  cp "$SRC/hook.py" "$STATE/hook.py"
   # z CLAUDE_ACC_NO_HOOKS=1 zdejmujemy też hooki dopisane przez wcześniejszą instalację
   action=install
   [ -n "${CLAUDE_ACC_NO_HOOKS:-}" ] && action=uninstall
-  /usr/bin/python3 "$STATE/hook.py" "$action" "$CLAUDE_SETTINGS" \
+  "$STATE/python" "$STATE/hook.py" "$action" "$CLAUDE_SETTINGS" \
     || echo "hooki pauzy limitów: $action nieudany, szczegóły wyżej" >&2
 else
   echo "brak hook.py w $SRC: pauza limitów bez hooków w sesjach Claude Code" >&2
@@ -75,14 +95,17 @@ echo "$SRC" > "$STATE/source"
 cat > "$HOME/.local/bin/claude-acc" <<'EOF'
 #!/bin/sh
 STATE="$HOME/.local/share/claude-acc"
+PY="$STATE/python"
+[ -x "$PY" ] || PY=/usr/bin/python3
+RUN="$STATE/acc.py"
 case "$1" in
-  mac) shift; exec /usr/bin/python3 "$STATE/janitor.py" "$@" ;;
-  clean) shift; exec /usr/bin/python3 "$STATE/janitor.py" sweep --force "$@" ;;
-  guard) shift; exec /usr/bin/python3 "$STATE/devguard.py" "$@" ;;
-  perf) shift; exec /usr/bin/python3 "$STATE/perf.py" "$@" ;;
-  sched) shift; exec /usr/bin/python3 "$STATE/sched.py" "$@" ;;
-  update) shift; exec /usr/bin/python3 "$STATE/updates.py" run --force "$@" ;;
-  updates) shift; exec /usr/bin/python3 "$STATE/updates.py" "$@" ;;
+  mac) shift; exec "$PY" "$RUN" janitor "$@" ;;
+  clean) shift; exec "$PY" "$RUN" janitor sweep --force "$@" ;;
+  guard) shift; exec "$PY" "$RUN" devguard "$@" ;;
+  perf) shift; exec "$PY" "$RUN" perf "$@" ;;
+  sched) shift; exec "$PY" "$RUN" sched "$@" ;;
+  update) shift; exec "$PY" "$RUN" updates run --force "$@" ;;
+  updates) shift; exec "$PY" "$RUN" updates "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
@@ -99,7 +122,7 @@ case "$1" in
     exec "$BIN" "${@:-read}" ;;
   uninstall) exec "$(cat "$STATE/source")/setup.sh" --uninstall ;;
 esac
-exec /usr/bin/python3 "$STATE/accswitch.py" "$@"
+exec "$PY" "$RUN" accswitch "$@"
 EOF
 chmod +x "$HOME/.local/bin/claude-acc"
 
