@@ -128,9 +128,13 @@ struct UpdatesState: Decodable {
         let admin: Bool?
         /// The command that retries it by hand, in Terminal.
         let retry: String?
+        /// The Python a pip package lives in, like "3.13": numpy can be in two.
+        let python: String?
+
+        var label: String { python.map { "\(name) (Python \($0))" } ?? name }
     }
 
-    /// One package manager in the last run: Homebrew, npm, Go, or Python, which is only checked.
+    /// One package manager in the last run: Homebrew, npm, Go, or Python.
     struct Step: Decodable, Identifiable {
         let name: String
         let label: String
@@ -138,9 +142,7 @@ struct UpdatesState: Decodable {
         let updated: [Package]
         let failed: [Package]
         let held: [Package]?
-        let outdated: [Package]?
         let error: String?
-        let reportOnly: Bool?
 
         var id: String { name }
     }

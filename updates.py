@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aktualizacje narzędzi na Macu: Homebrew, globalne paczki npm i programy Go co 3 dni.
+"""Aktualizacje narzędzi na Macu: Homebrew, globalne paczki npm i pip oraz programy Go co 3 dni.
 
 launchd uruchamia `updates.py run` codziennie o 4:30 (uśpiony Mac nadrabia po obudzeniu);
 przebieg rusza, gdy od poprzedniego minęły 3 dni, a po nieudanym próbuje znowu następnej
@@ -10,9 +10,12 @@ Co aktualizuje, do najnowszej wersji:
   z własnym aktualizatorem (Chrome, Claude) robią to same. Przypięte (`brew pin`) zostają;
 - npm: globalne paczki, także o wersję główną wyżej. `npm_pins` w updates.json trzyma
   paczkę w jednej wersji głównej, np. {"pnpm": "11"};
-- Go: programy postawione przez `go install` w GOBIN.
-Python tylko sprawdza: globalne paczki pip dzielą zależności, a hurtowe podbicie potrafi po
-cichu zepsuć inne narzędzia, więc panel pokazuje, co jest do zrobienia, a robi to człowiek.
+- Go: programy postawione przez `go install` w GOBIN;
+- Python: paczki pip w każdym Pythonie z PYTHONS (domyślny od uv, python.org, Homebrew). Dzielą
+  zależności, więc idą razem: jedno `pip install -U --upgrade-strategy eager` po paczkach, których
+  nic nie wymaga, i tylko z wheeli (paczka bez wheela, np. llama-cpp-python, zostaje, jaka jest).
+  Potem `pip check`: nowa niezgodność cofa tego Pythona do wersji sprzed przebiegu. Paczka, której
+  resolver nie podbił, bo inna trzyma ją niżej, jest przytrzymana, nie nieudana.
 
 Każda paczka idzie osobno albo jest sprawdzana po fakcie, więc jedna nieudana (np. aplikacja,
 która chce hasła administratora) nie zatrzymuje reszty i w panelu widać, która to była.
@@ -56,7 +59,7 @@ DEFAULT_CONFIG = {
     "skip": [],
     # paczka npm -> zakres, w którym ma zostać ("11" to każda 11.x)
     "npm_pins": {},
-    # Python, którego paczki sprawdzać; domyślnie python.org, potem Homebrew
+    # Python (ścieżka albo lista), którego paczki aktualizować; domyślnie PYTHONS
     "python": None,
 }
 
@@ -78,6 +81,11 @@ ENV = dict(
     npm_config_update_notifier="false",
     npm_config_fund="false",
     npm_config_audit="false",
+    # Homebrew i uv znaczą swoje Pythony jako zarządzane z zewnątrz (PEP 668), a paczki w nich i tak
+    # stawia człowiek. Zmienna, nie flaga: pip sprzed 23.0 nie zna flagi, a nieznaną zmienną pominie.
+    PIP_BREAK_SYSTEM_PACKAGES="1",
+    PIP_DISABLE_PIP_VERSION_CHECK="1",
+    PIP_NO_INPUT="1",
 )
 
 
@@ -173,9 +181,8 @@ class StepError(Exception):
 class Step:
     def __init__(self, name, label):
         self.name, self.label = name, label
-        self.updated, self.failed, self.held, self.outdated = [], [], [], []
+        self.updated, self.failed, self.held = [], [], []
         self.error = None
-        self.report_only = False
 
     def to_json(self):
         data = {
@@ -186,9 +193,6 @@ class Step:
             "failed": self.failed,
             "held": self.held,
         }
-        if self.report_only:
-            data["report_only"] = True
-            data["outdated"] = self.outdated
         if self.error:
             data["error"] = self.error
         return data
@@ -392,38 +396,146 @@ def step_go(st, cfg, dry):
     return True
 
 
-# ---------- Python (tylko raport) ----------
+# ---------- Python ----------
+
+# Pythony z paczkami stawianymi ręcznie: domyślny python3 od uv (`uv python install --default`),
+# python.org i Homebrew. Nie /usr/bin/python3: bez narzędzi Xcode wyskakuje okno instalatora.
+PYTHONS = (
+    os.path.join(HOME, ".local/bin/python3"),
+    "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+    "/opt/homebrew/bin/python3",
+)
+
+# Wersja, prefiks (po nim odpada drugi link do tego samego Pythona), user site i paczki spoza indeksu
+# (katalog, git, -e): `pip install -U nazwa` podmieniłby je obcą paczką o tej nazwie z PyPI.
+PYTHON_INFO = """
+import json, site, sys
+from importlib import metadata
+local = [d.metadata["Name"] for d in metadata.distributions() if d.read_text("direct_url.json")]
+print(json.dumps({"version": "%d.%d" % sys.version_info[:2], "prefix": sys.prefix,
+                  "user_site": site.getusersitepackages(), "local": [n for n in local if n]}))
+"""
+
+# "a 1.0 has requirement b<2, but you have b 2.1." albo "a 1.0 requires b, which is not installed."
+PIP_CHECK = re.compile(r"^(\S+) \S+ (?:has requirement|requires) ([A-Za-z0-9._-]+)")
 
 
-def python_for_pip(cfg):
-    if cfg.get("python"):
-        return cfg["python"]
-    # nie /usr/bin/python3: bez narzędzi Xcode wyskakuje okno instalatora
-    for path in ("/Library/Frameworks/Python.framework/Versions/Current/bin/python3", "/opt/homebrew/bin/python3"):
-        if os.access(path, os.X_OK):
-            return path
-    return None
+def canonical(name):
+    """Nazwa paczki według PEP 503: typing_extensions i typing-extensions to jedna paczka."""
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def step_pip(st, cfg, dry):
-    python = python_for_pip(cfg)
-    if not python:
-        return False
-    st.report_only = True
-    ok, out, err = call(
-        [python, "-m", "pip", "list", "--outdated", "--format=json", "--disable-pip-version-check"],
-        timeout=600,
-        quiet=True,
-    )
+def pip_list(python, *flags):
+    """Paczki po nazwie kanonicznej; -v dokłada katalog, w którym każda leży."""
+    ok, out, err = call([python, "-m", "pip", "list", "-v", "--format=json", *flags], timeout=600, quiet=True)
+    # -v kładzie na stdout także log pip („Link requires a different Python”); JSON to jedna linia
+    lines = [line for line in out.splitlines() if line.startswith("[")]
     try:
-        items = json.loads(out) if ok else None
+        items = json.loads(lines[-1]) if ok and lines else None
     except ValueError:
         items, err = None, "unreadable pip output"
     if items is None:
-        st.error = f"pip list: {err}"
-        return True
-    st.outdated = [pkg(i["name"], i.get("version"), i.get("latest_version")) for i in items]
-    return True
+        raise StepError(f"pip list: {err}")
+    return {canonical(i["name"]): i for i in items}
+
+
+def pip_check(python):
+    """Niezgodności jako pary (paczka, zależność), bo tekst zmienia się razem z wersjami."""
+    _, out, _ = call([python, "-m", "pip", "check"], timeout=300, codes=(0, 1), quiet=True)
+    found = {}
+    for line in out.splitlines():
+        match = PIP_CHECK.match(line.strip())
+        if match:
+            found[(canonical(match.group(1)), canonical(match.group(2)))] = line.strip()
+    return found
+
+
+def pip_install(python, args, user):
+    flags = ["--progress-bar", "off"] + (["--user"] if user else [])
+    return call([python, "-m", "pip", "install", *flags, *args], timeout=2 * HOUR)
+
+
+def pip_restore(python, before, after, in_user):
+    """Stan sprzed przebiegu: nowe paczki i kopie postawione w user site znikają, podbite wracają."""
+    added = {n for n in after if n not in before or after[n]["location"] != before[n]["location"]}
+    if added:
+        call([python, "-m", "pip", "uninstall", "-y", *(after[n]["name"] for n in sorted(added))], timeout=HOUR)
+    back = [n for n in before if n not in added and (n not in after or after[n]["version"] != before[n]["version"])]
+    for user in (False, True):
+        pins = [f"{before[n]['name']}=={before[n]['version']}" for n in back if in_user(n) == user]
+        if pins:
+            pip_install(python, ["--no-deps", *pins], user)
+
+
+def upgrade_python(st, python, info, dry):
+    label = info["version"]
+    local = {canonical(n) for n in info["local"]}
+    outdated = {n: i for n, i in pip_list(python, "--outdated").items() if n not in local}
+    if dry:
+        st.updated += [pkg(i["name"], i["version"], i["latest_version"], python=label) for i in outdated.values()]
+        return
+    if not outdated:
+        return
+    before = pip_list(python)
+    user_site = os.path.realpath(info["user_site"])
+    in_user = lambda n: os.path.realpath(before[n]["location"]) == user_site
+    # paczki, których nic nie wymaga, ciągną resztę: resolver widzi wtedy wszystkie ograniczenia naraz
+    todo = sorted((set(pip_list(python, "--not-required")) | set(outdated)) - local)
+    broken = pip_check(python)
+    errors = {}
+    # najpierw katalog Pythona, potem user site, do którego --user kładzie też nowsze zależności z dołu
+    for user in (False, True):
+        names = [before[n]["name"] for n in todo if n in before and in_user(n) == user]
+        if names:
+            upgrade = ["--upgrade", "--upgrade-strategy", "eager", "--only-binary", ":all:", *names]
+            ok, _, err = pip_install(python, upgrade, user)
+            if not ok:
+                errors[user] = err
+    after = pip_list(python)
+    bumped = [n for n in before if n in after and after[n]["version"] != before[n]["version"]]
+    new = [line for key, line in pip_check(python).items() if key not in broken]
+    if new:
+        pip_restore(python, before, after, in_user)
+        error = f"rolled back, pip check: {new[0]}"
+        st.failed += [
+            pkg(before[n]["name"], before[n]["version"], after[n]["version"], python=label, error=error) for n in bumped
+        ] or [pkg(f"Python {label}", "?", "?", error=error)]
+        return
+    st.updated += [pkg(after[n]["name"], before[n]["version"], after[n]["version"], python=label) for n in bumped]
+    for n, item in outdated.items():
+        now = after[n]["version"] if n in after else item["version"]
+        if n not in before or now == item["latest_version"]:
+            continue
+        entry = pkg(item["name"], now, item["latest_version"], python=label)
+        if in_user(n) in errors:
+            st.failed.append(dict(entry, error=errors[in_user(n)]))
+        else:  # resolver trzyma ją niżej dla innej paczki albo nowsza nie ma wheela
+            st.held.append(entry)
+
+
+def step_pip(st, cfg, dry):
+    pythons = cfg.get("python") or PYTHONS
+    seen = set()
+    for python in [pythons] if isinstance(pythons, str) else pythons:
+        if not os.access(python, os.X_OK):
+            continue
+        ok, out, err = call([python, "-c", PYTHON_INFO], timeout=120, quiet=True)
+        try:
+            info = json.loads(out) if ok else None
+        except ValueError:
+            info, err = None, "unreadable output"
+        if info is None:
+            st.failed.append(pkg(python, "?", "?", error=f"couldn't start: {err}"))
+            continue
+        if info["prefix"] in seen:
+            continue
+        seen.add(info["prefix"])
+        # jeden zepsuty Python nie zatrzymuje pozostałych
+        try:
+            upgrade_python(st, python, info, dry)
+        except StepError as err:
+            st.failed.append(pkg(f"Python {info['version']}", "?", "?", error=str(err)))
+    return bool(seen or st.failed)
 
 
 STEPS = [
@@ -515,10 +627,9 @@ def cmd_run(cfg, args):
     done = {s["name"] for s in steps}
     state["steps"] = steps + [s for s in state.get("steps", []) if s["name"] not in done]
     state["steps"].sort(key=lambda s: [n for n, _, _ in STEPS].index(s["name"]))
-    counted = [s for s in steps if not s.get("report_only")]
-    updated = sum(len(s["updated"]) for s in counted)
-    failures = [f"{f['name']} ({s['label']})" for s in counted for f in s["failed"]]
-    failures += [s["label"] for s in counted if s.get("error")]
+    updated = sum(len(s["updated"]) for s in steps)
+    failures = [f"{f['name']} ({s['label']})" for s in steps for f in s["failed"]]
+    failures += [s["label"] for s in steps if s.get("error")]
     ok = not failures
     if not only:  # przebieg zawężony nie przesuwa terminu dla reszty
         state["last_run"] = {
@@ -544,16 +655,16 @@ def cmd_run(cfg, args):
 
 
 def print_plan(steps):
+    # paczka pip mówi, w którym Pythonie leży: numpy bywa w dwóch
+    named = lambda p: p["name"] + (f" ({p['python']})" if p.get("python") else "")
     for st in steps:
         line = f"{st.label}: "
         if st.error:
             line += f"błąd: {st.error}"
-        elif st.report_only:
-            line += f"{len(st.outdated)} do aktualizacji ręcznie" if st.outdated else "aktualne"
         else:
-            line += ", ".join(f"{p['name']} {p['from']} → {p['to']}" for p in st.updated) or "aktualne"
+            line += ", ".join(f"{named(p)} {p['from']} → {p['to']}" for p in st.updated) or "aktualne"
         if st.held:
-            line += "; przytrzymane: " + ", ".join(f"{p['name']} {p['from']} (jest {p['to']})" for p in st.held)
+            line += "; przytrzymane: " + ", ".join(f"{named(p)} {p['from']} (jest {p['to']})" for p in st.held)
         if st.failed:
             line += "; nie do sprawdzenia: " + ", ".join(f"{p['name']}: {p['error']}" for p in st.failed)
         print(line)
@@ -575,10 +686,7 @@ def cmd_status(cfg, args):
     if state.get("running_since"):
         print("Aktualizacja trwa teraz")
     for s in state.get("steps", []):
-        if s.get("report_only"):
-            detail = f"{len(s.get('outdated', []))} do aktualizacji ręcznie"
-        else:
-            detail = f"zaktualizowano {len(s['updated'])}" + (f", nie udało się {len(s['failed'])}" if s["failed"] else "")
+        detail = f"zaktualizowano {len(s['updated'])}" + (f", nie udało się {len(s['failed'])}" if s["failed"] else "")
         print(f"  {s['label']}: {detail}" + (f", błąd: {s['error']}" if s.get("error") else ""))
         for f in s["failed"]:
             print(f"    ! {f['name']}: {f['error']}")
