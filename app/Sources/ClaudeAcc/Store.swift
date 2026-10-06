@@ -102,7 +102,7 @@ final class Store {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.cancelLogin() }
         }
-        registerLoginItemOnFirstRun()
+        registerLoginItemUnlessTurnedOff()
         launchAtLogin = SMAppService.mainApp.status == .enabled
         poller = Task { [weak self] in
             while !Task.isCancelled {
@@ -445,6 +445,7 @@ final class Store {
     // MARK: Login item
 
     func setLaunchAtLogin(_ on: Bool) {
+        UserDefaults.standard.set(!on, forKey: Self.loginItemOffKey)
         do {
             if on {
                 try SMAppService.mainApp.register()
@@ -457,12 +458,20 @@ final class Store {
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 
-    /// The app should run without being remembered, so the first run adds it to the login items.
-    private func registerLoginItemOnFirstRun() {
-        let key = "didRegisterLoginItem"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
-        try? SMAppService.mainApp.register()
-        UserDefaults.standard.set(true, forKey: key)
+    private static let loginItemOffKey = "launchAtLoginTurnedOff"
+
+    /// The app should run without being remembered. Every install signs the bundle anew,
+    /// and macOS can drop the login item with the old signature, so each launch puts it
+    /// back unless the switch in the panel was turned off. `.requiresApproval` means it was
+    /// turned off in System Settings, which stays the user's call.
+    private func registerLoginItemUnlessTurnedOff() {
+        guard !UserDefaults.standard.bool(forKey: Self.loginItemOffKey) else { return }
+        switch SMAppService.mainApp.status {
+        case .notRegistered, .notFound:
+            try? SMAppService.mainApp.register()
+        default:
+            break
+        }
     }
 }
 
