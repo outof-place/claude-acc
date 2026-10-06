@@ -125,7 +125,8 @@ private struct UpdateStepRow: View {
             if failed.admin == true, let retry = failed.retry {
                 return "\(failed.name) needs your admin password. In Terminal: \(retry)"
             }
-            return "\(failed.label): \(failed.error ?? "failed")"
+            let retry = failed.retry.map { ". In Terminal: \($0)" } ?? ""
+            return "\(failed.label): \(failed.error ?? "failed")\(retry)"
         }
     }
 
