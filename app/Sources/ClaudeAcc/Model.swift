@@ -19,6 +19,9 @@ struct Snapshot: Decodable {
     /// The limit pause: no account has headroom, so sessions wind down to a checkpoint.
     /// Missing from older scripts, which decodes as no pause.
     let pause: Pause?
+    /// Whether the limit pause is on (`claude-acc pause on|off`). Missing from scripts
+    /// before 1.10, which had no switch, so the panel hides it.
+    let limitPause: Bool?
     let accounts: [Account]
 
     var active: Account? { accounts.first { $0.active } }
