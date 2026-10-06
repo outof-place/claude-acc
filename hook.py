@@ -2,7 +2,9 @@
 """Hook sesji Claude Code dla pauzy limitów claude-acc.
 
 Gdy żadne konto nie ma zapasu, automat (accswitch.py tick) zapisuje plik pauzy.
-Ten skrypt go tylko czyta i robi z niego punkt kontrolny w każdej sesji:
+Ten skrypt go tylko czyta i robi z niego punkt kontrolny w każdej sesji. Pauza jest
+opcjonalna (`limit_pause` w config.json, `claude-acc pause on|off`, domyślnie wyłączona):
+bez niej install wpisuje tylko budzik po ścianie limitu (watch-wall).
 
   post         PostToolUse: sesja i każdy subagent raz na epizod dostają polecenie,
                żeby dokończyć krok, zapisać stan i się zatrzymać
@@ -46,6 +48,9 @@ PAUSE_NATIVE = os.path.join(HOME, ".local/share", PAUSE_MARKER)
 NATIVE_MARKER = "claude-acc/claude-acc-hook"
 NATIVE = os.path.join(HOME, ".local/share", NATIVE_MARKER)
 BACKUP_SUFFIX = ".bak-claude-acc"
+# ten sam plik i ta sama wartość domyślna co DEFAULT_CONFIG w accswitch.py; hook go nie
+# importuje, bo poza pauzą nie ładuje niczego
+CONFIG_PATH = os.path.join(HOME, ".local/share/claude-acc/config.json")
 
 
 def load(path):
@@ -267,15 +272,25 @@ def checked(mode, **extra):
     return hook
 
 
-def entries():
+def pause_enabled():
+    cfg = load(CONFIG_PATH)
+    return isinstance(cfg, dict) and bool(cfg.get("limit_pause"))
+
+
+def entries(pause=True):
+    """Wpisy do settings.json. Bez pauzy zostaje sam budzik po ścianie limitu: sesję,
+    która w nią uderzyła, wznawia przełączenie konta (reset wznawia już sam Claude Code)."""
     always = f'h="{SCRIPT}"; if [ -e "$h" ]; then exec /usr/bin/python3 "$h" watch-wall; fi; cat >/dev/null'
+    wall = {"StopFailure": {"matcher": "rate_limit", "hooks": [{"type": "command", "command": always,
+                                                                "asyncRewake": True, "timeout": WATCH_TIMEOUT}]}}
+    if not pause:
+        return wall
     return {
         "PostToolUse": {"matcher": "*", "hooks": [checked("post", timeout=10)]},
         "PreToolUse": {"matcher": "Agent|Task", "hooks": [checked("agent", timeout=10)]},
         "UserPromptSubmit": {"hooks": [checked("prompt", timeout=10)]},
         "Stop": {"hooks": [checked("watch", asyncRewake=True, timeout=WATCH_TIMEOUT)]},
-        "StopFailure": {"matcher": "rate_limit", "hooks": [{"type": "command", "command": always, "asyncRewake": True,
-                                                            "timeout": WATCH_TIMEOUT}]},
+        **wall,
     }
 
 
@@ -355,7 +370,7 @@ def run_install(args, add):
         strip(settings)
         if add:
             hooks = settings.setdefault("hooks", {})
-            for event, group in entries().items():
+            for event, group in entries(pause_enabled()).items():
                 hooks.setdefault(event, []).append(group)
         if json.dumps(settings, sort_keys=False) == before:
             # także uninstall bez pliku: nie zakładamy pustego settings.json
