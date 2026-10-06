@@ -27,9 +27,11 @@ hook = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hook)
 
 REAL_SETTINGS = os.path.expanduser("~/.claude/settings.json")
-# natywny front z `swift build -c release` w app/; bez niego testy exec form się pomijają
+# natywne programy z `swift build -c release` w app/; bez nich testy exec form się pomijają
 BUILT = os.path.join(os.path.dirname(HERE), "app/.build/release/claude-acc-hook")
+BUILT_PAUSE = os.path.join(os.path.dirname(HERE), "app/.build/release/claude-acc-pause")
 needs_native = unittest.skipUnless(os.access(BUILT, os.X_OK), "brak app/.build/release/claude-acc-hook")
+needs_pause = unittest.skipUnless(os.access(BUILT_PAUSE, os.X_OK), "brak app/.build/release/claude-acc-pause")
 
 
 def stamp(path):
@@ -42,7 +44,9 @@ def stamp(path):
 class Guarded(unittest.TestCase):
     """Siatka bezpieczeństwa: prawdziwe ustawienia Claude nie mogą się zmienić w teście."""
 
-    native = False  # hooki przez natywny claude-acc-hook (exec form) zamiast powłoki
+    # hooki w powłoce (False) albo bez niej przez natywny program: "swift" to claude-acc-hook
+    # pause, "c" to claude-acc-pause (oba programy na miejscu, jak po instalacji)
+    native = False
 
     def setUp(self):
         self.real_settings = stamp(REAL_SETTINGS)
@@ -63,6 +67,8 @@ class World:
         shutil.copy(HOOK, os.path.join(self.dir, "hook.py"))
         if self.native:
             shutil.copy(BUILT, os.path.join(self.dir, "claude-acc-hook"))
+        if self.native == "c":
+            shutil.copy(BUILT_PAUSE, os.path.join(self.dir, "claude-acc-pause"))
         self.transcript = os.path.join(self.home, "transcript.jsonl")
         open(self.transcript, "w").write('{"type":"assistant","message":"robię"}\n')
 
@@ -73,15 +79,20 @@ class World:
     def unpause(self):
         os.remove(os.path.join(self.dir, "pause.json"))
 
+    extra_env = {}
+
     def env(self):
-        return {"HOME": self.home, "PATH": "/usr/bin:/bin", "CLAUDE_ACC_HOOK_POLL": "0.1"}
+        return {"HOME": self.home, "PATH": "/usr/bin:/bin", "CLAUDE_ACC_HOOK_POLL": "0.1", **self.extra_env}
 
     def argv(self, event):
         """Wpis z instalacji w tym HOME i to, co Claude Code z nim uruchamia."""
-        with mock.patch.object(hook, "NATIVE", os.path.join(self.dir, "claude-acc-hook")):
+        with mock.patch.object(hook, "NATIVE", os.path.join(self.dir, "claude-acc-hook")), \
+                mock.patch.object(hook, "PAUSE_NATIVE", os.path.join(self.dir, "claude-acc-pause")):
             entry = hook.entries()[event]["hooks"][0]
         # z programem na miejscu instalacja daje exec form; budzik po ścianie zostaje w powłoce
-        assert ("args" in entry) == (self.native and event != "StopFailure"), entry
+        assert ("args" in entry) == bool(self.native and event != "StopFailure"), entry
+        if self.native == "c" and event != "StopFailure":
+            assert entry["command"].endswith("claude-acc-pause"), entry
         if "args" in entry:
             return [entry["command"], *entry["args"]]
         return ["/bin/sh", "-c", entry["command"]]
@@ -127,6 +138,18 @@ class OutsidePauseTest(Guarded):
             w.fire(event)
 
         self.assertFalse(os.path.exists(started))
+
+    def test_session_with_its_own_pause_file_follows_only_that_file(self):
+        # CLAUDE_ACC_PAUSE_FILE: jedna sesja testowa pauzuje bez wstrzymywania pozostałych
+        w = World()
+        w.pause()
+        own = os.path.join(w.home, "own-pause.json")
+        w.extra_env = {"CLAUDE_ACC_PAUSE_FILE": own}
+
+        self.assertEqual(w.fire("PostToolUse").stdout, "")
+
+        os.replace(os.path.join(w.dir, "pause.json"), own)
+        self.assertIn("TASKS.md", w.context(w.fire("PostToolUse")))
 
     def test_missing_script_never_blocks_a_session(self):
         # katalog stanu usunięty, a wpisy w settings.json zostały: python3 z brakującym
@@ -277,17 +300,35 @@ class WakeTest(Guarded):
 
 @needs_native
 class NativeOutsidePauseTest(OutsidePauseTest):
-    native = True
+    native = "swift"
 
 
 @needs_native
 class NativeCheckpointTest(CheckpointTest):
-    native = True
+    native = "swift"
 
 
 @needs_native
 class NativeWakeTest(WakeTest):
-    native = True
+    native = "swift"
+
+
+@needs_native
+@needs_pause
+class CPauseOutsidePauseTest(OutsidePauseTest):
+    native = "c"
+
+
+@needs_native
+@needs_pause
+class CPauseCheckpointTest(CheckpointTest):
+    native = "c"
+
+
+@needs_native
+@needs_pause
+class CPauseWakeTest(WakeTest):
+    native = "c"
 
 
 ORIGINAL = {
@@ -346,6 +387,17 @@ class InstallTest(Guarded):
         [wall] = self.ours(data["hooks"]["StopFailure"])
         self.assertNotIn("args", wall["hooks"][0])
         self.assertEqual(data["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "rtk-rewrite.sh")
+
+        # potem program w C: zastępuje wpisy claude-acc-hook pause, po jednym na zdarzenie
+        pause = os.path.join(os.path.dirname(native), "claude-acc-pause")
+        shutil.copy(native, pause)
+        self.assertEqual(self.run_hook("install").returncode, 0)
+        data = self.read()
+        for event, mode in (("PostToolUse", "post"), ("PreToolUse", "agent"),
+                            ("UserPromptSubmit", "prompt"), ("Stop", "watch")):
+            [group] = self.ours(data["hooks"][event])
+            [entry] = group["hooks"]
+            self.assertEqual((entry["command"], entry["args"]), (pause, [mode]), event)
         self.run_hook("uninstall")
         self.assertEqual(open(self.path).read(), before)
 
@@ -355,6 +407,7 @@ class InstallTest(Guarded):
         self.assertFalse(hook.ours({"command": native, "args": []}))  # hook strażnika z Ultry
         self.assertFalse(hook.ours({"command": native}))
         self.assertFalse(hook.ours({"command": "/x/other-hook", "args": ["pause", "post"]}))
+        self.assertTrue(hook.ours({"command": "/u/.local/share/claude-acc/claude-acc-pause", "args": ["post"]}))
 
     def test_install_keeps_other_settings_and_uninstall_restores_the_file(self):
         self.write(ORIGINAL)
@@ -388,7 +441,8 @@ class InstallTest(Guarded):
         # Claude Code ubija hook z asyncRewake po jego timeout, bez niego po 600 s:
         # budziki ze starej instalacji umierały, zanim kończyła się pauza dłuższa niż 10 min
         old = json.loads(json.dumps(ORIGINAL))
-        with mock.patch.object(hook, "NATIVE", os.path.join(self.dir, "brak")):
+        with mock.patch.object(hook, "NATIVE", os.path.join(self.dir, "brak")), \
+                mock.patch.object(hook, "PAUSE_NATIVE", os.path.join(self.dir, "brak")):
             groups = hook.entries()
         for event, group in groups.items():
             group = json.loads(json.dumps(group))
