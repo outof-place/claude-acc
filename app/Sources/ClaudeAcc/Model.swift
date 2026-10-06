@@ -128,9 +128,13 @@ struct UpdatesState: Decodable {
         let admin: Bool?
         /// The command that retries it by hand, in Terminal.
         let retry: String?
+        /// Why a held package stayed: pin, deps, edited, confirm, install.
+        let why: String?
+        /// A downloaded, signature-checked installer for the user to open (a newer Python).
+        let installer: String?
     }
 
-    /// One package manager in the last run: Homebrew, npm, Go, or Python, which is only checked.
+    /// One package manager in the last run: Homebrew, npm, Go, Python or Claude Code.
     struct Step: Decodable, Identifiable {
         let name: String
         let label: String
@@ -138,9 +142,7 @@ struct UpdatesState: Decodable {
         let updated: [Package]
         let failed: [Package]
         let held: [Package]?
-        let outdated: [Package]?
         let error: String?
-        let reportOnly: Bool?
 
         var id: String { name }
     }

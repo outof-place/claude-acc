@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aktualizacje narzędzi na Macu: Homebrew, globalne paczki npm i programy Go co 3 dni.
+"""Aktualizacje wszystkiego na Macu co 3 dni: Homebrew, npm, Go, Python, Claude Code.
 
 launchd uruchamia `updates.py run` codziennie o 4:30 (uśpiony Mac nadrabia po obudzeniu);
 przebieg rusza, gdy od poprzedniego minęły 3 dni, a po nieudanym próbuje znowu następnej
@@ -10,16 +10,24 @@ Co aktualizuje, do najnowszej wersji:
   z własnym aktualizatorem (Chrome, Claude) robią to same. Przypięte (`brew pin`) zostają;
 - npm: globalne paczki, także o wersję główną wyżej. `npm_pins` w updates.json trzyma
   paczkę w jednej wersji głównej, np. {"pnpm": "11"};
-- Go: programy postawione przez `go install` w GOBIN.
-Python tylko sprawdza: globalne paczki pip dzielą zależności, a hurtowe podbicie potrafi po
-cichu zepsuć inne narzędzia, więc panel pokazuje, co jest do zrobienia, a robi to człowiek.
+- Go: programy postawione przez `go install` w GOBIN;
+- Python: globalne pakiety (python.org) jednym rozwiązaniem zależności uv, z kodem bajtowym
+  skompilowanym od razu; po aktualizacji `uv pip check` i import każdego pakietu, a gdy coś
+  przestało działać, wracają poprzednie wersje. `pip_pins` trzyma pakiet ({"fb-idb": "==1.1.7"}).
+  Nowy playwright dostaje swoje przeglądarki. Nowszą wersję poprawkową Pythona z python.org
+  automat pobiera i sprawdza podpis, a instaluje człowiek przyciskiem w panelu (hasło
+  administratora). Pythony z uv idą `uv python upgrade`;
+- Claude Code: `claude update`, katalogi wtyczek, wtyczki w każdym zakresie (user, project,
+  local; projekty, których już nie ma, są pomijane), skille z `npx skills`. Skill poprawiony
+  ręcznie zostaje, a wtyczka, której aktualizacja chce uruchomić polecenie z katalogu, czeka
+  na potwierdzenie człowieka.
 
 Każda paczka idzie osobno albo jest sprawdzana po fakcie, więc jedna nieudana (np. aplikacja,
 która chce hasła administratora) nie zatrzymuje reszty i w panelu widać, która to była.
 Stan dla panelu: updates-state.json; pełne wyjście poleceń: updates.log.
 
 Komendy:
-  run [--force] [--dry-run] [--only brew,npm,go,pip]
+  run [--force] [--dry-run] [--only brew,npm,go,python,claude]
         --force pomija odstęp 3 dni (przycisk w panelu), --dry-run tylko wypisuje plan,
         --only zawęża przebieg i nie przesuwa terminu następnego
   status [--json]
@@ -32,7 +40,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 HOME = os.path.expanduser("~")
@@ -52,11 +62,13 @@ DEFAULT_CONFIG = {
     "every_days": 3,
     # po nieudanym przebiegu: następnej nocy, nie za 3 dni
     "retry_hours": 20,
-    # kroki do pominięcia: brew, npm, go, pip
+    # kroki do pominięcia: brew, npm, go, python, claude
     "skip": [],
     # paczka npm -> zakres, w którym ma zostać ("11" to każda 11.x)
     "npm_pins": {},
-    # Python, którego paczki sprawdzać; domyślnie python.org, potem Homebrew
+    # pakiet Pythona -> specyfikator, przy którym ma zostać ("==1.1.7", "<2")
+    "pip_pins": {},
+    # Python, którego pakiety aktualizować; domyślnie python.org, potem Homebrew
     "python": None,
 }
 
@@ -65,7 +77,10 @@ def tool_path():
     """PATH dla narzędzi: launchd daje procesowi tylko /usr/bin:/bin:/usr/sbin:/sbin."""
     if os.environ.get("CLAUDE_ACC_TOOL_PATH"):  # testy: atrapy brew, npm, go
         return os.environ["CLAUDE_ACC_TOOL_PATH"]
-    dirs = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    # ~/.local/bin pierwszy, jak w powłoce: tam jest natywny Claude Code, a starsze kopie z npm
+    # w /usr/local/bin albo /opt/homebrew/bin przy `claude update` przestawiają jego konfigurację
+    dirs = [os.path.join(HOME, ".local/bin"), "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin",
+            "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     return ":".join(d for d in dirs if os.path.isdir(d))
 
 
@@ -143,11 +158,11 @@ def error_line(text):
     return (lines[-1] if lines else "unknown error")[:300]
 
 
-def call(cmd, timeout=600, codes=(0,), quiet=False):
+def call(cmd, timeout=600, codes=(0,), quiet=False, cwd=HOME):
     """(udało się, stdout, opis błędu). Polecenia, które coś zmieniają, trafiają do logu w całości."""
     try:
         done = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=ENV, cwd=HOME, stdin=subprocess.DEVNULL
+            cmd, capture_output=True, text=True, timeout=timeout, env=ENV, cwd=cwd, stdin=subprocess.DEVNULL
         )
     except subprocess.TimeoutExpired:
         log(f"$ {' '.join(cmd)}: przekroczony czas {timeout} s")
@@ -173,9 +188,8 @@ class StepError(Exception):
 class Step:
     def __init__(self, name, label):
         self.name, self.label = name, label
-        self.updated, self.failed, self.held, self.outdated = [], [], [], []
+        self.updated, self.failed, self.held = [], [], []
         self.error = None
-        self.report_only = False
 
     def to_json(self):
         data = {
@@ -186,9 +200,6 @@ class Step:
             "failed": self.failed,
             "held": self.held,
         }
-        if self.report_only:
-            data["report_only"] = True
-            data["outdated"] = self.outdated
         if self.error:
             data["error"] = self.error
         return data
@@ -230,7 +241,7 @@ def step_brew(st, cfg, dry):
         return True
     before = brew_outdated()
     short = lambda name: name.rsplit("/", 1)[-1]  # facebook/fb/idb-companion
-    st.held = [pkg(short(n), i["from"], i["to"]) for n, i in before.items() if i["pinned"]]
+    st.held = [pkg(short(n), i["from"], i["to"], why="pin") for n, i in before.items() if i["pinned"]]
     todo = {n: i for n, i in before.items() if not i["pinned"]}
     if dry:
         st.updated = [pkg(short(n), i["from"], i["to"]) for n, i in todo.items()]
@@ -302,7 +313,7 @@ def step_npm(st, cfg, dry):
         if name in pins:
             target = npm_newest(name, pins[name]) or info["current"]
             if target != info["latest"]:
-                st.held.append(pkg(name, target, info["latest"], pin=pins[name]))
+                st.held.append(pkg(name, target, info["latest"], why="pin", pin=pins[name]))
         if target != info["current"]:
             todo.append((name, info["current"], target))
     if dry:
@@ -392,7 +403,34 @@ def step_go(st, cfg, dry):
     return True
 
 
-# ---------- Python (tylko raport) ----------
+# ---------- Python ----------
+
+# uruchamiane w docelowym Pythonie: moduły dystrybucji z argv[1] i te, których nie da się zaimportować
+IMPORT_CHECK = r"""
+import importlib, importlib.metadata as md, json, re, sys
+norm = lambda n: re.sub(r"[-_.]+", "-", n).lower()
+dist = norm(sys.argv[1])
+skip = {"test", "tests", "docs", "doc", "examples", "benchmarks"}
+mods = sorted(m for m, ds in md.packages_distributions().items()
+              if any(norm(d) == dist for d in ds) and m.isidentifier() and not m.startswith("_") and m not in skip)
+failed = []
+for m in mods:
+    try:
+        importlib.import_module(m)
+    except BaseException as e:
+        failed.append(f"{m}: {type(e).__name__}: {e}"[:200])
+print(json.dumps({"modules": mods, "failed": failed}))
+"""
+PLAYWRIGHT_CACHE = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or os.path.join(HOME, "Library/Caches/ms-playwright")
+PYTHON_RELEASES = os.environ.get(
+    "CLAUDE_ACC_PYTHON_RELEASES", "https://www.python.org/api/v2/downloads/release/?is_published=true"
+)
+PYTHON_FTP = os.environ.get("CLAUDE_ACC_PYTHON_FTP", "https://www.python.org/ftp/python")
+DOWNLOADS = os.path.join(STATE_DIR, "downloads")
+
+
+def norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def python_for_pip(cfg):
@@ -405,24 +443,325 @@ def python_for_pip(cfg):
     return None
 
 
-def step_pip(st, cfg, dry):
-    python = python_for_pip(cfg)
-    if not python:
-        return False
-    st.report_only = True
-    ok, out, err = call(
-        [python, "-m", "pip", "list", "--outdated", "--format=json", "--disable-pip-version-check"],
-        timeout=600,
-        quiet=True,
-    )
+def pip_versions(python):
+    ok, out, err = call(["uv", "pip", "list", "--python", python, "--format", "json"], timeout=120, quiet=True)
+    try:
+        return {norm(p["name"]): (p["name"], p["version"]) for p in json.loads(out)} if ok else None
+    except ValueError:
+        return None
+
+
+def pip_outdated(python):
+    ok, out, err = call(["uv", "pip", "list", "--python", python, "--outdated", "--format", "json"], timeout=300, quiet=True)
     try:
         items = json.loads(out) if ok else None
     except ValueError:
-        items, err = None, "unreadable pip output"
+        items = None
     if items is None:
-        st.error = f"pip list: {err}"
-        return True
-    st.outdated = [pkg(i["name"], i.get("version"), i.get("latest_version")) for i in items]
+        raise StepError(f"uv pip list: {err or 'unreadable output'}")
+    return {norm(i["name"]): (i["name"], i["version"], i["latest_version"]) for i in items}
+
+
+def import_failures(python, dists):
+    """Dystrybucje, których moduły nie dają się zaimportować; każda w osobnym procesie, bo zepsuta
+    biblioteka natywna potrafi zabić cały interpreter."""
+
+    def check(dist):
+        try:
+            done = subprocess.run([python, "-c", IMPORT_CHECK, dist], capture_output=True, text=True,
+                                  timeout=300, env=ENV, cwd=HOME, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return dist, "import timed out"
+        if done.returncode != 0:
+            return dist, error_line(done.stderr) or f"exit {done.returncode}"
+        try:
+            failed = json.loads(done.stdout.strip().splitlines()[-1])["failed"]
+        except (ValueError, IndexError, KeyError):
+            return dist, "unreadable import check"
+        return dist, "; ".join(failed) or None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        return {d: why for d, why in pool.map(check, dists) if why}
+
+
+def python_packages(st, cfg, python, dry):
+    """Wszystkie pakiety naraz, jednym rozwiązaniem zależności uv, a po nim dowód, że nic nie padło:
+    `uv pip check` i import każdego pakietu instalowanego wprost. Gdy coś przestało działać,
+    wracają wersje sprzed aktualizacji."""
+    pins = {norm(k): v for k, v in (cfg.get("pip_pins") or {}).items()}
+    outdated = pip_outdated(python)
+    st.held += [pkg(n, v, latest, why="pin") for k, (n, v, latest) in outdated.items() if k in pins]
+    todo = {k: o for k, o in outdated.items() if k not in pins}
+    if not todo:
+        return
+    if dry:
+        st.updated += [pkg(n, v, latest) for n, v, latest in todo.values()]
+        return
+    ok, out, _ = call([python, "-m", "pip", "list", "--not-required", "--format=json", "--disable-pip-version-check"],
+                      timeout=120, quiet=True)
+    try:
+        top = [p["name"] for p in json.loads(out)] if ok else []
+    except ValueError:
+        top = []
+    if not top:
+        raise StepError("pip list --not-required: unreadable output")
+    before = pip_versions(python)
+    ok, snapshot, err = call(["uv", "pip", "freeze", "--python", python], timeout=120, quiet=True)
+    if not ok or before is None:
+        raise StepError(f"uv pip freeze: {err}")
+    snapshot_path = os.path.join(STATE_DIR, "python-before-update.txt")
+    with open(snapshot_path, "w") as f:
+        f.write(snapshot)
+    checked_before, _, _ = call(["uv", "pip", "check", "--python", python], timeout=120, quiet=True)
+    broken_before = import_failures(python, top)
+
+    wanted = [n for n in top if norm(n) not in pins] + [f"{n}{spec}" for n, spec in (cfg.get("pip_pins") or {}).items()]
+    ok, _, err = call(["uv", "pip", "install", "--python", python, "--upgrade", "--compile-bytecode", *wanted],
+                      timeout=HOUR)
+    if not ok:
+        st.error = f"uv pip install: {err}"
+        return
+    checked, check_out, check_err = call(["uv", "pip", "check", "--python", python], timeout=120, quiet=True)
+    broken = {d: why for d, why in import_failures(python, top).items() if d not in broken_before}
+    problem = None
+    if checked_before and not checked:
+        problem = f"dependency conflict: {check_err}"
+    elif broken:
+        dist, why = next(iter(broken.items()))
+        problem = f"{dist} stopped importing: {why}"
+    if problem:
+        ok, _, err = call(["uv", "pip", "install", "--python", python, "--compile-bytecode", "-r", snapshot_path],
+                          timeout=HOUR)
+        st.error = f"{problem}; rolled back" if ok else f"{problem}; rollback failed: {err}"
+        if not ok:
+            st.failed.append(pkg("Python packages", None, None, error=st.error,
+                                 retry=f"uv pip install --python {python} -r {snapshot_path}"))
+        return
+    after = pip_versions(python) or {}
+    st.updated += [pkg(name, before[k][1], v) for k, (name, v) in sorted(after.items())
+                   if k in before and before[k][1] != v]
+    try:
+        left = pip_outdated(python)
+    except StepError:
+        left = {}
+    st.held += [pkg(n, v, latest, why="deps") for k, (n, v, latest) in left.items() if k not in pins]
+    playwright_browsers(st, python, before.get("playwright"), after.get("playwright"))
+
+
+def playwright_browsers(st, python, before, after):
+    """Nowy playwright szuka przeglądarek w nowych wersjach: bez ich pobrania skrypty padają."""
+    if not before or not after or before[1] == after[1] or not os.path.isdir(PLAYWRIGHT_CACHE):
+        return
+    present = os.listdir(PLAYWRIGHT_CACHE)
+    browsers = [b for b in ("chromium", "firefox", "webkit") if any(d.startswith(b) for d in present)]
+    if not browsers:
+        return
+    ok, _, err = call([python, "-m", "playwright", "install", *browsers], timeout=1800)
+    if not ok:
+        st.failed.append(pkg("Playwright browsers", before[1], after[1], error=err,
+                             retry=f"{python} -m playwright install {' '.join(browsers)}"))
+
+
+def fetch(url, timeout=60):
+    ok, out, err = call(["curl", "-fsSL", "--max-time", str(timeout), url], timeout=timeout + 10, quiet=True)
+    if not ok:
+        raise StepError(f"{url}: {err}")
+    return out
+
+
+def python_org(st, python, dry):
+    """python.org nie aktualizuje się bez hasła administratora: automat pobiera i sprawdza instalator
+    nowszej wersji poprawkowej, a panel daje przycisk, który go otwiera."""
+    ok, out, _ = call([python, "-c", "import sys; print(sys.version.split()[0], sys.base_prefix)"], quiet=True)
+    if not ok or "/Python.framework/" not in out:
+        return
+    current = out.split()[0]
+    minor = ".".join(current.split(".")[:2])
+    try:
+        releases = json.loads(fetch(PYTHON_RELEASES))
+    except (StepError, ValueError) as err:
+        st.failed.append(pkg("Python", current, "?", error=f"couldn't check python.org: {err}"))
+        return
+    found = [r["name"].split()[1] for r in releases if re.fullmatch(rf"Python {re.escape(minor)}\.\d+", r.get("name", ""))]
+    latest = max(found, key=version_key, default=current)
+    if version_key(latest) <= version_key(current):
+        return
+    if dry:
+        st.held.append(pkg("Python", current, latest, why="install"))
+        return
+    os.makedirs(DOWNLOADS, exist_ok=True)
+    path = os.path.join(DOWNLOADS, f"python-{latest}-macos11.pkg")
+    for old in os.listdir(DOWNLOADS):
+        if old.startswith("python-") and old.endswith(".pkg") and old != os.path.basename(path):
+            os.remove(os.path.join(DOWNLOADS, old))
+    if not os.path.exists(path):
+        ok, _, err = call(["curl", "-fsSL", "--max-time", "1200", "-o", f"{path}.part",
+                           f"{PYTHON_FTP}/{latest}/python-{latest}-macos11.pkg"], timeout=1260, quiet=True)
+        if not ok:
+            st.failed.append(pkg("Python", current, latest, error=f"download: {err}"))
+            return
+        os.replace(f"{path}.part", path)
+    ok, out, err = call(["pkgutil", "--check-signature", path], quiet=True)
+    if not ok or "Developer ID Installer: Python Software Foundation" not in out:
+        os.remove(path)
+        st.failed.append(pkg("Python", current, latest, error=f"installer signature check failed: {err or out[:200]}"))
+        return
+    st.held.append(pkg("Python", current, latest, why="install", installer=path))
+
+
+def uv_pythons():
+    ok, out, _ = call(["uv", "python", "list", "--only-installed", "--managed-python", "--output-format", "json"],
+                      timeout=60, quiet=True)
+    newest = {}
+    try:
+        for p in json.loads(out) if ok else []:
+            minor = ".".join(p["version"].split(".")[:2])
+            if version_key(p["version"]) > version_key(newest.get(minor, "0")):
+                newest[minor] = p["version"]
+    except (ValueError, KeyError):
+        pass
+    return newest
+
+
+def uv_python_upgrade(st, dry):
+    """Pythony z uv (projekty, uvx) do najnowszej wersji poprawkowej."""
+    before = uv_pythons()
+    if not before or dry:
+        return
+    ok, _, err = call(["uv", "python", "upgrade"], timeout=1200)
+    after = uv_pythons()
+    for minor, old in sorted(before.items()):
+        new = after.get(minor, old)
+        if new != old:
+            st.updated.append(pkg(f"Python {minor} (uv)", old, new))
+    if not ok:
+        st.failed.append(pkg("uv Pythons", None, None, error=err))
+
+
+def step_python(st, cfg, dry):
+    python = python_for_pip(cfg)
+    if not which("uv"):
+        if python:
+            st.error = "uv is missing: brew install uv"
+        return bool(python)
+    if python:
+        python_packages(st, cfg, python, dry)
+        python_org(st, python, dry)
+    uv_python_upgrade(st, dry)
+    return True
+
+
+# ---------- Claude Code ----------
+
+SKILLS_DIR = os.path.join(HOME, ".agents/skills")
+SKILLS_LOCK = os.path.join(HOME, ".agents/.skill-lock.json")
+
+
+def claude_version():
+    ok, out, _ = call(["claude", "--version"], timeout=60, quiet=True)
+    return out.split()[0] if ok and out.strip() else None
+
+
+def plugin_installs():
+    """Instalacje wtyczek, których projekt jeszcze istnieje; reszta to ślady po skasowanych worktree."""
+    ok, out, err = call(["claude", "plugin", "list", "--json"], timeout=120, quiet=True)
+    try:
+        items = json.loads(out) if ok else None
+    except ValueError:
+        items = None
+    if items is None:
+        raise StepError(f"claude plugin list: {err or 'unreadable output'}")
+    seen, live = set(), []
+    for p in items:
+        where = p.get("projectPath") if p.get("scope") != "user" else HOME
+        key = (p.get("id"), p.get("scope"), where)
+        if not where or not os.path.isdir(where) or key in seen:
+            continue
+        seen.add(key)
+        live.append((p["id"], p["scope"], where))
+    return live
+
+
+def update_plugins(st):
+    ok, _, err = call(["claude", "plugin", "marketplace", "update"], timeout=600)
+    if not ok:
+        st.failed.append(pkg("plugin marketplaces", None, None, error=err))
+    for plugin_id, scope, where in plugin_installs():
+        name = plugin_id.split("@")[0]
+        # bez -y: polecenie z katalogu wtyczki potwierdza człowiek
+        ok, out, err = call(["claude", "plugin", "update", plugin_id, "-s", scope, "--json"],
+                            timeout=300, cwd=where, quiet=True)
+        try:
+            result = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            st.failed.append(pkg(f"{name} plugin", None, None, error=err or "unreadable output"))
+            continue
+        old, new = result.get("oldVersion"), result.get("newVersion")
+        if result.get("outcome") == "ok":
+            if old != new and not any(p["name"] == f"{name} plugin" and p["to"] == new for p in st.updated):
+                st.updated.append(pkg(f"{name} plugin", old, new))
+        elif result.get("shownCommand"):
+            st.held.append(pkg(f"{name} plugin", old, new, why="confirm",
+                               retry=f"claude plugin update {plugin_id} -s {scope}"))
+        else:
+            st.failed.append(pkg(f"{name} plugin", old, new, error=result.get("message") or err))
+
+
+def tree_hash(folder, scratch):
+    """Hash drzewa git folderu, ten sam, który CLI skills zapisuje w blokadzie po pobraniu z GitHuba."""
+    env = dict(ENV, GIT_DIR=os.path.join(scratch, "repo"), GIT_INDEX_FILE=os.path.join(scratch, "index"),
+               GIT_WORK_TREE=folder)
+    try:
+        if os.path.exists(env["GIT_INDEX_FILE"]):
+            os.remove(env["GIT_INDEX_FILE"])
+        subprocess.run(["git", "add", "-A", "."], cwd=folder, env=env, capture_output=True, check=True, timeout=60)
+        return subprocess.run(["git", "write-tree"], env=env, capture_output=True, text=True, check=True,
+                              timeout=60).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def update_skills(st, dry):
+    """Skille z `npx skills add -g`. Skill poprawiony ręcznie zostaje: aktualizacja by go nadpisała."""
+    skills = load_json(SKILLS_LOCK, {}).get("skills", {})
+    if not skills or not which("npx") or not which("git"):
+        return
+    scratch = tempfile.mkdtemp(prefix="claude-acc-skills-")
+    try:
+        subprocess.run(["git", "init", "-q", "--bare", os.path.join(scratch, "repo")], env=ENV, capture_output=True)
+        edited = [n for n, info in sorted(skills.items())
+                  if os.path.isdir(os.path.join(SKILLS_DIR, n))
+                  and tree_hash(os.path.join(SKILLS_DIR, n), scratch) != info.get("skillFolderHash")]
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    st.held += [pkg(f"{n} skill", None, None, why="edited") for n in edited]
+    names = [n for n in sorted(skills) if n not in edited]
+    if dry or not names:
+        return
+    ok, _, err = call(["npx", "-y", "skills", "update", "-g", "-y", *names], timeout=900)
+    after = load_json(SKILLS_LOCK, {}).get("skills", {})
+    for n in names:
+        old, new = skills[n].get("skillFolderHash"), after.get(n, {}).get("skillFolderHash")
+        if new and new != old:
+            st.updated.append(pkg(f"{n} skill", (old or "?")[:7], new[:7]))
+    if not ok:
+        st.failed.append(pkg("skills", None, None, error=err))
+
+
+def step_claude(st, cfg, dry):
+    if not which("claude"):
+        return False
+    before = claude_version()
+    if not dry:
+        # natywny Claude Code: nowa wersja obok starej, działające sesje zostają na swojej
+        ok, _, err = call(["claude", "update"], timeout=900)
+        after = claude_version()
+        if before and after and after != before:
+            st.updated.append(pkg("Claude Code", before, after))
+        elif not ok:
+            st.failed.append(pkg("Claude Code", before, None, error=err))
+        update_plugins(st)
+    update_skills(st, dry)
     return True
 
 
@@ -430,7 +769,8 @@ STEPS = [
     ("brew", "Homebrew", step_brew),
     ("npm", "npm", step_npm),
     ("go", "Go", step_go),
-    ("pip", "Python", step_pip),
+    ("python", "Python", step_python),
+    ("claude", "Claude Code", step_claude),
 ]
 
 
@@ -512,10 +852,12 @@ def cmd_run(cfg, args):
             write_json(STATE_PATH, current)
 
     state = load_json(STATE_PATH, {})
+    order = [n for n, _, _ in STEPS]
     done = {s["name"] for s in steps}
-    state["steps"] = steps + [s for s in state.get("steps", []) if s["name"] not in done]
-    state["steps"].sort(key=lambda s: [n for n, _, _ in STEPS].index(s["name"]))
-    counted = [s for s in steps if not s.get("report_only")]
+    # kroki z poprzednich przebiegów zostają, a tych, których skrypt już nie zna, nie ma
+    state["steps"] = steps + [s for s in state.get("steps", []) if s["name"] not in done and s["name"] in order]
+    state["steps"].sort(key=lambda s: order.index(s["name"]))
+    counted = steps
     updated = sum(len(s["updated"]) for s in counted)
     failures = [f"{f['name']} ({s['label']})" for s in counted for f in s["failed"]]
     failures += [s["label"] for s in counted if s.get("error")]
@@ -543,17 +885,21 @@ def cmd_run(cfg, args):
     return 0
 
 
+WHY = {"pin": "przypięte", "deps": "trzymane przez zależności", "edited": "poprawione ręcznie",
+       "confirm": "czeka na potwierdzenie", "install": "instalator do uruchomienia"}
+
+
 def print_plan(steps):
     for st in steps:
         line = f"{st.label}: "
         if st.error:
             line += f"błąd: {st.error}"
-        elif st.report_only:
-            line += f"{len(st.outdated)} do aktualizacji ręcznie" if st.outdated else "aktualne"
         else:
             line += ", ".join(f"{p['name']} {p['from']} → {p['to']}" for p in st.updated) or "aktualne"
         if st.held:
-            line += "; przytrzymane: " + ", ".join(f"{p['name']} {p['from']} (jest {p['to']})" for p in st.held)
+            line += "; przytrzymane: " + ", ".join(
+                f"{p['name']} ({WHY.get(p.get('why'), p.get('why'))}" + (f", jest {p['to']})" if p.get("to") else ")")
+                for p in st.held)
         if st.failed:
             line += "; nie do sprawdzenia: " + ", ".join(f"{p['name']}: {p['error']}" for p in st.failed)
         print(line)
@@ -575,10 +921,7 @@ def cmd_status(cfg, args):
     if state.get("running_since"):
         print("Aktualizacja trwa teraz")
     for s in state.get("steps", []):
-        if s.get("report_only"):
-            detail = f"{len(s.get('outdated', []))} do aktualizacji ręcznie"
-        else:
-            detail = f"zaktualizowano {len(s['updated'])}" + (f", nie udało się {len(s['failed'])}" if s["failed"] else "")
+        detail = f"zaktualizowano {len(s['updated'])}" + (f", nie udało się {len(s['failed'])}" if s["failed"] else "")
         print(f"  {s['label']}: {detail}" + (f", błąd: {s['error']}" if s.get("error") else ""))
         for f in s["failed"]:
             print(f"    ! {f['name']}: {f['error']}")

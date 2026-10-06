@@ -1,0 +1,69 @@
+#!/usr/bin/python3
+"""Atrapa uv: pip list/freeze/check/install na pakietach ze świata i python list/upgrade."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("uv", args)
+world = _world.load()
+py = world["python"]
+packages = py["packages"]
+
+
+def flag(name):
+    return name in args
+
+
+if args[:2] == ["pip", "list"]:
+    if flag("--outdated"):
+        out = [{"name": n, "version": p["installed"], "latest_version": p["latest"], "latest_filetype": "wheel"}
+               for n, p in packages.items() if p["installed"] != p["latest"]]
+    else:
+        out = [{"name": n, "version": p["installed"]} for n, p in packages.items()]
+    print(json.dumps(out))
+    sys.exit(0)
+
+if args[:2] == ["pip", "freeze"]:
+    print("\n".join(f"{n}=={p['installed']}" for n, p in packages.items()))
+    sys.exit(0)
+
+if args[:2] == ["pip", "check"]:
+    if py.get("conflict_after_upgrade") and py.get("upgraded"):
+        print("Checked 5 packages\nFound 1 incompatibility\nThe package `rembg` requires `numpy<2.5`, but `2.5.3` is installed", file=sys.stderr)
+        sys.exit(1)
+    print("All installed packages are compatible")
+    sys.exit(0)
+
+if args[:2] == ["pip", "install"]:
+    if "-r" in args:  # powrót do wersji z pliku
+        for line in open(args[args.index("-r") + 1]).read().split():
+            name, version = line.split("==")
+            packages[name]["installed"] = version
+        py["upgraded"] = False
+    else:
+        if _world.fails(world, "uv pip install"):
+            print("error: No solution found when resolving dependencies", file=sys.stderr)
+            sys.exit(1)
+        pinned = {a.split("==")[0]: a.split("==")[1] for a in args if "==" in a}
+        for name, p in packages.items():
+            p["installed"] = pinned.get(name, p.get("cap", p["latest"]))
+        py["upgraded"] = True
+    _world.save(world)
+    sys.exit(0)
+
+if args[:2] == ["python", "list"]:
+    print(json.dumps([{"key": f"cpython-{v['installed']}-macos-aarch64-none", "version": v["installed"]}
+                      for v in world.get("uv_pythons", [])]))
+    sys.exit(0)
+
+if args[:2] == ["python", "upgrade"]:
+    for v in world.get("uv_pythons", []):
+        v["installed"] = v["latest"]
+    _world.save(world)
+    sys.exit(0)
+
+sys.exit(2)

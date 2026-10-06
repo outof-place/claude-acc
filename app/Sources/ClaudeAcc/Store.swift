@@ -264,7 +264,7 @@ final class Store {
 
     // MARK: Updates
 
-    /// Upgrade Homebrew, npm and Go packages now instead of waiting for the 4:30 run.
+    /// Update Homebrew, npm, Go, Python and Claude Code now instead of waiting for the 4:30 run.
     func runUpdates() async {
         guard !updating else { return }
         updating = true

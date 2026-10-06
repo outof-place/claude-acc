@@ -1,0 +1,51 @@
+#!/usr/bin/python3
+"""Atrapa claude: --version, update, plugin list/marketplace update/update z zapisem katalogu roboczego."""
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+args = sys.argv[1:]
+_world.record("claude", args + [f"cwd={os.getcwd()}"])
+world = _world.load()
+c = world["claude"]
+
+if args == ["--version"]:
+    print(f"{c['version']} (Claude Code)")
+    sys.exit(0)
+
+if args == ["update"]:
+    c["version"] = c["latest"]
+    _world.save(world)
+    print(f"Successfully updated to version {c['latest']}")
+    sys.exit(0)
+
+if args[:3] == ["plugin", "list", "--json"]:
+    print(json.dumps([{k: v for k, v in p.items() if k != "latest" and k != "confirm"} for p in c["plugins"]]))
+    sys.exit(0)
+
+if args[:3] == ["plugin", "marketplace", "update"]:
+    print("Successfully updated 3 marketplaces")
+    sys.exit(0)
+
+if args[:2] == ["plugin", "update"]:
+    plugin_id, scope = args[2], args[args.index("-s") + 1]
+    where = os.getcwd()
+    p = next(p for p in c["plugins"] if p["id"] == plugin_id and p["scope"] == scope
+             and (scope == "user" or os.path.realpath(p["projectPath"]) == os.path.realpath(where)))
+    old = p["version"]
+    if p.get("confirm"):
+        print(json.dumps({"command": "update", "outcome": "error", "pluginId": plugin_id, "scope": scope,
+                          "message": "The marketplace declares a command to run", "oldVersion": old,
+                          "newVersion": p["latest"], "shownCommand": {"sha256": "abc"}}))
+        sys.exit(1)
+    p["version"] = p["latest"]
+    _world.save(world)
+    print(json.dumps({"command": "update", "outcome": "ok", "pluginId": plugin_id, "scope": scope,
+                      "updateOutcome": "up_to_date" if old == p["latest"] else "updated",
+                      "oldVersion": old, "newVersion": p["latest"]}))
+    sys.exit(0)
+
+sys.exit(2)

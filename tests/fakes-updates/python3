@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Atrapa Pythona z pip: list --outdated --format=json; każde inne polecenie tylko zapisane."""
+"""Atrapa Pythona z python.org: pip list --not-required, wersja, test importów, playwright install."""
 import json
 import os
 import sys
@@ -8,8 +8,28 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _world
 
 args = sys.argv[1:]
-_world.record("python3", args)
-if args[:3] == ["-m", "pip", "list"] and "--outdated" in args:
-    print(json.dumps(_world.load()["pip"]))
+_world.record("python3", args[:1] + (["<import check>", args[2]] if len(args) > 2 and "packages_distributions" in args[1] else args[1:]))
+world = _world.load()
+py = world["python"]
+
+if args[:3] == ["-m", "pip", "list"] and "--not-required" in args:
+    print(json.dumps([{"name": n, "version": py["packages"][n]["installed"]} for n in py["top"]]))
     sys.exit(0)
+
+if args[:1] == ["-c"] and "packages_distributions" in args[1]:
+    dist = args[2]
+    breaks = py.get("breaks", {})
+    failed = []
+    if dist in breaks and py["packages"][dist]["installed"] == breaks[dist]:
+        failed = [f"{dist}: ImportError: numpy.core.multiarray failed to import"]
+    print(json.dumps({"modules": [dist], "failed": failed}))
+    sys.exit(0)
+
+if args[:1] == ["-c"] and "base_prefix" in args[1]:
+    print(f"{py['version']} /Library/Frameworks/Python.framework/Versions/3.14")
+    sys.exit(0)
+
+if args[:3] == ["-m", "playwright", "install"]:
+    sys.exit(1 if _world.fails(world, "playwright install") else 0)
+
 sys.exit(0)
