@@ -361,6 +361,8 @@ def write_settings(path, settings, stamp):
 
 def run_install(args, add):
     path = args[0] if args else os.path.join(HOME, ".claude/settings.json")
+    pause = pause_enabled()
+    what = ("hooki pauzy limitów" if pause else "budzik po ścianie limitu (pauza wyłączona)") if add else "hooki claude-acc"
     for _ in range(5):
         settings, stamp = read_settings(path)
         if settings is None or not isinstance(settings.get("hooks", {}), dict):
@@ -370,18 +372,18 @@ def run_install(args, add):
         strip(settings)
         if add:
             hooks = settings.setdefault("hooks", {})
-            for event, group in entries(pause_enabled()).items():
+            for event, group in entries(pause).items():
                 hooks.setdefault(event, []).append(group)
         if json.dumps(settings, sort_keys=False) == before:
             # także uninstall bez pliku: nie zakładamy pustego settings.json
-            print(f"hooki pauzy limitów w {path} bez zmian")
+            print(f"{what} w {path} bez zmian")
             return 0
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         # kopia sprzed pierwszej zmiany: kolejne instalacje jej nie nadpisują
         if stamp is not None and not os.path.exists(path + BACKUP_SUFFIX):
             shutil.copy2(path, path + BACKUP_SUFFIX)
         if write_settings(path, settings, stamp):
-            print(f"{'dopisano' if add else 'usunięto'} hooki pauzy limitów w {path}")
+            print(f"{'ustawiono' if add else 'usunięto'} {what} w {path}")
             return 0
     print(f"{path} zmienia się bez przerwy, spróbuj później", file=sys.stderr)
     return 1

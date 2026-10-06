@@ -288,6 +288,12 @@ class WakeTest(Guarded):
         w = World()
         json.dump({"switched_at": 100}, open(os.path.join(w.dir, "state.json"), "w"))
         p = w.spawn("StopFailure")
+        # przełączenie dopiero po starcie budzika: wolny start (load 40) czytał już nowy
+        # switched_at jako punkt wyjścia i czekał w nieskończoność
+        lock = os.path.join(w.dir, "pause-watchers", "s1.lock")
+        deadline = time.time() + 10
+        while not os.path.exists(lock) and time.time() < deadline and p.poll() is None:
+            time.sleep(0.05)
         time.sleep(0.4)
         self.assertIsNone(p.poll())
 
