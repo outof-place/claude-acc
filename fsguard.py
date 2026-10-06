@@ -11,11 +11,13 @@ bo fseventsd działa jako root.
 
 Co robi strażnik (launchd uruchamia go jako root co minutę):
 - mierzy phys_footprint fseventsd, ten sam licznik, którym jetsam wybiera ofiary;
-- gdy dwa kolejne odczyty są ponad limitem (domyślnie 2 GB), wysyła SIGTERM, a po 10 s
-  SIGKILL; launchd wznawia demona od razu (KeepAlive), a klienci FSEvents dostają sygnał,
-  że zdarzenia przepadły i trzeba przeskanować;
+- gdy dwa kolejne odczyty są ponad limitem (domyślnie 4 GB), wysyła SIGTERM, a po 10 s
+  SIGKILL; launchd wznawia demona od razu (KeepAlive). Obserwatory sprzed restartu głuchną
+  (sprawdzone 6.10: fs.watch w node nie dostaje już nic), stąd wysoki limit i to, co niżej;
 - potem zatrzymuje demony `git fsmonitor--daemon`: ich odpowiedź dla `git status` zależy od
   ciągłego strumienia zdarzeń, a następne polecenie git stawia demona od nowa z pełnym skanem;
+- dev serwery postawione przed restartem restartuje devguard, gdy zobaczy last_restart
+  w stanie strażnika; edytory i serwery języka (tsserver, gopls) trzeba zrestartować samemu;
 - między restartami odczekuje co najmniej 5 minut i zapisuje w logu trend (co godzinę albo
   co 10 minut, gdy demon ma ponad 500 MB) oraz każdy inny proces ponad 8 GB, do diagnozy.
 
@@ -32,7 +34,7 @@ import subprocess
 import sys
 import time
 
-LIMIT_MB = 2048
+LIMIT_MB = 4096  # 100 razy więcej niż zwykle, 10 razy mniej niż w noc awarii
 MIN_GAP_S = 300  # najkrótszy odstęp między restartami
 TREND_EVERY_S = 3600
 TREND_BIG_EVERY_S = 600
@@ -151,7 +153,7 @@ class Guard:
         stopped = self.stop_fsmonitors()
         if stopped:
             self.log(f"   zatrzymane demony git fsmonitor: {len(stopped)} (wstaną przy następnym git)")
-        notify(f"fseventsd zjadł {mb(size)} pamięci, zrestartowany. Szczegóły: {self.log_path}")
+        notify(f"fseventsd zjadł {mb(size)} pamięci, zrestartowany. Edytory i serwery języka mogą nie widzieć zmian plików do restartu.")
 
     def stop_fsmonitors(self):
         out = subprocess.run(["/bin/ps", "-axo", "pid=,args="], capture_output=True, text=True).stdout
