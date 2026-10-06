@@ -32,7 +32,7 @@ cd claude-acc
 ./install-fsguard.sh      # optional, root: restarts a bloated fseventsd
 ```
 
-Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads its launchd jobs (the account watcher, the janitor, the dev server guard, Ultra's keeper and the updater) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items and puts itself back after every reinstall, unless you turn **Open at Login** off in the panel. It also adds the [limit pause hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks, keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
+Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads its launchd jobs (the account watcher, the janitor, the dev server guard, Ultra's keeper and the updater) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items and puts itself back after every reinstall, unless you turn **Open at Login** off in the panel. It also adds its [limit hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks (the alarm for sessions that hit a limit, and the pause hooks when the optional pause is on), keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
 
 After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app, the command and the limit pause hooks and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
 
@@ -40,7 +40,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 
 | | |
 | --- | --- |
-| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. When no account is left, it [pauses your sessions at a checkpoint](#how-the-pause-works) instead of letting agents run into the wall, and wakes them when limits come back. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
+| **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. When no account is left, it tells you once; with the optional [limit pause](#how-the-pause-works) (`claude-acc pause on`) it also stops your sessions at a checkpoint instead of letting agents run into the wall, and wakes them when limits come back. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
 | **Dev server guard** | Agents in [Orca](https://github.com/stablyai/orca) each run their own `next dev` with a preview tab, and Turbopack grows to 6-9 GB per server under their edits. The guard watches every dev server's real memory (the number macOS kills by), knows who is looking at it, restarts a bloated one in its own Orca terminal in seconds, stops duplicates, orphans and loops, and turns away an agent about to start a second server of the same app. |
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
@@ -146,6 +146,8 @@ Each of these rules comes from an account that actually lost its login while the
 
 ## How the pause works
 
+The pause is optional and off by default. `claude-acc pause on` turns it on and `claude-acc pause off` turns it off: both write `limit_pause` to `config.json` and update the hooks in `settings.json` right away, and turning it off during a pause wakes the paused sessions. Open sessions keep the hooks they started with; new and resumed ones pick up the change. Without the pause, sessions keep working until the limit, Claude Code resumes them after the reset, the `StopFailure` alarm below wakes them earlier when the watcher switches to an account with headroom, and the watcher sends one notification per episode when no account has headroom.
+
 Claude Code already waits at a usage limit and continues on its own after the reset (`Continue automatically at usage limit` in `/config`, on by default). What it lacks is a warning early enough for subagents to stop cleanly, any warning before the weekly limit, and a way to know that capacity came back on another account. Agents that hit the wall stop halfway through an edit and have to be started over. The pause fills those gaps with Claude Code hooks, which setup adds to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) next to your own hooks.
 
 - The watcher writes `~/.local/share/claude-acc/pause.json` when the active account is down to its switch threshold and no other account qualifies. It removes the file once the active account or another one is back at `min_session_left` and `min_weekly_left` (15% and 8%), not just above the switch threshold, so sessions don't wake up for one minute of work. A switch to an account with headroom ends it too. A throttled usage read leaves the pause as it is. With an account selected in Orca, or Claude Code signed in to an account outside Orca, there is no pause, because the watcher isn't in charge then.
@@ -177,6 +179,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc heal [--deep]` | Recover accounts whose Orca copy died after a rotation elsewhere |
 | `claude-acc tick` | One watcher pass (what launchd runs) |
 | `claude-acc resume` | Lift the limit pause until limits recover (the panel's Resume Now) |
+| `claude-acc pause [on\|off]` | Show, turn on or turn off the optional limit pause |
 | `claude-acc depot [--force]` | Which account the Depot sandboxes run on; `--force` sends its token again |
 | `claude-acc depot --fallback` | Store a long-lived `claude setup-token` token for when no account has headroom |
 | `claude-acc clean [--dry-run]` | Clean up now: every janitor task, whatever its schedule |
@@ -214,6 +217,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `hard_session_left` | `5` | Switch when the active account has this % of the 5-hour window left |
 | `hard_weekly_left` | `3` | Switch when it has this % of the week left |
 | `min_session_left` / `min_weekly_left` | `15` / `8` | An account needs at least this much to be switched to, and the limit pause ends once an account has it again |
+| `limit_pause` | `false` | [Pause sessions at a checkpoint](#how-the-pause-works) when no account has headroom; `claude-acc pause on\|off` sets it and updates the hooks |
 | `last_resort` | `[]` | Emails used only when nothing else has headroom |
 | `never` | `[]` | Emails never switched to |
 | `config_dir` | `~/.claude` | The config directory whose sessions get switched |

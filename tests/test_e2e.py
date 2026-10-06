@@ -513,6 +513,15 @@ FAKE_DEPOT = os.path.join(HERE, "fakes-depot", "depot")
 DEPOT_FALLBACK = "Claude Acc Depot fallback token"
 
 
+def configure(w, **fields):
+    """Zmiana config.json tak, jak robi ją użytkownik albo `claude-acc pause on|off`."""
+    path = os.path.join(w.state_dir, "config.json")
+    cfg = json.load(open(path))
+    cfg.update(fields)
+    json.dump(cfg, open(path, "w"))
+    return w
+
+
 def with_depot(w):
     """Włącza synchronizację Depot z atrapą CLI zamiast prawdziwego `depot`."""
     path = os.path.join(w.state_dir, "config.json")
@@ -921,13 +930,92 @@ class HistoryTrimTest(unittest.TestCase):
         self.assertEqual(kept, [float(48 * 60 - 10), 30.0, 10.0])
 
 
+class OptionalPauseTest(unittest.TestCase):
+    """Pauza limitów jest opcjonalna i domyślnie wyłączona: sesje pracują do ściany limitu,
+    Claude Code wznawia je po resecie, a budzik watch-wall po przełączeniu konta."""
+
+    def exhausted_world(self):
+        w = Env()
+        a = w.account("a@x", session_used=97, weekly_used=40)
+        w.account("b@x", weekly_used=99)
+        w.runtime(a)
+        w.write()
+        return w
+
+    def warnings(self, w):
+        return [n for n in w.notifications() if '"Claude: brak konta z zapasem"' in n]
+
+    def tick(self, w):
+        w.forget_usage_cache()
+        return w.run("tick")
+
+    def ours(self, w):
+        settings = json.load(open(os.path.join(w.config_dir, "settings.json")))
+        return sorted(e for e, groups in settings.get("hooks", {}).items()
+                      if any("claude-acc/hook.py" in h.get("command", "") for g in groups for h in g["hooks"]))
+
+    def test_without_the_option_sessions_keep_working_and_hear_once(self):
+        w = self.exhausted_world()
+
+        for _ in range(3):
+            self.tick(w)
+
+        self.assertIsNone(w.pause())
+        self.assertEqual(len(self.warnings(w)), 1)  # raz na epizod, nie co 2 minuty
+        self.assertFalse([n for n in w.notifications() if '"Claude: pauza limit' in n])
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"]["accessToken"],
+                         w.managed("a@x")["claudeAiOauth"]["accessToken"])
+
+    def test_the_warning_comes_back_in_the_next_episode(self):
+        w = self.exhausted_world()
+        self.tick(w)
+
+        w.set_usage("a@x", session_used=0)
+        self.tick(w)
+        w.set_usage("a@x", session_used=97)
+        self.tick(w)
+
+        self.assertEqual(len(self.warnings(w)), 2)
+
+    def test_tick_wakes_sessions_from_a_pause_once_the_option_is_off(self):
+        # pauza z czasu, gdy opcja była włączona (albo sprzed aktualizacji): plik musi zniknąć,
+        # bo z nim sesje czekają na budzik, którego automat już nie odpali
+        w = configure(self.exhausted_world(), limit_pause=True)
+        self.tick(w)
+        self.assertIsNotNone(w.pause())
+
+        configure(w, limit_pause=False)
+        self.tick(w)
+
+        self.assertIsNone(w.pause())
+        self.assertEqual(len(self.warnings(w)), 1)
+
+    def test_pause_command_switches_the_option_hooks_and_a_running_pause(self):
+        w = self.exhausted_world()
+        self.assertIn("wyłączona", w.run("pause").stdout)
+
+        r = w.run("pause", "on")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.ours(w), ["PostToolUse", "PreToolUse", "Stop", "StopFailure", "UserPromptSubmit"])
+        self.tick(w)
+        self.assertIsNotNone(w.pause())
+
+        r = w.run("pause", "off")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIsNone(w.pause())
+        self.assertEqual(self.ours(w), ["StopFailure"])  # budzik po ścianie limitu zostaje
+        self.assertFalse(json.load(open(os.path.join(w.state_dir, "config.json")))["limit_pause"])
+        self.assertEqual(w.run("pause", "maybe").returncode, 2)
+
+
 class PauseTest(unittest.TestCase):
     """Pauza limitów: gdy aktywne konto się kończy, a żadne inne nie ma zapasu,
     sesje dostają czas na punkt kontrolny zamiast paść w połowie pracy agentów."""
 
     def exhausted_world(self):
         # a@x ma 3% sesji (próg 5%), b@x ma 1% tygodnia: nie ma dokąd przełączyć
-        w = Env()
+        w = configure(Env(), limit_pause=True)
         a = w.account("a@x", session_used=97, weekly_used=40)
         w.account("b@x", weekly_used=99)
         w.runtime(a)
