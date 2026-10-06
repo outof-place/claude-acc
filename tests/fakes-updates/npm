@@ -28,8 +28,15 @@ if args[:1] == ["view"]:
     print(json.dumps(matching[0] if len(matching) == 1 else matching, indent=2))
     sys.exit(0)
 
+if args[:2] == ["prefix", "-g"]:
+    print(os.path.join(os.environ["HOME"], "npm-global"))
+    sys.exit(0)
+
 if args[:2] == ["install", "-g"]:
     name, version = args[2].rsplit("@", 1)
+    for blocked in packages[name].get("blocked", []):
+        print(f"npm warn install-scripts 1 package had install scripts blocked because they are not covered by allowScripts:\n"
+              f"npm warn install-scripts   {blocked}@1.0.0 (postinstall: node install.js)", file=sys.stderr)
     if _world.fails(world, f"npm {name}"):
         print("npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/" + name + "\n"
               "npm error A complete log of this run can be found in: /tmp/npm.log", file=sys.stderr)

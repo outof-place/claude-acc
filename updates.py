@@ -158,8 +158,9 @@ def error_line(text):
     return (lines[-1] if lines else "unknown error")[:300]
 
 
-def call(cmd, timeout=600, codes=(0,), quiet=False, cwd=HOME):
-    """(udało się, stdout, opis błędu). Polecenia, które coś zmieniają, trafiają do logu w całości."""
+def call(cmd, timeout=600, codes=(0,), quiet=False, cwd=HOME, merge=False):
+    """(udało się, stdout, opis błędu); z merge=True drugie pole to stdout i stderr razem.
+    Polecenia, które coś zmieniają, trafiają do logu w całości."""
     try:
         done = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, env=ENV, cwd=cwd, stdin=subprocess.DEVNULL
@@ -173,7 +174,8 @@ def call(cmd, timeout=600, codes=(0,), quiet=False, cwd=HOME):
     if not quiet or not ok:
         output = (done.stdout + done.stderr).strip()
         log(f"$ {' '.join(cmd)}  (kod {done.returncode})" + (f"\n{output}" if output else ""))
-    return ok, done.stdout, "" if ok else error_line(done.stderr + "\n" + done.stdout)
+    out = done.stdout + done.stderr if merge else done.stdout
+    return ok, out, "" if ok else error_line(done.stderr + "\n" + done.stdout)
 
 
 def version_key(version):
@@ -301,6 +303,57 @@ def npm_newest(name, pin):
     return max(versions, key=version_key) if versions else None
 
 
+# npm 12 nie uruchamia skryptów instalacyjnych zależności spoza allowScripts; paczka, która ich
+# potrzebuje (np. pobiera binarkę), instaluje się bez błędu, a potem nie działa
+BLOCKED = re.compile(r"npm warn install-scripts\s+(\S+?)@\S+ \(")
+
+
+def npm_commands(prefix, name):
+    """Komendy paczki z pola bin jej package.json, jako pełne ścieżki w katalogu bin npm."""
+    try:
+        with open(os.path.join(prefix, "lib/node_modules", name, "package.json")) as f:
+            bins = json.load(f).get("bin") or {}
+    except (OSError, ValueError):
+        return []
+    if isinstance(bins, str):
+        bins = {name.split("/")[-1]: bins}
+    return [os.path.join(prefix, "bin", b) for b in sorted(bins)]
+
+
+def working(commands):
+    """Komendy, które odpowiadają na --version."""
+    alive = set()
+    for command in commands:
+        try:
+            done = subprocess.run([command, "--version"], capture_output=True, timeout=20, env=ENV, cwd=HOME,
+                                  stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0:
+            alive.add(os.path.basename(command))
+    return alive
+
+
+def npm_install(name, old, new, prefix):
+    """Instaluje i sprawdza, czy komendy paczki dalej działają; jeśli któraś przestała, wraca stara
+    wersja. Zwraca (błąd albo None, komenda do ponowienia albo None)."""
+    commands = npm_commands(prefix, name) if prefix else []
+    alive = working(commands)
+    ok, out, err = call(["npm", "install", "-g", f"{name}@{new}"], timeout=1200, merge=True)
+    if not ok:
+        return err, None
+    broken = alive - working(npm_commands(prefix, name) if prefix else [])
+    if not broken:
+        return None, None
+    call(["npm", "install", "-g", f"{name}@{old}"], timeout=1200)
+    blocked = sorted(set(BLOCKED.findall(out)))
+    error = f"{', '.join(sorted(broken))} stopped working after {new}, rolled back"
+    if blocked:
+        error += f"; npm blocked install scripts of {', '.join(blocked)}"
+        return error, f"npm install -g --allow-scripts={','.join(blocked)} {name}@{new}"
+    return error, None
+
+
 def step_npm(st, cfg, dry):
     if not which("npm"):
         return False
@@ -319,11 +372,15 @@ def step_npm(st, cfg, dry):
     if dry:
         st.updated = [pkg(n, old, new) for n, old, new in todo]
         return True
-    errors = {}
+    ok, out, _ = call(["npm", "prefix", "-g"], timeout=60, quiet=True)
+    prefix = out.strip() if ok and out.strip() else None
+    errors, retries = {}, {}
     for name, old, new in todo:
-        ok, _, err = call(["npm", "install", "-g", f"{name}@{new}"], timeout=1200)
-        if not ok:
-            errors[name] = err
+        error, retry = npm_install(name, old, new, prefix)
+        if error:
+            errors[name] = error
+        if retry:
+            retries[name] = retry
     try:
         after = npm_outdated() if todo else {}
     except StepError:
@@ -336,7 +393,10 @@ def step_npm(st, cfg, dry):
         if now == new:
             st.updated.append(pkg(name, old, new))
         else:
-            st.failed.append(pkg(name, old, new, error=errors.get(name) or f"still {now} after npm install"))
+            entry = pkg(name, old, new, error=errors.get(name) or f"still {now} after npm install")
+            if name in retries:
+                entry["retry"] = retries[name]
+            st.failed.append(entry)
     return True
 
 

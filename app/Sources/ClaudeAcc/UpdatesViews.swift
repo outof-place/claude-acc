@@ -145,7 +145,8 @@ private struct UpdateStepRow: View {
             if failed.admin == true, let retry = failed.retry {
                 return "\(failed.name) needs your admin password. In Terminal: \(retry)"
             }
-            return "\(failed.name): \(failed.error ?? "failed")"
+            let retry = failed.retry.map { ". In Terminal: \($0)" } ?? ""
+            return "\(failed.name): \(failed.error ?? "failed")\(retry)"
         }
         let confirm = held.filter { $0.why == "confirm" }.map { held in
             "\(held.name) wants to run a command. Review it in Terminal: \(held.retry ?? "claude plugin update")"

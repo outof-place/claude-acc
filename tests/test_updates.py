@@ -34,7 +34,7 @@ WORLD = {
         "casks": {"ngrok": {"installed": "3.20.0", "latest": "3.22.1"}},
     },
     "npm": {
-        "vercel": {"installed": "59.16.0", "latest": "62.4.0", "versions": ["59.16.0", "62.4.0"]},
+        "vercel": {"installed": "59.16.0", "latest": "62.4.0", "versions": ["59.16.0", "62.4.0"], "bin": "vercel"},
         # rejestr nie sortuje: 11.9.0 po 11.28.5, a tekstowo "11.9.0" > "11.28.5"
         "pnpm": {"installed": "11.8.0", "latest": "12.9.1", "versions": ["11.8.0", "11.28.5", "11.9.0", "12.9.1"]},
         "npm": {"installed": "11.19.1", "latest": "12.2.0", "versions": ["11.19.1", "12.2.0"]},
@@ -102,6 +102,14 @@ class Env:
         self.write("python-releases.json", json.dumps(RELEASES))
         self.write("ftp/3.14.8/python-3.14.8-macos11.pkg", "pkg")
         os.makedirs(os.path.join(self.home, "ms-playwright/chromium-1243"))
+        # globalne paczki npm z komendami: package.json z polem bin i komenda w npm-global/bin
+        os.makedirs(os.path.join(self.home, "npm-global/bin"))
+        for name, package in world["npm"].items():
+            if "bin" in package:
+                self.write(f"npm-global/lib/node_modules/{name}/package.json", json.dumps({"bin": {package["bin"]: "cli.js"}}))
+                command = os.path.join(self.home, "npm-global/bin", package["bin"])
+                os.symlink(os.path.join(FAKES, "npm-bin"), command)
+                self.write(f"npm-global/bin/{package['bin']}.package", name)
         self.config(npm_pins={"pnpm": "11"}, pip_pins={"fb-idb": "==1.1.7"}, python=os.path.join(FAKES, "python3"))
 
     def write(self, name, text):
@@ -241,6 +249,21 @@ class UpdatesTest(unittest.TestCase):
         env.run("run")
         self.assertEqual(sum(c == "brew update --quiet" for c in env.calls()), 2)
         self.assertEqual(len(env.notifications()), 1)
+
+    def test_an_npm_package_whose_command_breaks_is_rolled_back(self):
+        # npm 12 nie uruchamia skryptów instalacyjnych: paczka się instaluje, a komenda nie działa
+        def breaks(world):
+            world["npm"]["vercel"].update(breaks="62.4.0", blocked=["@vercel/fun"])
+
+        env = Env(self, edit=breaks)
+        env.run("run", "--force")
+        world = env.world()
+        self.assertEqual(world["npm"]["vercel"]["installed"], "59.16.0")
+        self.assertEqual(world["npm"]["npm"]["installed"], "12.2.0")
+        [vercel] = step(env.state(), "npm")["failed"]
+        self.assertIn("vercel stopped working after 62.4.0, rolled back", vercel["error"])
+        self.assertIn("npm blocked install scripts of @vercel/fun", vercel["error"])
+        self.assertEqual(vercel["retry"], "npm install -g --allow-scripts=@vercel/fun vercel@62.4.0")
 
     def test_runs_every_three_days_and_retries_a_failure_the_next_night(self):
         env = Env(self)
