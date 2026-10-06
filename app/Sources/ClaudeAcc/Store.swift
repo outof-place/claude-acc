@@ -51,9 +51,9 @@ final class Store {
     private(set) var ultraPick: Bool?
     /// The fan mode just picked, until the daemon's state file shows it.
     private(set) var fanPick: String?
-    /// The value asked of `claude-acc pause on|off`, shown until a reading confirms it.
-    private(set) var limitPausePick: Bool?
-    private(set) var limitPauseBusy = false
+    /// The value asked of a watcher setting's command, shown until a reading confirms it.
+    private(set) var settingPicks: [Setting: Bool] = [:]
+    private(set) var settingBusy: Setting?
     /// The mode just picked in the panel, until the guard's next snapshot shows it.
     private var guardModeOverride: String?
     /// Rendering only: the account whose details start open.
@@ -141,7 +141,7 @@ final class Store {
             do {
                 snapshot = try Self.decoder.decode(Snapshot.self, from: Data(result.stdout.utf8))
                 problem = nil
-                if let pick = limitPausePick, pick == snapshot?.limitPause { limitPausePick = nil }
+                for (setting, pick) in settingPicks where pick == value(of: setting) { settingPicks[setting] = nil }
             } catch {
                 problem = "The script returned unreadable data: \(error.localizedDescription)"
             }
@@ -295,22 +295,42 @@ final class Store {
         await refresh()
     }
 
-    /// Turns the limit pause on or off: the script saves it and rewrites the hooks in
-    /// settings.json; turning it off during a pause wakes the paused sessions.
-    func setLimitPause(_ on: Bool) async {
-        guard !limitPauseBusy else { return }
-        limitPauseBusy = true
-        limitPausePick = on
+    /// A watcher setting the panel switches through `claude-acc <command> on|off`.
+    enum Setting: String {
+        /// Turning it off during a pause wakes the paused sessions; the script rewrites the hooks.
+        case limitPause = "pause"
+        /// With no headroom anywhere, use up the last few percent of every account.
+        case drain
+    }
+
+    func value(of setting: Setting) -> Bool? {
+        switch setting {
+        case .limitPause: snapshot?.limitPause
+        case .drain: snapshot?.drain
+        }
+    }
+
+    func set(_ setting: Setting, _ on: Bool) async {
+        guard settingBusy == nil else { return }
+        settingBusy = setting
+        settingPicks[setting] = on
         notice = nil
-        let result = await CLI.run(["pause", on ? "on" : "off"])
-        limitPauseBusy = false
+        let result = await CLI.run([setting.rawValue, on ? "on" : "off"])
+        settingBusy = nil
         if result.status == 0 {
-            notice = Notice(text: on
-                ? "Limit pause is on: with no headroom left, sessions stop at a checkpoint"
-                : "Limit pause is off: sessions work until the limit and resume after the reset")
+            switch setting {
+            case .limitPause:
+                notice = Notice(text: on
+                    ? "Limit pause is on: with no headroom left, sessions stop at a checkpoint"
+                    : "Limit pause is off: sessions work until the limit and resume after the reset")
+            case .drain:
+                notice = Notice(text: on
+                    ? "With no headroom left, sessions use up the last few percent of every account"
+                    : "Accounts below the switch threshold stay untouched")
+            }
         } else {
-            limitPausePick = nil
-            notice = Notice(text: result.message.isEmpty ? "Couldn't change the limit pause" : result.message, isError: true)
+            settingPicks[setting] = nil
+            notice = Notice(text: result.message.isEmpty ? "Couldn't change the setting" : result.message, isError: true)
         }
         await refresh()
     }
