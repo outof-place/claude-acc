@@ -1,15 +1,76 @@
 #!/usr/bin/python3
-"""Atrapa Pythona z pip: list --outdated --format=json; każde inne polecenie tylko zapisane."""
+"""Atrapa Pythona z pip. Paczki w world["pip"], dla drugiego Pythona (link o innej nazwie)
+w world["pip:<nazwa linku>"]: {"nazwa": {"installed", "latest", opcjonalnie "user", "required",
+"local", "nowheel", "held", "breaks"}}. user: leży w user site; required: wymaga jej inna paczka;
+local: postawiona z katalogu; nowheel: najnowsza bez wheela, więc --only-binary jej nie weźmie;
+held: resolver trzyma ją niżej; breaks: po podbiciu `pip check` zgłasza ten tekst.
+world["pip_broken"]: niezgodności sprzed przebiegu."""
 import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _world
 
+name = os.path.basename(sys.argv[0])
+key = "pip" if name == "python3" else f"pip:{name}"
 args = sys.argv[1:]
-_world.record("python3", args)
-if args[:3] == ["-m", "pip", "list"] and "--outdated" in args:
-    print(json.dumps(_world.load()["pip"]))
-    sys.exit(0)
+_world.record(name, args)
+world = _world.load()
+pkgs = world.get(key, {})
+user_site = f"/fake/{name}/user"
+VALUED = {"--progress-bar", "--upgrade-strategy", "--only-binary"}
+
+
+def operands(rest):
+    found, skip = [], False
+    for arg in rest:
+        if skip:
+            skip = False
+        elif arg in VALUED:
+            skip = True
+        elif not arg.startswith("-"):
+            found.append(arg)
+    return found
+
+
+if args[:1] == ["-c"]:
+    local = [n for n, p in pkgs.items() if p.get("local")]
+    version = world.get(f"{key}:version", "3.13")
+    print(json.dumps({"version": version, "prefix": f"/fake/{name}", "user_site": user_site, "local": local}))
+elif args[:3] == ["-m", "pip", "list"]:
+    if "-v" in args and "--outdated" in args:  # prawdziwy pip loguje wtedy na stdout
+        print("  Link requires a different Python (3.15.0 not in: '>=3.7,<3.11'): https://files.example/x.whl")
+    rows = []
+    for n, p in sorted(pkgs.items()):
+        if "--outdated" in args and p["installed"] == p["latest"]:
+            continue
+        if "--not-required" in args and p.get("required"):
+            continue
+        row = {"name": n, "version": p["installed"], "location": user_site if p.get("user") else f"/fake/{name}/base"}
+        if "--outdated" in args:
+            row["latest_version"] = p["latest"]
+        rows.append(row)
+    print(json.dumps(rows))
+elif args[:3] == ["-m", "pip", "check"]:
+    lines = world.get("pip_broken", [])
+    lines += [p["breaks"] for p in pkgs.values() if p.get("breaks") and p["installed"] == p["latest"]]
+    print("\n".join(lines) or "No broken requirements found.")
+    sys.exit(1 if lines else 0)
+elif args[:3] == ["-m", "pip", "install"]:
+    if _world.fails(world, "pip install"):
+        print("ERROR: ResolutionImpossible: fake conflict", file=sys.stderr)
+        sys.exit(1)
+    for spec in operands(args[3:]):
+        n, _, version = spec.partition("==")
+        p = pkgs[n]
+        if version:
+            p["installed"] = version
+        elif bool(p.get("user")) == ("--user" in args) and not p.get("nowheel") and not p.get("held"):
+            p["installed"] = p["latest"]
+    _world.save(world)
+elif args[:3] == ["-m", "pip", "uninstall"]:
+    for n in operands(args[3:]):
+        pkgs.pop(n, None)
+    _world.save(world)
 sys.exit(0)

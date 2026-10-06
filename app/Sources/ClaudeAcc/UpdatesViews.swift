@@ -100,30 +100,22 @@ private struct UpdateStepRow: View {
         }
     }
 
-    private var reportOnly: Bool { step.reportOnly == true }
-
     private var symbol: String {
-        if reportOnly { return "info.circle" }
         if step.error != nil { return "xmark.octagon.fill" }
         return step.failed.isEmpty ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
     }
 
     private var tint: Color {
-        if reportOnly { return .secondary }
         if step.error != nil { return .red }
         return step.failed.isEmpty ? .green : .orange
     }
 
     private var detail: String {
-        if reportOnly {
-            if step.error != nil { return "couldn't check" }
-            let count = step.outdated?.count ?? 0
-            return count == 0 ? "up to date" : "\(count) outdated · by hand"
-        }
         if step.error != nil { return "didn't run" }
         var parts = [step.updated.isEmpty ? "up to date" : "\(step.updated.count) updated"]
         if !step.failed.isEmpty { parts.append("\(step.failed.count) failed") }
-        if let held = step.held, !held.isEmpty { parts.append("\(held.count) pinned") }
+        // brew and npm hold what you pinned; pip holds what another package needs lower
+        if let held = step.held, !held.isEmpty { parts.append("\(held.count) \(step.name == "pip" ? "held back" : "pinned")") }
         return parts.joined(separator: " · ")
     }
 
@@ -133,19 +125,13 @@ private struct UpdateStepRow: View {
             if failed.admin == true, let retry = failed.retry {
                 return "\(failed.name) needs your admin password. In Terminal: \(retry)"
             }
-            return "\(failed.name): \(failed.error ?? "failed")"
+            return "\(failed.label): \(failed.error ?? "failed")"
         }
     }
 
     private var tooltip: String {
-        let version = { (p: UpdatesState.Package) in "\(p.name) \(p.from ?? "?") → \(p.to ?? "?")" }
-        if reportOnly {
-            let list = (step.outdated ?? []).prefix(12).map(version)
-            return (["Python packages share dependencies, so they are not upgraded on their own. "
-                + "Upgrade one with: python3 -m pip install -U <name>"] + list).joined(separator: "\n")
-        }
-        var lines = step.updated.map(version)
-        lines += (step.held ?? []).map { "\($0.name) kept at \($0.from ?? "?") (\($0.to ?? "?") is out)" }
+        var lines = step.updated.map { "\($0.label) \($0.from ?? "?") → \($0.to ?? "?")" }
+        lines += (step.held ?? []).map { "\($0.label) kept at \($0.from ?? "?") (\($0.to ?? "?") is out)" }
         return lines.isEmpty ? "Nothing to update last time" : lines.joined(separator: "\n")
     }
 }

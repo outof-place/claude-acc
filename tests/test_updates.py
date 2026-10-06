@@ -44,7 +44,7 @@ WORLD = {
                 "installed": "v1.61.7", "latest": "v1.67.4"},
         "ent": {"path": "entgo.io/ent/cmd/ent", "module": "entgo.io/ent", "installed": "v0.14.6", "latest": "v0.14.6"},
     },
-    "pip": [{"name": "attrs", "version": "25.4.0", "latest_version": "26.1.0", "latest_filetype": "wheel"}],
+    "pip": {"attrs": {"installed": "25.4.0", "latest": "26.1.0"}},
     "fail": [],
 }
 
@@ -141,7 +141,7 @@ class UpdatesTest(unittest.TestCase):
         run = state["last_run"]
         self.assertTrue(run["ok"])
         self.assertEqual(state["last_success"], run["at"])
-        self.assertEqual(run["updated"], 6)  # railway, ngrok, vercel, pnpm, npm, air
+        self.assertEqual(run["updated"], 7)  # railway, ngrok, vercel, pnpm, npm, air, attrs
         self.assertNotIn("running_since", state)
         self.assertEqual(names(state["steps"]), ["brew", "npm", "go", "pip"])
         self.assertEqual(names(step(state, "go")["updated"]), ["air"])
@@ -208,15 +208,82 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual((upcoming.hour, upcoming.minute), (4, 30))
         self.assertTrue(3 * DAY - 3600 <= upcoming.timestamp() - run["at"] < 4 * DAY)
 
-    def test_python_packages_are_reported_not_upgraded(self):
-        env = Env(self)
+    def test_python_packages_are_upgraded_together_from_wheels(self):
+        env = Env(self, pip={
+            "attrs": {"installed": "25.4.0", "latest": "26.1.0"},
+            # pydantic trzyma ją niżej; llama-cpp-python ma nowszą tylko w źródłach
+            "pydantic-core": {"installed": "2.46.5", "latest": "2.49.0", "required": True, "held": True},
+            "llama-cpp-python": {"installed": "0.3.16", "latest": "0.3.36", "nowheel": True},
+            "openpyxl": {"installed": "3.1.2", "latest": "3.1.5", "user": True},
+            # postawiona z katalogu: pod tą nazwą na PyPI jest coś innego
+            "mytool": {"installed": "0.1.0", "latest": "9.9.9", "local": True},
+        })
         env.run("run", "--force")
+        installed = {n: p["installed"] for n, p in env.world()["pip"].items()}
+        self.assertEqual(installed, {
+            "attrs": "26.1.0", "pydantic-core": "2.46.5", "llama-cpp-python": "0.3.16",
+            "openpyxl": "3.1.5", "mytool": "0.1.0",
+        })
+
         state = env.state()
         pip = step(state, "pip")
-        self.assertTrue(pip["report_only"])
-        self.assertEqual(pip["outdated"], [{"name": "attrs", "from": "25.4.0", "to": "26.1.0"}])
-        self.assertFalse([c for c in env.calls() if c.startswith("python3") and "install" in c])
+        self.assertEqual(pip["updated"], [
+            {"name": "attrs", "from": "25.4.0", "to": "26.1.0", "python": "3.13"},
+            {"name": "openpyxl", "from": "3.1.2", "to": "3.1.5", "python": "3.13"},
+        ])
+        self.assertEqual(sorted(names(pip["held"])), ["llama-cpp-python", "pydantic-core"])
+        self.assertEqual(pip["failed"], [])
         self.assertTrue(state["last_run"]["ok"])
+
+        # jedno polecenie na katalog: resolver widzi wszystkie paczki naraz; user site osobno
+        base, user = [c for c in env.calls() if c.startswith("python3 -m pip install")]
+        self.assertIn("--upgrade-strategy eager --only-binary :all:", base)
+        self.assertTrue(base.endswith(" attrs llama-cpp-python pydantic-core"), base)
+        self.assertNotIn("--user", base)
+        self.assertTrue(user.endswith(" openpyxl") and "--user" in user, user)
+
+    def test_a_python_upgrade_that_breaks_a_dependency_is_rolled_back(self):
+        broken = "cattrs 24.1.0 has requirement attrs<26, but you have attrs 26.1.0."
+        env = Env(self, pip={"attrs": {"installed": "25.4.0", "latest": "26.1.0", "breaks": broken}})
+        env.run("run")
+        self.assertEqual(env.world()["pip"]["attrs"]["installed"], "25.4.0")
+        state = env.state()
+        [attrs] = step(state, "pip")["failed"]
+        self.assertEqual((attrs["from"], attrs["to"]), ("25.4.0", "26.1.0"))
+        self.assertEqual(attrs["error"], f"rolled back, pip check: {broken}")
+        self.assertFalse(state["last_run"]["ok"])
+        [note] = env.notifications()
+        self.assertIn("attrs (Python)", note)
+
+    def test_a_dependency_problem_from_before_the_run_is_not_rolled_back(self):
+        env = Env(self, pip_broken=["cattrs 24.1.0 requires exceptiongroup, which is not installed."])
+        env.run("run", "--force")
+        self.assertEqual(env.world()["pip"]["attrs"]["installed"], "26.1.0")
+        self.assertTrue(env.state()["last_run"]["ok"])
+
+    def test_a_failed_pip_install_is_named_and_the_rest_goes_on(self):
+        env = Env(self, fail=["pip install"])
+        env.run("run", "--force")
+        state = env.state()
+        [attrs] = step(state, "pip")["failed"]
+        self.assertEqual(attrs["error"], "ERROR: ResolutionImpossible: fake conflict")
+        self.assertEqual(env.world()["npm"]["vercel"]["installed"], "62.4.0")
+        self.assertFalse(state["last_run"]["ok"])
+
+    def test_every_python_is_upgraded_once_and_named(self):
+        env = Env(self, **{
+            "pip:python3-brew": {"numpy": {"installed": "2.4.3", "latest": "2.5.3"}},
+            "pip:python3-brew:version": "3.14",
+        })
+        fake = os.path.join(FAKES, "python3")
+        brew = os.path.join(env.home, "fake/python3-brew")
+        os.symlink(fake, brew)
+        env.config(python=[fake, brew, fake])  # ten sam Python drugi raz nie liczy się
+        env.run("run", "--force")
+        pip = step(env.state(), "pip")
+        self.assertEqual([(p["name"], p["python"]) for p in pip["updated"]], [("attrs", "3.13"), ("numpy", "3.14")])
+        self.assertEqual(sum(c.startswith("python3 -m pip install") for c in env.calls()), 1)
+        self.assertEqual(env.world()["pip:python3-brew"]["numpy"]["installed"], "2.5.3")
 
     def test_dry_run_prints_the_plan_and_changes_nothing(self):
         env = Env(self)
@@ -224,6 +291,7 @@ class UpdatesTest(unittest.TestCase):
         self.assertIn("railway 5.63.1 → 5.63.3", done.stdout)
         self.assertIn("pnpm 11.8.0 → 11.28.5", done.stdout)
         self.assertIn("air v1.61.7 → v1.67.4", done.stdout)
+        self.assertIn("attrs (3.13) 25.4.0 → 26.1.0", done.stdout)
         self.assertEqual(env.world(), {**copy.deepcopy(WORLD)})
         self.assertIsNone(env.state())
 
