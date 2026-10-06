@@ -1,11 +1,13 @@
-// claude-acc-hook: the native front of the `devguard.py admit` PreToolUse hook.
+// claude-acc-hook: the native front of the `devguard.py admit` PreToolUse hook, and with
+// `pause <mode>` of the limit pause hooks.
 //
 // The hook runs before every Bash command of every agent on the Mac. Most commands neither
 // start a dev server nor bring Go or JS work for the scheduler, and for those the answer is
 // "nothing to say": this binary gives it in about a millisecond, where starting Python alone
-// takes 25-40 ms (and hundreds under load). A command with one of the words goes to `devguard.py admit` with the same
-// bytes on stdin, so every decision stays in Python. The words come from
-// `devguard.py words`, written to hook-words.json at install: one source for both lists.
+// takes 25-40 ms (and hundreds under load). A command where one of the words stands as a whole
+// word goes to `devguard.py admit` with the same bytes on stdin, so every decision stays in
+// Python. The words and the gate come from `devguard.py words`, written to hook-words.json at
+// install: one source for both fronts.
 //
 // Anything unexpected (no words file, no interpreter) hands the event to Python as well;
 // only an event that isn't JSON ends here, exactly as the Python fast path ends it.
@@ -14,6 +16,26 @@ import Foundation
 
 // HOME first, like the Python scripts' expanduser: tests point it at a scratch folder
 let state = (ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()) + "/.local/share/claude-acc"
+
+// `pause <mode>`: the limit pause hooks of hook.py, which Claude Code runs without a shell
+// (exec form), after every tool call of every session. Outside a pause that is two file
+// checks and the event drained; during one, hook.py gets the event untouched on stdin. The
+// same checks as the shell guard hook.py installs when this binary is missing.
+if CommandLine.arguments.count > 2, CommandLine.arguments[1] == "pause" {
+    let override = ProcessInfo.processInfo.environment["CLAUDE_ACC_PAUSE_FILE"] ?? ""
+    let pause = override.isEmpty ? state + "/pause.json" : override
+    let script = state + "/hook.py"
+    if access(pause, F_OK) == 0, access(script, F_OK) == 0 {
+        let python = "/usr/bin/python3"
+        let args = [python, script, CommandLine.arguments[2]]
+        var argv = args.map { strdup($0) } + [nil]
+        execv(python, &argv)
+    }
+    // the shell's `cat >/dev/null`: Claude Code's write of the event never meets a closed pipe
+    _ = FileHandle.standardInput.readDataToEndOfFile()
+    exit(0)
+}
+
 let event = FileHandle.standardInput.readDataToEndOfFile()
 
 /// The managed interpreter setup.sh links, or the system one.
@@ -57,5 +79,10 @@ func contains(_ word: String) -> Bool {
     }
 }
 
+// whole words only (HOOK_GATE in devguard.py); a words file from before the gate keeps substrings
+if let pattern = words["gate"]?.first, let gate = try? NSRegularExpression(pattern: pattern) {
+    if gate.firstMatch(in: command, range: NSRange(command.startIndex..., in: command)) != nil { handOver() }
+    exit(0)
+}
 if (dev + sched).contains(where: contains) { handOver() }
 exit(0)
