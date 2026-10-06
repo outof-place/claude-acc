@@ -24,6 +24,7 @@
   "reason": "main@example.com: tydzie\u0144 52%, sesja 3%",
   "resume_at": 1790439657
  },
+ "limit_pause": true,
  "accounts": [
   {
    "id": "demo-1",

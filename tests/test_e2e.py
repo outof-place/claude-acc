@@ -949,6 +949,9 @@ class OptionalPauseTest(unittest.TestCase):
         w.forget_usage_cache()
         return w.run("tick")
 
+    def snapshot(self, w):
+        return json.loads(w.run("status", "--json").stdout)
+
     def ours(self, w):
         settings = json.load(open(os.path.join(w.config_dir, "settings.json")))
         return sorted(e for e, groups in settings.get("hooks", {}).items()
@@ -994,9 +997,12 @@ class OptionalPauseTest(unittest.TestCase):
         w = self.exhausted_world()
         self.assertIn("wyłączona", w.run("pause").stdout)
 
+        self.assertIs(self.snapshot(w)["limit_pause"], False)  # przełącznik w panelu czyta to pole
+
         r = w.run("pause", "on")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.ours(w), ["PostToolUse", "PreToolUse", "Stop", "StopFailure", "UserPromptSubmit"])
+        self.assertIs(self.snapshot(w)["limit_pause"], True)
         self.tick(w)
         self.assertIsNotNone(w.pause())
 
@@ -1006,6 +1012,7 @@ class OptionalPauseTest(unittest.TestCase):
         self.assertIsNone(w.pause())
         self.assertEqual(self.ours(w), ["StopFailure"])  # budzik po ścianie limitu zostaje
         self.assertFalse(json.load(open(os.path.join(w.state_dir, "config.json")))["limit_pause"])
+        self.assertIs(self.snapshot(w)["limit_pause"], False)
         self.assertEqual(w.run("pause", "maybe").returncode, 2)
 
 

@@ -51,6 +51,9 @@ final class Store {
     private(set) var ultraPick: Bool?
     /// The fan mode just picked, until the daemon's state file shows it.
     private(set) var fanPick: String?
+    /// The value asked of `claude-acc pause on|off`, shown until a reading confirms it.
+    private(set) var limitPausePick: Bool?
+    private(set) var limitPauseBusy = false
     /// The mode just picked in the panel, until the guard's next snapshot shows it.
     private var guardModeOverride: String?
     /// Rendering only: the account whose details start open.
@@ -138,6 +141,7 @@ final class Store {
             do {
                 snapshot = try Self.decoder.decode(Snapshot.self, from: Data(result.stdout.utf8))
                 problem = nil
+                if let pick = limitPausePick, pick == snapshot?.limitPause { limitPausePick = nil }
             } catch {
                 problem = "The script returned unreadable data: \(error.localizedDescription)"
             }
@@ -288,6 +292,26 @@ final class Store {
         notice = result.status == 0
             ? Notice(text: "Pause lifted, sessions are resuming")
             : Notice(text: result.message.isEmpty ? "Couldn't lift the pause" : result.message, isError: true)
+        await refresh()
+    }
+
+    /// Turns the limit pause on or off: the script saves it and rewrites the hooks in
+    /// settings.json; turning it off during a pause wakes the paused sessions.
+    func setLimitPause(_ on: Bool) async {
+        guard !limitPauseBusy else { return }
+        limitPauseBusy = true
+        limitPausePick = on
+        notice = nil
+        let result = await CLI.run(["pause", on ? "on" : "off"])
+        limitPauseBusy = false
+        if result.status == 0 {
+            notice = Notice(text: on
+                ? "Limit pause is on: with no headroom left, sessions stop at a checkpoint"
+                : "Limit pause is off: sessions work until the limit and resume after the reset")
+        } else {
+            limitPausePick = nil
+            notice = Notice(text: result.message.isEmpty ? "Couldn't change the limit pause" : result.message, isError: true)
+        }
         await refresh()
     }
 
