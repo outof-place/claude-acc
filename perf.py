@@ -755,6 +755,12 @@ PLAIN_COMMAND = re.compile(r"[\w./~$@%+=:,-]+(\s+[\w./~$@%+=:,-]+)*")
 # hooki pauzy limitów (hook.py, ten sam znacznik co jego MARKER) zostają synchroniczne:
 # w tle ich polecenie dla sesji i odmowa dla nowych subagentów przepadają bez śladu
 PAUSE_HOOKS = "claude-acc/hook.py"
+# hooki przed każdą komendą Bash, które mają natywny odpowiednik (claude-hooks-native):
+# devguard wprost albo przez acc.py, i skrypt rtk, którego instalator rtk sam uznaje za
+# przestarzały na rzecz `rtk hook claude`
+DEVGUARD_ADMIT = re.compile(r"(?:^|\s)\S*(?:devguard\.py|acc\.py devguard) admit$")
+RTK_SCRIPT = re.compile(r"^\S*/rtk-rewrite\.sh$")
+RTK_NATIVE = "rtk hook claude"
 # w zapisie poprzedniej wartości: klucza wcześniej nie było
 MISSING = {"__missing__": True}
 # `change` w edit_json_file: plik ma zniknąć (powstał przez nas i znowu jest pusty)
@@ -767,13 +773,28 @@ DEFAULT_CONFIG = {
     # bez końca (zmierzone 2026-10-04: 24-32% rdzenia P, około 1 W)
     "background": [r"/cavemem/dist/index\.js worker"],
     # hooki Claude Code puszczane w tle ("async": true): nie zwracają nic, na co sesja
-    # czeka, a każde wywołanie narzędzia czekało na start node (54 ms p50)
+    # czeka, a każde wywołanie narzędzia czekało na start node (54 ms p50). Hook Orki tylko
+    # zgłasza jej status sesji i zawsze wypisuje {}: 36-39 ms p50 przed i po każdym
+    # narzędziu (6.10). SessionStart, SessionEnd i PermissionRequest Orki zostają
+    # synchroniczne: przy końcu sesji hook w tle mógłby nie zdążyć
     "async_hooks": [
         {
             "event": "PostToolUse",
             "match": "cavemem/dist/index.js hook run post-tool-use",
         },
         {"event": "Stop", "match": "cavemem/dist/index.js hook run stop"},
+    ]
+    + [
+        {"event": event, "match": ".orca/agent-hooks/claude-hook"}
+        for event in (
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "UserPromptSubmit",
+            "Stop",
+            "SubagentStart",
+            "SubagentStop",
+        )
     ],
     # limity dev serwerów strażnika w Ultra: procent RAM na wszystkie (strażnik domyślnie
     # ma 35) i GB, powyżej których jeden serwer jest spuchnięty (domyślnie 5)
@@ -848,6 +869,24 @@ class System:
     def git(self, repo, *args):
         """Wyjście gita albo None (brak klucza w configu to też None)."""
         return janitor.run(["git", "-C", repo, *args], timeout=120)
+
+    def rtk_hook(self):
+        """Czy rtk ma wbudowany hook Claude Code: `rtk hook claude` czyta zdarzenie ze stdin."""
+        rtk = janitor.which("rtk")
+        if not rtk:
+            return False
+        try:
+            done = subprocess.run(
+                [rtk, "hook", "claude"],
+                input='{"tool_name": "Bash", "tool_input": {"command": "true"}}',
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=janitor.ENV,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return done.returncode == 0
 
     def docker_memory(self):
         """Pamięć maszyny Dockera w bajtach z `docker info`, gdy Docker działa."""
@@ -1010,7 +1049,7 @@ class AsyncHooks:
     )
     effect = (
         "PostToolUse czekał na start node w hooku cavemem: 54 ms p50, 99 ms p90 na każde "
-        "narzędzie; równoległy hook Orki trwa 26/71 ms (transkrypty z 24 h, 12 tys. wywołań)"
+        "narzędzie; hook Orki 36-39 ms p50 przed i po każdym narzędziu (transkrypty, 6.10)"
     )
     path = None  # testy podstawiają plik; None to CLAUDE_SETTINGS
 
@@ -1086,6 +1125,14 @@ class AsyncHooks:
 def hook_label(command):
     if "cavemem" in command and "hook run " in command:
         return "cavemem " + command.split("hook run ")[-1].split()[0]
+    if ".orca/agent-hooks/" in command:
+        return "Orca"
+    if PAUSE_HOOKS in command:
+        return "pauza limitów"
+    parts = command.split()
+    # program z podkomendą (`fasthooks read-guard`, `rtk hook claude`): nazwa i podkomenda
+    if len(parts) > 1 and re.fullmatch(r"[a-z][\w-]*", parts[1]) and "." not in os.path.basename(parts[0]):
+        return f"{os.path.basename(parts[0])} {parts[1]}"
     return short_command(command)
 
 
@@ -1476,6 +1523,105 @@ class HookWrap:
         return ", ".join(names) or "brak hooków z listy `npx_fast_hooks`"
 
 
+class NativeHooks:
+    """Hooki przed każdą komendą Bash na natywnych programach: ten sam wynik bez startu
+    powłoki, jq i Pythona przy każdej komendzie każdego agenta.
+
+    - devguard: `python3 .../devguard.py admit` (także przez acc.py) zamienia się na
+      claude-acc-hook, natywny front tego samego admit: zwykłe komendy przepuszcza sam,
+      komendę ze słowem od dev serwera albo od schedulera oddaje Pythonowi;
+    - rtk: skrypt rtk-rewrite.sh zamienia się na `rtk hook claude`, hook wbudowany w rtk.
+      Skrypt zostaje nietknięty, bo rtk sprawdza jego sha256 i po zmianie odmawia pracy.
+
+    Zamiana tylko wtedy, gdy natywny program jest na miejscu; oryginał wraca przy cofnięciu.
+    """
+
+    name = "claude-hooks-native"
+    group = "claude"
+    root = False
+    title = (
+        "hooki przed komendą Bash na natywnych programach: claude-acc-hook zamiast "
+        "devguard.py admit, `rtk hook claude` zamiast rtk-rewrite.sh"
+    )
+    effect = (
+        "na każdą komendę Bash: devguard 25-57 -> 5-8 ms, rtk 57-80 -> 12-14 ms "
+        "(6.10; decyzje identyczne na 10 i 18 przypadkach)"
+    )
+    path = None
+
+    def settings_path(self):
+        return self.path or CLAUDE_SETTINGS
+
+    def targets(self, system):
+        """[(wzorzec komendy, natywny zamiennik)] dla programów, które są zainstalowane."""
+        found = []
+        hook = os.path.join(STATE_DIR, "claude-acc-hook")
+        if os.access(hook, os.X_OK):
+            found.append((DEVGUARD_ADMIT, shlex.quote(hook)))
+        if system.rtk_hook():
+            found.append((RTK_SCRIPT, RTK_NATIVE))
+        return found
+
+    def apply(self, cfg, system, record=None):
+        entries = list((record or {}).get("hooks", []))
+        targets = self.targets(system)
+        if not targets or not os.path.exists(self.settings_path()):
+            return {"hooks": entries}, []
+        changed = []
+
+        def change(data):
+            del changed[:]
+            known = {(e["event"], e["original"]) for e in entries}
+            for event, groups in (data.get("hooks") or {}).items():
+                for group in groups or []:
+                    for hook in group.get("hooks", []) or []:
+                        command = hook.get("command", "")
+                        if not PLAIN_COMMAND.fullmatch(command):
+                            continue
+                        for pattern, native in targets:
+                            if command == native or not pattern.search(command):
+                                continue
+                            hook["command"] = native
+                            if (event, command) not in known:
+                                entries.append(
+                                    {"event": event, "original": command, "native": native}
+                                )
+                            changed.append(f"{event}: {hook_label(command)} -> {hook_label(native)}")
+                            break
+            return bool(changed)
+
+        edit_json_file(self.settings_path(), change)
+        return {"hooks": entries}, changed
+
+    def undo(self, record, system):
+        restored = []
+        entries = record.get("hooks", [])
+
+        def change(data):
+            del restored[:]
+            # dwa różne oryginały mogły dostać ten sam zamiennik: wracają w kolejności zapisu
+            queue = {}
+            for e in entries:
+                queue.setdefault((e["event"], e["native"]), []).append(e["original"])
+            for event, groups in (data.get("hooks") or {}).items():
+                for group in groups or []:
+                    for hook in group.get("hooks", []) or []:
+                        waiting = queue.get((event, hook.get("command")))
+                        if waiting:
+                            hook["command"] = waiting.pop(0)
+                            restored.append(f"{event}: {hook_label(hook['command'])}")
+            return bool(restored)
+
+        if entries and os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        return restored
+
+    def describe(self, record, system):
+        hooks = (record or {}).get("hooks", [])
+        pairs = sorted({f"{hook_label(e['original'])} -> {hook_label(e['native'])}" for e in hooks})
+        return ", ".join(pairs) or "brak hooków z natywnym odpowiednikiem"
+
+
 class RootTweak:
     """Poprawka, która wymaga roota: perf.py tylko ją opisuje, robi ją perf-root.sh."""
 
@@ -1489,6 +1635,7 @@ class RootTweak:
 TWEAKS = [
     BackgroundHelpers(),
     AsyncHooks(),
+    NativeHooks(),
     ClaudeEnv(
         "node-compile-cache",
         "NODE_COMPILE_CACHE",
@@ -1718,8 +1865,27 @@ def hook_latency(
 
     {"PostToolUse": {"n": ..., "p50": ..., "p90": ...}, ...}
     """
+    return hook_stats(since, until, events, skip)[0]
+
+
+def stats_of(values):
+    return {
+        "n": len(values),
+        "p50": rnd(percentile(values, 0.5), 0),
+        "p90": rnd(percentile(values, 0.9), 0),
+    }
+
+
+def hook_stats(
+    since, until=None, events=("PreToolUse", "PostToolUse", "Stop"), skip=()
+):
+    """(czekanie na zdarzenie jak w hook_latency, czas każdego hooka z osobna) z jednego
+    czytania transkryptów. Drugie: {(zdarzenie, etykieta hooka): {"n", "p50", "p90"}}.
+    Transkrypt zapisuje tylko hooki, które coś wypisały: cichy hook (devguard przy
+    zwykłej komendzie) w tych liczbach nie występuje."""
     until = until or time.time()
     calls = {event: {} for event in events}
+    per_hook = {}
     for path in glob.glob(os.path.join(CLAUDE_PROJECTS, "*", "*.jsonl")):
         try:
             if os.path.getmtime(path) < since:
@@ -1730,20 +1896,13 @@ def hook_latency(
         for event, key, ms, stamp, command in records:
             if event not in calls or not since <= stamp <= until:
                 continue
+            per_hook.setdefault((event, hook_label(command)), []).append(ms)
             if any(s in command for s in skip):
                 calls[event].setdefault(key, 0)
                 continue
             calls[event][key] = max(calls[event].get(key, 0), ms)
-    result = {}
-    for event, per_call in calls.items():
-        values = list(per_call.values())
-        if values:
-            result[event] = {
-                "n": len(values),
-                "p50": rnd(percentile(values, 0.5), 0),
-                "p90": rnd(percentile(values, 0.9), 0),
-            }
-    return result
+    waits = {e: stats_of(list(c.values())) for e, c in calls.items() if c}
+    return waits, {key: stats_of(values) for key, values in per_hook.items()}
 
 
 def tool_calls(since, until=None):
@@ -1902,12 +2061,16 @@ def bench_agents(hours=24):
     data = agent_turnaround(since)
     families = data["families"]
     top = sorted(families.items(), key=lambda kv: -kv[1]["n"] * (kv[1]["p50"] or 0))
+    waits, per_hook = hook_stats(since)
+    # najwięcej łącznego czasu: hook do przepisania na program albo do puszczenia w tle
+    slow = sorted(per_hook.items(), key=lambda kv: -kv[1]["n"] * (kv[1]["p50"] or 0))
     return {
         "hours": hours,
         "tools": dict(top[:16]),
         "formatted_edits": data["formatted_edits"],
         "capped_per_day": rnd(data["capped"] * 24 / hours, 1),
-        "hooks": hook_latency(since),
+        "hooks": waits,
+        "slow_hooks": [dict(st, event=event, hook=label) for (event, label), st in slow[:8]],
     }
 
 
@@ -2059,6 +2222,7 @@ def git_status_ms(system, repos, runs=5, write_index=False):
 ULTRA = [
     "bg-helpers",
     "claude-hooks-async",
+    "claude-hooks-native",
     "node-compile-cache",
     "devguard-budget",
     "devguard-max-server",
@@ -2086,6 +2250,8 @@ def ultra_state(state):
     ultra.setdefault("pending_root", [])
     ultra.setdefault("pending_manual", [])
     ultra.setdefault("results", {})
+    # poprawki Ultry cofnięte ręcznie przy włączonej Ultrze: keep ich nie przywraca
+    ultra.setdefault("declined", [])
     return ultra
 
 
@@ -2260,66 +2426,71 @@ def ultra_on(cfg, system, state):
             restored = ["cofnę po zamknięciu Dockera"]
         report += [f"{name} (już nie w Ultra): {what}" for what in restored]
     for name in ULTRA:
-        item = tweak(name)
-        old = state["applied"].get(name)
-        if old is not None and name not in ultra["applied"]:
-            continue  # włączone ręcznie przed Ultra: nie nasze, nie ruszamy
-        before = None
-        if name == "bg-helpers" and old is None:
-            before = item.measure(cfg, system)
-        # także gdy repozytoria doszły do włączonej już poprawki (pusta lista `git_repos`)
-        if name == "git-speed" and not (old or {}).get("repos") and git_repos(cfg):
-            before = git_status_ms(system, git_repos(cfg))
-        try:
-            record, changed = item.apply(cfg, system, old)
-        except (OSError, ValueError, RuntimeError) as err:
-            report.append(f"{name}: błąd {err}")
-            continue
-        record["at"] = old["at"] if old else time.time()
-        record["ultra"] = True
-        if name == "docker-vm" and record.get("written"):
-            # Docker wczyta nową wartość dopiero przy następnym starcie
-            record.setdefault("active", bool((old or {}).get("active")))
-        state["applied"][name] = record
-        if name not in ultra["applied"]:
-            ultra["applied"].append(name)
-        for what in changed:
-            report.append(f"{name}: {what}")
-        result = None
-        if name == "bg-helpers" and before is not None:
-            # planista przenosi wątki na rdzenie E nie od razu
-            time.sleep(SETTLE_SECONDS)
-            after = item.measure(cfg, system)
-            result = {"before": before, "after": after, "unit": "% rdzenia P"}
-        elif name == "git-speed" and before is not None:
-            # fsmonitor startuje demona i buduje cache przy pierwszym statusie: mierzymy
-            # dopiero rozgrzane repo, tak jak zobaczy je następne polecenie agenta
-            git_status_ms(system, git_repos(cfg), runs=2, write_index=True)
-            time.sleep(SETTLE_SECONDS)
-            after = git_status_ms(system, git_repos(cfg))
-            result = {"before": before, "after": after, "unit": "ms git status"}
-        elif (
-            name in ("fast-npx-hooks", "claude-limits") and name not in ultra["results"]
-        ):
-            result = transcript_before(name, ultra["since"])
-        elif name == "claude-hooks-async" and name not in ultra["results"]:
-            since = ultra["since"]
-            stats = hook_latency(since - 86400, since).get("PostToolUse")
-            if stats:
-                result = {
-                    "before": stats["p50"],
-                    "after": None,
-                    "unit": "ms hooków na narzędzie (p50)",
-                    "note": f"po {HOOK_SAMPLES} wywołaniach od włączenia",
-                }
-        elif name not in ultra["results"]:
-            result = measure_before_after(item, cfg, system, record)
-        if result:
-            ultra["results"][name] = result
+        if name not in ultra["declined"]:
+            report += ultra_apply(name, cfg, system, state)
     spotlight_result(cfg, state, force=True)
     sync_root(cfg, state)
     ultra["pending_manual"] = pending_manual(state)
     return report
+
+
+def ultra_apply(name, cfg, system, state):
+    """Włącza jedną poprawkę Ultry (albo pilnuje włączonej) i mierzy ją; zwraca zmiany."""
+    ultra = ultra_state(state)
+    item = tweak(name)
+    old = state["applied"].get(name)
+    if old is not None and name not in ultra["applied"]:
+        return []  # włączone ręcznie przed Ultra: nie nasze, nie ruszamy
+    before = None
+    if name == "bg-helpers" and old is None:
+        before = item.measure(cfg, system)
+    # także gdy repozytoria doszły do włączonej już poprawki (pusta lista `git_repos`)
+    if name == "git-speed" and not (old or {}).get("repos") and git_repos(cfg):
+        before = git_status_ms(system, git_repos(cfg))
+    try:
+        record, changed = item.apply(cfg, system, old)
+    except (OSError, ValueError, RuntimeError) as err:
+        return [f"{name}: błąd {err}"]
+    record["at"] = old["at"] if old else time.time()
+    record["ultra"] = True
+    if name == "docker-vm" and record.get("written"):
+        # Docker wczyta nową wartość dopiero przy następnym starcie
+        record.setdefault("active", bool((old or {}).get("active")))
+    state["applied"][name] = record
+    if name not in ultra["applied"]:
+        ultra["applied"].append(name)
+    result = None
+    if name == "bg-helpers" and before is not None:
+        # planista przenosi wątki na rdzenie E nie od razu
+        time.sleep(SETTLE_SECONDS)
+        after = item.measure(cfg, system)
+        result = {"before": before, "after": after, "unit": "% rdzenia P"}
+    elif name == "git-speed" and before is not None:
+        # fsmonitor startuje demona i buduje cache przy pierwszym statusie: mierzymy
+        # dopiero rozgrzane repo, tak jak zobaczy je następne polecenie agenta
+        git_status_ms(system, git_repos(cfg), runs=2, write_index=True)
+        time.sleep(SETTLE_SECONDS)
+        after = git_status_ms(system, git_repos(cfg))
+        result = {"before": before, "after": after, "unit": "ms git status"}
+    elif (
+        name in ("fast-npx-hooks", "claude-limits") and name not in ultra["results"]
+    ):
+        result = transcript_before(name, ultra["since"])
+    elif name == "claude-hooks-async" and name not in ultra["results"]:
+        since = ultra["since"]
+        stats = hook_latency(since - 86400, since).get("PostToolUse")
+        if stats:
+            result = {
+                "before": stats["p50"],
+                "after": None,
+                "unit": "ms hooków na narzędzie (p50)",
+                "note": f"po {HOOK_SAMPLES} wywołaniach od włączenia",
+            }
+    elif name not in ultra["results"]:
+        result = measure_before_after(item, cfg, system, record)
+    if result:
+        ultra["results"][name] = result
+    return [f"{name}: {what}" for what in changed]
 
 
 def transcript_before(name, since):
@@ -2386,7 +2557,7 @@ def ultra_off(cfg, system, state):
         else:
             report += [f"{name}: {what}" for what in restored]
         del state["applied"][name]
-    ultra.update(on=False, applied=[], pending_root=[], pending_manual=[])
+    ultra.update(on=False, applied=[], declined=[], pending_root=[], pending_manual=[])
     return report
 
 
@@ -2450,6 +2621,7 @@ def cmd_ultra(cfg, args, system=None):
     action = args[0] if args else "status"
     state = load_state()
     if action == "on":
+        ultra_state(state)["declined"] = []  # "wszystko" znaczy także to, co cofnięto ręcznie
         report = ultra_on(cfg, system, state)
         save_state(state)
         log(f"ultra on: {len(report)} zmian")
@@ -2642,6 +2814,11 @@ def describe_agents(r):
             f"{k} {fmt(v['p50'])}/{fmt(v['p90'])} ms" for k, v in hooks.items()
         )
         lines.append(f"czekanie na hooki (p50/p90): {parts}")
+    slow = r.get("slow_hooks") or []
+    if slow:
+        lines.append("hooki, które kosztują najwięcej (ms p50 / p90, liczba):")
+        for h in slow:
+            lines.append(f"  {h['hook']} ({h['event']}): {fmt(h['p50'])} / {fmt(h['p90'])} ({h['n']})")
     lines.append(
         f"polecenia ścięte do 10 min wbrew timeoutowi agenta: {fmt(r.get('capped_per_day'))} na dobę"
     )
@@ -2856,8 +3033,11 @@ def cmd_undo(cfg, args, system=None):
         else:
             print(f"{item.name}: cofnięte ({', '.join(restored) or 'nic do zmiany'})")
         del state["applied"][item.name]
-        if item.name in ultra_state(state)["applied"]:
-            ultra_state(state)["applied"].remove(item.name)
+        ultra = ultra_state(state)
+        if item.name in ultra["applied"]:
+            ultra["applied"].remove(item.name)
+        if ultra["on"] and item.name in ULTRA and item.name not in ultra["declined"]:
+            ultra["declined"].append(item.name)
         log(f"undo {item.name}")
     save_state(state)
     return 0
@@ -2897,7 +3077,16 @@ def cmd_keep(cfg, args, system=None):
         state["applied"][item.name] = record
         if changed:
             log(f"keep {item.name}: {', '.join(changed)}")
-    if ultra_state(state)["on"]:
+    ultra = ultra_state(state)
+    if ultra["on"]:
+        # aktualizacja claude-acc dokłada poprawki do Ultry: włączona Ultra je przejmuje
+        for name in ULTRA:
+            if name in ultra["applied"] or name in ultra["declined"]:
+                continue
+            if name in state["applied"]:
+                continue  # włączona ręcznie, pilnuje jej pętla wyżej
+            changed = ultra_apply(name, cfg, system, state)
+            log(f"keep {name}: nowa w Ultra, {', '.join(changed) or 'bez zmian'}")
         refresh_ultra(cfg, state, system)
     save_state(state)
     return 0

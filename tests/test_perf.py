@@ -35,10 +35,14 @@ import perf
 class FakeSystem:
     """Procesy jako {pid: [start, linia poleceń, w tle?]}; zapisuje każdą zmianę priorytetu."""
 
-    def __init__(self, procs, docker=False):
+    def __init__(self, procs, docker=False, rtk=False):
         self.procs = {pid: list(v) for pid, v in procs.items()}
         self.calls = []
         self.docker = docker
+        self.rtk = rtk
+
+    def rtk_hook(self):
+        return self.rtk
 
     def docker_running(self):
         return self.docker
@@ -499,7 +503,8 @@ class ParseTest(unittest.TestCase):
             self.assertEqual(perf.short_command(launcher), script)
 
 
-ORCA = 'if [ -z "${HOME-}" ]; then printf "{}"; fi  # ORCA_AGENT_HOOK_PORT'
+# skrót prawdziwego hooka Orki: gałąź bez HOME i jej skrypt w ~/.orca/agent-hooks
+ORCA = 'if [ -z "${HOME-}" ]; then printf "{}"; else /bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"; fi'
 CAVE = "/x/node /x/lib/node_modules/cavemem/dist/index.js hook run"
 
 
@@ -552,6 +557,7 @@ def claude_settings():
                     ]
                 }
             ],
+            "SessionStart": [{"hooks": [{"type": "command", "command": ORCA, "timeout": 10}]}],
         },
     }
 
@@ -562,13 +568,16 @@ class AsyncHooksTest(Isolated):
         self.write(self.claude, original)
         item = perf.tweak("claude-hooks-async")
         record, changed = item.apply(self.cfg, FakeSystem({}))
-        self.assertEqual(len(changed), 2)
+        self.assertEqual(len(changed), 3)
         data = self.read(self.claude)
         post = data["hooks"]["PostToolUse"][1]["hooks"]
         self.assertIs(post[0]["async"], True)
-        self.assertNotIn("async", post[1])  # hook Orki zostaje synchroniczny
+        self.assertIs(post[1]["async"], True)  # hook Orki tylko zgłasza status i wypisuje {}
         self.assertIs(data["hooks"]["Stop"][0]["hooks"][0]["async"], True)
         self.assertNotIn("async", data["hooks"]["UserPromptSubmit"][0]["hooks"][0])
+        # start sesji Orki zostaje synchroniczny: przy końcu sesji hook w tle mógłby nie zdążyć
+        self.assertNotIn("async", data["hooks"]["SessionStart"][0]["hooks"][0])
+        self.assertIn("PostToolUse: Orca", changed)
         # drugi raz nic nie zmienia
         record2, changed2 = item.apply(self.cfg, FakeSystem({}), record)
         self.assertEqual(changed2, [])
@@ -599,6 +608,97 @@ class AsyncHooksTest(Isolated):
         )
         self.assertEqual((record, changed), ({"hooks": []}, []))
         self.assertFalse(os.path.exists(self.claude))
+
+
+DEVGUARD_PY = "/usr/bin/python3 $HOME/.local/share/claude-acc/devguard.py admit"
+DEVGUARD_ACC = "/u/.local/share/claude-acc/python /u/.local/share/claude-acc/acc.py devguard admit"
+RTK_SCRIPT = "/Users/x/.claude/hooks/rtk-rewrite.sh"
+
+
+class NativeHooksTest(Isolated):
+    def setUp(self):
+        super().setUp()
+        self.state = os.path.join(self.dir, "state")
+        os.makedirs(self.state)
+        patcher = mock.patch.object(perf, "STATE_DIR", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.native = os.path.join(self.state, "claude-acc-hook")
+
+    def install_native(self):
+        with open(self.native, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(self.native, 0o755)
+
+    def settings(self, *commands):
+        data = claude_settings()
+        data["hooks"]["PreToolUse"] = [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": c, "timeout": 10}]}
+            for c in commands
+        ]
+        self.write(self.claude, data)
+        return self.text(self.claude)
+
+    def pre(self):
+        return [g["hooks"][0]["command"] for g in self.read(self.claude)["hooks"]["PreToolUse"]]
+
+    def test_bash_hooks_become_native_and_come_back_exactly(self):
+        self.install_native()
+        mine = "/x/hooks/rtk-gain-log.sh"  # cudzy hook z rtk w nazwie zostaje
+        piped = "cd /tmp && python3 devguard.py admit"  # składnia powłoki: nie nasza sprawa
+        before = self.settings(RTK_SCRIPT, DEVGUARD_PY, DEVGUARD_ACC, mine, piped)
+        item = perf.tweak("claude-hooks-native")
+        record, changed = item.apply(self.cfg, FakeSystem({}, rtk=True))
+        self.assertEqual(self.pre(), ["rtk hook claude", self.native, self.native, mine, piped])
+        self.assertIn("PreToolUse: rtk-rewrite.sh -> rtk hook", changed)
+        self.assertIn("PreToolUse: devguard -> claude-acc-hook", changed)
+        # timeout i reszta wpisu zostają
+        self.assertEqual(self.read(self.claude)["hooks"]["PreToolUse"][1]["hooks"][0]["timeout"], 10)
+        again, changed = item.apply(self.cfg, FakeSystem({}, rtk=True), record)
+        self.assertEqual((again, changed), (record, []))
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), before)
+
+    def test_nothing_changes_without_the_native_programs(self):
+        before = self.settings(RTK_SCRIPT, DEVGUARD_PY)
+        record, changed = perf.tweak("claude-hooks-native").apply(self.cfg, FakeSystem({}, rtk=False))
+        self.assertEqual((record, changed), ({"hooks": []}, []))
+        self.assertEqual(self.text(self.claude), before)
+        # sam claude-acc-hook bez rtk z hookiem: zmienia się tylko devguard
+        self.install_native()
+        perf.tweak("claude-hooks-native").apply(self.cfg, FakeSystem({}, rtk=False))
+        self.assertEqual(self.pre(), [RTK_SCRIPT, self.native])
+
+    def test_a_hook_the_user_changed_after_us_survives_undo(self):
+        self.install_native()
+        self.settings(DEVGUARD_PY)
+        item = perf.tweak("claude-hooks-native")
+        record, _ = item.apply(self.cfg, FakeSystem({}))
+        data = self.read(self.claude)
+        data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] = "/x/own-guard"
+        self.write(self.claude, data)
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.pre(), ["/x/own-guard"])
+
+    def test_ultra_includes_it(self):
+        self.assertIn("claude-hooks-native", perf.ULTRA)
+
+
+class HookLabelTest(unittest.TestCase):
+    def test_labels_name_the_hook_not_its_shell(self):
+        cases = {
+            ORCA: "Orca",
+            "rtk hook claude": "rtk hook",
+            "$HOME/.claude/hooks/fasthooks/fasthooks read-guard": "fasthooks read-guard",
+            DEVGUARD_PY: "devguard",
+            DEVGUARD_ACC: "devguard",
+            RTK_SCRIPT: "rtk-rewrite.sh",
+            f"{CAVE} stop --ide claude-code": "cavemem stop",
+            'f="$HOME/.local/share/claude-acc/pause.json"; h="$HOME/.local/share/claude-acc/hook.py"': "pauza limitów",
+        }
+        for command, label in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(perf.hook_label(command), label)
 
 
 class ClaudeEnvTest(Isolated):
@@ -774,6 +874,11 @@ class HookLatencyTest(Isolated):
         )
         self.assertEqual(skipped["PostToolUse"]["p50"], 28)
         self.assertEqual(skipped["Stop"]["p50"], 40)
+        # każdy hook osobno, pod czytelną nazwą: widać, który przepisać albo puścić w tle
+        _, per_hook = perf.hook_stats(since, since + 7200)
+        self.assertEqual(per_hook[("PostToolUse", "Orca")], {"n": 2, "p50": 28, "p90": 30})
+        self.assertEqual(per_hook[("PostToolUse", "cavemem post-tool-use")]["n"], 2)
+        self.assertEqual(per_hook[("Stop", "cavemem stop")], {"n": 1, "p50": 70, "p90": 70})
 
 
 class FsBenchTest(Isolated):
@@ -1183,6 +1288,7 @@ class UltraTest(Isolated):
                 "on",
                 "since",
                 "applied",
+                "declined",
                 "root_applied",
                 "pending_root",
                 "pending_manual",
@@ -1262,6 +1368,32 @@ class UltraTest(Isolated):
         self.assertTrue(self.system.procs[11][2])
         self.ultra("off")
         self.assertFalse(self.system.procs[11][2])
+
+    def test_keep_turns_on_what_an_update_added_to_ultra(self):
+        """Ultra włączona w starszej wersji, nowa dokłada poprawkę: keep ją przejmuje."""
+        older = [n for n in perf.ULTRA if n != "devguard-budget"]
+        with mock.patch.object(perf, "ULTRA", older):
+            self.ultra("on")
+        self.assertEqual(self.read(self.devguard), {"protect": ["~/x"], "max_server_gb": 4})
+        self.run_cmd(perf.cmd_keep, system=self.system)
+        self.assertEqual(self.read(self.devguard)["budget_percent"], 25)
+        self.assertIn("devguard-budget", self.status()["applied"])
+        self.ultra("off")
+        self.assertEqual(self.text(self.devguard), self.originals[self.devguard])
+        self.run_cmd(perf.cmd_keep, system=self.system)
+        self.assertEqual(perf.load_state()["applied"], {})
+
+    def test_keep_leaves_alone_what_was_undone_by_hand(self):
+        self.ultra("on")
+        self.run_cmd(perf.cmd_undo, "devguard-budget", system=self.system)
+        self.run_cmd(perf.cmd_keep, system=self.system)
+        self.assertNotIn("budget_percent", self.read(self.devguard))
+        self.assertNotIn("devguard-budget", self.status()["applied"])
+        # jawne `ultra on` znaczy wszystko, także to, co cofnięto ręcznie
+        self.ultra("on")
+        self.assertEqual(self.read(self.devguard)["budget_percent"], 25)
+        self.ultra("off")
+        self.assertEqual(self.text(self.devguard), self.originals[self.devguard])
 
     def test_manual_tweak_survives_ultra_off(self):
         self.run_cmd(perf.cmd_apply, "devguard-budget", system=self.system)
