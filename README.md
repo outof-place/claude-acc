@@ -29,6 +29,7 @@ git clone https://github.com/outof-place/claude-acc.git
 cd claude-acc
 ./install.sh              # builds the app and fanctl, then runs setup.sh
 ./install-fans.sh         # optional, root
+./install-fsguard.sh      # optional, root: restarts a bloated fseventsd
 ```
 
 Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads three launchd jobs (the account watcher, the janitor and the dev server guard) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. It also adds the [limit pause hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks, keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
@@ -314,6 +315,12 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `scope` | `[]` | When set, the guard only sees servers under these paths |
 | `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
 | `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |
+
+## fseventsd guard
+
+`fseventsd` hands file events to every watcher on the Mac: Spotlight, git fsmonitor, dev servers, tsserver, editors. It normally takes 5 to 50 MB. On 2026-10-06 it grew to 41.7 GB on a 48 GB Mac, swap reached 48 GB, the system stopped answering and the kernel restarted it (`watchdog timeout: no checkins from watchdogd`). It had been growing for a day: 7.2 GB seven hours before the crash, then about 5 GB an hour. The memory guard for your own processes can't see it, because it runs as root.
+
+`./install-fsguard.sh` installs `fsguard.py` as a root LaunchDaemon that runs every minute. When two readings in a row are over 2 GB, it stops `fseventsd` (SIGTERM, then SIGKILL after 10 seconds). launchd starts it again at once, and FSEvents clients get the "events were dropped, rescan" flag. It then stops the `git fsmonitor--daemon` processes, because their answers to `git status` depend on an unbroken event stream; the next git command starts a fresh one with a full scan. Restarts are at least five minutes apart. The log at `/Library/Logs/claude-acc-fsguard.log` keeps the daemon's size every hour (every ten minutes above 512 MB) and notes any other process above 8 GB. `./install-fsguard.sh --uninstall` removes it.
 
 ## Stay Awake
 
