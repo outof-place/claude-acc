@@ -755,8 +755,10 @@ PLAIN_COMMAND = re.compile(r"[\w./~$@%+=:,-]+(\s+[\w./~$@%+=:,-]+)*")
 # hooki pauzy limitów (hook.py, ten sam znacznik co jego MARKER) zostają synchroniczne:
 # w tle ich polecenie dla sesji i odmowa dla nowych subagentów przepadają bez śladu
 PAUSE_HOOKS = "claude-acc/hook.py"
-# ...także wtedy, gdy hook.py wpisał je bez powłoki: claude-acc-hook z argumentami ["pause", tryb]
+# ...także wtedy, gdy hook.py wpisał je bez powłoki: claude-acc-pause [tryb] albo (bez programu
+# w C) claude-acc-hook z argumentami ["pause", tryb]
 NATIVE_HOOK = "claude-acc/claude-acc-hook"
+PAUSE_NATIVE = "claude-acc/claude-acc-pause"
 # hooki przed każdą komendą Bash, które mają natywny odpowiednik (claude-hooks-native):
 # devguard wprost albo przez acc.py, i skrypt rtk, którego instalator rtk sam uznaje za
 # przestarzały na rzecz `rtk hook claude`
@@ -1140,7 +1142,7 @@ def hook_label(command):
     if ".orca/agent-hooks/" in command:
         return "Orca"
     # transkrypt zapisuje hook bez powłoki jako program i argumenty po spacji
-    if PAUSE_HOOKS in command or f"{NATIVE_HOOK} pause " in command:
+    if PAUSE_HOOKS in command or f"{NATIVE_HOOK} pause " in command or f"{PAUSE_NATIVE} " in command:
         return "pauza limitów"
     parts = command.split()
     # program z podkomendą (`fasthooks read-guard`, `rtk hook claude`): nazwa i podkomenda
@@ -1540,11 +1542,12 @@ class HookWrap:
 
 
 def pause_hook(hook):
-    """Hook pauzy limitów: w powłoce ze znacznikiem hook.py albo bez niej (`claude-acc-hook pause`)."""
+    """Hook pauzy limitów: w powłoce ze znacznikiem hook.py albo bez niej (claude-acc-pause,
+    `claude-acc-hook pause`)."""
     command = hook.get("command") or ""
     args = hook.get("args")
     native = command.endswith(NATIVE_HOOK) and isinstance(args, list) and args[:1] == ["pause"]
-    return PAUSE_HOOKS in command or native
+    return PAUSE_HOOKS in command or native or command.endswith(PAUSE_NATIVE)
 
 
 def exec_form(command):

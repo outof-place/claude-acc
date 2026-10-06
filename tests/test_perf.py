@@ -772,6 +772,7 @@ class HookLabelTest(unittest.TestCase):
             'f="$HOME/.local/share/claude-acc/pause.json"; h="$HOME/.local/share/claude-acc/hook.py"': "pauza limitów",
             # bez powłoki: tak zapisuje je transkrypt (program i argumenty po spacji)
             "/u/.local/share/claude-acc/claude-acc-hook pause post": "pauza limitów",
+            "/u/.local/share/claude-acc/claude-acc-pause post": "pauza limitów",
             "/u/.local/share/claude-acc/claude-acc-hook admit": "claude-acc-hook admit",
             "/opt/homebrew/bin/rtk hook claude": "rtk hook",
         }
@@ -1092,22 +1093,26 @@ class PauseHooksTest(Isolated):
     może zabrać drugiemu jego wpisów ani cofnąć ich przy swoim cofnięciu."""
 
     EVENTS = ("PostToolUse", "PreToolUse", "UserPromptSubmit", "Stop", "StopFailure")
-    native = False  # hook.py wpisuje hooki bez powłoki, gdy claude-acc-hook jest na miejscu
+    # hook.py wpisuje hooki bez powłoki, gdy natywny program jest na miejscu: "swift" to
+    # claude-acc-hook pause, "c" to claude-acc-pause
+    native = False
 
     def setUp(self):
         super().setUp()
         import hook
 
         self.hook = hook
-        program = os.path.join(self.dir, ".local/share/claude-acc/claude-acc-hook")
-        if self.native:
-            os.makedirs(os.path.dirname(program), exist_ok=True)
-            with open(program, "w") as f:
-                f.write("#!/bin/sh\n")
-            os.chmod(program, 0o755)
-        patcher = mock.patch.object(hook, "NATIVE", program)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        state = os.path.join(self.dir, ".local/share/claude-acc")
+        for name, attr, wanted in (("claude-acc-hook", "NATIVE", ("swift", "c")), ("claude-acc-pause", "PAUSE_NATIVE", ("c",))):
+            program = os.path.join(state, name)
+            if self.native in wanted:
+                os.makedirs(state, exist_ok=True)
+                with open(program, "w") as f:
+                    f.write("#!/bin/sh\n")
+                os.chmod(program, 0o755)
+            patcher = mock.patch.object(hook, attr, program)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # jak w prawdziwej instalacji: wrapper szybkiego npx leży w ~/.local/share/claude-acc/hooks
         self.hooks_dir = os.path.join(self.dir, ".local/share/claude-acc/hooks")
         patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
@@ -1175,12 +1180,22 @@ class PauseHooksTest(Isolated):
 
 
 class NativePauseHooksTest(PauseHooksTest):
-    native = True
+    native = "swift"
 
     def test_pause_hooks_are_written_without_a_shell(self):
         self.pause_hooks(True)
         [group] = self.ours()["PostToolUse"]
         self.assertEqual(group["hooks"][0]["args"], ["pause", "post"])
+
+
+class CPauseHooksTest(PauseHooksTest):
+    native = "c"
+
+    def test_pause_hooks_go_to_the_c_program(self):
+        self.pause_hooks(True)
+        [group] = self.ours()["PostToolUse"]
+        self.assertTrue(group["hooks"][0]["command"].endswith("claude-acc-pause"))
+        self.assertEqual(group["hooks"][0]["args"], ["post"])
 
 class NpxShimTest(unittest.TestCase):
     """Atrapa npx na prawdziwych plikach: narzędzie z node_modules/.bin wyżej w drzewie,
