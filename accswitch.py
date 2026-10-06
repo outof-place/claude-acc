@@ -22,6 +22,7 @@ Komendy:
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
   resume            zdejmij pauzę limitów ręcznie (do czasu, aż limity wrócą)
   pause [on|off]    pauza limitów: stan, włącz albo wyłącz (domyślnie wyłączona)
+  drain [on|off]    dobijanie kont: przy braku zapasu zużyj resztki każdego konta (domyślnie wyłączone)
   depot [--force]   token sandboxów `depot claude`: konto i ważność, --force wysyła od nowa
   depot --fallback  zapisz długi token z `claude setup-token` na wypadek braku konta z zapasem
   token [--json] [--min-minutes N]
@@ -100,6 +101,10 @@ DEFAULT_CONFIG = {
     # Opcjonalna (`claude-acc pause on|off`): bez niej sesje pracują do ściany limitu, Claude
     # Code wznawia je sam po resecie, a budzik watch-wall po przełączeniu konta
     "limit_pause": False,
+    # tryb dobijania: gdy żadne konto nie ma zapasu, aktywne pracuje do ostatniego procenta,
+    # a potem automat przełącza po kolei na konta z resztkami (od DRAIN_FLOOR w obu oknach),
+    # zanim przyjdzie pauza albo ściana
+    "drain": False,
     # sandboxy Claude Code w Depot (`depot claude`) biorą CLAUDE_CODE_OAUTH_TOKEN z sekretu
     # organizacji; tick trzyma tam konto z największym zapasem poza kontem lokalnym
     "depot_sync": True,
@@ -108,6 +113,9 @@ DEFAULT_CONFIG = {
     # ścieżka CLI Depot; pusta = szukaj na PATH i w Homebrew
     "depot_bin": "",
 }
+
+# tryb dobijania: tyle procent w obu oknach wystarczy, żeby konto jeszcze się przydało
+DRAIN_FLOOR = 1
 
 DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
 DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
@@ -1061,6 +1069,13 @@ def queue(rows):
     return sorted([r for r in rows if r["usable"]], key=lambda r: r["rank"])
 
 
+def drain_queue(rows):
+    """Resztki kont w kolejności dobijania: najwięcej zapasu w słabszym z dwóch okien
+    (to ono skończy się pierwsze), konto firmowe na końcu."""
+    scraps = [r for r in rows if r["data"] and not r["error"] and min(headroom(r["data"])) >= DRAIN_FLOOR]
+    return sorted(scraps, key=lambda r: (r["rank"][0], -min(headroom(r["data"]))))
+
+
 
 
 # ---------- Depot: token sandboxów `depot claude` ----------
@@ -1262,6 +1277,7 @@ def snapshot(cfg):
         "orca_selected": orca,
         "pause": load_json(PAUSE_PATH, None),
         "limit_pause": bool(cfg["limit_pause"]),
+        "drain": bool(cfg["drain"]),
         "accounts": items,
     }
 
@@ -1578,7 +1594,7 @@ def drop_pause():
 def end_pause(why):
     """Koniec epizodu: limity wróciły, automat przełączył konto albo przestał pilnować."""
     state = load_state()
-    ended = [state.pop(key, None) for key in ("pause_dismissed", "out_of_headroom")]
+    ended = [state.pop(key, None) for key in ("pause_dismissed", "out_of_headroom", "draining")]
     if any(ended):
         save_state(state)
     if drop_pause():
@@ -1597,6 +1613,45 @@ def out_of_headroom(reason):
            f"{reason}. Sesje pracują do limitu i wznowią się po resecie albo przełączeniu konta")
 
 
+def keep_draining(reason):
+    """Tryb dobijania trwa: sesje pracują na resztkach, więc pauza (choćby sprzed włączenia
+    trybu) znika, a powiadomienie przychodzi raz na epizod; przełączenia zostają w logu."""
+    if drop_pause():
+        log("dobijanie kont: pauza zdjęta, sesje wznawiają pracę")
+    if load_state().get("draining"):
+        return
+    update_state(draining=True)
+    log(f"tick: {reason}, brak konta z zapasem, dobijam resztki kont")
+    notify("Claude: dobijam resztki kont",
+           "Żadne konto nie ma zapasu, więc sesje zużywają po kolei ostatnie procenty każdego konta")
+
+
+def save_setting(key, value):
+    """Zapis jednego klucza w config.json; resztę pliku zostawia, jak była."""
+    saved = load_json(CONFIG_PATH, {})
+    saved[key] = value
+    write_json(CONFIG_PATH, saved)
+
+
+def cmd_drain(cfg, args):
+    """Włącza albo wyłącza tryb dobijania kont (`drain` w config.json)."""
+    if not args:
+        print(f"dobijanie kont {'włączone' if cfg['drain'] else 'wyłączone'} (claude-acc drain on|off)")
+        return 0
+    if args[0] not in ("on", "off"):
+        print("użycie: claude-acc drain [on|off]", file=sys.stderr)
+        return 2
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg właśnie trwa, spróbuj za chwilę")
+        return 1
+    on = args[0] == "on"
+    save_setting("drain", on)
+    log(f"dobijanie kont {'włączone' if on else 'wyłączone'}")
+    print(f"dobijanie kont {'włączone' if on else 'wyłączone'}; działa od następnego przebiegu automatu")
+    return 0
+
+
 def cmd_pause(cfg, args):
     """Włącza albo wyłącza pauzę limitów: zapis `limit_pause` w config.json i od razu
     hooki w settings.json. Wyłączenie w trakcie pauzy budzi wstrzymane sesje."""
@@ -1611,9 +1666,7 @@ def cmd_pause(cfg, args):
         print("inny przebieg właśnie trwa, spróbuj za chwilę")
         return 1
     on = args[0] == "on"
-    saved = load_json(CONFIG_PATH, {})
-    saved["limit_pause"] = on
-    write_json(CONFIG_PATH, saved)
+    save_setting("limit_pause", on)
     state = load_state()
     if state.pop("pause_dismissed", None):
         save_state(state)  # ręczne zdjęcie dotyczyło starego ustawienia
@@ -1723,6 +1776,16 @@ def cmd_tick(cfg, _args):
         # sesje wracają do pracy, a przełączenie przyjdzie przy progu jak zwykle
         end_pause(f"{candidates[0]['account'].email} ma znowu zapas")
         return 0
+    if not candidates and cfg["drain"]:
+        if not dead and min(headroom(data)) >= DRAIN_FLOOR:
+            keep_draining(reason)  # aktywne konto pracuje do ostatniego procenta
+            return 0
+        scraps = drain_queue(rows)
+        if scraps:
+            target = scraps[0]["account"]
+            switch_to(target, cfg, f"{reason}; dobijanie, {scraps[0]['why']}")
+            keep_draining(reason)  # Depot bierze tylko konta z zapasem, więc resztek nie dotyka
+            return 0
     if not candidates:
         if not cfg["limit_pause"]:
             out_of_headroom(reason)
@@ -1913,7 +1976,7 @@ def cmd_token(cfg, args):
 
 
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
-            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "resume": cmd_resume, "pause": cmd_pause,
+            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "resume": cmd_resume, "pause": cmd_pause, "drain": cmd_drain,
             "watch": cmd_watch, "depot": cmd_depot, "token": cmd_token}
 
 

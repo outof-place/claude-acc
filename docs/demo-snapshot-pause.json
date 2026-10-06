@@ -25,6 +25,7 @@
   "resume_at": 1790439657
  },
  "limit_pause": true,
+ "drain": false,
  "accounts": [
   {
    "id": "demo-1",

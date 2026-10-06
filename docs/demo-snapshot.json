@@ -22,6 +22,7 @@
  "last_tick": 1790432047.435127,
  "switched_at": 1790421297.435127,
  "limit_pause": false,
+ "drain": true,
  "accounts": [
   {
    "id": "demo-1",

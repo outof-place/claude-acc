@@ -22,6 +22,9 @@ struct Snapshot: Decodable {
     /// Whether the limit pause is on (`claude-acc pause on|off`). Missing from scripts
     /// before 1.10, which had no switch, so the panel hides it.
     let limitPause: Bool?
+    /// Whether accounts below the switch threshold get used up when none has headroom
+    /// (`claude-acc drain on|off`). Missing from scripts before 1.12.
+    let drain: Bool?
     let accounts: [Account]
 
     var active: Account? { accounts.first { $0.active } }
