@@ -238,8 +238,8 @@ struct Ultra: Decodable {
 
     /// perf.py's ULTRA list, in the order it applies them.
     static let order = [
-        "bg-helpers", "claude-hooks-async", "node-compile-cache", "devguard-budget", "devguard-max-server", "git-speed",
-        "fast-npx-hooks", "claude-limits", "workflow-size",
+        "bg-helpers", "claude-hooks-async", "claude-hooks-native", "node-compile-cache", "devguard-budget",
+        "devguard-max-server", "git-speed", "fast-npx-hooks", "claude-limits", "workflow-size",
     ]
 
     static let catalog: [String: Tweak] = [
@@ -247,7 +247,10 @@ struct Ultra: Decodable {
             title: "Background helpers", detail: "Helpers no agent waits on move to the efficiency cores",
             unit: "% of a P-core"),
         "claude-hooks-async": Tweak(
-            title: "Async hooks", detail: "Memory hooks stop holding up every tool call", unit: "ms per tool call"),
+            title: "Async hooks", detail: "Memory and Orca hooks stop holding up every tool call", unit: "ms per tool call"),
+        "claude-hooks-native": Tweak(
+            title: "Native Bash hooks", detail: "The guard and rtk check each Bash command in ms, without Python or a shell",
+            unit: "ms per Bash command"),
         "node-compile-cache": Tweak(
             title: "Node compile cache", detail: "What sessions spawn (tsc, eslint, MCP servers) starts warm",
             unit: "ms to load TypeScript"),

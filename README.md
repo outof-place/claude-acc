@@ -32,7 +32,7 @@ cd claude-acc
 ./install-fsguard.sh      # optional, root: restarts a bloated fseventsd
 ```
 
-Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads its launchd jobs (the account watcher, the janitor, the dev server guard, Ultra's keeper and the updater) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items on first run. It also adds the [limit pause hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks, keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
+Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` command to `~/.local/bin`, loads its launchd jobs (the account watcher, the janitor, the dev server guard, Ultra's keeper and the updater) and opens `~/Applications/Claude Acc.app`, which adds itself to your login items and puts itself back after every reinstall, unless you turn **Open at Login** off in the panel. It also adds the [limit pause hooks](#how-the-pause-works) to `~/.claude/settings.json`, next to your own hooks, keeping a copy of the file from before the first change in `settings.json.bak-claude-acc`; run setup with `CLAUDE_ACC_NO_HOOKS=1` to leave them out. To stop agents from starting a second dev server of the same app, add the [Claude Code hook](#dev-server-guard).
 
 After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app, the command and the limit pause hooks and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
 
@@ -129,6 +129,9 @@ Ultra, measured on the same Mac with Orca and nine Claude Code sessions running:
 | Node compile cache for what sessions spawn: `require('typescript')` | 96 ms | 49 ms |
 | `git status` in an agent worktree repo, with `untrackedCache` and `fsmonitor` (opt-in) | 71 ms | 26 ms |
 | Hook wait on every agent tool call, with a synchronous memory hook made async | 53 ms p50, 73 ms p90 | 24 ms p50, 30 ms p90 |
+| Orca's status hook, which every tool call waited for, made async | 36-39 ms p50 per call | 0 |
+| The guard's hook before every Bash command, native instead of Python | 25-57 ms | 5-8 ms |
+| rtk's hook before every Bash command, `rtk hook claude` instead of its shell script | 57-80 ms | 12-14 ms |
 
 ## How it avoids logging you out
 
@@ -198,6 +201,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc perf-root vnodes trial [--keep]` | Root: a bigger vnode cache, measured before and after; `vnodes apply --persist` keeps it across reboots |
 | `claude-acc perf-root spotlight apps-only\|undo` | Root: Spotlight indexes apps only; undo restores the previous privacy list |
 | `claude-acc perf-root devtools add\|undo\|status` | Opens Developer Tools in System Settings and waits until Orca is on the list, so fresh Go test binaries skip Gatekeeper |
+| `claude-acc perf bench agents` | Tool turnaround and hook waits from the last day of Claude Code transcripts, with the hooks that cost the most |
 | `claude-acc perf bench gatekeeper` | How long the first run of a freshly built binary waits for Gatekeeper from this terminal |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
@@ -391,15 +395,18 @@ Setting the fans needs root, so `claude-acc fans install` puts `fanctl` in `/usr
 
 ## Ultra
 
-A Mac running a dozen agents spends a surprising amount of its time on work nobody waits for. `perf.py` measured where it went on an M4 Max with Orca and nine Claude Code sessions, and Ultra turns on the fixes that paid off. Every tweak records what was there before, measures before and after, and `ultra off` restores it byte for byte, leaving alone anything you changed by hand in the meantime. Running `ultra on` twice is safe. launchd runs `perf.py keep` every 5 minutes, which reapplies tweaks to processes that restarted with a new pid and fills in numbers that arrive later.
+A Mac running a dozen agents spends a surprising amount of its time on work nobody waits for. `perf.py` measured where it went on an M4 Max with Orca and nine Claude Code sessions, and Ultra turns on the fixes that paid off. Every tweak records what was there before, measures before and after, and `ultra off` restores it byte for byte, leaving alone anything you changed by hand in the meantime. Running `ultra on` twice is safe. launchd runs `perf.py keep` every 5 minutes, which reapplies tweaks to processes that restarted with a new pid and to `settings.json` when something rewrote it, fills in numbers that arrive later, and turns on what a newer version added to Ultra. A tweak you undid by hand with `perf undo` stays off until the next `ultra on`.
 
 | Tweak | What it changes |
 | --- | --- |
 | `bg-helpers` | Background QoS (`PRIO_DARWIN_BG`: efficiency cores, throttled disk) for always-on helpers matched by `background` in `perf.json` |
-| `claude-hooks-async` | `"async": true` on the hooks listed in `async_hooks`, in `~/.claude/settings.json`. Every tool call of every session waited for them |
+| `claude-hooks-async` | `"async": true` on the hooks listed in `async_hooks`, in `~/.claude/settings.json`: a memory plugin's hooks and Orca's status hook on tool, prompt, stop and subagent events, which only report and print `{}`. Every tool call of every session waited for them. Orca's `SessionStart`, `SessionEnd` and `PermissionRequest` stay synchronous |
+| `claude-hooks-native` | The hooks before every Bash command on native programs: the guard's `devguard.py admit` becomes `claude-acc-hook`, which answers plain commands itself and hands the ones with a dev server or scheduler word to Python, and rtk's `rtk-rewrite.sh` becomes `rtk hook claude`. Only when the native program is installed. The script stays untouched, because rtk checks its hash |
 | `node-compile-cache` | `NODE_COMPILE_CACHE` in the `env` of `~/.claude/settings.json`, so tsc, eslint, MCP servers and hooks start from a warm V8 cache. The `claude` binary itself runs on Bun and doesn't need it |
 | `devguard-budget`, `devguard-max-server` | The guard's `budget_percent` from 35 to 25 and `max_server_gb` from 5 to 4 |
 | `git-speed` | `core.untrackedCache` and `core.fsmonitor` in the repos listed in `git_repos` (empty by default) |
+
+Claude Code runs every hook of an event in parallel and waits for the slowest, and a shell script with `jq` pays 50-80 ms in process starts on every tool call of every session. `claude-acc perf bench agents` lists the hooks that cost the most (it sees the hooks that print something). For a hook of your own that shows up there, a small compiled program (Go, Swift) answers in about 5 ms, and `"async": true` removes the wait for a hook whose output nobody reads. Running sessions keep the hook commands they started with: the change shows in new and resumed sessions.
 
 Docker's VM is left out of Ultra because the cap applies only after a Docker restart: `claude-acc perf apply docker-vm` writes `MemoryMiB` 6144 while Docker is closed (the VM held 8 GB for 3.7 GB of containers), and every container with a restart policy comes back on its own.
 
@@ -420,7 +427,7 @@ The tests run the real script end to end against fake `security`, `curl` and `cl
 
 The janitor tests run the real script on a temporary `$HOME` with the real `lsof`: caches that go, caches kept because a file is open or a dev server works in the app, a shell prompt that doesn't block, protected paths, stale and active projects, an interrupted delete, and `caps` dropping the oldest snapshots.
 
-The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, a value someone changed after Ultra survives `ultra off`, and Ultra and the pause hooks come off in either order without taking each other's entries along.
+The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, a value someone changed after Ultra survives `ultra off`, a hook command someone changed after `claude-hooks-native` survives its undo, a tweak a newer version adds to Ultra is turned on by `keep` while one undone by hand is not, and Ultra and the pause hooks come off in either order without taking each other's entries along.
 
 The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go`, `pip`, `uv`, `claude`, `npx` and `pkgutil` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, an npm package rolled back when its command stops working after npm blocked its install scripts, the 3-day interval and the next-night retry, Python packages upgraded together from wheels (with the user site on its own, a package installed from a folder left alone, a source-only release and one held lower by another package reported as held back), an upgrade that breaks `pip check` rolled back while a conflict from before the run is not, an upgrade that stops a package importing rolled back, a pinned package and a pinned dependency held, a new Playwright given its browsers, a failed `pip install`, every Python upgraded once and named, a newer python.org patch offered (and not a new minor, nor Homebrew's Python) and an unsigned installer thrown away, a uv Python that holds pip packages left on its patch, Claude Code and its plugins updated, plugins updated from their own project and never auto-confirmed, a hand-edited skill left alone, the native `claude` first on the `PATH`, a step from an older version dropped from the state, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
 
