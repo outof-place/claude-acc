@@ -105,6 +105,51 @@ struct JanitorState: Decodable {
     let alerts: [Alert]?
 }
 
+// MARK: - Updates (`updates-state.json`, written by updates.py)
+
+struct UpdatesState: Decodable {
+    struct Package: Decodable, Hashable {
+        let name: String
+        let from: String?
+        let to: String?
+        let error: String?
+        /// The installer wanted an admin password, which a background run can't type.
+        let admin: Bool?
+        /// The command that retries it by hand, in Terminal.
+        let retry: String?
+    }
+
+    /// One package manager in the last run: Homebrew, npm, Go, or Python, which is only checked.
+    struct Step: Decodable, Identifiable {
+        let name: String
+        let label: String
+        let ok: Bool
+        let updated: [Package]
+        let failed: [Package]
+        let held: [Package]?
+        let outdated: [Package]?
+        let error: String?
+        let reportOnly: Bool?
+
+        var id: String { name }
+    }
+
+    struct Run: Decodable {
+        let at: Double
+        let ok: Bool
+        let updated: Int
+        let failed: Int
+    }
+
+    let lastRun: Run?
+    let lastSuccess: Double?
+    /// The 4:30 launchd run that will be due next.
+    let nextRun: Double?
+    /// A run in progress; a crashed script can leave the mark, so only a fresh one counts.
+    let runningSince: Double?
+    let steps: [Step]?
+}
+
 struct DiskSpace {
     let free: Double
     let total: Double

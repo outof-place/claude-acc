@@ -12,7 +12,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
-JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf"
+JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates"
 
 APP_SRC=""
 FANCTL=""
@@ -36,7 +36,7 @@ done
 [ -d "$APP_SRC" ] || { echo "brak aplikacji: --app \"<Claude Acc.app>\"" >&2; exit 2; }
 
 mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
-cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$SRC/sched.py" "$STATE/"
+cp "$SRC/accswitch.py" "$SRC/janitor.py" "$SRC/devguard.py" "$SRC/perf.py" "$SRC/sched.py" "$SRC/updates.py" "$STATE/"
 # hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
@@ -44,7 +44,7 @@ rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$S
 echo "$SRC" > "$STATE/source"
 
 # jedna komenda na wszystko: konta, porządki (mac, clean), strażnik (guard), wydajność (perf,
-# perf-root), wiatraki (fans),
+# perf-root), wiatraki (fans), aktualizacje (update, updates),
 # a `claude-acc uninstall` zdejmuje to, co postawił ten skrypt
 cat > "$HOME/.local/bin/claude-acc" <<'EOF'
 #!/bin/sh
@@ -55,6 +55,8 @@ case "$1" in
   guard) shift; exec /usr/bin/python3 "$STATE/devguard.py" "$@" ;;
   perf) shift; exec /usr/bin/python3 "$STATE/perf.py" "$@" ;;
   sched) shift; exec /usr/bin/python3 "$STATE/sched.py" "$@" ;;
+  update) shift; exec /usr/bin/python3 "$STATE/updates.py" run --force "$@" ;;
+  updates) shift; exec /usr/bin/python3 "$STATE/updates.py" "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
@@ -76,7 +78,7 @@ EOF
 chmod +x "$HOME/.local/bin/claude-acc"
 
 # automaty: tick kont co 2 minuty, porządki przy logowaniu i co 3 godziny, strażnik dev serwerów cały czas,
-# perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie)
+# perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie), aktualizacje o 4:30 co 3 dni
 for job in $JOBS; do
   plist="$AGENTS/$job.plist"
   sed "s|__HOME__|$HOME|g" "$SRC/launchd/$job.plist.template" > "$plist"
