@@ -284,6 +284,24 @@ class RootRecordTest(Isolated):
     def test_record_refuses_non_root_tweak(self):
         self.assertEqual(perf.cmd_record(self.cfg, ["bg-helpers", "x"]), 2)
 
+    def test_devtools_step_goes_when_orca_measures_no_gatekeeper_wait(self):
+        """Orka dodana w Ustawieniach ręcznie, bez perf-root: zapisu nie ma, pomiar jest."""
+        os.makedirs(self.orca_app)
+        for responsible, penalty, nagged in (
+            ("Orca", 192.5, True),
+            ("Terminal", 0.6, True),
+            ("Orca", 0.6, False),
+        ):
+            state = perf.load_state()
+            perf.record_bench(
+                state,
+                "gatekeeper",
+                {"responsible": responsible, "first_ms": 4.0 + penalty, "second_ms": 4.0,
+                 "penalty_ms": penalty},
+                1,
+            )
+            self.assertEqual("devtools" in perf.pending_manual(state), nagged, responsible)
+
     def test_devtools_is_manual_until_recorded(self):
         self.assertNotIn("devtools", perf.pending_manual(perf.load_state()))
         os.makedirs(self.orca_app)
