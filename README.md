@@ -146,7 +146,7 @@ Each of these rules comes from an account that actually lost its login while the
 
 ## How the pause works
 
-The pause is optional and off by default. `claude-acc pause on` turns it on and `claude-acc pause off` turns it off: both write `limit_pause` to `config.json` and update the hooks in `settings.json` right away, and turning it off during a pause wakes the paused sessions. Open sessions keep the hooks they started with; new and resumed ones pick up the change. Without the pause, sessions keep working until the limit, Claude Code resumes them after the reset, the `StopFailure` alarm below wakes them earlier when the watcher switches to an account with headroom, and the watcher sends one notification per episode when no account has headroom.
+The pause is optional and off by default. **Pause at the limit** in the panel's Claude Code card switches it, and so do `claude-acc pause on` and `claude-acc pause off`: both write `limit_pause` to `config.json` and update the hooks in `settings.json` right away, and turning it off during a pause wakes the paused sessions. Open sessions keep the hooks they started with; new and resumed ones pick up the change. Without the pause, sessions keep working until the limit, Claude Code resumes them after the reset, the `StopFailure` alarm below wakes them earlier when the watcher switches to an account with headroom, and the watcher sends one notification per episode when no account has headroom.
 
 Claude Code already waits at a usage limit and continues on its own after the reset (`Continue automatically at usage limit` in `/config`, on by default). What it lacks is a warning early enough for subagents to stop cleanly, any warning before the weekly limit, and a way to know that capacity came back on another account. Agents that hit the wall stop halfway through an edit and have to be started over. The pause fills those gaps with Claude Code hooks, which setup adds to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`) next to your own hooks.
 
@@ -217,7 +217,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `hard_session_left` | `5` | Switch when the active account has this % of the 5-hour window left |
 | `hard_weekly_left` | `3` | Switch when it has this % of the week left |
 | `min_session_left` / `min_weekly_left` | `15` / `8` | An account needs at least this much to be switched to, and the limit pause ends once an account has it again |
-| `limit_pause` | `false` | [Pause sessions at a checkpoint](#how-the-pause-works) when no account has headroom; `claude-acc pause on\|off` sets it and updates the hooks |
+| `limit_pause` | `false` | [Pause sessions at a checkpoint](#how-the-pause-works) when no account has headroom; **Pause at the limit** in the panel and `claude-acc pause on\|off` set it and update the hooks |
 | `last_resort` | `[]` | Emails used only when nothing else has headroom |
 | `never` | `[]` | Emails never switched to |
 | `config_dir` | `~/.claude` | The config directory whose sessions get switched |

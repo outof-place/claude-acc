@@ -19,6 +19,9 @@ struct ActiveAccountCard: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if let on = snapshot.limitPause {
+                    LimitPauseRow(store: store, on: on)
+                }
             } else if store.problem == nil {
                 ProgressView("Reading account limits…").controlSize(.small)
             } else {
@@ -86,6 +89,21 @@ private struct ActiveAccount: View {
             }
         }
         .animation(.smooth(duration: 0.32), value: showDetails)
+    }
+}
+
+/// The switch for the optional limit pause. Its explanation sits in the tooltip, so the card
+/// stays one row taller and no more.
+private struct LimitPauseRow: View {
+    let store: Store
+    let on: Bool
+
+    var body: some View {
+        SettingRow("Pause at the limit", symbol: "pause.circle", isOn: Binding(
+            get: { store.limitPausePick ?? on },
+            set: { value in Task { await store.setLimitPause(value) } }))
+            .disabled(store.limitPauseBusy)
+            .help("When no account has headroom, sessions finish their step at a checkpoint and wake when limits return. Off: they work until the limit and Claude Code resumes them after the reset.")
     }
 }
 

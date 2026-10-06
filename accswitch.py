@@ -1261,6 +1261,7 @@ def snapshot(cfg):
         "switched_at": state.get("switched_at"),
         "orca_selected": orca,
         "pause": load_json(PAUSE_PATH, None),
+        "limit_pause": bool(cfg["limit_pause"]),
         "accounts": items,
     }
 
