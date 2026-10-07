@@ -10,7 +10,7 @@ struct PanelView: View {
     var frozenNow: Date?
     @Environment(\.renderingToFile) private var renderingToFile
 
-    static let columnHeight: CGFloat = 640
+    static let columnHeight: CGFloat = 760
 
     var body: some View {
         TimelineView(PanelClock(running: store.panelOpen)) { context in
@@ -30,9 +30,13 @@ struct PanelView: View {
                     Column(width: 360) {
                         DevServersCard(store: store)
                         BuildsCard(store: store)
+                        MailCard(store: store).fixedSize(horizontal: false, vertical: true)
                     }
                     Column(width: 310) {
                         AwakeCard(awake: store.awake).fixedSize(horizontal: false, vertical: true)
+                        if store.browser?.installed == true {
+                            BrowserCard(store: store).fixedSize(horizontal: false, vertical: true)
+                        }
                         FansCard(store: store)
                     }
                     Column(width: 300) {

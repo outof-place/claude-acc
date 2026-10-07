@@ -14,7 +14,9 @@ import os
 import sys
 from importlib.machinery import SourceFileLoader
 
-SCRIPTS = ("accswitch", "devguard", "janitor", "perf", "sched", "updates")
+SCRIPTS = ("accswitch", "browser", "devguard", "hint", "janitor", "mail", "mailhint", "perf", "sched", "updates")
+# dawna nazwa skryptu, która może jeszcze stać we wpisie hooka w settings.json
+ALIASES = {"mailhint": "hint"}
 
 
 def main():
@@ -22,7 +24,7 @@ def main():
         print("usage: acc.py {" + ",".join(SCRIPTS) + "} [args...]", file=sys.stderr)
         return 2
     path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), sys.argv[1] + ".py"
+        os.path.dirname(os.path.realpath(__file__)), ALIASES.get(sys.argv[1], sys.argv[1]) + ".py"
     )
     # the loader caches by file path, so the name the module runs under doesn't matter;
     # importlib.util would cost 4 ms more on Python 3.9 (it pulls in typing)

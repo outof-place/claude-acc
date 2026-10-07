@@ -41,6 +41,9 @@ while [ $# -gt 0 ]; do
         fi
       done
       rm -rf "$STATE/pause.json" "$STATE/pause-marks"
+      # bramki agentów: MCP, skille i hook podpowiedzi (skrzynki, Pęk kluczy i konfiguracja zostają)
+      [ -f "$STATE/mail.py" ] && /usr/bin/python3 "$STATE/mail.py" uninstall >/dev/null 2>&1 || true
+      [ -f "$STATE/browser.py" ] && /usr/bin/python3 "$STATE/browser.py" uninstall >/dev/null 2>&1 || true
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -53,6 +56,8 @@ mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
 cp "$SRC"/*.py "$STATE/"
 # hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
+# drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
+[ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
 [ -n "$HOOK" ] && cp "$HOOK" "$STATE/claude-acc-hook.new" && mv -f "$STATE/claude-acc-hook.new" "$STATE/claude-acc-hook"
 # hooki pauzy w C leżą obok claude-acc-hook (install.sh: katalog builda, formuła: libexec);
@@ -93,6 +98,13 @@ else
 fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
+# bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
+# przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
+if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
+  "$STATE/python" "$STATE/acc.py" mail install --refresh >/dev/null 2>&1 || true
+  "$STATE/python" "$STATE/acc.py" browser install --refresh >/dev/null 2>&1 || true
+  "$STATE/python" "$STATE/acc.py" hint sync >/dev/null 2>&1 || true
+fi
 
 # jedna komenda na wszystko: konta, porządki (mac, clean), strażnik (guard), wydajność (perf,
 # perf-root), wiatraki (fans), aktualizacje (update, updates),
@@ -111,6 +123,8 @@ case "$1" in
   sched) shift; exec "$PY" "$RUN" sched "$@" ;;
   update) shift; exec "$PY" "$RUN" updates run --force "$@" ;;
   updates) shift; exec "$PY" "$RUN" updates "$@" ;;
+  mail) shift; exec "$PY" "$RUN" mail "$@" ;;
+  browser) shift; exec "$PY" "$RUN" browser "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
