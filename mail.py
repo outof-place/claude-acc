@@ -67,11 +67,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import formataddr, getaddresses, make_msgid, parsedate_to_datetime
 from html.parser import HTMLParser
+
+import mcpbase
 
 VERSION = "1.0.0"
 HOME = os.path.expanduser("~")
@@ -105,10 +107,6 @@ PROVIDERS = ("gmail", "imap")
 SEND_MODES = ("off", "ask", "auto")
 MAX_RESULTS = 50
 DEFAULT_BODY_CHARS = 40000
-MCP_PROTOCOL = "2025-11-25"
-MCP_SUPPORTED = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
-MCP_MODERN = ("2026-07-28",)
-MODERN_KEY = "io.modelcontextprotocol/protocolVersion"
 RECENT = 12
 
 
@@ -2090,30 +2088,22 @@ def render(result, nonce=None):
     )
 
 
-# ---------- serwer MCP (stdio, JSON-RPC 2.0, bez SDK) ----------
+# ---------- serwer MCP (stdio, JSON-RPC 2.0, bez SDK; protokół w mcpbase.py) ----------
+
+_RpcError = mcpbase.RpcError
 
 
-class _RpcError(Exception):
-    def __init__(self, code, message):
-        super().__init__(message)
-        self.code = code
+class McpServer(mcpbase.McpServer):
+    name = "claude-acc-mail"
+    title = "Mail gateway (claude-acc)"
+    version = VERSION
+    instructions = INSTRUCTIONS
+    tools = TOOLS
 
-
-class McpServer:
     def __init__(self, cfg_loader=load_config, out=None, gateway=None):
+        super().__init__(out=out)
         self.cfg_loader = cfg_loader
-        self.out = out or sys.stdout
         self.gateway = gateway
-        self.client = "mcp"
-        self.client_caps = {}
-        self.write_lock = threading.Lock()
-        self.pending = {}
-        self.next_id = 0
-
-    def send(self, msg):
-        with self.write_lock:
-            self.out.write(json.dumps(msg, ensure_ascii=False) + "\n")
-            self.out.flush()
 
     def gw(self):
         if self.gateway is None:
@@ -2123,19 +2113,6 @@ class McpServer:
         if self.client_caps.get("elicitation") is not None:
             self.gateway.confirm = self.elicit_confirm
         return self.gateway
-
-    def request(self, method, params, timeout=600):
-        """Zapytanie serwera do klienta (np. elicitation/create); odpowiedź przychodzi przez serve()."""
-        with self.write_lock:
-            self.next_id += 1
-            rid = f"srv-{self.next_id}"
-        future = Future()
-        self.pending[rid] = future
-        self.send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        try:
-            return future.result(timeout=timeout)
-        finally:
-            self.pending.pop(rid, None)
 
     def elicit_confirm(self, text):
         try:
@@ -2165,124 +2142,16 @@ class McpServer:
             return bool((result.get("content") or {}).get("send"))
         return False
 
-    def handle(self, msg):
-        if not isinstance(msg, dict):
-            return None
-        if msg.get("method") is None:
-            future = self.pending.get(msg.get("id"))
-            if future is not None and not future.done():
-                future.set_result(msg)  # odpowiedź klienta na nasze zapytanie
-            return None
-        if msg.get("id") is None:
-            return None  # notyfikacja (initialized, cancelled)
-        params = msg.get("params") or {}
-        meta = params.get("_meta") or {}
-        modern = MODERN_KEY in meta or msg["method"] == "server/discover"
-        if modern:
-            # 2026-07-28: bez initialize, wersja i możliwości klienta w każdym żądaniu
-            asked = meta.get(MODERN_KEY)
-            if asked not in MCP_MODERN:
-                return {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32022, "message": "Unsupported protocol version",
-                        "data": {"supported": list(MCP_MODERN) + list(MCP_SUPPORTED), "requested": asked}}}
-            info = meta.get("io.modelcontextprotocol/clientInfo") or {}
-            self.client = f"mcp:{info.get('name', '?')}/{info.get('version', '?')}"
-            self.client_caps = meta.get("io.modelcontextprotocol/clientCapabilities") or {}
+    def call_tool(self, name, args):
         try:
-            result = self.dispatch(msg["method"], params)
-            if modern and isinstance(result, dict):
-                result.setdefault("resultType", "complete")
-        except _RpcError as exc:
-            return {
-                "jsonrpc": "2.0",
-                "id": msg["id"],
-                "error": {"code": exc.code, "message": str(exc)},
-            }
-        return {"jsonrpc": "2.0", "id": msg["id"], "result": result}
-
-    def dispatch(self, method, params):
-        if method == "server/discover":
-            return {
-                "supportedVersions": list(MCP_MODERN),
-                "capabilities": {"tools": {}},
-                "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "claude-acc-mail", "title": "Mail gateway (claude-acc)", "version": VERSION}},
-                "instructions": INSTRUCTIONS,
-                "ttlMs": 3600000,
-                "cacheScope": "private",
-            }
-        if method == "initialize":
-            info = params.get("clientInfo") or {}
-            self.client = f"mcp:{info.get('name', '?')}/{info.get('version', '?')}"
-            self.client_caps = params.get("capabilities") or {}
-            asked = params.get("protocolVersion")
-            return {
-                "protocolVersion": asked if asked in MCP_SUPPORTED else MCP_PROTOCOL,
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {
-                    "name": "claude-acc-mail",
-                    "title": "Mail gateway (claude-acc)",
-                    "version": VERSION,
-                },
-                "instructions": INSTRUCTIONS,
-            }
-        if method == "ping":
-            return {}
-        if method == "tools/list":
-            return {"tools": TOOLS, "ttlMs": 300000, "cacheScope": "private"}
-        if method == "tools/call":
-            name, args = params.get("name"), params.get("arguments") or {}
-            if name not in {t["name"] for t in TOOLS}:
-                raise _RpcError(-32602, f"unknown tool: {name}")
-            try:
-                result = self.gw().run(name, args)
-            except MailError as exc:
-                return {
-                    "content": [{"type": "text", "text": f"error: {exc}"}],
-                    "isError": True,
-                }
-            except Exception as exc:  # błąd bramki widzi agent, serwer żyje dalej
-                return {
-                    "content": [
-                        {"type": "text", "text": f"error: {type(exc).__name__}: {exc}"}
-                    ],
-                    "isError": True,
-                }
-            nonce = secrets.token_hex(6)
-            return {
-                "content": [{"type": "text", "text": render(result, nonce)}],
-                "structuredContent": structured(result, nonce),
-            }
-        raise _RpcError(-32601, f"method not found: {method}")
-
-    def serve(self, stream=None):
-        stream = stream or sys.stdin
-        pool = ThreadPoolExecutor(max_workers=4)
-        for line in stream:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                self.send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": None,
-                        "error": {"code": -32700, "message": "parse error"},
-                    }
-                )
-                continue
-            for item in msg if isinstance(msg, list) else [msg]:
-                # tools/call idzie do puli: długie przeszukanie i czekanie na zgodę nie blokują odczytu
-                if isinstance(item, dict) and item.get("method") == "tools/call":
-                    pool.submit(self._answer, item)
-                else:
-                    self._answer(item)
-        pool.shutdown(wait=True)
-
-    def _answer(self, item):
-        reply = self.handle(item)
-        if reply is not None:
-            self.send(reply)
+            result = self.gw().run(name, args)
+        except MailError as exc:
+            return {"content": [{"type": "text", "text": f"error: {exc}"}], "isError": True}
+        nonce = secrets.token_hex(6)
+        return {
+            "content": [{"type": "text", "text": render(result, nonce)}],
+            "structuredContent": structured(result, nonce),
+        }
 
 
 # ---------- CLI ----------
@@ -2583,46 +2452,7 @@ def install_mcp(name="mail"):
     return out.returncode, (out.stdout or out.stderr).strip()
 
 
-SETTINGS = os.path.join(HOME, ".claude/settings.json")
 SKILL_DIR = os.path.join(HOME, ".claude/skills/mail")
-HINT_MARKER = "mailhint"  # po tym poznajemy własny wpis UserPromptSubmit w settings.json
-
-
-def hint_hook():
-    """Wpis w formie exec (bez powłoki): interpreter claude-acc, acc.py i skrypt podpowiedzi."""
-    python = os.path.join(STATE, "python")
-    if not os.access(python, os.X_OK):
-        python = "/usr/bin/python3"
-    return {"type": "command", "command": python, "args": [os.path.join(STATE, "acc.py"), HINT_MARKER], "timeout": 5}
-
-
-def ours(hook):
-    return HINT_MARKER in (hook.get("args") or []) or HINT_MARKER in (hook.get("command") or "")
-
-
-def set_hint(enabled, path=None):
-    """Dopisuje albo zdejmuje hook podpowiedzi w settings.json, nie ruszając cudzych wpisów."""
-    path = path or SETTINGS
-    try:
-        with open(path) as f:
-            settings = json.load(f)
-    except FileNotFoundError:
-        settings = {}
-    groups = settings.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
-    for group in groups:
-        group["hooks"] = [h for h in group.get("hooks", []) if not ours(h)]
-    groups[:] = [g for g in groups if g.get("hooks")]
-    if enabled:
-        groups.append({"hooks": [hint_hook()]})
-    if not groups:
-        settings["hooks"].pop("UserPromptSubmit")
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(settings, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
-
-
 def install_skill(source_dir):
     import shutil
 
@@ -2647,22 +2477,26 @@ def cmd_install(args):
     if "--refresh" in args and not (read_config().get("mailboxes")):
         return 0
     quiet = "--quiet" in args or "--refresh" in args
+    import hint
+
     code, message = install_mcp()
     skill = install_skill(source_dir())
-    set_hint(True)
+    hint.sync()
     if not quiet:
         print(message)
-        print(f"skill: {SKILL_DIR if skill else 'brak źródła skills/mail'}; hook podpowiedzi: {SETTINGS}")
+        print(f"skill: {SKILL_DIR if skill else 'brak źródła skills/mail'}; hook podpowiedzi: {hint.SETTINGS}")
     return code
 
 
 def cmd_uninstall(args):
     import shutil
 
+    import hint
+
     subprocess.run(["claude", "mcp", "remove", "--scope", "user", "mail"], capture_output=True)
     shutil.rmtree(SKILL_DIR, ignore_errors=True)
-    set_hint(False)
-    print("zdjęte: MCP mail, skill mail i hook podpowiedzi (konfiguracja i Pęk kluczy zostają)")
+    hint.sync()
+    print("zdjęte: MCP mail i skill mail; hook podpowiedzi zostaje tylko przy bramce przeglądarki (konfiguracja i Pęk kluczy zostają)")
     return 0
 
 

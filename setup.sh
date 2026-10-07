@@ -41,8 +41,9 @@ while [ $# -gt 0 ]; do
         fi
       done
       rm -rf "$STATE/pause.json" "$STATE/pause-marks"
-      # bramka pocztowa: MCP, skill i hook podpowiedzi (skrzynki i Pęk kluczy zostają)
+      # bramki agentów: MCP, skille i hook podpowiedzi (skrzynki, Pęk kluczy i konfiguracja zostają)
       [ -f "$STATE/mail.py" ] && /usr/bin/python3 "$STATE/mail.py" uninstall >/dev/null 2>&1 || true
+      [ -f "$STATE/browser.py" ] && /usr/bin/python3 "$STATE/browser.py" uninstall >/dev/null 2>&1 || true
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -95,9 +96,12 @@ else
 fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
-# bramka pocztowa: MCP `mail`, skill `mail` i hook podpowiedzi, odświeżane tylko przy skonfigurowanych skrzynkach
+# bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
+# przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
 if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
   "$STATE/python" "$STATE/acc.py" mail install --refresh >/dev/null 2>&1 || true
+  "$STATE/python" "$STATE/acc.py" browser install --refresh >/dev/null 2>&1 || true
+  "$STATE/python" "$STATE/acc.py" hint sync >/dev/null 2>&1 || true
 fi
 
 # jedna komenda na wszystko: konta, porządki (mac, clean), strażnik (guard), wydajność (perf,
@@ -118,6 +122,7 @@ case "$1" in
   update) shift; exec "$PY" "$RUN" updates run --force "$@" ;;
   updates) shift; exec "$PY" "$RUN" updates "$@" ;;
   mail) shift; exec "$PY" "$RUN" mail "$@" ;;
+  browser) shift; exec "$PY" "$RUN" browser "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka

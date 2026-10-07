@@ -33,6 +33,8 @@ final class Store {
     private(set) var updating = false
     private(set) var mail: MailPanel?
     private(set) var mailChecking = false
+    private(set) var browser: BrowserPanel?
+    private(set) var browserBusy = false
     private(set) var guardState: GuardState?
     /// Unit the panel is restarting or stopping right now.
     private(set) var guardBusy: String?
@@ -70,6 +72,8 @@ final class Store {
     @ObservationIgnored private var refreshAgain = false
     @ObservationIgnored private var poller: Task<Void, Never>?
     @ObservationIgnored private var depotSyncing = false
+    @ObservationIgnored private var browserSyncing = false
+    @ObservationIgnored private var browserSyncedAt = Date.distantPast
     @ObservationIgnored private var live: Task<Void, Never>?
     /// The state files as last read: a file that didn't change costs one stat and wakes no view.
     @ObservationIgnored private var files: [String: StateFile] = [:]
@@ -173,6 +177,9 @@ final class Store {
         if let data = changedFile(CLI.mailPanel) {
             mail = Self.decode(MailPanel.self, from: data)
         }
+        if let data = changedFile(CLI.browserPanel) {
+            browser = Self.decode(BrowserPanel.self, from: data)
+        }
         let level = Self.kernelMemoryLevel()
         if level != memoryLevel { memoryLevel = level }
         if let data = changedFile(CLI.perfState) {
@@ -220,6 +227,7 @@ final class Store {
                 self?.readLocal()
                 self?.sampleLoad()
                 self?.syncDepot()
+                self?.syncBrowser()
                 // the scheduler rewrites its state every second while builds run
                 try? await Task.sleep(for: .seconds(self?.sched?.busy == true ? 1 : 3))
             }
@@ -236,6 +244,19 @@ final class Store {
         Task { [weak self] in
             _ = await CLI.run(["depot", "--max-age", String(maxAge)], script: CLI.sched)
             self?.depotSyncing = false
+            self?.readLocal()
+        }
+    }
+
+    /// The daemon rewrites the browser file on every change; a browser started, quit or switched
+    /// on without an agent around shows up only through `status`, so it runs every 10 s while open.
+    private func syncBrowser() {
+        guard !browserSyncing, browser?.installed == true, Date.now.timeIntervalSince(browserSyncedAt) > 10 else { return }
+        browserSyncing = true
+        Task { [weak self] in
+            _ = await CLI.run(["status", "--json"], script: CLI.browser)
+            self?.browserSyncing = false
+            self?.browserSyncedAt = .now
             self?.readLocal()
         }
     }
@@ -399,6 +420,28 @@ final class Store {
         } else {
             notice = Notice(text: result.message.isEmpty ? "Mail check failed" : result.message, isError: true)
         }
+    }
+
+    // MARK: Browser gateway
+
+    /// Closes the agents' tabs and the connection (browser.py disconnect): the automation bar goes away.
+    func disconnectBrowser() async {
+        guard !browserBusy else { return }
+        browserBusy = true
+        let result = await CLI.run(["disconnect"], script: CLI.browser)
+        browserBusy = false
+        readLocal()
+        notice = result.status == 0
+            ? Notice(text: "Browser disconnected, agent tabs closed")
+            : Notice(text: result.message.isEmpty ? "Disconnect failed" : result.message, isError: true)
+    }
+
+    /// Opens the browser's remote debugging page, where the user ticks the checkbox once.
+    func enableBrowser(_ browser: BrowserPanel.Browser) async {
+        let result = await CLI.run(["setup", browser.name], script: CLI.browser)
+        notice = result.status == 0
+            ? Notice(text: "In \(browser.title), tick Allow remote debugging for this browser instance")
+            : Notice(text: result.message.isEmpty ? "Couldn't open \(browser.title)" : result.message, isError: true)
     }
 
     /// Lists the projects Spotlight indexes and opens the pane that excludes them.

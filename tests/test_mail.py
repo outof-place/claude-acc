@@ -531,7 +531,7 @@ class Mcp(unittest.TestCase):
                 "params": {"protocolVersion": "1999-01-01"},
             }
         )
-        self.assertEqual(replies[0]["result"]["protocolVersion"], mail.MCP_PROTOCOL)
+        self.assertEqual(replies[0]["result"]["protocolVersion"], mail.mcpbase.PROTOCOL)
 
 
 class SigV4(unittest.TestCase):
@@ -662,9 +662,9 @@ class KeyIdentity(unittest.TestCase):
         self.assertIn(b"Verified OK", check.stdout)
 
 
-_hspec = importlib.util.spec_from_file_location("mailhint", os.path.join(os.path.dirname(HERE), "mailhint.py"))
-mailhint = importlib.util.module_from_spec(_hspec)
-_hspec.loader.exec_module(mailhint)
+_hspec = importlib.util.spec_from_file_location("hint", os.path.join(os.path.dirname(HERE), "hint.py"))
+hint = importlib.util.module_from_spec(_hspec)
+_hspec.loader.exec_module(hint)
 
 
 class Hint(unittest.TestCase):
@@ -674,8 +674,9 @@ class Hint(unittest.TestCase):
         with open(os.path.join(TMP, "panel.json"), "w") as f:
             json.dump(self.PANEL, f)
         out = io.StringIO()
-        with mock.patch.object(mailhint, "MAIL_DIR", TMP), mock.patch("sys.stdout", out):
-            mailhint.hint(json.dumps({"prompt": prompt, "session_id": session}))
+        with mock.patch.object(hint, "MAIL_DIR", TMP), mock.patch.object(hint, "MARKS", os.path.join(TMP, "marks")), \
+                mock.patch.object(hint, "installed", lambda name: name == "mail"), mock.patch("sys.stdout", out):
+            hint.hint(json.dumps({"prompt": prompt, "session_id": session}))
         return out.getvalue()
 
     def test_mail_words_and_addresses_trigger_once(self):
@@ -725,17 +726,18 @@ class Install(unittest.TestCase):
     def test_hint_hook_added_once_and_removed_without_touching_others(self):
         path = os.path.join(TMP, "settings.json")
         other = {"type": "command", "command": "/usr/local/bin/mine"}
+        legacy = {"type": "command", "command": "/py", "args": ["/x/acc.py", "mailhint"], "timeout": 5}
         with open(path, "w") as f:
-            json.dump({"hooks": {"UserPromptSubmit": [{"hooks": [other]}]}, "model": "x"}, f)
-        mail.set_hint(True, path)
-        mail.set_hint(True, path)
+            json.dump({"hooks": {"UserPromptSubmit": [{"hooks": [other]}, {"hooks": [legacy]}]}, "model": "x"}, f)
+        hint.sync(path, enabled=True)
+        hint.sync(path, enabled=True)
         with open(path) as f:
             hooks = json.load(f)["hooks"]["UserPromptSubmit"]
         flat = [h for g in hooks for h in g["hooks"]]
-        self.assertEqual(sum(1 for h in flat if mail.ours(h)), 1)
+        self.assertEqual(sum(1 for h in flat if hint.ours(h)), 1)  # dawny wpis mailhint podmieniony
         self.assertIn(other, flat)
-        self.assertEqual(next(h for h in flat if mail.ours(h))["args"][-1], "mailhint")
-        mail.set_hint(False, path)
+        self.assertEqual(next(h for h in flat if hint.ours(h))["args"][-1], "hint")
+        hint.sync(path, enabled=False)
         with open(path) as f:
             data = json.load(f)
         self.assertEqual(data["hooks"]["UserPromptSubmit"], [{"hooks": [other]}])
