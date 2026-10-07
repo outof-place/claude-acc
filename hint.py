@@ -96,7 +96,7 @@ def mail_context(prompt, panel):
     named = False
     for box in boxes:
         local, _, domain = box["mailbox"].partition("@")
-        # "contact@portivo.eu", "contact@" i "contact portivo" (bez @, jak się pisze w biegu)
+        # "contact@example.com", "contact@" i "contact example" (bez @, jak się pisze w biegu)
         label = re.escape(domain.split(".")[0])
         if box["mailbox"] in lowered or re.search(
             rf"(?<![\w.-]){re.escape(local)}\s*(?:@|\s)\s*(?:{label}|$|\W)", lowered

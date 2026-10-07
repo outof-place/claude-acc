@@ -668,7 +668,7 @@ _hspec.loader.exec_module(hint)
 
 
 class Hint(unittest.TestCase):
-    PANEL = {"mailboxes": [{"mailbox": "contact@portivo.eu", "provider": "gmail", "access": "draft", "send": "ask"}]}
+    PANEL = {"mailboxes": [{"mailbox": "contact@example.com", "provider": "gmail", "access": "draft", "send": "ask"}]}
 
     def run_hint(self, prompt, session="s1"):
         with open(os.path.join(TMP, "panel.json"), "w") as f:
@@ -680,8 +680,8 @@ class Hint(unittest.TestCase):
         return out.getvalue()
 
     def test_mail_words_and_addresses_trigger_once(self):
-        first = self.run_hint("przyszła odpowiedź na contact portivo", "a1")
-        self.assertIn("contact@portivo.eu (gmail, draft, sends after the user approves)", first)
+        first = self.run_hint("przyszła odpowiedź na contact example", "a1")
+        self.assertIn("contact@example.com (gmail, draft, sends after the user approves)", first)
         self.assertEqual(self.run_hint("sprawdź maila", "a1"), "")  # raz na sesję
         self.assertIn("mail", self.run_hint("jaki jest kod weryfikacyjny?", "a2"))
 
