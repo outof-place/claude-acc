@@ -81,7 +81,7 @@ GATE_PROGRAMS = (
 # Tak samo z przeglądarkami: klucz "Chrome/Brave Safe Storage" odszyfrowuje ciasteczka i hasła,
 # a pliki Cookies, Login Data i Web Data w profilu to sesje, hasła i karty. Agent wchodzi na
 # strony z Twoimi loginami przez bramkę przeglądarki (browser.py), nigdy przez te pliki.
-SECRET_WORDS = ("claude-acc-mail", "google-service-account", "dump-keychain", "Safe Storage", "BraveSoftware", "Google/Chrome")
+SECRET_WORDS = ("claude-acc-mail", "claude-acc-browser", "google-service-account", "dump-keychain", "Safe Storage", "BraveSoftware", "Google/Chrome")
 HOOK_GATE = (
     r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
     r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
@@ -106,7 +106,7 @@ def secret_read(command):
         return SECRET_DENY
     if (
         re.search(r"(?<![\w-])security(?![\w-])", command)
-        and re.search(r"(?<![\w-])(?:claude-acc-mail|google-service-account)(?![\w-])", command)
+        and re.search(r"(?<![\w-])(?:claude-acc-mail|claude-acc-browser|google-service-account)(?![\w-])", command)
         and re.search(r"find-(?:generic|internet)-password|export(?![\w-])|\s-[a-zA-Z]*[wg]\b", command)
     ):
         return SECRET_DENY

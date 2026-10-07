@@ -56,6 +56,8 @@ mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
 cp "$SRC"/*.py "$STATE/"
 # hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
+# drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
+[ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
 [ -n "$HOOK" ] && cp "$HOOK" "$STATE/claude-acc-hook.new" && mv -f "$STATE/claude-acc-hook.new" "$STATE/claude-acc-hook"
 # hooki pauzy w C leżą obok claude-acc-hook (install.sh: katalog builda, formuła: libexec);

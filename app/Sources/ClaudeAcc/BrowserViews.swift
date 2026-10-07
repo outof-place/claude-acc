@@ -99,7 +99,7 @@ private struct BrowserRow: View {
                     Button("Turn on", action: enable)
                         .buttonStyle(.link)
                         .font(.caption)
-                        .help("Opens \(browser.inspect): tick Allow remote debugging for this browser instance (once)")
+                        .help("Opens \(browser.inspect) in \(browser.title): tick Allow remote debugging for this browser instance (once)")
                 } else {
                     Text(state)
                         .font(.caption)

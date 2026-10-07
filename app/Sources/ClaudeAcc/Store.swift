@@ -249,9 +249,9 @@ final class Store {
     }
 
     /// The daemon rewrites the browser file on every change; a browser started, quit or switched
-    /// on without an agent around shows up only through `status`, so it runs every 10 s while open.
+    /// on without an agent around shows up only through `status`, so it runs every 5 s while open.
     private func syncBrowser() {
-        guard !browserSyncing, browser?.installed == true, Date.now.timeIntervalSince(browserSyncedAt) > 10 else { return }
+        guard !browserSyncing, browser?.installed == true, Date.now.timeIntervalSince(browserSyncedAt) > 5 else { return }
         browserSyncing = true
         Task { [weak self] in
             _ = await CLI.run(["status", "--json"], script: CLI.browser)
@@ -440,7 +440,9 @@ final class Store {
     func enableBrowser(_ browser: BrowserPanel.Browser) async {
         let result = await CLI.run(["setup", browser.name], script: CLI.browser)
         notice = result.status == 0
-            ? Notice(text: "In \(browser.title), tick Allow remote debugging for this browser instance")
+            ? Notice(text: result.message.contains("schowku")
+                ? "\(browser.inspect) copied: in \(browser.title) press ⌘L, ⌘V, Return, then tick Allow remote debugging"
+                : "In \(browser.title), tick Allow remote debugging for this browser instance")
             : Notice(text: result.message.isEmpty ? "Couldn't open \(browser.title)" : result.message, isError: true)
     }
 

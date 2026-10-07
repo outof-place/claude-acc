@@ -10,7 +10,7 @@ struct PanelView: View {
     var frozenNow: Date?
     @Environment(\.renderingToFile) private var renderingToFile
 
-    static let columnHeight: CGFloat = 640
+    static let columnHeight: CGFloat = 760
 
     var body: some View {
         TimelineView(PanelClock(running: store.panelOpen)) { context in
