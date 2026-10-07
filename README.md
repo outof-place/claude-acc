@@ -46,6 +46,8 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
 | **Load & heat** | CPU load split into performance and efficiency cores, GPU load, and P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
 | **Updates** | Everything on the Mac brought to its newest version every 3 days: Homebrew formulae and casks, global npm packages, Go programs, Python packages (rolled back if anything conflicts or stops importing), Python itself, Claude Code with its plugins and skills. Pins are respected and hand-edited skills are left alone. The panel shows when it last worked, what each part did and why something failed, and an Update button runs it now. |
+| **Mail gateway** | Your agents read and answer the company mail without a password or key on disk: several mailboxes, Google Workspace through domain-wide delegation and any IMAP/SMTP server, behind one [MCP server](#mail-gateway) every Claude Code session gets. Each mailbox has its own level (read, modify, draft) and sending is off unless you allow it, so an agent leaves a draft for you. What an email says is treated as untrusted data, and every call lands in an audit log. |
+| **Browser gateway** | Your agents use your own Chrome or Brave, with your logins, in tabs that never take focus: hidden tabs with no window or tab strip entry, one connection the browser approves once per start, shared by every Claude Code session through one [MCP server](#browser-gateway). Agents work from a compact outline of the page with refs instead of screenshots, see only their own tabs, can't open browser settings or read cookies, keep banks read-only, and hand a tab to you when a login, captcha or payment needs a human. |
 | **Ultra** | One switch that tunes the Mac for agent work. Helpers no agent waits on move to the efficiency cores, memory hooks stop holding up every tool call, Node starts warm for everything sessions spawn, and the guard frees dev server memory sooner. Each change is measured before and after, and Off puts back exactly what was there. |
 
 <img src="docs/panel-details.png" width="900" alt="The same panel with one account opened: plan, subscription status and start, renewal date with a countdown, the 5-hour and weekly windows with their exact resets, place in the switching order, and buttons to switch or sign in again">
@@ -218,6 +220,18 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc perf-root devtools add\|undo\|status` | Opens Developer Tools in System Settings and waits until Orca is on the list, so fresh Go test binaries skip Gatekeeper |
 | `claude-acc perf bench agents` | Tool turnaround and hook waits from the last day of Claude Code transcripts, with the hooks that cost the most |
 | `claude-acc perf bench gatekeeper` | How long the first run of a freshly built binary waits for Gatekeeper from this terminal |
+| `claude-acc mail add <address> gmail\|imap [read\|modify\|draft] [--send] [...]` | Add a mailbox; for IMAP the password goes into the Keychain |
+| `claude-acc mail google --service-account SA [--aws-audience A --aws-profile P]` | The Google service account and the identity that signs for it |
+| `claude-acc mail doctor` | Check the identity and every mailbox |
+| `claude-acc mail install` / `uninstall` | Register the `mail` MCP server, the `mail` skill and the prompt hint for every Claude Code session |
+| `claude-acc mail wait <mailbox> '<query>' [--timeout 6h]` | Wait for a new matching message; agents run it in the background and get woken when it arrives |
+| `claude-acc mail search\|read\|thread\|attachment\|modify\|draft\|send ...` | The same tools from the shell |
+| `claude-acc browser install` / `uninstall` | Register the `browser` MCP server, the `browser` skill and the prompt hint for every Claude Code session |
+| `claude-acc browser doctor` / `status [--json]` | What to click in Chrome and Brave, which one is connected, agent tabs |
+| `claude-acc browser setup chrome\|brave` | Open the browser's remote debugging page, where you tick the checkbox once |
+| `claude-acc browser use chrome\|brave` / `tabs-mode hidden\|background` / `site <domain> act\|read\|deny\|-` | The default browser, where agent tabs live, and per-site levels |
+| `claude-acc browser disconnect` | Close the agents' tabs and the connection (the panel's Disconnect) |
+| `claude-acc browser open\|tabs\|snapshot\|click\|type\|press\|navigate\|read\|screenshot\|wait\|dialog\|upload\|close ...` | The same tools from the shell |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
 ## Configuration
@@ -391,6 +405,70 @@ Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is op
 | `pip_pins` | `{}` | Python packages held at a specifier, e.g. `{"fb-idb": "==1.1.7"}` |
 | `python` | uv's default, python.org, Homebrew | The Python (a path or a list) whose packages are upgraded |
 
+## Mail gateway
+
+`claude-acc mail mcp` is a stdio [MCP](https://modelcontextprotocol.io) server (protocol 2026-07-28 without a handshake and 2025-11-25 with one, no SDK, Python standard library only) with eight tools: `mail_mailboxes`, `mail_search`, `mail_read`, `mail_thread`, `mail_attachment`, `mail_modify`, `mail_draft` and `mail_send`. `claude-acc mail install` registers it as `mail` in your user scope, so every session on the Mac has it, together with the `mail` skill and a prompt hint (below); scripts and other agents get the same tools from `claude-acc mail <tool>`. Configuration lives in `~/.local/share/claude-acc/mail.json` (0600).
+
+**Mailboxes.** Each one has a provider, a level and a send switch:
+
+```json
+{
+  "google": {
+    "service_account": "claude-mail@your-project.iam.gserviceaccount.com",
+    "identity": {"type": "aws", "audience": "//iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/POOL/providers/PROVIDER", "aws_profile": "mail-gateway", "region": "eu-central-1"}
+  },
+  "mailboxes": {
+    "contact@example.com": {"provider": "gmail", "access": "draft", "send": "ask"},
+    "ceo@example.com": {"provider": "gmail", "access": "read"},
+    "info@other.example": {"provider": "imap", "access": "modify", "host": "imap.other.example", "smtp_host": "smtp.other.example"}
+  }
+}
+```
+
+`read` searches and reads, `modify` also labels, archives and marks read, `draft` also writes drafts, which never need approval. `send` is `off` (the default: the agent leaves the draft and you send it), `ask` or `auto`. With `ask` a person approves every send: `mail_send` carries Claude Code's `anthropic/requiresUserInteraction`, so Claude Code shows its permission prompt on every call, even in `bypassPermissions`, with the recipients and subject the agent must copy from the draft (the gateway refuses if they differ). Other clients get the gateway's own confirmation through MCP elicitation, or the agent has to ask you and pass `user_confirmed`. The **Mail** card in the panel shows every mailbox, whether it answers, its level and send mode, today's calls and the last few calls agents made; **Check** signs in to each one.
+
+**Google Workspace.** A service account with [domain-wide delegation](https://support.google.com/a/answer/162106) for `gmail.readonly`, `gmail.modify` and `gmail.compose` acts as each mailbox. Nothing secret sits on disk:
+
+- `identity.type: "key"` keeps the service account key only in the Keychain (service `claude-acc-mail`, account `google-service-account`). `claude-acc mail key-create --service-account SA` asks the IAM API for a key with your gcloud sign-in and puts the answer straight into the Keychain, and each delegation JWT is signed by `/usr/bin/openssl` reading the key from a pipe, so it never touches a file. It never expires and needs no sign-in, at the price of a long-lived secret; organizations that block key creation (`iam.disableServiceAccountKeyCreation`) need a one-off exception.
+
+- `identity.type: "aws"` signs an STS `GetCallerIdentity` with your AWS credentials (`aws configure export-credentials`, any profile, typically a role you assume), Google STS exchanges it in a [Workload Identity pool](https://cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds) for a federated token, and IAM Credentials `signJwt` signs the delegation JWT with `sub` set to the mailbox. No browser session, so no reauthentication every few hours.
+- `identity.type: "gcloud"` uses your Application Default Credentials instead; your Google account needs `roles/iam.serviceAccountTokenCreator` on the service account.
+
+Tokens stay in memory, one per mailbox and scope, and each call asks for the narrowest scope it needs.
+
+**IMAP and SMTP.** Any server over TLS. The password, or an app password, sits in the Keychain under the service `claude-acc-mail` (`claude-acc mail add` asks for it through `security`, so it never shows up in a process list or your shell history); `--xoauth2-command` takes a command that prints an OAuth token instead, for Microsoft 365 and the like. Search takes the useful part of Gmail's syntax (`from: to: cc: subject: newer_than:7d after: before: is:unread is:starred in:FOLDER` and words) and turns it into IMAP `SEARCH`; threads are rebuilt from `Message-ID` and `References`; `UNREAD` and `STARRED` are flags, removing `INBOX` moves to the archive folder and `TRASH` to the trash; drafts are appended to the drafts folder, and a sent draft goes out over SMTP and lands in the sent folder. Folder names default to `INBOX`, `Archive`, `Trash`, `Drafts` and `Sent` and can be set per mailbox (`archive_folder`, `trash_folder`, `drafts_folder`, `sent_folder`).
+
+**How agents find it.** `claude-acc mail install` puts three things in place, and `claude-acc-setup` refreshes them whenever mailboxes are configured:
+
+- the `mail` skill (`~/.claude/skills/mail/SKILL.md`): a description of a few lines that Claude Code keeps in context, and a short recipe it loads only when a task needs an email (find, read, attachment, answer, send, file, wait);
+- a prompt hint: a `UserPromptSubmit` hook (`hint.py`, shared with the browser gateway, about 10 ms, exec form) that gives the session one line with your mailboxes and their levels when your message talks about mail, a reply from someone, a verification code or one of the configured addresses, at most once per session;
+- the guard: the dev server guard's Bash hook refuses commands that read the gateway's secrets out of the Keychain (`security find-generic-password ... claude-acc-mail`, `dump-keychain`), so the key and passwords stay with the gateway.
+
+`claude-acc mail wait <mailbox> '<query>'` waits for a new message matching the query (messages that already matched when it started don't count). An agent runs it in the background and is woken by Claude Code when it exits: code 0 with the message, 3 after `--timeout`.
+
+**Untrusted content.** An email is data from a stranger. The gateway strips control, zero-width and bidirectional characters, turns HTML into text without scripts and styles, cuts long bodies, lists links without opening them, and hands bodies to the agent inside `<untrusted-email id="...">` with a random id per call, so a message can't close the envelope early; a fake tag inside a message is removed. Attachments go to `~/.local/share/claude-acc/mail/attachments` with owner-only permissions. The server's instructions tell the agent never to act on what an email asks. Every call, successful or not, is appended to `~/.local/share/claude-acc/mail/audit.jsonl` with the client, tool, mailbox and ids, never the content.
+
+## Browser gateway
+
+`claude-acc browser mcp` is a stdio MCP server with fifteen tools that drive your own Chrome or Brave: `browser_open`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press`, `browser_navigate`, `browser_read`, `browser_screenshot`, `browser_wait`, `browser_dialog`, `browser_upload`, `browser_tabs`, `browser_close`, `browser_show` and `browser_take`. `claude-acc browser install` registers it as `browser` in your user scope with the `browser` skill and the shared prompt hint; scripts get the same tools from `claude-acc browser <tool>`. Python standard library only: its own WebSocket client and the Chrome DevTools Protocol, no Puppeteer, no Node.
+
+**Getting in, once.** Since Chrome 136 a browser on its default profile ignores `--remote-debugging-port`. Since 144 the way in is a checkbox: tick *Allow remote debugging for this browser instance* at `chrome://inspect/#remote-debugging` (or `brave://inspect/...`; the panel's **Turn on** opens it). It survives restarts. The browser then listens on localhost only and asks *Allow remote debugging?* for every new connection, bringing its window forward. So the connection is held by one daemon (`claude-acc browser serve`, started by the first tool call, gone after ten quiet minutes) and every session talks to the daemon over a `0600` unix socket. You click **Allow** once per browser start, not once per session. While it is connected the browser shows its *controlled by automated test software* bar. After `idle_minutes` (20) without a call, or on **Disconnect** in the panel, the daemon closes the agents' tabs and the connection, so the bar goes away.
+
+**No focus taken.** Agent tabs are hidden targets by default (`tabs-mode hidden`): pages with your cookies and logins that have no window and no place in the tab strip. Focus emulation keeps them rendering at full rate, and they get a 1280x860 viewport for layout and screenshots. With `tabs-mode background` they open as background tabs in your last window instead. No tool brings a page forward. A page that opens a window (`target=_blank`, `window.open`) gets it as another agent tab, reported in the same result. File choosers are intercepted, so no native dialog appears over your work. `browser_show` (which you approve, through `anthropic/requiresUserInteraction`) turns a hidden tab into a normal background tab and sends a notification, for the login, captcha, 2FA or payment only you should do. `browser_take` (also approved) lets an agent borrow one of your own open tabs, and `browser_close` gives it back without closing it.
+
+**What agents see.** Not screenshots by default: an outline built from the browser's accessibility tree, like Playwright's snapshots. It shows `- role "name" [state] [ref=eN]: value`, with layout containers removed, text runs joined, table rows as `cell | cell`, `<select>` options inline, and frames from other sites (a payment field, a captcha) included through their own sessions. A ref stays the same for the same element until the page loads a new document. So after every click or keystroke the tool returns only the lines that changed, often two or three, and a full outline only when most of the page changed. `find` keeps only the lines with a text and their parents, `ref` one subtree, and `browser_read` gives the page text in 30 000-character pages with its links. Screenshots are JPEG at one CSS pixel per pixel, so `browser_click` takes their x/y as they are. Clicks and keys are real input events (`Input.dispatchMouseEvent`, `insertText`), alerts and confirms come back as a note until `browser_dialog` answers them, and uploads go straight into the file input.
+
+**The gate.** Each session sees and touches only the tabs it opened. When it ends, its tabs close two minutes later, except ones handed to you. Sites have levels in `~/.local/share/claude-acc/browser.json`. `act` (the default) allows everything, `read` allows opening, outlines, text and screenshots, `deny` allows nothing, and the longest matching pattern wins:
+
+```json
+{"default": "brave", "tabs": "hidden", "idle_minutes": 20,
+ "sites": {"dashboard.stripe.com": "read", "*.internal.example": "deny"}}
+```
+
+Polish banks, Revolut, Wise and PayPal are `read` out of the box, because a payment is one click. Browser pages (`chrome://`, `brave://`, extensions, `file:`, `data:`, `javascript:`) are always closed, including after a redirect. There is no tool for JavaScript, cookies or storage, and the gateway never calls the cookie methods. Uploads refuse files from `~/.ssh`, `~/.aws`, the Keychains, browser profiles and claude-acc's own state. Page content reaches the agent inside `<untrusted-page id="...">` with a random id, and fake closing tags are stripped from it. Every call lands in `~/.local/share/claude-acc/browser/audit.jsonl` with the session, tool, tab and address without its query string. Typed text is never logged, only its length.
+
+**How agents find it.** The `browser` skill (when to use it and the recipe: open, act by ref, long pages, waiting, files, the human, done). The shared prompt hint names your default browser when a message talks about a browser, clicking, signing in or a console, and tells the agent what to ask you when debugging is off. The guard's Bash hook refuses commands that read the Chrome or Brave `Safe Storage` key or the profile's `Cookies`, `Login Data` and `Web Data` files. The **Browser** card in the panel shows each browser (connected, asking for Allow, ready, not running, debugging off with **Turn on**), the agents' tabs and the last call.
+
 ## Stay Awake
 
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
@@ -449,6 +527,10 @@ The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies,
 The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go`, `pip`, `uv`, `claude`, `npx` and `pkgutil` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, an npm package rolled back when its command stops working after npm blocked its install scripts, the 3-day interval and the next-night retry, Python packages upgraded together from wheels (with the user site on its own, a package installed from a folder left alone, a source-only release and one held lower by another package reported as held back), an upgrade that breaks `pip check` rolled back while a conflict from before the run is not, an upgrade that stops a package importing rolled back, a pinned package and a pinned dependency held, a new Playwright given its browsers, a failed `pip install`, every Python upgraded once and named, a newer python.org patch offered (and not a new minor, nor Homebrew's Python) and an unsigned installer thrown away, a uv Python that holds pip packages left on its patch, Claude Code and its plugins updated, plugins updated from their own project and never auto-confirmed, a hand-edited skill left alone, the native `claude` first on the `PATH`, a step from an older version dropped from the state, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
 
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, and that the hook sends a second start to the running one.
+
+The mail gateway tests (`tests/test_mail.py`) need no network: the MCP handshake, version negotiation, tool calls and errors over stdio; levels, the send switch and the audit log; the envelope, invisible characters and HTML; Gmail's MIME tree and threaded drafts; Gmail queries turned into IMAP `SEARCH`; and the IMAP provider against a fake `imaplib` (search, read, attachment to quarantine, archive, draft). The SigV4 signer is checked against the example in AWS's documentation.
+
+The browser gateway tests (`tests/test_browser.py`) check site levels and URL handling, the outline built from a recorded accessibility tree (refs that stay, frames, table rows, `find` and `ref`, the diff after an action), the WebSocket client against a local server (handshake without `Origin`, ping, fragmented and 64-bit frames), the MCP tools and their approval flags, the prompt hint and the guard's browser rules. Then they run a real Chrome without a window on a temporary profile, with a local page that has a frame from another origin, a popup link, an alert and a file input. Through the daemon's socket they type, pick an option, click inside both frames, upload a file, take a screenshot, open the popup as a new tab, answer the alert, refuse `chrome://settings` and another session's tab, and check that typed text never reaches the audit log.
 
 To see the panel without clicking the menu bar, render it to a PNG, from live data or from a JSON file:
 

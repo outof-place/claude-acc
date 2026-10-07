@@ -495,3 +495,105 @@ struct GuardEvent: Decodable, Identifiable {
 
     var id: Double { at }
 }
+
+// MARK: - Mail gateway (`mail/panel.json`, written by mail.py on every call and check)
+
+struct MailPanel: Decodable {
+    struct Health: Decodable {
+        let ok: Bool
+        let detail: String?
+        /// A short English reason for the panel; `detail` keeps the script's full message.
+        let reason: String?
+        let checkedAt: Double?
+    }
+
+    struct Mailbox: Decodable, Identifiable {
+        let mailbox: String
+        /// gmail or imap
+        let provider: String
+        /// read, modify or draft
+        let access: String
+        /// off, ask or auto
+        let send: String
+        let health: Health?
+        let lastUsed: Double?
+        let callsToday: Int
+        let errorsToday: Int
+
+        var id: String { mailbox }
+    }
+
+    struct Call: Decodable, Identifiable {
+        let at: Double
+        let client: String?
+        let tool: String
+        let mailbox: String?
+        let ok: Bool
+        let detail: String?
+
+        var id: String { "\(at)-\(tool)-\(mailbox ?? "")" }
+    }
+
+    let configured: Bool
+    let error: String?
+    let identity: Health?
+    let checkedAt: Double?
+    let mcpRegistered: Bool
+    let mailboxes: [Mailbox]
+    let recent: [Call]
+}
+
+// MARK: - Browser gateway (`browser/panel.json`, written by browser.py's daemon and `status`)
+
+struct BrowserPanel: Decodable {
+    struct Browser: Decodable, Identifiable {
+        let name: String
+        let title: String
+        let installed: Bool
+        /// connected, connecting (the browser asks for Allow), ready, closed, disabled, missing or error
+        let state: String
+        let error: String?
+        let since: Double?
+        let tabs: Int
+        /// The page with the remote debugging checkbox (chrome://inspect/#remote-debugging).
+        let inspect: String
+
+        var id: String { name }
+    }
+
+    struct Tab: Decodable, Identifiable {
+        let tab: String
+        let browser: String
+        /// hidden, background or user
+        let mode: String
+        let handed: Bool
+        let title: String
+        let url: String
+        let client: String?
+
+        var id: String { tab }
+    }
+
+    struct Call: Decodable, Identifiable {
+        let at: Double
+        let op: String
+        let tab: String?
+        let browser: String?
+        let url: String
+        let ok: Bool
+
+        var id: String { "\(at)-\(op)-\(tab ?? "")" }
+    }
+
+    let error: String?
+    let installed: Bool
+    let mcpRegistered: Bool
+    let hub: Bool
+    let `default`: String?
+    let tabsMode: String
+    let idleMinutes: Int
+    let browsers: [Browser]
+    let tabs: [Tab]
+    let clients: Int
+    let recent: [Call]
+}

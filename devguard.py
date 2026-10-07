@@ -75,10 +75,49 @@ GATE_PROGRAMS = (
     "go", "golangci-lint", "make", "govulncheck", "npx", "bunx", "pnpm", "yarn", "npm", "bun",
     "vitest", "jest", "playwright", "next", "tsc", "vue-tsc", "eslint", "turbo", "vite", "expo",
 )  # fmt: skip
+# Sekrety bramki pocztowej (klucz konta serwisowego Google, hasła IMAP) leżą w Pęku kluczy pod
+# usługą claude-acc-mail. Agent korzysta z poczty przez narzędzia mail, a komendy, która je
+# wyciąga (`security find-generic-password ... -w`, `dump-keychain`), strażnik nie przepuszcza.
+# Tak samo z przeglądarkami: klucz "Chrome/Brave Safe Storage" odszyfrowuje ciasteczka i hasła,
+# a pliki Cookies, Login Data i Web Data w profilu to sesje, hasła i karty. Agent wchodzi na
+# strony z Twoimi loginami przez bramkę przeglądarki (browser.py), nigdy przez te pliki.
+SECRET_WORDS = ("claude-acc-mail", "google-service-account", "dump-keychain", "Safe Storage", "BraveSoftware", "Google/Chrome")
 HOOK_GATE = (
     r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
     r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
+    r"|(?<![\w.-])(?:" + "|".join(SECRET_WORDS) + r")(?![\w.-])"
 )
+SECRET_DENY = (
+    "Sekrety bramki pocztowej zostają w Pęku kluczy. Do poczty użyj narzędzi mail "
+    "(skill `mail`, `claude-acc mail ...`); diagnoza: `claude-acc mail doctor`."
+)
+BROWSER_SECRET_DENY = (
+    "Ciasteczka, hasła i karty z Chrome i Brave zostają w przeglądarce. Na strony z Twoimi "
+    "loginami agent wchodzi bramką przeglądarki (skill `browser`, `claude-acc browser ...`)."
+)
+
+
+def secret_read(command):
+    """Powód odmowy dla komendy, która wyciąga sekret bramki pocztowej z Pęku kluczy albo
+    ciasteczka, hasła i karty z profilu Chrome lub Brave; None dla każdej innej."""
+    import re
+
+    if re.search(r"(?<![\w-])dump-keychain(?![\w-])", command):
+        return SECRET_DENY
+    if (
+        re.search(r"(?<![\w-])security(?![\w-])", command)
+        and re.search(r"(?<![\w-])(?:claude-acc-mail|google-service-account)(?![\w-])", command)
+        and re.search(r"find-(?:generic|internet)-password|export(?![\w-])|\s-[a-zA-Z]*[wg]\b", command)
+    ):
+        return SECRET_DENY
+    if re.search(r"(?:Chrome|Brave|Chromium)\s+Safe\s+Storage", command, re.IGNORECASE):
+        return BROWSER_SECRET_DENY
+    flat = command.replace("\\ ", " ")
+    if re.search(r"Google/Chrome|BraveSoftware/Brave-Browser", flat) and re.search(
+        r"(?<![\w-])(?:Cookies|Login Data(?: For Account)?|Web Data)(?![\w-])", flat
+    ):
+        return BROWSER_SECRET_DENY
+    return None
 
 # komenda stawiająca dev serwer, po zdjęciu opakowań (zmienne, rtk proxy, npx, pnpm exec).
 # Wzorce to tekst: `re` kompiluje je przy pierwszym użyciu, więc komenda bez słowa od dev
@@ -162,7 +201,7 @@ def admit(raw):
     dalej i odpada na wzorcach; do strażnika (devguard_core) trafia tylko komenda, która
     naprawdę stawia dev serwer.
     """
-    if "\\u" not in raw and not any(w in raw for w in DEV_WORDS + SCHED_WORDS):
+    if "\\u" not in raw and not any(w in raw for w in DEV_WORDS + SCHED_WORDS + SECRET_WORDS):
         return 0
     import json
 
@@ -170,6 +209,11 @@ def admit(raw):
         event = json.loads(raw)
         command = (event.get("tool_input") or {}).get("command") or ""
     except (ValueError, AttributeError):
+        return 0
+    reason = event.get("tool_name") == "Bash" and any(w in command for w in SECRET_WORDS) and secret_read(command)
+    if reason:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": reason}}))
         return 0
     if any(word in command for word in DEV_WORDS):
         if event.get("tool_name") != "Bash":

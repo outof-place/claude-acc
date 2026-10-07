@@ -30,9 +30,13 @@ struct PanelView: View {
                     Column(width: 360) {
                         DevServersCard(store: store)
                         BuildsCard(store: store)
+                        MailCard(store: store).fixedSize(horizontal: false, vertical: true)
                     }
                     Column(width: 310) {
                         AwakeCard(awake: store.awake).fixedSize(horizontal: false, vertical: true)
+                        if store.browser?.installed == true {
+                            BrowserCard(store: store).fixedSize(horizontal: false, vertical: true)
+                        }
                         FansCard(store: store)
                     }
                     Column(width: 300) {
