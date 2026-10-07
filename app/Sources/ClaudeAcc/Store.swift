@@ -31,6 +31,8 @@ final class Store {
     private(set) var sweeping = false
     private(set) var updates: UpdatesState?
     private(set) var updating = false
+    private(set) var mail: MailPanel?
+    private(set) var mailChecking = false
     private(set) var guardState: GuardState?
     /// Unit the panel is restarting or stopping right now.
     private(set) var guardBusy: String?
@@ -167,6 +169,9 @@ final class Store {
         }
         if let data = changedFile(CLI.updatesState) {
             updates = Self.decode(UpdatesState.self, from: data)
+        }
+        if let data = changedFile(CLI.mailPanel) {
+            mail = Self.decode(MailPanel.self, from: data)
         }
         let level = Self.kernelMemoryLevel()
         if level != memoryLevel { memoryLevel = level }
@@ -373,6 +378,26 @@ final class Store {
             notice = run.ok
                 ? Notice(text: run.updated == 0 ? "Everything was already up to date" : "Updated \(packages(run.updated))")
                 : Notice(text: "Updated \(packages(run.updated)), \(run.failed) failed: see the Updates card", isError: true)
+        }
+    }
+
+    // MARK: Mail gateway
+
+    /// Signs in to every mailbox once (mail.py doctor) and refreshes the card from its file.
+    func checkMail() async {
+        guard !mailChecking else { return }
+        mailChecking = true
+        notice = nil
+        let result = await CLI.run(["doctor", "--quiet"], script: CLI.mail)
+        mailChecking = false
+        readLocal()
+        let failing = mail?.mailboxes.filter { $0.health?.ok == false }.count ?? 0
+        if result.status == 0 {
+            notice = Notice(text: "Every mailbox answers")
+        } else if failing > 0 {
+            notice = Notice(text: failing == 1 ? "1 mailbox doesn't answer: see the Mail card" : "\(failing) mailboxes don't answer: see the Mail card", isError: true)
+        } else {
+            notice = Notice(text: result.message.isEmpty ? "Mail check failed" : result.message, isError: true)
         }
     }
 

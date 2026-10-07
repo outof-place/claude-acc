@@ -495,3 +495,50 @@ struct GuardEvent: Decodable, Identifiable {
 
     var id: Double { at }
 }
+
+// MARK: - Mail gateway (`mail/panel.json`, written by mail.py on every call and check)
+
+struct MailPanel: Decodable {
+    struct Health: Decodable {
+        let ok: Bool
+        let detail: String?
+        /// A short English reason for the panel; `detail` keeps the script's full message.
+        let reason: String?
+        let checkedAt: Double?
+    }
+
+    struct Mailbox: Decodable, Identifiable {
+        let mailbox: String
+        /// gmail or imap
+        let provider: String
+        /// read, modify or draft
+        let access: String
+        /// off, ask or auto
+        let send: String
+        let health: Health?
+        let lastUsed: Double?
+        let callsToday: Int
+        let errorsToday: Int
+
+        var id: String { mailbox }
+    }
+
+    struct Call: Decodable, Identifiable {
+        let at: Double
+        let client: String?
+        let tool: String
+        let mailbox: String?
+        let ok: Bool
+        let detail: String?
+
+        var id: String { "\(at)-\(tool)-\(mailbox ?? "")" }
+    }
+
+    let configured: Bool
+    let error: String?
+    let identity: Health?
+    let checkedAt: Double?
+    let mcpRegistered: Bool
+    let mailboxes: [Mailbox]
+    let recent: [Call]
+}

@@ -399,7 +399,7 @@ Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is op
 
 ## Mail gateway
 
-`claude-acc mail mcp` is a stdio [MCP](https://modelcontextprotocol.io) server (protocol 2025-11-25, no SDK, Python standard library only) with eight tools: `mail_mailboxes`, `mail_search`, `mail_read`, `mail_thread`, `mail_attachment`, `mail_modify`, `mail_draft` and `mail_send`. `claude-acc mail install-mcp` registers it as `mail` in your user scope, so every session on the Mac has it; scripts and other agents get the same tools from `claude-acc mail <tool>`. Configuration lives in `~/.local/share/claude-acc/mail.json` (0600).
+`claude-acc mail mcp` is a stdio [MCP](https://modelcontextprotocol.io) server (protocol 2026-07-28 without a handshake and 2025-11-25 with one, no SDK, Python standard library only) with eight tools: `mail_mailboxes`, `mail_search`, `mail_read`, `mail_thread`, `mail_attachment`, `mail_modify`, `mail_draft` and `mail_send`. `claude-acc mail install-mcp` registers it as `mail` in your user scope, so every session on the Mac has it; scripts and other agents get the same tools from `claude-acc mail <tool>`. Configuration lives in `~/.local/share/claude-acc/mail.json` (0600).
 
 **Mailboxes.** Each one has a provider, a level and a send switch:
 
@@ -410,16 +410,18 @@ Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is op
     "identity": {"type": "aws", "audience": "//iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/POOL/providers/PROVIDER", "aws_profile": "mail-gateway", "region": "eu-central-1"}
   },
   "mailboxes": {
-    "contact@example.com": {"provider": "gmail", "access": "draft", "send": false},
+    "contact@example.com": {"provider": "gmail", "access": "draft", "send": "ask"},
     "ceo@example.com": {"provider": "gmail", "access": "read"},
     "info@other.example": {"provider": "imap", "access": "modify", "host": "imap.other.example", "smtp_host": "smtp.other.example"}
   }
 }
 ```
 
-`read` searches and reads, `modify` also labels, archives and marks read, `draft` also writes drafts. `send: true` lets `mail_send` send a draft; without it the agent leaves the draft and you send it.
+`read` searches and reads, `modify` also labels, archives and marks read, `draft` also writes drafts, which never need approval. `send` is `off` (the default: the agent leaves the draft and you send it), `ask` or `auto`. With `ask` a person approves every send: `mail_send` carries Claude Code's `anthropic/requiresUserInteraction`, so Claude Code shows its permission prompt on every call, even in `bypassPermissions`, with the recipients and subject the agent must copy from the draft (the gateway refuses if they differ). Other clients get the gateway's own confirmation through MCP elicitation, or the agent has to ask you and pass `user_confirmed`. The **Mail** card in the panel shows every mailbox, whether it answers, its level and send mode, today's calls and the last few calls agents made; **Check** signs in to each one.
 
-**Google Workspace, keyless.** A service account with [domain-wide delegation](https://support.google.com/a/answer/162106) for `gmail.readonly`, `gmail.modify` and `gmail.compose` acts as each mailbox. Nothing secret sits on disk:
+**Google Workspace.** A service account with [domain-wide delegation](https://support.google.com/a/answer/162106) for `gmail.readonly`, `gmail.modify` and `gmail.compose` acts as each mailbox. Nothing secret sits on disk:
+
+- `identity.type: "key"` keeps the service account key only in the Keychain (service `claude-acc-mail`, account `google-service-account`). `claude-acc mail key-create --service-account SA` asks the IAM API for a key with your gcloud sign-in and puts the answer straight into the Keychain, and each delegation JWT is signed by `/usr/bin/openssl` reading the key from a pipe, so it never touches a file. It never expires and needs no sign-in, at the price of a long-lived secret; organizations that block key creation (`iam.disableServiceAccountKeyCreation`) need a one-off exception.
 
 - `identity.type: "aws"` signs an STS `GetCallerIdentity` with your AWS credentials (`aws configure export-credentials`, any profile, typically a role you assume), Google STS exchanges it in a [Workload Identity pool](https://cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds) for a federated token, and IAM Credentials `signJwt` signs the delegation JWT with `sub` set to the mailbox. No browser session, so no reauthentication every few hours.
 - `identity.type: "gcloud"` uses your Application Default Credentials instead; your Google account needs `roles/iam.serviceAccountTokenCreator` on the service account.

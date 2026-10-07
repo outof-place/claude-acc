@@ -36,6 +36,7 @@ CFG = {
     "mailboxes": {
         "contact@example.com": {"provider": "gmail", "access": "modify", "send": False},
         "ops@example.com": {"provider": "gmail", "access": "draft", "send": True},
+        "ask@example.com": {"provider": "gmail", "access": "draft", "send": "ask"},
         "info@own.example": {
             "provider": "imap",
             "access": "draft",
@@ -93,6 +94,9 @@ class FakeProvider:
             "thread_id": reply and reply["thread_id"],
             "review": "x",
         }
+
+    def draft_summary(self, addr, draft_id):
+        return {"to": "ComReg <sid@comreg.ie>", "cc": "", "subject": "Re: SIDO number", "body": "Thanks", "attachments": []}
 
     def send(self, addr, draft_id):
         self.calls.append(("send", addr, draft_id))
@@ -378,7 +382,7 @@ class Imap(unittest.TestCase):
         FakeImap.instances = []
         patches = [
             mock.patch.object(mail.imaplib, "IMAP4_SSL", FakeImap),
-            mock.patch.object(mail, "keychain_password", lambda account: "s3cret"),
+            mock.patch.object(mail, "keychain_secret", lambda account: "s3cret"),
         ]
         for p in patches:
             p.start()
@@ -570,6 +574,92 @@ class SigV4(unittest.TestCase):
             }
             <= keys
         )
+
+
+class AskMode(unittest.TestCase):
+    def test_send_mode_normalized(self):
+        cfg = config()
+        self.assertEqual([cfg["mailboxes"][a]["send"] for a in ("contact@example.com", "ops@example.com", "ask@example.com")], ["off", "auto", "ask"])
+
+    def test_agent_must_ask_without_client_prompt(self):
+        gw, fake = gateway()
+        with self.assertRaisesRegex(mail.MailError, "user_confirmed"):
+            gw.run("mail_send", {"mailbox": "ask@example.com", "draft_id": "d1"})
+        self.assertNotIn("send", [c[0] for c in fake.calls])
+        out = gw.run("mail_send", {"mailbox": "ask@example.com", "draft_id": "d1", "user_confirmed": True})
+        self.assertEqual(out["approved_by"], "user (asked by the agent)")
+
+    def test_client_prompt_needs_true_to_and_subject(self):
+        gw, fake = gateway()
+        gw.prompted_by_client = True
+        with self.assertRaisesRegex(mail.MailError, "dokładne to i subject"):
+            gw.run("mail_send", {"mailbox": "ask@example.com", "draft_id": "d1", "to": "evil@x.example", "subject": "Re: SIDO number"})
+        out = gw.run("mail_send", {"mailbox": "ask@example.com", "draft_id": "d1", "to": "sid@comreg.ie", "subject": "Re: SIDO number"})
+        self.assertEqual(out["approved_by"], "user (Claude Code approval prompt)")
+
+    def test_dialog_decides(self):
+        gw, fake = gateway()
+        gw.confirm = lambda text: False
+        with self.assertRaisesRegex(mail.MailError, "nie zgodził"):
+            gw.run("mail_send", {"mailbox": "ask@example.com", "draft_id": "d1", "user_confirmed": True})
+        gw.confirm = lambda text: "Subject: Re: SIDO number" in text
+        self.assertEqual(gw.run("mail_send", {"mailbox": "ask@example.com", "draft_id": "d1"})["approved_by"], "user (confirmation dialog)")
+
+    def test_send_tool_always_prompts_in_claude_code(self):
+        tool = next(t for t in mail.TOOLS if t["name"] == "mail_send")
+        self.assertIs(tool["_meta"]["anthropic/requiresUserInteraction"], True)
+
+
+class ModernMcp(unittest.TestCase):
+    META = {"io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2.1.292"},
+            "io.modelcontextprotocol/clientCapabilities": {}}
+
+    def roundtrip(self, *messages):
+        gw, _ = gateway()
+        out = io.StringIO()
+        server = mail.McpServer(out=out, gateway=gw)
+        server.serve(io.StringIO("\n".join(json.dumps(m) for m in messages) + "\n"))
+        return {r["id"]: r for r in (json.loads(line) for line in out.getvalue().splitlines())}, gw
+
+    def test_discover_list_call_without_initialize(self):
+        replies, gw = self.roundtrip(
+            {"jsonrpc": "2.0", "id": "d1", "method": "server/discover", "params": {"_meta": self.META}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": self.META}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "mail_read", "arguments": {"mailbox": "contact@example.com", "message_id": "m1"}, "_meta": self.META}},
+        )
+        self.assertEqual(replies["d1"]["result"]["supportedVersions"], ["2026-07-28"])
+        self.assertEqual(replies["d1"]["result"]["resultType"], "complete")
+        self.assertEqual(replies[2]["result"]["cacheScope"], "private")
+        body = replies[3]["result"]["structuredContent"]["body"]
+        self.assertTrue(body.startswith("<untrusted-email id="))
+        self.assertTrue(gw.prompted_by_client)
+
+    def test_unsupported_modern_version(self):
+        meta = dict(self.META, **{"io.modelcontextprotocol/protocolVersion": "1900-01-01"})
+        replies, _ = self.roundtrip({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": meta}})
+        self.assertEqual(replies[1]["error"]["code"], -32022)
+        self.assertIn("2026-07-28", replies[1]["error"]["data"]["supported"])
+
+
+class KeyIdentity(unittest.TestCase):
+    def test_rs256_signature_verifies(self):
+        import subprocess
+        key = os.path.join(TMP, "k.pem")
+        pub = os.path.join(TMP, "k.pub")
+        subprocess.run(["/usr/bin/openssl", "genrsa", "-out", key, "2048"], capture_output=True, check=True)
+        subprocess.run(["/usr/bin/openssl", "rsa", "-in", key, "-pubout", "-out", pub], capture_output=True, check=True)
+        with open(key) as f:
+            pem = f.read()
+        jwt = mail.key_assertion({"private_key": pem, "private_key_id": "kid1", "client_email": "sa@p.iam.gserviceaccount.com"}, "contact@example.com", mail.SCOPES["read"], now=1000)
+        head, claims, sig = jwt.split(".")
+        decoded = json.loads(mail.b64url_decode(claims))
+        self.assertEqual((decoded["iss"], decoded["sub"], decoded["exp"] - decoded["iat"]), ("sa@p.iam.gserviceaccount.com", "contact@example.com", 3600))
+        sig_path = os.path.join(TMP, "sig")
+        with open(sig_path, "wb") as f:
+            f.write(mail.b64url_decode(sig))
+        check = subprocess.run(["/usr/bin/openssl", "dgst", "-sha256", "-verify", pub, "-signature", sig_path], input=(head + "." + claims).encode(), capture_output=True)
+        self.assertIn(b"Verified OK", check.stdout)
 
 
 if __name__ == "__main__":
