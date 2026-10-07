@@ -111,6 +111,7 @@ case "$1" in
   sched) shift; exec "$PY" "$RUN" sched "$@" ;;
   update) shift; exec "$PY" "$RUN" updates run --force "$@" ;;
   updates) shift; exec "$PY" "$RUN" updates "$@" ;;
+  mail) shift; exec "$PY" "$RUN" mail "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka

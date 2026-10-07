@@ -46,6 +46,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 | **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
 | **Load & heat** | CPU load split into performance and efficiency cores, GPU load, and P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
 | **Updates** | Everything on the Mac brought to its newest version every 3 days: Homebrew formulae and casks, global npm packages, Go programs, Python packages (rolled back if anything conflicts or stops importing), Python itself, Claude Code with its plugins and skills. Pins are respected and hand-edited skills are left alone. The panel shows when it last worked, what each part did and why something failed, and an Update button runs it now. |
+| **Mail gateway** | Your agents read and answer the company mail without a password or key on disk: several mailboxes, Google Workspace through domain-wide delegation and any IMAP/SMTP server, behind one [MCP server](#mail-gateway) every Claude Code session gets. Each mailbox has its own level (read, modify, draft) and sending is off unless you allow it, so an agent leaves a draft for you. What an email says is treated as untrusted data, and every call lands in an audit log. |
 | **Ultra** | One switch that tunes the Mac for agent work. Helpers no agent waits on move to the efficiency cores, memory hooks stop holding up every tool call, Node starts warm for everything sessions spawn, and the guard frees dev server memory sooner. Each change is measured before and after, and Off puts back exactly what was there. |
 
 <img src="docs/panel-details.png" width="900" alt="The same panel with one account opened: plan, subscription status and start, renewal date with a countdown, the 5-hour and weekly windows with their exact resets, place in the switching order, and buttons to switch or sign in again">
@@ -218,6 +219,11 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc perf-root devtools add\|undo\|status` | Opens Developer Tools in System Settings and waits until Orca is on the list, so fresh Go test binaries skip Gatekeeper |
 | `claude-acc perf bench agents` | Tool turnaround and hook waits from the last day of Claude Code transcripts, with the hooks that cost the most |
 | `claude-acc perf bench gatekeeper` | How long the first run of a freshly built binary waits for Gatekeeper from this terminal |
+| `claude-acc mail add <address> gmail\|imap [read\|modify\|draft] [--send] [...]` | Add a mailbox; for IMAP the password goes into the Keychain |
+| `claude-acc mail google --service-account SA [--aws-audience A --aws-profile P]` | The Google service account and the identity that signs for it |
+| `claude-acc mail doctor` | Check the identity and every mailbox |
+| `claude-acc mail install-mcp` | Register the `mail` MCP server for every Claude Code session |
+| `claude-acc mail search\|read\|thread\|attachment\|modify\|draft\|send ...` | The same tools from the shell |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
 ## Configuration
@@ -391,6 +397,39 @@ Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is op
 | `pip_pins` | `{}` | Python packages held at a specifier, e.g. `{"fb-idb": "==1.1.7"}` |
 | `python` | uv's default, python.org, Homebrew | The Python (a path or a list) whose packages are upgraded |
 
+## Mail gateway
+
+`claude-acc mail mcp` is a stdio [MCP](https://modelcontextprotocol.io) server (protocol 2025-11-25, no SDK, Python standard library only) with eight tools: `mail_mailboxes`, `mail_search`, `mail_read`, `mail_thread`, `mail_attachment`, `mail_modify`, `mail_draft` and `mail_send`. `claude-acc mail install-mcp` registers it as `mail` in your user scope, so every session on the Mac has it; scripts and other agents get the same tools from `claude-acc mail <tool>`. Configuration lives in `~/.local/share/claude-acc/mail.json` (0600).
+
+**Mailboxes.** Each one has a provider, a level and a send switch:
+
+```json
+{
+  "google": {
+    "service_account": "claude-mail@your-project.iam.gserviceaccount.com",
+    "identity": {"type": "aws", "audience": "//iam.googleapis.com/projects/N/locations/global/workloadIdentityPools/POOL/providers/PROVIDER", "aws_profile": "mail-gateway", "region": "eu-central-1"}
+  },
+  "mailboxes": {
+    "contact@example.com": {"provider": "gmail", "access": "draft", "send": false},
+    "ceo@example.com": {"provider": "gmail", "access": "read"},
+    "info@other.example": {"provider": "imap", "access": "modify", "host": "imap.other.example", "smtp_host": "smtp.other.example"}
+  }
+}
+```
+
+`read` searches and reads, `modify` also labels, archives and marks read, `draft` also writes drafts. `send: true` lets `mail_send` send a draft; without it the agent leaves the draft and you send it.
+
+**Google Workspace, keyless.** A service account with [domain-wide delegation](https://support.google.com/a/answer/162106) for `gmail.readonly`, `gmail.modify` and `gmail.compose` acts as each mailbox. Nothing secret sits on disk:
+
+- `identity.type: "aws"` signs an STS `GetCallerIdentity` with your AWS credentials (`aws configure export-credentials`, any profile, typically a role you assume), Google STS exchanges it in a [Workload Identity pool](https://cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds) for a federated token, and IAM Credentials `signJwt` signs the delegation JWT with `sub` set to the mailbox. No browser session, so no reauthentication every few hours.
+- `identity.type: "gcloud"` uses your Application Default Credentials instead; your Google account needs `roles/iam.serviceAccountTokenCreator` on the service account.
+
+Tokens stay in memory, one per mailbox and scope, and each call asks for the narrowest scope it needs.
+
+**IMAP and SMTP.** Any server over TLS. The password, or an app password, sits in the Keychain under the service `claude-acc-mail` (`claude-acc mail add` asks for it through `security`, so it never shows up in a process list or your shell history); `--xoauth2-command` takes a command that prints an OAuth token instead, for Microsoft 365 and the like. Search takes the useful part of Gmail's syntax (`from: to: cc: subject: newer_than:7d after: before: is:unread is:starred in:FOLDER` and words) and turns it into IMAP `SEARCH`; threads are rebuilt from `Message-ID` and `References`; `UNREAD` and `STARRED` are flags, removing `INBOX` moves to the archive folder and `TRASH` to the trash; drafts are appended to the drafts folder, and a sent draft goes out over SMTP and lands in the sent folder. Folder names default to `INBOX`, `Archive`, `Trash`, `Drafts` and `Sent` and can be set per mailbox (`archive_folder`, `trash_folder`, `drafts_folder`, `sent_folder`).
+
+**Untrusted content.** An email is data from a stranger. The gateway strips control, zero-width and bidirectional characters, turns HTML into text without scripts and styles, cuts long bodies, lists links without opening them, and hands bodies to the agent inside `<untrusted-email id="...">` with a random id per call, so a message can't close the envelope early; a fake tag inside a message is removed. Attachments go to `~/.local/share/claude-acc/mail/attachments` with owner-only permissions. The server's instructions tell the agent never to act on what an email asks. Every call, successful or not, is appended to `~/.local/share/claude-acc/mail/audit.jsonl` with the client, tool, mailbox and ids, never the content.
+
 ## Stay Awake
 
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
@@ -449,6 +488,8 @@ The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies,
 The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go`, `pip`, `uv`, `claude`, `npx` and `pkgutil` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, an npm package rolled back when its command stops working after npm blocked its install scripts, the 3-day interval and the next-night retry, Python packages upgraded together from wheels (with the user site on its own, a package installed from a folder left alone, a source-only release and one held lower by another package reported as held back), an upgrade that breaks `pip check` rolled back while a conflict from before the run is not, an upgrade that stops a package importing rolled back, a pinned package and a pinned dependency held, a new Playwright given its browsers, a failed `pip install`, every Python upgraded once and named, a newer python.org patch offered (and not a new minor, nor Homebrew's Python) and an unsigned installer thrown away, a uv Python that holds pip packages left on its patch, Claude Code and its plugins updated, plugins updated from their own project and never auto-confirmed, a hand-edited skill left alone, the native `claude` first on the `PATH`, a step from an older version dropped from the state, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
 
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, and that the hook sends a second start to the running one.
+
+The mail gateway tests (`tests/test_mail.py`) need no network: the MCP handshake, version negotiation, tool calls and errors over stdio; levels, the send switch and the audit log; the envelope, invisible characters and HTML; Gmail's MIME tree and threaded drafts; Gmail queries turned into IMAP `SEARCH`; and the IMAP provider against a fake `imaplib` (search, read, attachment to quarantine, archive, draft). The SigV4 signer is checked against the example in AWS's documentation.
 
 To see the panel without clicking the menu bar, render it to a PNG, from live data or from a JSON file:
 
