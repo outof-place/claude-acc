@@ -75,10 +75,32 @@ GATE_PROGRAMS = (
     "go", "golangci-lint", "make", "govulncheck", "npx", "bunx", "pnpm", "yarn", "npm", "bun",
     "vitest", "jest", "playwright", "next", "tsc", "vue-tsc", "eslint", "turbo", "vite", "expo",
 )  # fmt: skip
+# Sekrety bramki pocztowej (klucz konta serwisowego Google, hasła IMAP) leżą w Pęku kluczy pod
+# usługą claude-acc-mail. Agent korzysta z poczty przez narzędzia mail, a komendy, która je
+# wyciąga (`security find-generic-password ... -w`, `dump-keychain`), strażnik nie przepuszcza.
+SECRET_WORDS = ("claude-acc-mail", "google-service-account", "dump-keychain")
 HOOK_GATE = (
     r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
     r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
+    r"|(?<![\w.-])(?:" + "|".join(SECRET_WORDS) + r")(?![\w.-])"
 )
+SECRET_DENY = (
+    "Sekrety bramki pocztowej zostają w Pęku kluczy. Do poczty użyj narzędzi mail "
+    "(skill `mail`, `claude-acc mail ...`); diagnoza: `claude-acc mail doctor`."
+)
+
+
+def secret_read(command):
+    """True dla komendy, która wyciąga sekret bramki pocztowej z Pęku kluczy."""
+    import re
+
+    if re.search(r"(?<![\w-])dump-keychain(?![\w-])", command):
+        return True
+    return bool(
+        re.search(r"(?<![\w-])security(?![\w-])", command)
+        and re.search(r"(?<![\w-])(?:claude-acc-mail|google-service-account)(?![\w-])", command)
+        and re.search(r"find-(?:generic|internet)-password|export(?![\w-])|\s-[a-zA-Z]*[wg]\b", command)
+    )
 
 # komenda stawiająca dev serwer, po zdjęciu opakowań (zmienne, rtk proxy, npx, pnpm exec).
 # Wzorce to tekst: `re` kompiluje je przy pierwszym użyciu, więc komenda bez słowa od dev
@@ -162,7 +184,7 @@ def admit(raw):
     dalej i odpada na wzorcach; do strażnika (devguard_core) trafia tylko komenda, która
     naprawdę stawia dev serwer.
     """
-    if "\\u" not in raw and not any(w in raw for w in DEV_WORDS + SCHED_WORDS):
+    if "\\u" not in raw and not any(w in raw for w in DEV_WORDS + SCHED_WORDS + SECRET_WORDS):
         return 0
     import json
 
@@ -170,6 +192,10 @@ def admit(raw):
         event = json.loads(raw)
         command = (event.get("tool_input") or {}).get("command") or ""
     except (ValueError, AttributeError):
+        return 0
+    if event.get("tool_name") == "Bash" and any(w in command for w in SECRET_WORDS) and secret_read(command):
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": SECRET_DENY}}))
         return 0
     if any(word in command for word in DEV_WORDS):
         if event.get("tool_name") != "Bash":

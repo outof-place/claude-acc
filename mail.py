@@ -2,7 +2,8 @@
 """Bramka pocztowa dla agentów: wiele skrzynek (Google Workspace i dowolne IMAP/SMTP) za jednym MCP.
 
     claude-acc mail mcp                       serwer MCP na stdio (Claude Code, inne agenty)
-    claude-acc mail install-mcp [nazwa]       rejestruje serwer w Claude Code (zakres użytkownika)
+    claude-acc mail install [--refresh]       MCP w Claude Code, skill `mail` i hook podpowiedzi (uninstall zdejmuje)
+    claude-acc mail wait <skrzynka> <zapytanie> [--timeout 6h]   czeka na nową pasującą wiadomość (agent: w tle)
     claude-acc mail doctor                    sprawdza tożsamość i dostęp do każdej skrzynki
     claude-acc mail status [--json]           stan dla panelu: skrzynki, zdrowie, ostatnie wywołania
     claude-acc mail mailboxes                 skrzynki z konfiguracji i ich uprawnienia
@@ -2571,30 +2572,134 @@ def status(as_json):
             f"{r['mailbox']}: {r['provider']}, {r['access']}, wysyłka {r['send']}, "
             f"{'ok' if h.get('ok') else h.get('detail', 'niesprawdzona')}, dziś {r['calls_today']} wywołań"
         )
-    print(f"MCP w Claude Code: {'tak' if out['mcp_registered'] else 'nie (claude-acc mail install-mcp)'}")
+    print(f"MCP w Claude Code: {'tak' if out['mcp_registered'] else 'nie (claude-acc mail install)'}")
     return 0
 
 
 def install_mcp(name="mail"):
-    subprocess.run(
-        ["claude", "mcp", "remove", "--scope", "user", name], capture_output=True
-    )
-    cmd = [
-        "claude",
-        "mcp",
-        "add",
-        "--scope",
-        "user",
-        name,
-        "--",
-        os.path.join(HOME, ".local/bin/claude-acc"),
-        "mail",
-        "mcp",
-    ]
+    subprocess.run(["claude", "mcp", "remove", "--scope", "user", name], capture_output=True)
+    cmd = ["claude", "mcp", "add", "--scope", "user", name, "--", os.path.join(HOME, ".local/bin/claude-acc"), "mail", "mcp"]
     out = subprocess.run(cmd, capture_output=True, text=True)
-    print((out.stdout or out.stderr).strip())
-    return out.returncode
+    return out.returncode, (out.stdout or out.stderr).strip()
 
+
+SETTINGS = os.path.join(HOME, ".claude/settings.json")
+SKILL_DIR = os.path.join(HOME, ".claude/skills/mail")
+HINT_MARKER = "mailhint"  # po tym poznajemy własny wpis UserPromptSubmit w settings.json
+
+
+def hint_hook():
+    """Wpis w formie exec (bez powłoki): interpreter claude-acc, acc.py i skrypt podpowiedzi."""
+    python = os.path.join(STATE, "python")
+    if not os.access(python, os.X_OK):
+        python = "/usr/bin/python3"
+    return {"type": "command", "command": python, "args": [os.path.join(STATE, "acc.py"), HINT_MARKER], "timeout": 5}
+
+
+def ours(hook):
+    return HINT_MARKER in (hook.get("args") or []) or HINT_MARKER in (hook.get("command") or "")
+
+
+def set_hint(enabled, path=None):
+    """Dopisuje albo zdejmuje hook podpowiedzi w settings.json, nie ruszając cudzych wpisów."""
+    path = path or SETTINGS
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except FileNotFoundError:
+        settings = {}
+    groups = settings.setdefault("hooks", {}).setdefault("UserPromptSubmit", [])
+    for group in groups:
+        group["hooks"] = [h for h in group.get("hooks", []) if not ours(h)]
+    groups[:] = [g for g in groups if g.get("hooks")]
+    if enabled:
+        groups.append({"hooks": [hint_hook()]})
+    if not groups:
+        settings["hooks"].pop("UserPromptSubmit")
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def install_skill(source_dir):
+    import shutil
+
+    src = os.path.join(source_dir, "skills", "mail", "SKILL.md")
+    if not os.path.exists(src):
+        return False
+    os.makedirs(SKILL_DIR, exist_ok=True)
+    shutil.copyfile(src, os.path.join(SKILL_DIR, "SKILL.md"))
+    return True
+
+
+def source_dir():
+    try:
+        with open(os.path.join(STATE, "source")) as f:
+            return f.read().strip()
+    except OSError:
+        return os.path.dirname(os.path.realpath(__file__))
+
+
+def cmd_install(args):
+    """MCP w Claude Code, skill `mail` i hook podpowiedzi; `--refresh` tylko odświeża, gdy bramka jest skonfigurowana."""
+    if "--refresh" in args and not (read_config().get("mailboxes")):
+        return 0
+    quiet = "--quiet" in args or "--refresh" in args
+    code, message = install_mcp()
+    skill = install_skill(source_dir())
+    set_hint(True)
+    if not quiet:
+        print(message)
+        print(f"skill: {SKILL_DIR if skill else 'brak źródła skills/mail'}; hook podpowiedzi: {SETTINGS}")
+    return code
+
+
+def cmd_uninstall(args):
+    import shutil
+
+    subprocess.run(["claude", "mcp", "remove", "--scope", "user", "mail"], capture_output=True)
+    shutil.rmtree(SKILL_DIR, ignore_errors=True)
+    set_hint(False)
+    print("zdjęte: MCP mail, skill mail i hook podpowiedzi (konfiguracja i Pęk kluczy zostają)")
+    return 0
+
+
+def parse_duration(text):
+    m = re.fullmatch(r"(\d+)([smhd]?)", (text or "").strip())
+    if not m:
+        raise MailError(f"zły czas {text!r}: np. 90s, 30m, 6h, 2d")
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def cmd_wait(args):
+    """Czeka, aż w skrzynce pojawi się NOWA wiadomość pasująca do zapytania; agent puszcza to w tle.
+
+    Bazą są id pasujące w chwili startu, więc stara wiadomość nie kończy czekania. Kod 0 i
+    nagłówki nowej wiadomości na stdout, kod 3 po czasie, kod 1 przy błędzie."""
+    timeout = parse_duration(flag(args, "--timeout") or "6h")
+    every = max(20, parse_duration(flag(args, "--every") or "60"))
+    if len(args) < 2:
+        print("usage: claude-acc mail wait <skrzynka> <zapytanie> [--timeout 6h] [--every 60]", file=sys.stderr)
+        return 2
+    gw = Gateway(load_config(), client="cli:wait")
+    query = " ".join(args[1:])
+    seen = {m["id"] for m in gw.run("mail_search", {"mailbox": args[0], "query": query, "max_results": MAX_RESULTS})["messages"]}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(min(every, max(1, deadline - time.time())))
+        try:
+            found = gw.run("mail_search", {"mailbox": args[0], "query": query, "max_results": 10})["messages"]
+        except MailError as exc:
+            print(f"błąd (ponawiam): {exc}", file=sys.stderr)
+            continue
+        new = [m for m in found if m["id"] not in seen]
+        if new:
+            print(render({"mailbox": args[0], "query": query, "new": new}))
+            return 0
+    print(f"brak nowej wiadomości dla {query!r} w {args[0]} przez {timeout // 60} min", file=sys.stderr)
+    return 3
 
 def terminal_confirm(text):
     if not sys.stdin.isatty():
@@ -2617,8 +2722,12 @@ def main(argv):
             return cmd_add(args)
         if cmd == "remove":
             return cmd_remove(args)
-        if cmd == "install-mcp":
-            return install_mcp(args[0] if args else "mail")
+        if cmd in ("install", "install-mcp"):
+            return cmd_install(args)
+        if cmd == "uninstall":
+            return cmd_uninstall(args)
+        if cmd == "wait":
+            return cmd_wait(args)
         if cmd == "status":
             return status("--json" in args)
         if cmd == "mcp":

@@ -54,13 +54,13 @@ struct MailCard: View {
 
     private var subline: String {
         guard let panel, panel.configured else {
-            return "claude-acc mail add <address> gmail|imap, then claude-acc mail install-mcp"
+            return "claude-acc mail add <address> gmail|imap, then claude-acc mail install"
         }
         var parts: [String] = []
         if let identity = panel.identity, !identity.ok {
             parts.append("Google: \(identity.reason ?? "sign-in failed")")
         }
-        if !panel.mcpRegistered { parts.append("MCP off: claude-acc mail install-mcp") }
+        if !panel.mcpRegistered { parts.append("MCP off: claude-acc mail install") }
         if let call = panel.recent.first {
             parts.append("last: \(callLabel(call)) \(Format.ago(call.at, now: now))")
         } else if let checked = panel.checkedAt {

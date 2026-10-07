@@ -222,7 +222,8 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc mail add <address> gmail\|imap [read\|modify\|draft] [--send] [...]` | Add a mailbox; for IMAP the password goes into the Keychain |
 | `claude-acc mail google --service-account SA [--aws-audience A --aws-profile P]` | The Google service account and the identity that signs for it |
 | `claude-acc mail doctor` | Check the identity and every mailbox |
-| `claude-acc mail install-mcp` | Register the `mail` MCP server for every Claude Code session |
+| `claude-acc mail install` / `uninstall` | Register the `mail` MCP server, the `mail` skill and the prompt hint for every Claude Code session |
+| `claude-acc mail wait <mailbox> '<query>' [--timeout 6h]` | Wait for a new matching message; agents run it in the background and get woken when it arrives |
 | `claude-acc mail search\|read\|thread\|attachment\|modify\|draft\|send ...` | The same tools from the shell |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
@@ -399,7 +400,7 @@ Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is op
 
 ## Mail gateway
 
-`claude-acc mail mcp` is a stdio [MCP](https://modelcontextprotocol.io) server (protocol 2026-07-28 without a handshake and 2025-11-25 with one, no SDK, Python standard library only) with eight tools: `mail_mailboxes`, `mail_search`, `mail_read`, `mail_thread`, `mail_attachment`, `mail_modify`, `mail_draft` and `mail_send`. `claude-acc mail install-mcp` registers it as `mail` in your user scope, so every session on the Mac has it; scripts and other agents get the same tools from `claude-acc mail <tool>`. Configuration lives in `~/.local/share/claude-acc/mail.json` (0600).
+`claude-acc mail mcp` is a stdio [MCP](https://modelcontextprotocol.io) server (protocol 2026-07-28 without a handshake and 2025-11-25 with one, no SDK, Python standard library only) with eight tools: `mail_mailboxes`, `mail_search`, `mail_read`, `mail_thread`, `mail_attachment`, `mail_modify`, `mail_draft` and `mail_send`. `claude-acc mail install` registers it as `mail` in your user scope, so every session on the Mac has it, together with the `mail` skill and a prompt hint (below); scripts and other agents get the same tools from `claude-acc mail <tool>`. Configuration lives in `~/.local/share/claude-acc/mail.json` (0600).
 
 **Mailboxes.** Each one has a provider, a level and a send switch:
 
@@ -429,6 +430,14 @@ Configuration lives in `~/.local/share/claude-acc/updates.json`. Every key is op
 Tokens stay in memory, one per mailbox and scope, and each call asks for the narrowest scope it needs.
 
 **IMAP and SMTP.** Any server over TLS. The password, or an app password, sits in the Keychain under the service `claude-acc-mail` (`claude-acc mail add` asks for it through `security`, so it never shows up in a process list or your shell history); `--xoauth2-command` takes a command that prints an OAuth token instead, for Microsoft 365 and the like. Search takes the useful part of Gmail's syntax (`from: to: cc: subject: newer_than:7d after: before: is:unread is:starred in:FOLDER` and words) and turns it into IMAP `SEARCH`; threads are rebuilt from `Message-ID` and `References`; `UNREAD` and `STARRED` are flags, removing `INBOX` moves to the archive folder and `TRASH` to the trash; drafts are appended to the drafts folder, and a sent draft goes out over SMTP and lands in the sent folder. Folder names default to `INBOX`, `Archive`, `Trash`, `Drafts` and `Sent` and can be set per mailbox (`archive_folder`, `trash_folder`, `drafts_folder`, `sent_folder`).
+
+**How agents find it.** `claude-acc mail install` puts three things in place, and `claude-acc-setup` refreshes them whenever mailboxes are configured:
+
+- the `mail` skill (`~/.claude/skills/mail/SKILL.md`): a description of a few lines that Claude Code keeps in context, and a short recipe it loads only when a task needs an email (find, read, attachment, answer, send, file, wait);
+- a prompt hint: a `UserPromptSubmit` hook (`mailhint.py`, about 10 ms, exec form) that gives the session one line with your mailboxes and their levels when your message talks about mail, a reply from someone, a verification code or one of the configured addresses, at most once per session;
+- the guard: the dev server guard's Bash hook refuses commands that read the gateway's secrets out of the Keychain (`security find-generic-password ... claude-acc-mail`, `dump-keychain`), so the key and passwords stay with the gateway.
+
+`claude-acc mail wait <mailbox> '<query>'` waits for a new message matching the query (messages that already matched when it started don't count). An agent runs it in the background and is woken by Claude Code when it exits: code 0 with the message, 3 after `--timeout`.
 
 **Untrusted content.** An email is data from a stranger. The gateway strips control, zero-width and bidirectional characters, turns HTML into text without scripts and styles, cuts long bodies, lists links without opening them, and hands bodies to the agent inside `<untrusted-email id="...">` with a random id per call, so a message can't close the envelope early; a fake tag inside a message is removed. Attachments go to `~/.local/share/claude-acc/mail/attachments` with owner-only permissions. The server's instructions tell the agent never to act on what an email asks. Every call, successful or not, is appended to `~/.local/share/claude-acc/mail/audit.jsonl` with the client, tool, mailbox and ids, never the content.
 

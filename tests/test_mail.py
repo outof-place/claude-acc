@@ -662,5 +662,119 @@ class KeyIdentity(unittest.TestCase):
         self.assertIn(b"Verified OK", check.stdout)
 
 
+_hspec = importlib.util.spec_from_file_location("mailhint", os.path.join(os.path.dirname(HERE), "mailhint.py"))
+mailhint = importlib.util.module_from_spec(_hspec)
+_hspec.loader.exec_module(mailhint)
+
+
+class Hint(unittest.TestCase):
+    PANEL = {"mailboxes": [{"mailbox": "contact@portivo.eu", "provider": "gmail", "access": "draft", "send": "ask"}]}
+
+    def run_hint(self, prompt, session="s1"):
+        with open(os.path.join(TMP, "panel.json"), "w") as f:
+            json.dump(self.PANEL, f)
+        out = io.StringIO()
+        with mock.patch.object(mailhint, "MAIL_DIR", TMP), mock.patch("sys.stdout", out):
+            mailhint.hint(json.dumps({"prompt": prompt, "session_id": session}))
+        return out.getvalue()
+
+    def test_mail_words_and_addresses_trigger_once(self):
+        first = self.run_hint("przyszła odpowiedź na contact portivo", "a1")
+        self.assertIn("contact@portivo.eu (gmail, draft, sends after the user approves)", first)
+        self.assertEqual(self.run_hint("sprawdź maila", "a1"), "")  # raz na sesję
+        self.assertIn("mail", self.run_hint("jaki jest kod weryfikacyjny?", "a2"))
+
+    def test_quiet_on_unrelated_prompts(self):
+        for i, prompt in enumerate(["odpowiedz mi krótko", "napisz kod", "mailing nie działa", "przyszły tydzień"]):
+            self.assertEqual(self.run_hint(prompt, f"q{i}"), "", prompt)
+
+
+_gspec = importlib.util.spec_from_file_location("devguard", os.path.join(os.path.dirname(HERE), "devguard.py"))
+devguard = importlib.util.module_from_spec(_gspec)
+_gspec.loader.exec_module(devguard)
+
+
+class SecretGuard(unittest.TestCase):
+    def decide(self, command):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            devguard.admit(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/tmp"}))
+        return "deny" if '"deny"' in out.getvalue() else "allow"
+
+    def test_keychain_reads_denied(self):
+        for command in (
+            "security find-generic-password -s claude-acc-mail -a google-service-account -w",
+            "rtk proxy security find-generic-password -s claude-acc-mail -a info@x.example -g",
+            "security dump-keychain -d login.keychain",
+        ):
+            self.assertEqual(self.decide(command), "deny", command)
+
+    def test_other_commands_pass(self):
+        for command in ("claude-acc mail doctor", "grep -r claude-acc-mail README.md", "security list-keychains"):
+            self.assertEqual(self.decide(command), "allow", command)
+
+    def test_native_gate_sees_the_words(self):
+        import re
+
+        gate = re.compile(devguard.HOOK_GATE)
+        self.assertTrue(gate.search("security find-generic-password -s claude-acc-mail -w"))
+        self.assertTrue(gate.search("security dump-keychain"))
+
+
+class Install(unittest.TestCase):
+    def test_hint_hook_added_once_and_removed_without_touching_others(self):
+        path = os.path.join(TMP, "settings.json")
+        other = {"type": "command", "command": "/usr/local/bin/mine"}
+        with open(path, "w") as f:
+            json.dump({"hooks": {"UserPromptSubmit": [{"hooks": [other]}]}, "model": "x"}, f)
+        mail.set_hint(True, path)
+        mail.set_hint(True, path)
+        with open(path) as f:
+            hooks = json.load(f)["hooks"]["UserPromptSubmit"]
+        flat = [h for g in hooks for h in g["hooks"]]
+        self.assertEqual(sum(1 for h in flat if mail.ours(h)), 1)
+        self.assertIn(other, flat)
+        self.assertEqual(next(h for h in flat if mail.ours(h))["args"][-1], "mailhint")
+        mail.set_hint(False, path)
+        with open(path) as f:
+            data = json.load(f)
+        self.assertEqual(data["hooks"]["UserPromptSubmit"], [{"hooks": [other]}])
+        self.assertEqual(data["model"], "x")
+
+
+class Wait(unittest.TestCase):
+    def test_returns_only_a_new_message(self):
+        rounds = [[{"id": "old"}], [{"id": "old"}], [{"id": "new", "subject": "SIDO"}, {"id": "old"}]]
+
+        class Gw:
+            def __init__(self, cfg, client=None):
+                pass
+
+            def run(self, name, args):
+                return {"messages": rounds.pop(0)}
+
+        out = io.StringIO()
+        with mock.patch.object(mail, "Gateway", Gw), mock.patch.object(mail, "load_config", lambda: {}), \
+                mock.patch.object(mail.time, "sleep", lambda s: None), mock.patch("sys.stdout", out):
+            code = mail.cmd_wait(["contact@example.com", "from:comreg.ie", "--every", "20", "--timeout", "1h"])
+        self.assertEqual(code, 0)
+        self.assertIn('"id": "new"', out.getvalue())
+        self.assertNotIn('"id": "old"', out.getvalue())
+
+    def test_timeout_code_3(self):
+        class Gw:
+            def __init__(self, cfg, client=None):
+                pass
+
+            def run(self, name, args):
+                return {"messages": [{"id": "old"}]}
+
+        clock = iter(range(0, 10**6, 100))
+        with mock.patch.object(mail, "Gateway", Gw), mock.patch.object(mail, "load_config", lambda: {}), \
+                mock.patch.object(mail.time, "sleep", lambda s: None), mock.patch.object(mail.time, "time", lambda: next(clock)), \
+                mock.patch("sys.stderr", io.StringIO()):
+            self.assertEqual(mail.cmd_wait(["contact@example.com", "x", "--timeout", "10m"]), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
