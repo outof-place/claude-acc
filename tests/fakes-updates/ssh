@@ -1,0 +1,14 @@
+#!/usr/bin/python3
+"""Atrapa ssh: tylko `ssh -T git@github.com`; czy GitHub przyjmie klucz, mówi world["ssh_github"]."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _world
+
+_world.record("ssh", sys.argv[1:])
+if _world.load().get("ssh_github"):
+    print("Hi you! You've successfully authenticated, but GitHub does not provide shell access.", file=sys.stderr)
+    sys.exit(1)
+print("git@github.com: Permission denied (publickey).", file=sys.stderr)
+sys.exit(255)
