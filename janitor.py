@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -86,6 +87,23 @@ DEFAULT_CONFIG = {
     # [{"path": "~/.cache/portivo-perf/*/builds", "max_gb": 10, "keep": 1}]; wpisy w środku
     # ponad limit idą od najstarszych, `keep` najnowszych zostaje zawsze
     "caps": [],
+    # przezroczysta kompresja APFS (afsctool) plików, których nikt już nie zmienia:
+    # {"paths": ["~/.claude/projects"]}; pozostałe klucze w COMPRESS_DEFAULTS
+    "compress": {},
+}
+
+COMPRESS_DEFAULTS = {
+    # katalogi albo wzorce glob; puste wyłącza zadanie
+    "paths": [],
+    # plik zmieniony w ostatnich tylu minutach to zapis w toku
+    "min_age_minutes": 60,
+    # LZFSE: kompresja jak zlib, dekompresja kilka razy szybsza
+    "compressor": "LZFSE",
+    "threads": 4,
+    # afsctool czyta cały plik do pamięci, więc większe zostają
+    "max_file_mb": 1024,
+    # aplikacje (.app), które właśnie działają, zostają w spokoju
+    "exclude_running_apps": True,
 }
 
 # katalogi, do których skan projektów nie schodzi: zależności, buildy, cache, historia
@@ -871,6 +889,142 @@ def task_caps(sw, _scan):
                 sw.remove("caps", path, lambda n, want=name: n == want)
 
 
+# granica czasu dla każdego katalogu: pliki zmienione wcześniej już przeszły kompresję
+COMPRESS_STATE_PATH = os.path.join(STATE_DIR, "janitor-compress.json")
+UID = os.getuid()
+# afsctool dostaje pliki paczkami, żeby lista argumentów nie przekroczyła ARG_MAX
+COMPRESS_CHUNK = 200
+
+
+def bundle_of(path):
+    """Katalog .app, w którym leży plik, albo None."""
+    parts = path.split("/")
+    for i, part in enumerate(parts):
+        if part.endswith(".app"):
+            return "/".join(parts[: i + 1])
+    return None
+
+
+def compress_candidates(root, since, until, max_bytes, skip_bundles=()):
+    """Pliki do kompresji APFS: zwykłe, niepuste, jeszcze nieskompresowane, zapisywalne,
+    zmienione po `since` i nie później niż `until`. [(ścieżka, bajty na dysku, zmiana)]
+
+    Plik już skompresowany ma flagę UF_COMPRESSED, więc spacer nie czyta treści. Zmiana to
+    max(mtime, ctime): rozpakowana aktualizacja aplikacji ma stare mtime z archiwum, ale
+    świeży ctime. Twarde dowiązania (store pnpm) liczą się raz, po i-węźle.
+    """
+    found, inodes = [], set()
+    stack = [root]
+    while stack:
+        try:
+            entries = os.scandir(stack.pop())
+        except OSError:
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name.startswith(TRASH_PREFIX):
+                            continue
+                        if entry.name.endswith(".app") and entry.path in skip_bundles:
+                            continue
+                        stack.append(entry.path)
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                when = max(st.st_mtime, st.st_ctime)
+                if (
+                    st.st_flags & stat.UF_COMPRESSED
+                    or st.st_size == 0
+                    or st.st_size > max_bytes
+                    or not since < when <= until
+                    or (st.st_dev, st.st_ino) in inodes
+                    # właściciel kompresuje też plik tylko do odczytu (obiekty gita, moduły Go)
+                    or not (st.st_uid == UID or os.access(entry.path, os.W_OK))
+                ):
+                    continue
+                inodes.add((st.st_dev, st.st_ino))
+                found.append((entry.path, st.st_blocks * 512, when))
+    return found
+
+
+def allocated(paths):
+    total = 0
+    for path in paths:
+        try:
+            total += os.lstat(path).st_blocks * 512
+        except OSError:
+            pass
+    return total
+
+
+def task_compress(sw, _scan):
+    """Przezroczysta kompresja APFS (afsctool) plików, których nikt już nie zmienia.
+
+    Pliki czytają się jak zwykle, dekompresuje je jądro; tak samo Apple trzyma pliki
+    systemu. Dopisanie do skompresowanego pliku (transkrypt sesji Claude) zapisuje go
+    z powrotem bez kompresji, więc zadanie wraca do plików zmienionych od poprzedniego
+    przebiegu, ale dopiero gdy przeleżą `min_age_minutes`. Pomija pliki otwarte, aplikacje,
+    które właśnie działają (kompresja w miejscu podmienia zmapowany plik wykonywalny),
+    cudze pliki bez prawa zapisu (janitor nie ma roota) i ścieżki z `protect`.
+
+    Oszczędność to różnica bloków na dysku przed i po. Klony APFS (pnpm na APFS kopiuje
+    klonami) dzielą bloki, a po kompresji każdy ma własne, więc dla nich zysk bywa ujemny.
+    """
+    conf = dict(COMPRESS_DEFAULTS, **(sw.cfg.get("compress") or {}))
+    roots = [p for pattern in conf["paths"] for p in sorted(glob.glob(os.path.expanduser(pattern)))]
+    if not roots:
+        return
+    tool = which("afsctool")
+    if not tool:
+        log("compress: brak afsctool (brew install afsctool), pomijam")
+        sw.warnings.append("Kompresja APFS wymaga afsctool: brew install afsctool")
+        return
+    running = set()
+    if conf["exclude_running_apps"]:
+        for command in sw.usage.commands:
+            bundle = bundle_of(command.split(" -", 1)[0])
+            if bundle:
+                running.add(bundle)
+    state = load_json(COMPRESS_STATE_PATH, {})
+    until = time.time() - conf["min_age_minutes"] * 60
+    max_bytes = conf["max_file_mb"] * 1024**2
+    for root in roots:
+        real = os.path.realpath(root)
+        if not os.path.isdir(real) or sw.protected(real, real=True):
+            continue
+        since = state.get(real, 0)
+        files = compress_candidates(real, since, until, max_bytes, skip_bundles=running)
+        ready, busy = [], []
+        for path, size, when in files:
+            bundle = bundle_of(path)
+            if (bundle and bundle in running) or sw.protected(path, real=True) or sw.usage.holds(path):
+                busy.append(when)
+            else:
+                ready.append((path, size))
+        before = sum(size for _, size in ready)
+        if sw.dry_run:
+            print(f"kompresja APFS: {short(root)}: {len(ready)} plików, {human(before)} do skompresowania")
+            continue
+        paths = [path for path, _ in ready]
+        for i in range(0, len(paths), COMPRESS_CHUNK):
+            run(
+                [tool, "-c", "-T", conf["compressor"], f"-J{conf['threads']}", *paths[i : i + COMPRESS_CHUNK]],
+                timeout=3600,
+            )
+        saved = before - allocated(paths)
+        sw.record("compress", f"kompresja APFS {short(root)}", saved)
+        if paths:
+            log(f"compress: {short(root)}: {len(paths)} plików, {human(before)} -> {human(before - saved)}")
+        # pliki pominięte jako zajęte wrócą w następnym przebiegu
+        state[real] = min([until] + [when - 1 for when in busy])
+    if not sw.dry_run:
+        write_json(COMPRESS_STATE_PATH, state, indent=1)
+
+
 def task_logs(sw, _scan):
     since = time.time() - sw.cfg["log_days"] * DAY
     for root, dirs, files in os.walk(os.path.join(HOME, "Library/Logs")):
@@ -896,6 +1050,8 @@ TASKS = [
     ("brew", task_brew, WEEK),
     ("uv", task_uv, WEEK),
     ("logs", task_logs, DAY),
+    # na końcu: nie kompresuje tego, co przebieg właśnie skasował
+    ("compress", task_compress, 0),
 ]
 
 

@@ -10,6 +10,7 @@ Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -298,6 +299,157 @@ class JanitorTest(unittest.TestCase):
             ["/usr/bin/python3", SCRIPT, "sweep"], env=env, check=True, timeout=60
         )
         self.assertTrue(self.env.exists("idle2/.next"))
+
+
+def compressed(path):
+    return bool(os.stat(path).st_flags & stat.UF_COMPRESSED)
+
+
+AFSCTOOL = shutil.which("afsctool", path="/opt/homebrew/bin:/usr/local/bin")
+
+
+class CompressCandidatesTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="compress-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def write(self, rel, text="log line\n" * 2000):
+        path = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def names(self, **kwargs):
+        args = dict(since=0, until=time.time() + 5, max_bytes=1024**3)
+        args.update(kwargs)
+        found = self.janitor.compress_candidates(self.root, **args)
+        return sorted(os.path.relpath(path, self.root) for path, _, _ in found)
+
+    def test_age_window_and_size_limit(self):
+        self.write("a.jsonl")
+        self.write("empty.log", "")
+        self.write("big.bin", "x" * 50000)
+        now = time.time()
+        self.assertEqual(self.names(), ["a.jsonl", "big.bin"])
+        # zmienione przed chwilą to zapis w toku; zmienione przed `since` już przeszło kompresję
+        self.assertEqual(self.names(until=now - 3600), [])
+        self.assertEqual(self.names(since=now + 1), [])
+        self.assertEqual(self.names(max_bytes=40000), ["a.jsonl"])
+
+    def test_hard_links_count_once_and_running_bundles_are_skipped(self):
+        first = self.write("store/dep.js")
+        os.link(first, os.path.join(self.root, "node_modules-dep.js"))
+        self.write("Live.app/Contents/Resources/strings.txt")
+        self.write("Idle.app/Contents/Resources/strings.txt")
+        live = os.path.join(self.root, "Live.app")
+        found = self.names(skip_bundles={live})
+        self.assertEqual(len([n for n in found if n.endswith("dep.js")]), 1)
+        self.assertIn("Idle.app/Contents/Resources/strings.txt", found)
+        self.assertNotIn("Live.app/Contents/Resources/strings.txt", found)
+
+    def test_bundle_of(self):
+        path = "/Applications/Brave Browser.app/Contents/Frameworks/X.framework/Helpers/H.app/Contents/MacOS/H"
+        self.assertEqual(self.janitor.bundle_of(path), "/Applications/Brave Browser.app")
+        self.assertIsNone(self.janitor.bundle_of("/opt/homebrew/bin/afsctool"))
+
+    def test_missing_afsctool_warns_and_changes_nothing(self):
+        path = self.write("a.jsonl")
+        cfg = dict(self.janitor.DEFAULT_CONFIG, compress={"paths": [self.root], "min_age_minutes": 0})
+        sw = self.janitor.Sweep(cfg, dry_run=False)
+        original = self.janitor.which
+        self.janitor.which = lambda name: None
+        try:
+            self.janitor.task_compress(sw, None)
+        finally:
+            self.janitor.which = original
+        self.assertTrue(any("afsctool" in w for w in sw.warnings))
+        self.assertFalse(compressed(path))
+
+
+@unittest.skipUnless(AFSCTOOL, "brak afsctool (brew install afsctool)")
+class CompressSweepTest(unittest.TestCase):
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.cleanup)
+        self.logs = os.path.join(self.env.work, "logs")
+        self.env.config(compress={"paths": [self.logs], "min_age_minutes": 0, "threads": 2})
+
+    def write(self, rel, mode=None):
+        path = self.env.file(f"logs/{rel}", text='{"type":"assistant","text":"hello"}\n')
+        if mode is not None:
+            os.chmod(path, mode)
+        return path
+
+    def test_sweep_compresses_and_records_savings(self):
+        log = self.write("session.jsonl")
+        frozen = self.write("objects/pack.idx", mode=0o444)  # jak obiekty gita: tylko do odczytu
+        self.env.sweep()
+        self.assertTrue(compressed(log))
+        self.assertTrue(compressed(frozen))
+        with open(log) as f:
+            self.assertTrue(f.read().startswith('{"type"'))
+        state = self.env.state()
+        self.assertIn("compress", state["task_runs"])
+        self.assertGreater(state["last_sweep"]["freed"], 0)
+
+    def test_appended_file_is_compressed_again(self):
+        log = self.write("session.jsonl")
+        self.env.sweep()
+        with open(log, "a") as f:
+            f.write("more\n" * 100)
+        self.assertFalse(compressed(log))  # APFS zapisuje dopisany plik bez kompresji
+        time.sleep(1.1)
+        self.env.sweep()
+        self.assertTrue(compressed(log))
+
+    def test_open_file_waits(self):
+        log = self.write("session.jsonl")
+        with open(log, "a"):
+            self.env.sweep()
+        self.assertFalse(compressed(log))
+        self.env.sweep()
+        self.assertTrue(compressed(log))
+
+    def test_protected_path_stays(self):
+        log = self.write("footage/notes.txt")
+        self.env.config(
+            compress={"paths": [self.logs], "min_age_minutes": 0},
+            protect=[os.path.join(self.logs, "footage")],
+        )
+        self.env.sweep()
+        self.assertFalse(compressed(log))
+
+    def test_dry_run_compresses_nothing(self):
+        log = self.write("session.jsonl")
+        out = self.env.sweep("--dry-run")
+        self.assertIn("kompresja APFS", out)
+        self.assertFalse(compressed(log))
+        self.assertFalse(os.path.exists(os.path.join(self.env.state_dir, "janitor-compress.json")))
+
+    @unittest.skipUnless(shutil.which("cc"), "brak kompilatora C")
+    def test_running_app_stays_whole(self):
+        apps = os.path.join(self.env.work, "logs/Apps")
+        live = os.path.join(apps, "Live.app/Contents")
+        os.makedirs(os.path.join(live, "MacOS"))
+        source = os.path.join(self.env.home, "live.c")
+        with open(source, "w") as f:
+            f.write("#include <unistd.h>\nint main(void) { sleep(60); return 0; }\n")
+        binary = os.path.join(live, "MacOS/Live")
+        subprocess.run(["cc", "-o", binary, source], check=True)
+        resource = self.write("Apps/Live.app/Contents/Resources/strings.txt")
+        idle = self.write("Apps/Idle.app/Contents/Resources/strings.txt")
+        proc = subprocess.Popen([binary])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        time.sleep(0.3)
+        self.env.sweep()
+        self.assertFalse(compressed(resource))
+        self.assertTrue(compressed(idle))
 
 
 if __name__ == "__main__":
