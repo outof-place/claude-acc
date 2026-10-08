@@ -5,6 +5,7 @@ import SwiftUI
 
 struct AwakeCard: View {
     let awake: Awake
+    var store: Store?
     @Environment(\.now) private var now
 
     private static let presets: [(label: String, seconds: TimeInterval?)] = [
@@ -37,8 +38,14 @@ struct AwakeCard: View {
                     SettingRow("Keep the display on", symbol: "display", isOn: binding(\.keepDisplayOn))
                     SettingRow("Auto on any hotspot", symbol: "personalhotspot", isOn: binding(\.autoOnHotspot))
                     SettingRow("Keep the hotspot alive", symbol: "antenna.radiowaves.left.and.right", isOn: binding(\.keepHotspotAlive))
+                    if let store {
+                        SettingRow("Hotspot turbo", symbol: "gauge.with.dots.needle.67percent", isOn: Binding(
+                            get: { store.hotspotEnabled }, set: { store.setHotspot($0) }))
+                            .help("Shapes uploads just under the iPhone's uplink, so one session's upload doesn't queue everyone else's requests")
+                    }
                 }
                 hotspotLine
+                if let store, store.hotspotEnabled { turboLine(store) }
             }
         } accessory: {
             Toggle("Stay awake", isOn: Binding(
@@ -84,6 +91,29 @@ struct AwakeCard: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
+        .lineLimit(1)
+    }
+
+    @ViewBuilder private func turboLine(_ store: Store) -> some View {
+        HStack(spacing: 6) {
+            let state = store.hotspotLive
+            StatusDot(color: state?.active == true ? (state?.shaping == false ? .orange : Format.violet) : .gray, size: 7)
+            if !store.hotspotInstalled {
+                Text("Turbo needs its root helper: claude-acc hotspot install")
+            } else if let state, state.active, let rate = state.rateKbps {
+                let queue = state.delayP90Ms.map { " · queue p90 \(Int($0.rounded())) ms" } ?? ""
+                Text(state.shaping == false
+                     ? "Turbo: probes lost, upload unshaped"
+                     : "Turbo: upload \(String(format: "%.1f", Double(rate) / 1000)) Mb/s cap\(queue)")
+            } else if state != nil {
+                Text("Turbo: waits for the iPhone hotspot")
+            } else {
+                Text("Turbo: the root helper isn't answering")
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .monospacedDigit()
         .lineLimit(1)
     }
 

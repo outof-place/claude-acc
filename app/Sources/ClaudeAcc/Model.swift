@@ -332,6 +332,21 @@ struct PerfFile: Decodable {
     let ultra: Ultra?
 }
 
+// MARK: - Hotspot turbo (`hotspot-state.json`, written by the root hotspot daemon)
+
+struct HotspotState: Decodable, Equatable {
+    let at: Double
+    let enabled: Bool
+    let active: Bool
+    let iface: String?
+    let via: String?
+    let rateKbps: Int?
+    let txKbps: Int?
+    let delayP90Ms: Double?
+    /// False while no probe comes back: the daemon lifts the limit rather than shape blind.
+    let shaping: Bool?
+}
+
 // MARK: - Fans (`fans-state.json`, written by the root fanctl daemon)
 
 struct FanState: Decodable {
