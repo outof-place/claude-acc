@@ -55,7 +55,9 @@ func handOver() -> Never {
     guard written == event.count, lseek(fd, 0, SEEK_SET) == 0, dup2(fd, STDIN_FILENO) >= 0 else { exit(0) }
     close(fd)
     let python = interpreter()
-    let args = [python, state + "/devguard.py", "admit"]
+    // `claude-acc-hook codex`: the same hook for Codex, whose rewrite needs an "allow" next to it
+    let codex = CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "codex"
+    let args = [python, state + "/devguard.py", "admit"] + (codex ? ["--codex"] : [])
     var argv = args.map { strdup($0) } + [nil]
     execv(python, &argv)
     exit(0)  // the hook never blocks an agent over its own failure
@@ -67,7 +69,10 @@ guard let data = FileManager.default.contents(atPath: state + "/hook-words.json"
 else { handOver() }
 
 guard let parsed = try? JSONSerialization.jsonObject(with: event) as? [String: Any] else { exit(0) }
-let command = (parsed["tool_input"] as? [String: Any])?["command"] as? String ?? ""
+let input = parsed["tool_input"] as? [String: Any]
+// Codex sends a shell command as a string, as an argv array, or as `cmd` (exec_command)
+let command = input?["command"] as? String ?? input?["cmd"] as? String
+    ?? (input?["command"] as? [String])?.joined(separator: " ") ?? ""
 
 // Python's `word in command` compares code points; on UTF-8 bytes that is a byte search
 let bytes = Array(command.utf8)

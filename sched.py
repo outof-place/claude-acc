@@ -10,6 +10,7 @@ gradle, pod install) i start symulatora; jeden taki build to 6-12 GB, więc czek
   sched.py depot [--max-age S] [--json]
   sched.py wait [--max S] [--every S] -- 'WARUNEK'
   sched.py rtk-excludes [--write [PATH]]
+  sched.py codex install|uninstall|status
 
 `run` klasyfikuje komendę (moduł, czasownik, zakres pakietów), przewiduje jej szczyt pamięci i
 czas z historii, a potem:
@@ -552,6 +553,34 @@ def simulators_info(snap):
         return None
 
 
+def guard_view(snap):
+    """(stopień hamulca, długo żyjące w GB, rodziny) z pomiaru strażnika (devguard_snapshot);
+    (0, None, []) bez niego. Stopień: 0 spokój, 1 ciasno, 2 hamulec, 3 awaria (lastresort.py),
+    tylko z pomiaru młodszego niż 30 s: strażnik przy hamulcu mierzy co 2 s."""
+    if not snap:
+        return 0, None, []
+    try:
+        age = time.time() - float(snap.get("at", 0))
+        if age >= 120:
+            return 0, None, []
+        stage = int((snap.get("pressure") or {}).get("stage") or 0) if age < 30 else 0
+        inv = snap.get("inventory") or {}
+        fams = [
+            {"family": name, "gb": round(f["footprint"] / GB, 2), "count": f["count"]}
+            for name, f in sorted((inv.get("families") or {}).items(), key=lambda kv: -kv[1]["footprint"])
+            if name in LONG_LIVED_FAMILIES
+        ]
+        long_lived = inv.get("long_lived")
+        return stage, (round(long_lived / GB, 2) if long_lived is not None else None), fams
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return 0, None, []
+
+
+# rodziny procesów, które strażnik liczy jako długo żyjące (devguard_core.LONG_LIVED)
+LONG_LIVED_FAMILIES = ("dev", "metro", "watchers", "simulators", "headless", "lsp", "docker")
+STAGE_TEXT = ("normal", "tight", "brake", "emergency")
+
+
 # ---------- klasyfikacja komendy ----------
 
 WRAPPERS = {"rtk", "time", "nice", "env", "caffeinate", "command", "exec", "nohup"}
@@ -565,6 +594,8 @@ SKIP_MARKERS = (
     "depot-exec.sh",
     "depot-ci.sh",
     "SCHED_OFF=1",
+    "claude-acc sched",
+    "claude-acc' sched",
 )
 REDIRECTS = re.compile(r"(?:(?<=\s)|^)(?:\d*>&\d+|&>>?\s*\S+|\d*>>?\s*\S+|\d*<\s*\S+)")
 TAKES_VALUE = {
@@ -767,6 +798,20 @@ RTK_EXCLUDES = (
     r"^xcrun simctl (boot|bootstatus( \S+)* -b)(\s|$)",
     r'^open( \S+)* (-a "?Simulator(\.app)?"?|\S*/Simulator\.app)(\s|$)',
     r"^portivo-mobile up(\s|$)",
+    # reszta ciężkiej pracy (GENERIC_TOOLS); rtk porównuje je z komendą po swojej normalizacji
+    # (`python -m pytest` i `uv run pytest` to dla niego `pytest`), więc test sprawdza je samym rtk
+    r"^cargo (build|b|test|t|check|c|clippy|run|r|bench|doc|nextest|install|llvm-cov|tarpaulin|miri)(\s|$)",
+    r"^swift (build|test|run)(\s|$)",
+    r"^(pytest|py\.test|mypy)(\s|$)",
+    r"^docker (buildx build|compose build|image build|build)(\s|$)",
+    r"^(just|task)(\s|$)",
+    r"^deno (test|task|run|compile|check|bench)(\s|$)",
+    r"^(\S*/)?mvnw?(\s|$)",
+    r"^nx (run|run-many|affected|build|test|lint|e2e)(\s|$)",
+    r"^bun (\S+\.[cm]?[jt]sx?|build)(\s|$)",
+    r"^uv run(\s|$)",
+    r"^(npx( -y| --yes)? |bunx |(pnpm|yarn|bun) (exec |dlx |x )|npm exec (-- )?)(lighthouse|unlighthouse|cypress|mocha|ava|webpack|rollup|parcel|tsup|astro|nuxt|nuxi|svelte-check|storybook|nx|lerna|cargo|pytest|mypy|pyright|tox|nox)(\s|$)",
+    r"^(pnpm|yarn|npm|bun)( (-r|--recursive|-ws|--workspaces|-s|--silent|--if-present|--\S+=\S+|(-C|--dir|--prefix|--cwd|-F|--filter|--workspace|-w) \S+|-w))* (run|run-script) \S",
 )
 
 
@@ -1087,8 +1132,314 @@ def finish_native(raw):
     }
 
 
+# ---------- reszta ciężkiej pracy: po kształcie komendy, bez znajomości projektu ----------
+
+# Narzędzie -> (rodzaj, podkomendy, które pracują i same się kończą; None: każde wywołanie poza
+# flagami informacyjnymi). Wszystko tu jest ciężkie z natury: kompilacja, testy, przeglądarka,
+# symulator. Klasa joba to podpis komendy, uczony z historii jak Go i JS.
+GENERIC_TOOLS = {
+    "cargo": ("build", {"build", "b", "test", "t", "check", "c", "clippy", "run", "r", "bench", "doc", "nextest", "install", "llvm-cov", "tarpaulin", "miri"}),
+    "swift": ("build", {"build", "test", "run"}),
+    "pytest": ("test", None), "py.test": ("test", None), "tox": ("test", None), "nox": ("test", None),
+    "mypy": ("typecheck", None), "pyright": ("typecheck", None),
+    "deno": ("test", {"test", "task", "run", "compile", "check", "bench"}),
+    "bazel": ("build", {"build", "test", "run", "coverage"}), "bazelisk": ("build", {"build", "test", "run", "coverage"}),
+    "mvn": ("build", None), "mvnw": ("build", None),
+    "dotnet": ("build", {"build", "test", "run", "publish"}),
+    "nx": ("build", {"run", "run-many", "affected", "build", "test", "lint", "e2e"}),
+    "lerna": ("build", {"run"}),
+    "webpack": ("build", None), "rollup": ("build", None), "parcel": ("build", {"build"}), "tsup": ("build", None),
+    "astro": ("build", {"build", "check"}), "nuxt": ("build", {"build", "generate"}), "nuxi": ("build", {"build", "generate"}),
+    "svelte-check": ("typecheck", None),
+    "cypress": ("e2e", {"run"}), "mocha": ("test", None), "ava": ("test", None),
+    "lighthouse": ("e2e", None), "unlighthouse": ("e2e", None),
+    # xcodebuild, Gradle, expo i react-native zna parse_native (`expo export` jest tam lekki)
+    "storybook": ("build", {"build"}),
+    "just": ("script", None), "task": ("script", None), "make": ("script", None),
+}  # fmt: skip
+# `python -m X`: tylko moduły, które są pracą (testy, typecheck, budowanie paczki)
+PYTHON_MODULES = {"pytest": "test", "unittest": "test", "mypy": "typecheck", "pyright": "typecheck",
+                  "tox": "test", "nox": "test", "build": "build"}  # fmt: skip
+GENERIC_STOP_FLAGS = {"--version", "-V", "--help", "-h", "-version", "-help", "--list", "-l", "--watch",
+                      "-w"}  # fmt: skip
+# komendy, które się nie kończą albo nic nie liczą: dev serwery, watchery, demony, logi
+GENERIC_NEVER = re.compile(
+    r"(^|[/:_.-])(dev|serve|server|start|watch|preview|storybook|daemon|tail|logs?|repl|shell|console|emulator)([/:_.-]|$)"
+    r"|(serve|server|watch|daemon)$"
+)
+# podkomendy skryptu, które tylko pytają albo sprzątają (`stack.sh status`, `cli.js help`)
+LIGHT_SUBCOMMANDS = re.compile(r"^(status|stop|down|kill|ps|ls|list|help|version|show|whoami|info)$")
+# programy po pełnej ścieżce spoza projektu: systemowe, z Homebrew, aplikacje; tę samą listę ma
+# bramka hooka (devguard.HOOK_GATE)
+SYSTEM_PATHS = ("/usr/", "/bin/", "/sbin/", "/System/", "/opt/homebrew/", "/Library/", "/Applications/")
+# treść skryptu z package.json, który stawia serwer albo watcher (`"app": "next dev"`)
+SCRIPT_BODY_NEVER = re.compile(r"(^|[\s/:_-])(dev|serve|start|watch|preview|storybook)(\s|$|[:_-])|--watch")
+# skrypty menedżera pakietów, które są lekkie z natury: formatowanie, sprzątanie
+LIGHT_SCRIPTS = re.compile(r"^(format|fmt|prettier|clean|help|version|prepare|lint-staged)([:_-].*)?$")
+PM_BUILTINS = {
+    "add", "install", "i", "ci", "update", "up", "upgrade", "remove", "rm", "uninstall", "link", "unlink",
+    "import", "rebuild", "prune", "fetch", "patch", "patch-commit", "audit", "list", "ls", "ll", "outdated",
+    "why", "licenses", "store", "root", "bin", "env", "setup", "config", "get", "set", "doctor", "server",
+    "deploy", "help", "init", "create", "publish", "pack", "login", "logout", "whoami", "version", "info",
+    "view", "cache", "workspaces", "plugin", "constraints", "node", "npm", "dedupe", "explain", "search",
+    "owner", "dist-tag", "team", "token", "profile", "hook", "completion", "approve-builds", "self-update",
+}  # fmt: skip
+INTERPRETERS = re.compile(r"^(python(\d(\.\d+)?)?|node|tsx|ts-node|bun|bash|sh|zsh)$")
+NODE_VALUE_FLAGS = {"-r", "--require", "--import", "--loader", "--experimental-loader", "--env-file",
+                    "--conditions", "-C", "--input-type", "--title"}  # fmt: skip
+PYTHON_VALUE_FLAGS = {"-X", "-W", "-Q"}
+# przewidywanie do pierwszych biegów klasy (GB, s): ostrożnie, bo pierwszy bieg nieznanej komendy
+# może postawić przeglądarkę albo kompilator; potem p90 z historii
+GENERIC_PRIORS = {
+    "build": (6.0, 300), "test": (4.0, 180), "e2e": (4.0, 240), "typecheck": (3.0, 90),
+    "script": (4.0, 300), "run": (3.0, 120),
+}  # fmt: skip
+# docker: praca dzieje się w maszynie wirtualnej Dockera, nie w drzewie procesów komendy, więc
+# historia widzi z niej prawie nic; przewidywanie nie schodzi poniżej tego
+DOCKER_FLOOR_GB = 4.0
+# zmienna, którą `run` daje swojemu dziecku: `sched run` w środku wpuszczonego joba (skrypt,
+# który sam woła `claude-acc sched run`) nie czeka drugi raz na tę samą pamięć
+NESTED_ENV = "CLAUDE_ACC_SCHED_JOB"
+
+
+def generic_tool(words, here):
+    """Narzędzie z GENERIC_TOOLS albo docker: surowy job albo None."""
+    tool = os.path.basename(words[0])
+    args = words[1:]
+    if any(a.split("=", 1)[0] in GENERIC_STOP_FLAGS for a in args):
+        return None
+    positional = [a for a in args if not a.startswith("-")]
+    first = positional[0] if positional else None
+    if tool == "docker":
+        # `docker compose -f c.yml build`: wartość -f też stoi między słowami, więc build gdziekolwiek dalej
+        if positional[:1] == ["build"] or (positional[:1] in (["buildx"], ["compose"], ["image"]) and "build" in positional[1:]):
+            return {"kind": "build", "tool": "docker", "sig": "docker:build", "dir": here, "floor_gb": DOCKER_FLOOR_GB}
+        return None
+    if tool not in GENERIC_TOOLS:
+        return None
+    kind, verbs = GENERIC_TOOLS[tool]
+    if verbs is not None:
+        if first not in verbs:
+            return None
+        if tool == "cargo" and first in ("test", "t", "nextest", "bench"):
+            kind = "test"
+        elif tool in ("swift", "dotnet", "bazel", "bazelisk") and first == "test":
+            kind = "test"
+        elif tool == "nx" and first in ("test", "e2e", "lint"):
+            kind = {"lint": "typecheck"}.get(first, first)
+        sig = f"{tool}:{first}"
+    elif kind == "script":
+        # just/task/make: przepis, uczony z historii; bez celu to cel domyślny
+        target = first or "default"
+        if GENERIC_NEVER.search(target):
+            return None
+        sig = f"{tool}:{target}"
+    else:
+        sig = tool + (f":{first}" if first and re.match(r"^[a-z][\w:-]*$", first) else "")
+    if tool in ("webpack", "rollup", "tsup") and (first in ("serve", "watch") or "--watch" in args):
+        return None
+    return {"kind": kind, "tool": tool, "sig": sig, "dir": here}
+
+
+def script_sig(path, here):
+    """Ścieżka skryptu do podpisu klasy: względem repo, a spoza repo (tmp, scratchpad) sama nazwa,
+    bo te ścieżki są inne w każdej sesji."""
+    full = os.path.normpath(os.path.join(here, os.path.expanduser(path)))
+    repo = find_repo(here) if os.path.isdir(here) else None
+    if repo:
+        rel = os.path.relpath(full, repo)
+        if not rel.startswith(".."):
+            return rel
+    return os.path.basename(full)
+
+
+def interpreter_job(words, here):
+    """python/node/tsx/bun/bash ze skryptem z pliku: surowy job albo None (-c, -e, REPL, --version)."""
+    prog = os.path.basename(words[0])
+    tool = re.sub(r"\d.*$", "", prog) if prog.startswith("python") else prog
+    args = words[1:]
+    i = 0
+    while i < len(args) and args[i].startswith("-") and args[i] != "-":
+        flag = args[i].split("=", 1)[0]
+        if flag in ("-c", "-e", "-p", "--eval", "--print", "--version", "-V", "-v", "--help", "-h", "-i"):
+            return None
+        if tool == "python" and flag == "-m" and i + 1 < len(args):
+            module = args[i + 1]
+            kind = PYTHON_MODULES.get(module)
+            return kind and {"kind": kind, "tool": module, "sig": module, "dir": here}
+        if tool in ("node", "bun") and flag == "--test":
+            return {"kind": "test", "tool": tool, "sig": f"{tool}:--test", "dir": here}
+        takes = (tool == "python" and flag in PYTHON_VALUE_FLAGS) or (
+            tool in ("node", "tsx", "ts-node", "bun") and flag in NODE_VALUE_FLAGS and "=" not in args[i]
+        )
+        i += 2 if takes else 1
+    if i >= len(args) or args[i] == "-":
+        return None  # REPL albo skrypt ze stdin (heredoc): zwykle chwila liczenia
+    script = args[i]
+    if tool in ("bash", "sh", "zsh") and not script.endswith(".sh") and "/" not in script:
+        return None
+    if tool == "bun" and script in ("run", "x", "build"):
+        if script == "build":
+            return {"kind": "build", "tool": "bun", "sig": "bun:build", "dir": here}
+        return None  # bun run <skrypt> idzie przez parse_node albo pm_script
+    if tool == "bun" and not re.search(r"\.[cm]?[jt]sx?$", script):
+        return None
+    if GENERIC_NEVER.search(os.path.splitext(os.path.basename(script))[0]):
+        return None
+    if not os.path.isfile(os.path.join(here, os.path.expanduser(script))):
+        return None  # nie ma takiego pliku: komenda i tak padnie, nie ma czego wpuszczać
+    # pierwsze słowo po skrypcie to zwykle podkomenda (`manage.py test`, `cli.js capture`)
+    sub = next((a for a in args[i + 1 : i + 2] if re.match(r"^[a-z][\w:-]*$", a)), None)
+    if sub and (GENERIC_NEVER.search(sub) or LIGHT_SUBCOMMANDS.match(sub)):
+        return None
+    sig = f"{tool}:{script_sig(script, here)}" + (f":{sub}" if sub else "")
+    return {"kind": "script", "tool": tool, "sig": sig, "dir": here}
+
+
+def pm_script(words, here):
+    """Skrypt z package.json o nazwie spoza rodzajów JS (`pnpm sm capture`, `npm run e2e:ci`)."""
+    prog = os.path.basename(words[0])
+    i = 1
+    pkg_dir, filtered = here, False
+    while i < len(words) and words[i].startswith("-"):
+        opt, _, val = words[i].partition("=")
+        valued = opt in ("-C", "--dir", "--prefix", "--cwd", "--filter", "-F", "--workspace")
+        if valued and not val and i + 1 < len(words):
+            val = words[i + 1]
+            i += 1
+        if opt in ("-C", "--dir", "--prefix", "--cwd") and val:
+            pkg_dir = os.path.normpath(os.path.join(here, os.path.expanduser(val)))
+        elif opt in ("--filter", "-F", "--workspace", "-r", "--recursive", "-ws", "--workspaces"):
+            filtered = True
+        i += 1
+    rest = words[i:]
+    if not rest:
+        return None
+    if rest[0] in ("run", "run-script"):
+        rest = rest[1:]
+    elif prog == "npm":
+        return None  # npm uruchamia własne skrypty tylko przez `run`
+    if not rest or rest[0] in PM_BUILTINS or rest[0].startswith("-"):
+        return None
+    name, args = rest[0], [a for a in rest[1:] if a != "--"]
+    if NODE_NEVER.search(name) or LIGHT_SCRIPTS.match(name) or any(a in NODE_STOP_FLAGS for a in args):
+        return None
+    if not filtered:
+        # bez --filter sprawdzamy, że to naprawdę skrypt; `pnpm foo` bez skryptu to bin z node_modules
+        pkg = find_up(pkg_dir, "package.json", stop_at_git=True) if os.path.isdir(pkg_dir) else None
+        try:
+            with open(os.path.join(pkg, "package.json")) as f:
+                scripts = json.load(f).get("scripts") or {}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+        if name not in scripts or SCRIPT_BODY_NEVER.search(str(scripts[name])):
+            return None
+    sub = next((a for a in args if not a.startswith("-")), None)
+    sig = f"{prog}-script:{name}" + (f":{sub}" if sub and re.match(r"^[\w:-]+$", sub) else "")
+    return {"kind": "script", "tool": name, "sig": sig, "dir": pkg_dir}
+
+
+def parse_generic(words, here):
+    """Ciężka komenda spoza Go i JS: surowy job {kind, tool, sig, dir} albo None."""
+    prog = os.path.basename(words[0])
+    if prog in ("npx", "bunx"):
+        rest = words[1:]
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in ("-p", "--package") else rest[1:]
+        return generic_tool(rest, here) if rest else None
+    if prog in ("pnpm", "yarn", "npm", "bun"):
+        cmd = next((w for w in words[1:] if not w.startswith("-")), None)
+        if cmd in ("exec", "dlx", "x"):
+            rest = words[words.index(cmd) + 1 :]
+            rest = [w for w in rest if w != "--"]
+            return generic_tool(rest, here) if rest else None
+        if prog == "bun" and cmd and cmd not in ("run", "x") and cmd not in PM_BUILTINS:
+            job = interpreter_job(words, here)
+            if job:
+                return job
+        return pm_script(words, here)
+    if prog == "uv" and len(words) > 1 and words[1] == "run":
+        rest = words[2:]
+        while rest and rest[0].startswith("-"):
+            takes = rest[0] in ("--with", "--python", "-p", "--package", "--extra", "--group", "--env-file", "--directory", "--project")
+            rest = rest[2:] if takes and "=" not in rest[0] else rest[1:]
+        if not rest:
+            return None
+        inner = parse_generic(rest, here)
+        if inner:
+            return inner
+        if GENERIC_NEVER.search(os.path.basename(rest[0])) or os.path.basename(rest[0]) in ("python", "python3"):
+            return None
+        return {"kind": "script", "tool": "uv", "sig": f"uv-run:{os.path.basename(rest[0])}", "dir": here}
+    if INTERPRETERS.match(prog):
+        return interpreter_job(words, here)
+    if prog in GENERIC_TOOLS or prog == "docker":
+        return generic_tool(words, here)
+    path = words[0]
+    if prog in ("gradle", "gradlew"):
+        return None  # Gradle zna parse_native: buildy aplikacji tak, reszta zadań nie
+    if prog in ("claude-acc", "claude", "codex", "orca", "git", "gh", "rtk"):
+        return None  # po pełnej ścieżce to dalej te same programy, nie skrypt projektu
+    if "/" in path or path.endswith(".sh"):
+        # skrypt albo program projektu: ./scripts/e2e.sh, bin/capture, tools/verify
+        full = os.path.normpath(os.path.join(here, os.path.expanduser(path)))
+        if path.startswith(SYSTEM_PATHS):
+            return None  # program systemowy po pełnej ścieżce: znane narzędzia łapie gałąź wyżej
+        if not os.path.isfile(full) or GENERIC_NEVER.search(os.path.splitext(os.path.basename(path))[0]):
+            return None
+        if any(a.split("=", 1)[0] in GENERIC_STOP_FLAGS for a in words[1:]):
+            return None
+        sub = next((a for a in words[1:2] if re.match(r"^[a-z][\w:-]*$", a)), None)
+        if sub and (GENERIC_NEVER.search(sub) or LIGHT_SUBCOMMANDS.match(sub)):
+            return None
+        sig = f"script:{script_sig(path, here)}" + (f":{sub}" if sub else "")
+        return {"kind": "script", "tool": os.path.basename(path), "sig": sig, "dir": here}
+    return None
+
+
+def finish_generic(raw):
+    """Surowy job z parse_generic na pełny job; repo z katalogu komendy (albo sam katalog)."""
+    here = raw["dir"] if os.path.isdir(raw["dir"]) else os.getcwd()
+    repo = find_repo(here) or here
+    label = " ".join(shlex.quote(a) if re.search(r"[\s'\"$^*|&;]", a) else a for a in raw["argv"])
+    name = project_name(repo)
+    return {
+        "lang": "generic",
+        "kind": raw["kind"],
+        "tool": raw["tool"],
+        "class": f"{name}:{raw['kind']}:{raw['sig']}",
+        "family": f"{name}:{raw['kind']}:{raw['sig'].split(':', 1)[0]}",
+        "floor_gb": raw.get("floor_gb"),
+        "module_name": name,
+        "module": os.path.relpath(here, repo),
+        "module_dir": here,
+        "repo_dir": repo,
+        "repo": name,
+        "scope": "generic",
+        "scope_detail": raw["sig"],
+        "compile": False,
+        "filtered": False,
+        "all": False,
+        "race": False,
+        "p_explicit": None,
+        "count1": False,
+        "flags": {},
+        "pkgs": [],
+        "argv": raw["argv"],
+        "go_dir": here,
+        "env": raw.get("env") or {},
+        "label": label,
+    }
+
+
+def generic_prior(job):
+    gb, s = GENERIC_PRIORS.get(job["kind"], (4.0, 300))
+    return max(gb, job.get("floor_gb") or 0), s
+
+
 def classify(command, cwd, argv=None):
-    """Job z komendy powłoki albo argv; None, gdy nie ma w niej pracy Go, JS ani natywnej."""
+    """Job z komendy powłoki albo argv; None, gdy nie ma w niej ciężkiej pracy dla schedulera: Go,
+    JS, natywnej ani niczego, co z kształtu komendy jest pracą (GENERIC_TOOLS, skrypty)."""
     if argv is not None:
         if (
             len(argv) >= 3
@@ -1105,9 +1456,10 @@ def classify(command, cwd, argv=None):
         if segments is None:
             return None
     here = cwd
-    found = []
+    found, nested = [], []
     cfg = load_config()
     node_on, native_on = bool(cfg.get("node", True)), bool(cfg.get("native", True))
+    generic_on = bool(cfg.get("generic", True))
     for words, _sep in segments:
         if not words:
             continue
@@ -1118,6 +1470,11 @@ def classify(command, cwd, argv=None):
         job = None
         if prog == "cd" and len(words) >= 2:
             here = os.path.normpath(os.path.join(here, os.path.expanduser(words[1])))
+            continue
+        if prog in ("bash", "sh", "zsh") and len(words) >= 3 and words[1] == "-c":
+            inner = classify(words[2], here)
+            if inner:
+                nested.append(inner)
             continue
         if prog == "go":
             parsed = parse_go(words)
@@ -1160,12 +1517,24 @@ def classify(command, cwd, argv=None):
             job = parse_native(words, here) if native_on else None
             if job is None and node_on:
                 job = parse_node(words, here)
+        if job is None and generic_on and prog not in ("go", "golangci-lint", "govulncheck"):
+            job = parse_generic(words, here)
+            if job:
+                job["lang"] = "generic"
         if job:
             job["argv"] = words
             job["env"] = env
             found.append(job)
-    finishers = {"node": finish_node, "native": finish_native}
-    jobs = [j for j in (finishers.get(j.get("lang"), finish_job)(j) for j in found) if j]
+    finishers = {"node": finish_node, "native": finish_native, "generic": finish_generic}
+    jobs = list(nested)
+    for raw in found:
+        lang = raw.get("lang")
+        done = finishers.get(lang, finish_job)(raw)
+        if done is None and lang is None and raw["kind"] == "make" and generic_on and not GENERIC_NEVER.search(raw["target"]):
+            # make poza modułem Go: przepis jak każdy inny skrypt
+            done = finish_generic(dict(raw, lang="generic", kind="script", tool="make", sig=f"make:{raw['target']}"))
+        if done:
+            jobs.append(done)
     if not jobs:
         return None
     main = max(jobs, key=lambda j: prior(j, 4)[0])
@@ -1339,6 +1708,8 @@ def prior(job, p):
         return node_prior(job)
     if job.get("lang") == "native":
         return tuple(job["native_prior"])
+    if job.get("lang") == "generic":
+        return generic_prior(job)
     name, kind, scope, comp = (
         job["module_name"],
         job["kind"],
@@ -1395,7 +1766,9 @@ def base_prior(name, kind, scope, comp, p):
     return val
 
 
-def read_history(limit_bytes=8 * 1024 * 1024):
+def read_history(limit_bytes=8 * 1024 * 1024, needle=None):
+    """Wiersze historii; z `needle` tylko te, w których stoi ten tekst (bez parsowania reszty:
+    krótka komenda spoza Go nie płaci za cały plik)."""
     try:
         size = os.path.getsize(HISTORY_PATH)
         with open(HISTORY_PATH, "rb") as f:
@@ -1407,6 +1780,8 @@ def read_history(limit_bytes=8 * 1024 * 1024):
         return []
     rows = []
     for line in data.splitlines():
+        if needle and needle not in line:
+            continue
         try:
             rows.append(json.loads(line))
         except ValueError:
@@ -1434,15 +1809,38 @@ def predict(job, p, history):
         rows = [r for r in rows if r.get("p") == p]
     rows = rows[-20:]
     base_gb, base_s = prior(job, p)
+    src = "prior"
+    if job.get("lang") == "generic":
+        family = family_estimate(job, history)
+        if family:
+            base_gb, base_s, src = family
+    floor = job.get("floor_gb") or 0.0
     if not rows:
-        return base_gb, base_s, "prior"
+        return round(max(base_gb, floor), 2), round(base_s, 1), src
     gb = percentile([r["peak_gb"] for r in rows], 0.9) * 1.15
     s = percentile([r["wall_s"] for r in rows], 0.5)
     if len(rows) < 3:
         gb = max(gb, base_gb * 0.8)  # jeden czy dwa biegi to jeszcze nie statystyka
     if job.get("outside"):
         gb = max(gb, base_gb)  # pamięć poza drzewem: zmierzony szczyt to tylko jej część
-    return round(gb, 2), round(s, 1), f"history:{len(rows)}"
+    return round(max(gb, floor), 2), round(s, 1), f"history:{len(rows)}"
+
+
+def family_estimate(job, history):
+    """(GB, s, źródło) dla nieznanego jeszcze podpisu z rodziny (to samo repo, rodzaj i narzędzie):
+    nowy skrypt Pythona w repo, w którym skrypty Pythona biorą po 0,2 GB, nie czeka na 4 GB.
+    p90 × 1,5, bo w rodzinie bywa i skrypt z przeglądarką; None przy mniej niż 5 biegach."""
+    fam = job.get("family")
+    rows = [
+        r for r in history
+        if r.get("where") == "local" and r.get("lang") == "generic" and r.get("peak_gb") and r.get("wall_s")
+        and ":".join(str(r.get("class", "")).split(":")[:3]) == fam
+    ][-40:]  # fmt: skip
+    if len(rows) < 5:
+        return None
+    gb = max(1.0, percentile([r["peak_gb"] for r in rows], 0.9) * 1.5)
+    s = percentile([r["wall_s"] for r in rows], 0.5) * 1.5
+    return round(gb, 2), round(s, 1), f"family:{len(rows)}"
 
 
 def choose_p(job, free_gb, history):
@@ -1549,7 +1947,7 @@ def local_path_in(job):
 
 def depot_target(job, gb, wall, cfg, cache):
     """Dokąd na Depot i za ile: {target, job, cores, eta_s, units, cost_usd, argv, cwd} albo None."""
-    if job.get("lang") in ("node", "native"):
+    if job.get("lang"):
         return None  # Depot tu to tylko joby Go portivo
     if depot_blocker(job):
         return None
@@ -1806,7 +2204,7 @@ def count1_safe(job, cache):
 
 def uses_pg(job, cache):
     """Czy testy joba sięgają po Postgresa (dla depot-exec --with pg)."""
-    if job["kind"] != "test" or job.get("lang") in ("node", "native"):
+    if job["kind"] != "test" or job.get("lang"):
         return False
     if job["scope"] == "tree":
         return os.path.isdir(os.path.join(job["module_dir"], "internal/testhelpers"))
@@ -1961,6 +2359,18 @@ def reap(state):
     state["queue"] = [j for j in state["queue"] if alive(j.get("pid"))]
 
 
+def growth_left(job, now):
+    """O ile lokalny job jeszcze urośnie: prognoza minus teraz. Zero dla joba, który biegnie dużo
+    dłużej, niż miał (serwer albo watcher, który skrypt zostawił na pierwszym planie): jego pamięć
+    jest już w tym, co widzi jądro, a rezerwa na wzrost, który nie przyjdzie, blokowałaby kolejkę."""
+    if job.get("paused"):
+        return 0.0
+    elapsed = now - (job.get("started_at") or now)
+    if elapsed > max(600.0, 3 * (job.get("predicted_wall_s") or 0)):
+        return 0.0
+    return max(0.0, (job.get("mem_predicted_gb") or 0) - (job.get("mem_now_gb") or 0))
+
+
 def refresh_memory(state, cfg, mem=None):
     mem = mem or probe_memory()
     now = time.time()
@@ -1968,13 +2378,10 @@ def refresh_memory(state, cfg, mem=None):
     available = mem["level"] / 100 * ram
     local = [j for j in state["running"] if j["where"] == "local"]
     jobs_now = sum(j.get("mem_now_gb") or 0 for j in local)
-    reserved = sum(
-        max(0.0, (j.get("mem_predicted_gb") or 0) - (j.get("mem_now_gb") or 0))
-        for j in local
-        if not j.get("paused")
-    )
+    reserved = sum(growth_left(j, now) for j in local)
     snap = devguard_snapshot()
     dev = devserver_reserve_gb(snap)
+    stage, long_lived, families = guard_view(snap)
     internal = state["_internal"]
     # natywny build spoza schedulera (odczepiony builder portivo-mobile, Xcode): zajmuje miejsce
     # na natywny build i urośnie do szczytu buildu, więc jego wzrost idzie do rezerwy jak wzrost jobów
@@ -1984,6 +2391,8 @@ def refresh_memory(state, cfg, mem=None):
     elif now - float(nat.get("at", 0)) >= 5:
         scan = native_scan()
         nat = {"at": now, "gb": round(scan["gb"], 2), "active": scan["active"]}
+        if scan["active"]:
+            nat["in_job"] = native_host(local, scan["pids"])
     internal["native"] = nat
     owner = native_owner(state)
     outside = bool(nat.get("active")) and owner is None
@@ -2031,6 +2440,11 @@ def refresh_memory(state, cfg, mem=None):
             "owner_label": owner["label"] if owner else None,
         },
         "simulators": simulators_info(snap),
+        # hamulec strażnika i to, co siedzi w pamięci długo (dev serwery, symulatory, watchery,
+        # headless przeglądarki, LSP, Docker): jest już w `others_gb`, tu z nazwy
+        "brake": STAGE_TEXT[min(stage, 3)],
+        "long_lived_gb": long_lived,
+        "long_lived": families,
     }
     today = state["today"]
     today["max_reserved_gb"] = round(max(today.get("max_reserved_gb", 0), reserved), 1)
@@ -2041,8 +2455,9 @@ def refresh_memory(state, cfg, mem=None):
 
 
 def native_owner(state):
-    """Lokalny job, który trzyma miejsce na natywny build (jedno na Maca), albo None."""
-    return next(
+    """Lokalny job, który trzyma miejsce na natywny build (jedno na Maca), albo None: natywny job
+    w fazie buildu albo inny job, w którego drzewie biegnie build (`make ios`, `swift build`)."""
+    own = next(
         (
             j
             for j in state["running"]
@@ -2050,6 +2465,21 @@ def native_owner(state):
         ),
         None,
     )
+    if own is None:
+        host = (state.get("_internal", {}).get("native") or {}).get("in_job")
+        own = next((j for j in state["running"] if host and j["id"] == host), None)
+    return own
+
+
+def native_host(local, pids):
+    """Id lokalnego joba, w którego drzewie procesów leży natywny build ze skanu, albo None.
+    Bez tego skrypt z xcodebuild w środku albo `swift build` (swift-build to dla native_scan
+    natywny build) wyglądał jak build spoza schedulera i jego wzrost szedł do rezerwy drugi raz,
+    obok przewidywania samego joba."""
+    for j in local:
+        if j.get("pid") and not j.get("exclusive") and descendants(j["pid"]) & pids:
+            return j["id"]
+    return None
 
 
 def native_build_gb(internal):
@@ -2127,21 +2557,23 @@ def plan(state, cfg, now):
     mem = state["memory"]
     free = mem["free_for_admission_gb"]
     now_free = mem["available_gb"] - cfg["headroom_gb"] - sum(
-        max(0.0, (j.get("mem_predicted_gb") or 0) - (j.get("mem_now_gb") or 0))
-        for j in state["running"]
-        if j["where"] == "local" and j.get("small") and not j.get("paused")
+        growth_left(j, now) for j in state["running"] if j["where"] == "local" and j.get("small")
     )
     any_local = any(j["where"] == "local" for j in state["running"])
     pressure = mem.get("pressure", "normal")
     guard_critical = mem.get("guard_level") == 2
+    brake = mem.get("brake", "normal")
     admitted = {}
     blocked = None
     reserve = 0.0
     strict = False
     # jeden natywny build naraz: trzyma go job w fazie buildu albo build spoza schedulera
     slot = native_owner(state) is not None or bool((mem.get("native") or {}).get("outside"))
-    if pressure == "critical":
+    if pressure == "critical" or brake == "emergency":
         return admitted
+    if brake in ("tight", "brake"):
+        # hamulec strażnika: startuje tylko to, co się mieści, bez furtki „sam na Macu”
+        pressure = "warn"
     for job in queue_order(state):
         if (job.get("route") or {}).get("choice") == "depot":
             continue
@@ -2154,7 +2586,7 @@ def plan(state, cfg, now):
         quick = bool(job.get("small")) and not strict and not native and need <= now_free - reserve
         if blocked is None:
             spare = mem["available_gb"] - cfg["headroom_gb"]
-            alone = not any_local and not admitted
+            alone = not any_local and not admitted and brake != "brake"
             # sam na Macu: bez rezerwy na dev serwer, a po 30 s czekania nawet ponad pamięć
             # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP).
             # Przy „warn” bez tego ostatniego: macOS trzyma go tu godzinami przy połowie wolnej
@@ -2307,6 +2739,8 @@ def update_queue_view(state, cfg):
         waits_turn = False  # czeka na kolej, nie na pamięć: nie rezerwuje jej dla siebie
         if mem.get("pressure") == "critical":
             code, text = "pressure", "paused: memory pressure is critical"
+        elif mem.get("brake") == "emergency":
+            code, text = "pressure", "paused: the memory brake is freeing memory"
         elif job.get("lang") == "native" and mem.get("guard_level") == 2:
             code, text = "pressure", "paused: the dev server guard sees critical memory pressure"
         elif job.get("exclusive") and (owner or native.get("outside")):
@@ -2517,6 +2951,7 @@ def new_entry(job, command, argv, opts):
         "compile_only": job["compile"],
         "filtered": job.get("filtered", False),
         "module_name": job["module_name"],
+        "lang": job.get("lang"),
         "cmd": command
         if command is not None
         else " ".join(shlex.quote(a) for a in argv),
@@ -2538,6 +2973,10 @@ def cmd_run(args):
     if command is None and not argv:
         print(__doc__)
         return 2
+    if os.environ.get(NESTED_ENV):
+        # w środku wpuszczonego joba (skrypt, który sam woła `sched run`): jego pamięć liczy się już
+        # w drzewie zewnętrznego joba, a drugie czekanie na nią mogłoby czekać na samego siebie
+        return exec_plain(command, argv)
     cfg = load_config()
     cwd = os.getcwd()
     job = classify(command, cwd, argv=argv)
@@ -2545,6 +2984,10 @@ def cmd_run(args):
         job = opaque_job(argv, cwd)
     if job is None:
         return exec_plain(command, argv)
+    if job.get("lang") == "generic":
+        # cache to tylko Go (testy, Depot); historia tylko tej rodziny
+        history = read_history(needle='"class": "' + job["family"])
+        return schedule(new_entry(job, command, argv, opts), job, command, argv, opts, cfg, history, {})
     history = read_history()
     cache = load_cache()
     entry = new_entry(job, command, argv, opts)
@@ -2563,11 +3006,11 @@ def cmd_run(args):
             log(
                 "bez -count=1: testy nie uruchamiają innych programów, wynik może przyjść z cache testów"
             )
-    if job["kind"] == "test" and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
+    if job["kind"] == "test" and not job.get("lang") and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
         job["uses_pg"] = uses_pg(job, cache)
     if job.get("lang") == "native" and job.get("tool") == "portivo-mobile":
         entry["sim_lease"] = session_lease()
-    if likely_heavy(job) and job.get("lang") not in ("node", "native"):
+    if likely_heavy(job) and not job.get("lang"):
         refresh_depot_eta(cache, job["repo_dir"])
     save_cache(cache)
     return schedule(entry, job, command, argv, opts, cfg, history, cache)
@@ -2766,6 +3209,7 @@ def run_local(entry, job, command, argv, cfg):
     if ours_p or extra:
         env["GOFLAGS"] = goflags_with(ours_p, extra)
     target = shell_argv(command) if command is not None else argv
+    env[NESTED_ENV] = entry["id"]
     try:
         child = subprocess.Popen(target, env=env, preexec_fn=os.setpgrp)
     except OSError as err:
@@ -2812,7 +3256,9 @@ def run_local(entry, job, command, argv, cfg):
         if time.time() - last_beat >= 1.0:
             last_beat = time.time()
             built = heartbeat(jid, cfg, now_gb, peak, cpu_live, started, native=pool) or built
-        time.sleep(0.25)
+        # krótka komenda nie czeka ćwierć sekundy na własny koniec: gęsto na początku, potem rzadziej
+        ran = time.time() - started
+        time.sleep(0.01 if ran < 0.5 else 0.05 if ran < 3 else 0.25)
     rc = os.waitstatus_to_exitcode(status)
     cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
     finish(jid, cfg, rc, time.time() - started, peak, cpu)
@@ -2948,6 +3394,7 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
             "predicted_gb": me["mem_predicted_gb"],
             "predicted_wall_s": me.get("local_wall_s") or me.get("predicted_wall_s"),
             "count1_dropped": me.get("count1_dropped", False),
+            "lang": me.get("lang"),
         }
         if me.get("lang") == "native":
             row["native_built"] = bool(me.get("native_seen"))
@@ -3073,6 +3520,30 @@ def which(name):
 
 
 RECURSIVE_GREP = re.compile(r"(^|[\s;&|(])grep\s+(-[A-Za-z]*[rR][A-Za-z]*|--recursive)")
+GIT_GREP = re.compile(
+    r"((?:^|[;&|(`{\n])\s*(?:(?:do|then|else|!)\s+)*(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:rtk\s+proxy|time|command|nice)\s+)*"
+    r"(?:\S*/)?git(?:\s+-[Cc]\s+\S+)*\s+grep)(?=\s|$)"
+)
+GREP_BINARY_FLAG = re.compile(r"(^|\s)(-a|--text|--binary-files\S*|-I|-[A-Za-z]*I[A-Za-z]*)(?=\s|$)")
+
+
+def git_grep_text_only(command):
+    """`git grep` bez flagi o plikach binarnych dostaje -I (pomija binarki).
+
+    2026-10-08 `git grep -nE ... <commit>` agenta w repo z 368 MB filmów i obrazów w historii
+    urósł do 10 GB w 2 sekundy: wyrażenie -E idzie przez regex macOS, a binarka to jedna linia
+    długości megabajtów. Z -I ta sama komenda ma szczyt 270 MB, a agent i tak nie szuka w mp4."""
+    out, pos = [], 0
+    for m in GIT_GREP.finditer(command):
+        rest = command[m.end() :]
+        stop = re.search(r"[;&|\n]", rest)
+        segment = rest[: stop.start()] if stop else rest
+        if GREP_BINARY_FLAG.search(segment):
+            continue
+        out.append(command[pos : m.end()] + " -I")
+        pos = m.end()
+    out.append(command[pos:])
+    return "".join(out)
 
 def with_rtk(command):
     """Komenda tak, jak przepisałby ją hook rtk bez naszych wyjątków: komendy schedulera są w jego
@@ -3126,12 +3597,25 @@ def hook_rewrite(event):
         return None
     if RECURSIVE_GREP.search(command):
         return None  # tę komendę przepisuje rg-rewrite.sh; dwa updatedInput to wynik losowy
+    fixed = git_grep_text_only(command) if "grep" in command else command
     try:
-        job = classify(command, event.get("cwd") or os.getcwd())
+        job = classify(fixed, event.get("cwd") or os.getcwd())
     except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
-        return None
+        job = None
     if job is None:
-        return None
+        if fixed == command:
+            return None
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "updatedInput": dict(tool_input, command=with_rtk(fixed)),
+                "additionalContext": (
+                    "claude-acc: added -I to `git grep` (skip binary files); a regex over committed "
+                    "binaries once grew git to 10 GB in two seconds. Pass -a or --text to search them."
+                ),
+            }
+        }
+    command = fixed
     parts = runner() + ["run", "--via", "hook"]
     if event.get("session_id"):
         parts += ["--session", str(event["session_id"])]
@@ -3484,6 +3968,12 @@ def cmd_status(args):
         else ""
     )
     print(f"Natywny build (jeden naraz): {slot}{sims_text}")
+    if mem.get("long_lived_gb") is not None:
+        names = {"dev": "dev serwery", "metro": "expo/metro", "watchers": "watchery", "simulators": "symulatory",
+                 "headless": "headless przeglądarki", "lsp": "LSP", "docker": "Docker"}  # fmt: skip
+        parts = [f"{names[f['family']]} {pl_gb(f['gb'])}" for f in mem.get("long_lived") or [] if f["gb"] >= 0.05]
+        print(f"Długo żyjące: {pl_gb(mem['long_lived_gb'])}" + (" (" + ", ".join(parts) + ")" if parts else "")
+              + f"; hamulec strażnika: {mem.get('brake', 'normal')}")
     if not state["running"] and not state["queue"]:
         print("Nic nie biegnie.")
     for j in state["running"]:
@@ -3693,7 +4183,76 @@ def cmd_rtk_excludes(args):
     return 0
 
 
+CODEX_MARK = "devguard admit --codex"  # po tym poznajemy nasz wpis; native front podaje `codex`
+CODEX_NATIVE_MARK = re.compile(r"claude-acc-hook'? codex$")
+
+
+def codex_hooks_path():
+    return os.path.join(os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "hooks.json")
+
+
+def codex_hook_command():
+    """Komenda hooka dla Codeksa: natywny front, a bez niego Python z acc.py."""
+    native = os.path.join(STATE_DIR, "claude-acc-hook")
+    if os.access(native, os.X_OK):
+        return f"{shlex.quote(native)} codex"
+    return " ".join(shlex.quote(a) for a in (os.path.join(STATE_DIR, "python"), os.path.join(STATE_DIR, "acc.py"))) + " " + CODEX_MARK
+
+
+def is_codex_entry(entry):
+    return any(
+        CODEX_MARK in (h.get("command") or "") or CODEX_NATIVE_MARK.search(h.get("command") or "")
+        for h in (entry.get("hooks") or [])
+    )
+
+
+def cmd_codex(args):
+    """`codex install|uninstall|status`: hook PreToolUse w ~/.codex/hooks.json, który owija ciężkie
+    komendy Codeksa w scheduler tak samo jak w Claude Code. Codex uruchamia nowy hook dopiero
+    po zaufaniu mu w `/hooks`."""
+    action = args[0] if args else "status"
+    path = codex_hooks_path()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except (OSError, ValueError) as err:
+        log(f"{path}: {err}")
+        return 1
+    pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    ours = [e for e in pre if is_codex_entry(e)]
+    if action == "status":
+        print(f"{path}: {'hook schedulera jest' if ours else 'brak hooka schedulera'}")
+        return 0 if ours else 1
+    if action not in ("install", "uninstall"):
+        log("użycie: sched.py codex install|uninstall|status")
+        return 64
+    if action == "uninstall" and not ours:
+        print(f"{path}: brak hooka schedulera")
+        return 0
+    rest = [e for e in pre if not is_codex_entry(e)]
+    if action == "install":
+        entry = {"matcher": "Bash", "hooks": [{"type": "command", "command": codex_hook_command(), "timeout": 30}]}
+        if ours == [entry]:
+            print(f"{path}: bez zmian")
+            return 0
+        rest.append(entry)
+    data["hooks"]["PreToolUse"] = rest
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
+    if action == "install":
+        print(f"{path}: hook schedulera dopisany. Codex uruchomi go po zaufaniu: w Codeksie /hooks.")
+    else:
+        print(f"{path}: hook schedulera zdjęty")
+    return 0
+
+
 COMMANDS = {
+    "codex": cmd_codex,
     "run": cmd_run,
     "status": cmd_status,
     "classify": cmd_classify,

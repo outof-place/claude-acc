@@ -935,7 +935,6 @@ QUIET = (
     "export FOO=1; echo $FOO",
     "rg -n Foo main_test.go internal/x.go",
     "cat tsconfig.json playwright.config.ts vite.config.ts jest.config.js .eslintrc",
-    "./devguard.py status",
     "echo observe the server",
     "cat ~/dev/notes.md",
     "sed -n 1,20p cmd/server/main.go",
@@ -945,6 +944,50 @@ QUIET = (
     "rg -n easing src/",
     "ls ~/Library/Developer/CoreSimulator/Devices",
     "echo pods ready",
+    # słowa programów w ścieżkach i nazwach plików: dalej bez Pythona
+    "cat scripts/e2e.sh src/node_modules.txt",
+    "rg -n cargo_test docs/python-notes.md",
+    "ls node_modules .venv",
+    "git status --short",
+    "gh pr list",
+    # interpretery bez skryptu z pliku, docker bez buildu, program systemowy po ścieżce
+    "python3 -c 'print(1)'",
+    "python3 - <<'EOF'\nprint(1)\nEOF",
+    "node --version",
+    "node -e 'console.log(1)'",
+    "docker ps -a",
+    "bash -c 'echo hi'",
+    "uv pip list",
+    "/usr/bin/git status",
+)
+# reszta ciężkiej pracy (sched.GENERIC_TOOLS, interpretery ze skryptem, skrypty projektu): w
+# projekcie z tymi plikami idą do schedulera
+GENERIC = (
+    "cargo test",
+    "cargo build --release 2>&1 | tail -20",
+    "swift test",
+    "xcodebuild -scheme App test",
+    "docker build .",
+    "pytest -x tests",
+    "python3 -m pytest",
+    "uv run pytest",
+    "python3 scripts/capture.py --url http://localhost:3000",
+    "node plugins/cli/main.ts capture",
+    "bash scripts/e2e.sh",
+    "./scripts/e2e.sh",
+    "e2e.sh",
+    "bin/verify all",
+    "pnpm sm capture",
+    "npx lighthouse http://localhost:3000",
+    "just test",
+    "bash -c './scripts/e2e.sh'",
+    "docker compose -f c.yml build",
+    "python3 -W ignore -m unittest discover -s tests",
+    "uv run scripts/capture.py",
+    "tsx plugins/cli/main.ts capture",
+    "cd scripts && ./e2e.sh",
+    'SPECS="leads notifications" ./scripts/e2e.sh',
+    "nohup ./scripts/e2e.sh >/dev/null 2>&1 &",
 )
 
 
@@ -993,11 +1036,35 @@ class HookGateTest(unittest.TestCase):
             self.assertEqual(self.admit(command), "", command)
             self.assertIsNone(self.gate.search(command), command)
 
+    def generic_project(self):
+        for name, text in (("scripts/e2e.sh", "#!/bin/sh\n"), ("e2e.sh", "#!/bin/sh\n"),
+                           ("scripts/capture.py", ""), ("bin/verify", "#!/bin/sh\n"),
+                           ("plugins/cli/main.ts", ""), ("Cargo.toml", "[package]\n"),
+                           ("package.json", '{"scripts": {"sm": "node plugins/cli/main.ts"}}')):
+            path = os.path.join(self.project, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+
+    def test_every_generic_heavy_command_passes(self):
+        self.generic_project()
+        for command in GENERIC:
+            self.assertTrue(self.gate.search(command), command)
+            self.assertIn("updatedInput", self.admit(command), command)
+
+    def test_agent_git_grep_skips_binary_files(self):
+        out = json.loads(self.admit('for n in a b; do git grep -nE "<$n" HEAD -- apps; done'))
+        command = out["hookSpecificOutput"]["updatedInput"]["command"]
+        self.assertIn('git grep -I -nE "<$n" HEAD', command)
+        self.assertEqual(self.admit("git grep -a needle"), "")  # agent chce binarek: zostaje
+
     def test_every_program_the_scheduler_knows_is_in_the_gate(self):
         import sched as scheduler
 
         self.assertLessEqual(set(scheduler.NODE_TOOLS), set(entry.GATE_PROGRAMS))
         self.assertLessEqual(set(scheduler.NATIVE_PROGRAMS), set(entry.GATE_PROGRAMS))
+        # swift ma w bramce własny kształt (swift build|test|run), reszta stoi jako całe słowo
+        self.assertLessEqual(set(scheduler.GENERIC_TOOLS) - {"swift"}, set(entry.GATE_PROGRAMS))
 
     @unittest.skipUnless(os.access(BUILT_HOOK, os.X_OK), "brak app/.build/release/claude-acc-hook")
     def test_native_front_reads_the_gate_like_python(self):
@@ -1016,7 +1083,7 @@ class HookGateTest(unittest.TestCase):
             return subprocess.run([BUILT_HOOK], input=json.dumps(event), capture_output=True,
                                   text=True, env={"HOME": self.home}, timeout=30).stdout.strip()
 
-        for command in DEV_STARTS + SCHEDULED:
+        for command in DEV_STARTS + SCHEDULED + GENERIC:
             self.assertEqual(front(command), "python", command)
         for command in QUIET:
             self.assertEqual(front(command), "", command)
@@ -1708,6 +1775,109 @@ class AdmitFastPathTest(unittest.TestCase):
             entry.admit(self.event("DEVGUARD_ALLOW=1 pnpm dev"))
             entry.admit(self.event("pnpm build 2>/dev/null"))
         self.assertEqual(guard.main.call_count, 1)
+
+
+GB = 1024**3
+NOW_T = 1_800_000_000.0
+
+
+class TerminateTest(unittest.TestCase):
+    """Zatrzymanie drzewa: SIGCONT, SIGTERM, łaska, SIGKILL i czekanie na koniec."""
+
+    def test_stopped_process_gets_sigterm_not_sigkill(self):
+        # job wstrzymany przez scheduler (SIGSTOP przy rosnącym swapie) ma dostać szansę na
+        # porządne wyjście; bez SIGCONT stoi do końca łaski i ginie od SIGKILL
+        child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, sys, time\n"
+             "signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))\n"
+             "print('ready', flush=True)\n"
+             "time.sleep(60)\n"],
+            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        child.stdout.readline()
+        os.kill(child.pid, signal.SIGSTOP)
+        unit = types.SimpleNamespace(pids=[child.pid])
+        began = time.time()
+        left = dg.terminate(unit, {child.pid: (os.getpid(), "python3 job")}, grace=3)
+        self.assertEqual(left, [])
+        self.assertLess(time.time() - began, 3)
+        self.assertEqual(child.wait(timeout=5), 0)  # wyszedł sam, nie od SIGKILL (-9)
+
+
+class BrakeTickTest(unittest.TestCase):
+    """tick() i hamulec: kiedy gasi drzewo mimo akcji strażnika, kiedy czeka, kiedy nigdy."""
+
+    def run_tick(self, stage, plans=(), brake_at=0, last_action=0, inventory=None, **extra):
+        import lastresort as lr
+
+        cfg = dict(dg.DEFAULT_CONFIG, **extra)
+        pressure = types.SimpleNamespace(level=min(stage, 2), stage=stage, stage_reasons=[], ram=48 * GB,
+                                         swap_used=0, compressed=0, summary=lambda: {"stage": stage})
+        world = types.SimpleNamespace(now=NOW_T, units=[], table={}, pressure=pressure, orca=None)
+        state = {"brake_at": brake_at, "last_action": last_action, "inventory": inventory or {},
+                 "swap_history": [[NOW_T, 1, 1]]}
+        reap = mock.Mock(return_value="ostatnia linia: test")
+        with mock.patch.object(dg, "World", return_value=world), mock.patch.object(dg, "check_pending"), \
+                mock.patch.object(dg, "decide", return_value=list(plans)), mock.patch.object(dg, "execute"), \
+                mock.patch.object(lr, "reap", reap):
+            dg.tick(cfg, state, orca=None, now=NOW_T)
+        return reap, state
+
+    def test_emergency_acts_even_after_a_guard_action(self):
+        plan = types.SimpleNamespace(action="stop", summary=lambda: {})
+        reap, state = self.run_tick(3, plans=[plan], cooldown_seconds=0)
+        reap.assert_called_once()
+        self.assertEqual(reap.call_args.kwargs["level"], 3)
+        self.assertEqual(state["brake_at"], NOW_T)
+
+    def test_emergency_has_its_own_short_cooldown(self):
+        self.run_tick(3, brake_at=NOW_T - 6, last_action=NOW_T - 6)[0].assert_called_once()
+        self.run_tick(3, brake_at=NOW_T - 3)[0].assert_not_called()
+
+    def test_tight_never_kills(self):
+        self.run_tick(1)[0].assert_not_called()
+
+    def test_runaway_dies_on_a_calm_mac(self):
+        inv = {"biggest": [4242, 25 * GB, "node t.js"]}
+        reap, _ = self.run_tick(0, inventory=inv)
+        reap.assert_called_once()
+        self.run_tick(0, inventory={"biggest": [4242, 10 * GB, "node t.js"]})[0].assert_not_called()
+
+
+class PressureStageTest(unittest.TestCase):
+    def test_real_mac_reports_stage_and_compressor_segments(self):
+        p = dg.Pressure(dict(dg.DEFAULT_CONFIG), {}, time.time())
+        summary = p.summary()
+        self.assertIn(summary["stage"], (0, 1, 2, 3))
+        self.assertGreater(summary["segments_limit"] or 0, 0)  # macOS 26: vm.compressor.segment.limit
+        self.assertGreater(summary["segments"] or 0, 0)
+
+
+class InventoryTest(unittest.TestCase):
+    def test_long_lived_families_and_biggest(self):
+        table = {
+            10: (1, "claude --resume"),
+            11: (1, "/Users/u/Library/Caches/ms-playwright/chromium-1/chrome --headless"),
+            12: (1, "/Library/Developer/CoreSimulator/Volumes/x/launchd_sim"),
+            13: (1, "/opt/homebrew/bin/gopls"),
+            14: (1, "node /w/node_modules/.bin/../expo/bin/cli start --port 8081"),
+            15: (1, "node /w/node_modules/typescript/bin/tsc --watch"),
+            16: (1, "/Applications/Spotify.app/Contents/MacOS/Spotify"),
+            17: (1, "node /w/node_modules/.bin/next dev"),
+        }
+        sizes = {10: 1, 11: 2, 12: 3, 13: 1, 14: 2, 15: 1, 16: 5, 17: 4}
+        unit = types.SimpleNamespace(pids=[17])
+        with mock.patch.object(dg, "usage", lambda pid: {"footprint": sizes[pid] * GB, "start": 1}), \
+                mock.patch.object(dg.janitor, "load_json", lambda path, default: {}):
+            inv = dg.inventory(table, [unit], NOW_T)
+        fams = inv["families"]
+        self.assertEqual({n: f["footprint"] // GB for n, f in fams.items()},
+                         {"agents": 1, "headless": 2, "simulators": 3, "lsp": 1, "metro": 2, "watchers": 1,
+                          "rest": 5, "dev": 4})
+        self.assertEqual(inv["long_lived"], 13 * GB)  # bez agentów i reszty
+        self.assertEqual(inv["biggest"][0], 16)
+        self.assertIn("symulatory 3,0 GB", dg.inventory_line(inv).replace(".", ","))
 
 
 if __name__ == "__main__":

@@ -144,7 +144,7 @@ BROWSER = re.compile(
     r"Brave Browser|Google Chrome(?! for Testing)|Safari|com\.apple\.WebKit|firefox|Arc\.app|Microsoft Edge|Chromium|Vivaldi|Opera"
 )
 HEADLESS = re.compile(
-    r"Chrome for Testing|HeadlessChrome|headless_shell|ms-playwright|puppeteer"
+    r"Chrome for Testing|HeadlessChrome|headless_shell|chrome-headless-shell|ms-playwright|puppeteer"
 )
 LOOPBACK = {"127.0.0.1", "[::1]", "::1", "localhost", "0.0.0.0", "*"}
 # proces z danych symulatora (aplikacja w nim, launchd_sim): UDID urządzenia z jego ścieżki
@@ -481,6 +481,10 @@ class Pressure:
         self.available = sysctl_int("kern.memorystatus_level")
         self.swap_total, self.swap_used = swap_usage()
         self.compressed = sysctl_int("vm.compressor_bytes_used") or 0
+        # segmenty kompresora i ich limit: przy 98% limitu jądro ogłasza "compressor space
+        # shortage" (zamrożenie 08.10); na starszym macOS tych nazw nie ma i hamulec ich nie liczy
+        self.segments = sysctl_int("vm.compressor.segment.total")
+        self.segments_limit = sysctl_int("vm.compressor.segment.limit")
         swapouts = sysctl_int("vm.compressor.compactor.swapouts_queued_pressure")
         history = [h for h in state.get("swap_history", []) if now - h[0] <= 120]
         history.append([now, self.swap_used, swapouts])
@@ -510,6 +514,7 @@ class Pressure:
             self.reasons.append(f"swap {janitor.human(self.swap_used)} i rośnie")
         if self.reasons:
             self.level = 2
+            self._stage(cfg, kernel)
             return
         if kernel >= 2:
             self.reasons.append("jądro: ostrzeżenie o presji")
@@ -522,9 +527,33 @@ class Pressure:
             # pełny swap, który stoi, to ślad po dawnej presji: strony wracają dopiero
             # przy dotknięciu, więc gaszenie serwerów niczego tu nie zwolni
             self.notes.append(f"swap {janitor.human(self.swap_used)} stoi")
+        self._stage(cfg, kernel)
+
+    def _stage(self, cfg, kernel):
+        """Stopień hamulca (lastresort.stage): 0 spokój, 1 ciasno, 2 hamulec, 3 awaria."""
+        import lastresort
+
+        self.stage, self.stage_reasons = lastresort.stage(
+            {
+                "ram": self.ram,
+                "compressed": self.compressed,
+                "segments": self.segments,
+                "segments_limit": self.segments_limit,
+                "swap_used": self.swap_used,
+                "swap_growth": self.swap_growth,
+                "kernel": kernel,
+                "available": self.available,
+                "guard_level": self.level,
+            },
+            cfg,
+        )
 
     def summary(self):
         return {
+            "stage": self.stage,
+            "stage_reasons": self.stage_reasons,
+            "segments": self.segments,
+            "segments_limit": self.segments_limit,
             "level": self.level,
             "reasons": self.reasons,
             "notes": self.notes,
@@ -1664,18 +1693,21 @@ def terminate(unit, table, grace=10, reap=10):
     """SIGTERM do całego drzewa naraz, po `grace` sekundach SIGKILL dla tych, które zostały, i do
     `reap` sekund na ich koniec. Pod presją proces po SIGKILL kończy się sekundami (jądro zwalnia
     jego strony, także te w swapie i w kompresorze), więc żywy tuż po sygnale nie znaczy, że
-    przeżył: 2026-10-08 log mówił „nie chcą zginąć” o Metro, które za chwilę zniknęło."""
+    przeżył: 2026-10-08 log mówił „nie chcą zginąć” o Metro, które za chwilę zniknęło.
+    Przed SIGTERM idzie SIGCONT: proces wstrzymany (scheduler pauzuje joby przy rosnącym swapie,
+    ktoś zrobił Ctrl+Z) nie obsłuży SIGTERM, dopóki stoi, i ginąłby dopiero od SIGKILL."""
     targets = []
     for pid in unit.pids:
         command = table.get(pid, (0, ""))[1]
         info = usage(pid)
         if info and not SACRED.search(command) and pid != os.getpid():
             targets.append((pid, info["start"]))
-    for pid, _start in targets:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+    for sig in (signal.SIGCONT, signal.SIGTERM):
+        for pid, _start in targets:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
     deadline = time.time() + grace
     while time.time() < deadline:
         left = [(p, s) for p, s in targets if alive(p, s)]
@@ -1693,6 +1725,21 @@ def terminate(unit, table, grace=10, reap=10):
         time.sleep(0.25)
         left = [(p, s) for p, s in left if alive(p, s)]
     return [p for p, _s in left]
+
+
+def notify_quiet(title, text):
+    """Powiadomienie bez czekania na osascript (przy duszącym się Macu startuje sekundami) i bez
+    zabierania fokusu: `display notification` nie aktywuje żadnej aplikacji."""
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
 
 
 def shell_idle(shell):
@@ -2015,9 +2062,121 @@ def shape(cfg, world):
             del _background[pid]
 
 
+# ---------- długo żyjące procesy ----------
+
+# rodziny procesów, które siedzą w pamięci długo i zmniejszają to, co scheduler może wpuścić;
+# kolejność rozstrzyga, gdzie trafia proces pasujący do kilku
+FAMILIES = (
+    ("headless", HEADLESS),
+    ("simulators", re.compile(r"launchd_sim|CoreSimulator|Simulator\.app|SimulatorTrampoline|/Developer/CoreSimulator/")),
+    ("metro", re.compile(r"/expo(/bin/cli)?\s+start\b|/metro\b|react-native\s+start\b")),
+    ("watchers", re.compile(r"--watch(All)?\b|(^|/)nodemon(\s|$)|(^|\s)-w(\s|$)|/vitest(\.mjs)?\s+(watch|dev)\b")),
+    ("lsp", re.compile(r"(^|/)gopls(\s|$)|tsserver\.js|typescript-language-server|rust-analyzer|sourcekit-lsp|clangd|pyright-langserver")),
+    ("docker", re.compile(r"com\.docker|Docker\.app|com\.apple\.Virtualization")),
+    ("git", re.compile(r"^(\S*/)?git(\s|$)")),
+    ("agents", AGENT),
+    ("browsers", BROWSER),
+)
+FAMILY_NAMES = {
+    "dev": "dev serwery", "jobs": "joby schedulera", "headless": "headless przeglądarki",
+    "simulators": "symulatory", "metro": "expo/metro", "watchers": "watchery", "lsp": "LSP",
+    "docker": "Docker", "git": "git", "agents": "agenci", "browsers": "przeglądarki", "rest": "reszta",
+}  # fmt: skip
+# to liczy się jako długo żyjące: nie skończy się samo, a scheduler widzi je tylko jako mniej pamięci
+LONG_LIVED = ("dev", "metro", "watchers", "simulators", "headless", "lsp", "docker")
+
+
+def inventory(table, units, now):
+    """Pamięć procesów tego użytkownika po rodzinach: {at, families: {rodzina: {count, footprint,
+    top: [pid, rozmiar, komenda]}}, long_lived, biggest: [pid, rozmiar, komenda]}."""
+    dev = {p for u in units for p in u.pids}
+    jobs = set()
+    for job in janitor.load_json(os.path.join(STATE_DIR, "sched", "state.json"), {}).get("running", []) or []:
+        if job.get("child_pgid"):
+            jobs.update(descendants(job["child_pgid"], _children_of(table)))
+    families, biggest = {}, [0, 0, ""]
+    for pid, (_ppid, command) in table.items():
+        info = usage(pid)
+        if not info or not info["footprint"]:
+            continue
+        size = info["footprint"]
+        if pid in dev:
+            name = "dev"
+        elif pid in jobs:
+            name = "jobs"
+        else:
+            name = next((n for n, rx in FAMILIES if rx.search(command)), "rest")
+        f = families.setdefault(name, {"count": 0, "footprint": 0, "top": [0, 0, ""]})
+        f["count"] += 1
+        f["footprint"] += size
+        if size > f["top"][1]:
+            f["top"] = [pid, size, command[:120]]
+        if size > biggest[1] and not SACRED.search(command):
+            biggest = [pid, size, command[:120]]
+    return {
+        "at": now,
+        "families": families,
+        "long_lived": sum(f["footprint"] for n, f in families.items() if n in LONG_LIVED),
+        "biggest": biggest,
+    }
+
+
+def _children_of(table):
+    out = {}
+    for pid, (ppid, _command) in table.items():
+        out.setdefault(ppid, []).append(pid)
+    return out
+
+
+def inventory_line(inv):
+    """Jedna linia do statusu: długo żyjące rodziny od największej."""
+    fams = inv.get("families") or {}
+    parts = [
+        f"{FAMILY_NAMES[n]} {janitor.human(f['footprint'])}" + (f" ({f['count']})" if f["count"] > 1 else "")
+        for n, f in sorted(fams.items(), key=lambda kv: -kv[1]["footprint"])
+        if n in LONG_LIVED and f["footprint"] >= 50 * MB
+    ]
+    return f"Długo żyjące: {janitor.human(inv.get('long_lived', 0))}" + (": " + " · ".join(parts) if parts else "")
+
+
+def brake(cfg, world, state, now, enforce, acted):
+    """Hamulec pamięci (lastresort): jedno drzewo mniej, gdy stopień tego wymaga; opis albo None.
+
+    Hamulec (2) działa, gdy strażnik w tym przebiegu nic nie zrobił i minęła jego przerwa
+    między akcjami; awaria (3) nie czeka na nic poza własną krótką przerwą. Proces ponad pół
+    RAM ginie na każdym stopniu."""
+    import lastresort
+
+    if not (enforce and cfg.get("last_resort", True)):
+        return None
+    p = world.pressure
+    level = getattr(p, "stage", None)
+    if level is None:  # starszy kształt Pressure (testy): krytyczna presja strażnika to hamulec
+        level = 2 if p.level >= 2 else 0
+    s = lastresort.settings(cfg)
+    inv = state.get("inventory") or {}
+    runaway = (inv.get("biggest") or [0, 0])[1] >= s["runaway_percent"] / 100 * getattr(p, "ram", 0) > 0
+    if level < 2 and not runaway:
+        return None
+    gap = s["emergency_cooldown_seconds"] if level >= 3 else s["brake_cooldown_seconds"]
+    if now - state.get("brake_at", 0) < gap:
+        return None
+    if level < 3 and not runaway and (acted is not None or now - state.get("last_action", 0) < cfg["cooldown_seconds"]):
+        return None
+    reaped = lastresort.reap(world, state, sys.modules[__name__], level=level, cfg=cfg)
+    if reaped:
+        state["brake_at"] = now
+        state["last_action"] = now
+        # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
+        state["swap_history"] = []
+    return reaped
+
+
 def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
     now = now or time.time()
-    world = World(cfg, state, orca, now)
+    # przy awarii bez Orki: jej CLI to node, który przy duszącym się Macu startuje sekundami
+    previous = ((state.get("snapshot") or {}).get("pressure") or {}).get("stage", 0)
+    world = World(cfg, state, orca, now, use_orca=previous < 3)
     check_pending(world, state)
     plans = decide(cfg, world, state)
     enforce = cfg["mode"] == "enforce" and not dry_run
@@ -2038,20 +2197,11 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
                 state["swap_history"] = []
                 acted = plan
             break
-    reaped = None
-    if (
-        enforce
-        and acted is None
-        and cfg.get("last_resort", True)
-        and world.pressure.level >= 2
-        and now - state.get("last_action", 0) >= cfg["cooldown_seconds"]
-    ):
-        import lastresort
-
-        reaped = lastresort.reap(world, state, sys.modules[__name__])
-        if reaped:
-            state["last_action"] = now
-            state["swap_history"] = []
+    stage = getattr(world.pressure, "stage", 0)
+    inv = state.get("inventory") or {}
+    if hasattr(world, "table") and world.table and (stage >= 1 or now - inv.get("at", 0) >= 30):
+        state["inventory"] = inventory(world.table, world.units, now)
+    reaped = brake(cfg, world, state, now, enforce, acted)
     history = state.setdefault("history", [])
     if not history or now - history[-1][0] >= 30:
         p = world.pressure
@@ -2081,6 +2231,7 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
         "plans": [p.summary() for p in plans],
         "acted": acted.summary() if acted else None,
         "last_resort": reaped,
+        "inventory": state.get("inventory"),
     }
     return world, plans, acted
 
@@ -2143,7 +2294,9 @@ def cmd_run(_cfg, _args):
             except Exception as err:  # pętla nie może paść przez jeden zły pomiar
                 log(f"błąd {err!r}")
             save_state(state)
-            time.sleep(cfg["interval_seconds"])
+            # przy ciasnej pamięci co 2 s: między pomiarami co 5 s swap potrafi urosnąć o gigabajt
+            stage = ((state.get("snapshot") or {}).get("pressure") or {}).get("stage", 0)
+            time.sleep(min(cfg["interval_seconds"], 2) if stage >= 1 else cfg["interval_seconds"])
     finally:
         restore_background()
         log("koniec strażnika")
@@ -2184,6 +2337,42 @@ def cmd_status(cfg, args):
         print(
             f"  {when} {event['action']} {event['label']}: {event['reason']} -> {event['result']}"
         )
+    for event in state.get("lastresort", [])[-5:]:
+        when = time.strftime("%H:%M", time.localtime(event["at"]))
+        print(
+            f"  {when} hamulec {event['code']} pid {event['pid']} {janitor.human(event['size'])} -> {event['result']}"
+            + (f" | wznowienie: {event['resume']}" if event.get("resume") else "")
+        )
+    return 0
+
+
+def cmd_brake(cfg, args):
+    """`brake [--stage N] [--within PID] [--json]`: co hamulec zrobiłby teraz, bez sygnałów.
+
+    --stage udaje stopień (np. 3, żeby zobaczyć ofiarę awarii przy spokojnym Macu); --within
+    ogranicza tabelę procesów do drzewa pod PID i procesów, które się do niego przyznają
+    (CLAUDE_PID), np. na sztucznym drzewie w próbie."""
+    import lastresort
+
+    state = janitor.load_json(STATE_PATH, {})
+    world = World(cfg, dict(state), Orca(), time.time(), use_orca=False)
+    p = world.pressure
+    level = p.stage
+    if "--stage" in args:
+        level = int(args[args.index("--stage") + 1])
+    if "--within" in args:
+        root = int(args[args.index("--within") + 1])
+        keep = set(descendants(root, _children_of(world.table)))
+        keep |= {pid for pid in world.table if proc_env(pid).get("CLAUDE_ACC_BRAKE_PROBE") == str(root)}
+        world.table = {pid: row for pid, row in world.table.items() if pid in keep}
+        world.units = [u for u in world.units if set(u.pids) & keep]
+    pick = lastresort.reap(world, {}, sys.modules[__name__], level=level, cfg=cfg, dry_run=True)
+    out = {"stage": p.stage, "reasons": p.stage_reasons, "as_stage": level, "pick": pick}
+    if "--json" in args:
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    print(f"Stopień teraz: {lastresort.STAGE_NAMES[p.stage]}" + (": " + "; ".join(p.stage_reasons) if p.stage_reasons else ""))
+    print(f"Hamulec na stopniu „{lastresort.STAGE_NAMES[min(level, 3)]}” wybrałby: {pick or 'nic'}")
     return 0
 
 
@@ -2199,6 +2388,18 @@ def print_status(snap):
     )
     if p["reasons"] or p.get("notes"):
         print("  " + "; ".join(p["reasons"] + p.get("notes", [])))
+    import lastresort
+
+    stage = p.get("stage", 0)
+    seg = ""
+    if p.get("segments_limit"):
+        seg = f", segmenty kompresora {p['segments'] / p['segments_limit'] * 100:.0f}% limitu"
+    print(
+        f"Hamulec: {lastresort.STAGE_NAMES[stage]}{seg}"
+        + (": " + "; ".join(p.get("stage_reasons") or []) if p.get("stage_reasons") else "")
+    )
+    if snap.get("inventory"):
+        print(inventory_line(snap["inventory"]))
     print(
         f"Dev serwery: {h(snap['total'])} z budżetu {h(snap['budget'])}"
         f" | Orca: {'tak' if snap['orca'] else 'nie'} | tryb: {snap['mode']}"
@@ -2610,6 +2811,7 @@ COMMANDS = {
     "pins": cmd_pins,
     "admit": cmd_admit,
     "room": cmd_room,
+    "brake": cmd_brake,
 }
 
 

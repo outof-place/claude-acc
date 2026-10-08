@@ -2,8 +2,11 @@
 
 `sched.py` wpuszcza ciężkie komendy agentów po pamięci zamiast jednego zamka na wszystko: Go
 (build, vet, test, lint, cele make), JS (testy, e2e, buildy, typecheck, lint, w każdym projekcie z
-`package.json`) i natywne buildy iOS i Androida razem ze startem symulatora (sekcja „Natywne”). Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse (`devguard.py admit`)
-sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje. Pomiary, z których wzięły się
+`package.json`), natywne buildy iOS i Androida razem ze startem symulatora (sekcja „Natywne”) i
+resztę ciężkiej pracy po kształcie komendy (sekcja „Reszta ciężkiej pracy”). Każdy bieg przechodzi
+przez `sched.py run`; hook PreToolUse (`devguard.py admit`) sam owija komendy agentów Claude Code i,
+po `sched.py codex install`, Codeksa; `plock.py go` przekazuje do niego swoje, a terminal, skrypty i
+automatyzacje Orki wołają `claude-acc run -- KOMENDA`. Nikomu nie odmawia: najwyżej każe czekać. Pomiary, z których wzięły się
 liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
 
 Presja pamięci jądra (`kern.memorystatus_vm_pressure_level`): przy `critical` nic nie startuje,
@@ -89,6 +92,8 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `guard_level` | presja wg strażnika dev serwerów (0, 1, 2) z jego pomiaru młodszego niż minuta, albo `null`; liczy też rosnący swap, więc jej `2` wstrzymuje natywne joby |
 | `native` | `{build_gb, active, outside, reserve_gb, owner, owner_label}`: natywny build na Macu teraz. `active`: xcodebuild z akcją, która kompiluje, albo usługa buildów Xcode, pod którą biegnie kompilator (`swift-frontend`, `clang`, `ld`, `actool`…); sama otwarta usługa z pomocnikami buildem nie jest; `outside`: build spoza schedulera (nikt z `running[]` nie trzyma miejsca); `reserve_gb`: dla buildu z zewnątrz `max(0, przewidywany szczyt buildu - build_gb)`; `owner`: id joba, który trzyma miejsce |
 | `simulators` | `{booted, in_use, cap, gb, holders[]}` z pomiaru devguarda albo `null` bez świeżego pomiaru; `in_use`: żywa dzierżawa portivo-mobile, widz albo symulator człowieka |
+| `brake` | stopień hamulca strażnika: `normal`, `tight`, `brake`, `emergency` (niżej) |
+| `long_lived_gb`, `long_lived[]` | pamięć długo żyjących procesów ze stanu strażnika: dev serwery, symulatory, expo/metro, watchery, headless przeglądarki, LSP, Docker (`{family, gb, count}`); jest już w `others_gb`, tu z nazwy; `null` bez świeżego stanu strażnika |
 
 ### Job w `running[]` i `queue[]`
 
@@ -250,6 +255,7 @@ count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, który
 depot_org            ""     organizacja Depot dla `sched.py depot`; pusta: domyślna organizacja CLI
 node                 true   testy, buildy i typecheck JS w kolejce
 native               true   natywne buildy, pody i start symulatora w kolejce
+generic              true   reszta ciężkiej pracy po kształcie komendy (niżej)
 ```
 
 ## JS
@@ -336,6 +342,79 @@ się do pamięci, ale nie do tego limitu: strażnik ich nie wyłącza, więc Tw�
 symulator sesji pomiarów wydajności nie może na stałe zablokować agentom startu. Nieużywane symulatory wyłącza strażnik (README, sekcja o
 strażniku dev serwerów); bez jego świeżego pomiaru limitu nie ma.
 
+## Reszta ciężkiej pracy: po kształcie komendy
+
+Hook owija też komendy, których scheduler nie zna z projektu, ale które z samego kształtu są
+pracą, kończą się same i potrafią zjeść gigabajty (`GENERIC_TOOLS` w `sched.py`):
+
+- narzędzia: `cargo` (build, test, check, clippy, run, bench, doc, nextest, install), `swift`
+  (build, test, run), `docker build` (i `buildx build`, `compose build`), `pytest`,
+  `python -m pytest|unittest|mypy`, `mypy`, `pyright`, `tox`, `nox`, `deno`, `bazel`, `mvn`,
+  `dotnet`, `nx`, `lerna`, `webpack`, `rollup`, `parcel`, `tsup`, `astro build`, `nuxt build`,
+  `svelte-check`, `cypress run`, `mocha`, `ava`, `lighthouse`, `storybook build`, przepisy `just`,
+  `task` i `make` poza modułem Go, także przez `npx`, `pnpm exec` i `uv run`. xcodebuild, Gradle,
+  expo, react-native i start symulatora zna część natywna (sekcja wyżej). `swift build` jest tu, ale jego `swift-build`
+  zajmuje miejsce na natywny build jak każdy build w drzewie joba schedulera (niżej);
+- skrypty: plik uruchamiany po ścieżce (`./scripts/e2e.sh`, `bin/verify`, `e2e.sh`), przez
+  interpreter (`python x.py`, `node x.js`, `tsx`, `ts-node`, `bun x.ts`, `bash x.sh`) i skrypty z
+  `package.json` o dowolnej nazwie (`pnpm sm capture`, `npm run e2e:ci`), także `sh -c '...'`.
+
+Nigdy: serwery, watchery i REPL-e (nazwa skryptu, podkomenda albo treść skryptu z `dev`, `serve`,
+`server`, `start`, `watch`, `preview`, `runserver`..., `--watch`), `python -c`, `node -e`, heredoc
+(`python3 -`), flagi informacyjne (`--version`, `--help`), skrypt, którego pliku nie ma, lekkie
+skrypty (`format`, `fmt`, `clean`) i komendy menedżera pakietów (`install`, `add`, `why`...).
+
+Klasa: `<repo>:<rodzaj>:<podpis>`, np. `site:script:pnpm-script:sm:capture`,
+`app:test:cargo:test`, `site:script:python:scripts/capture.py`; skrypt spoza repo (tmp, scratchpad)
+podpisuje się samą nazwą pliku. Pierwszy bieg nieznanego podpisu dostaje ostrożne przewidywanie
+(GB, s): `build` 6/300, `test` 4/180, `e2e` 4/240, `typecheck` 3/90, `script` 4/300. Gdy rodzina
+(repo, rodzaj, narzędzie: wszystkie skrypty Pythona w tym repo) ma co najmniej 5 biegów, nowy podpis
+startuje od jej p90 × 1,5 (najmniej 1 GB). Potem p90 z historii tej klasy, jak w Go. `docker build`
+nie schodzi poniżej 4 GB: praca dzieje się w maszynie wirtualnej Dockera, nie w drzewie komendy.
+Te joby biegną tylko lokalnie, a `run` czyta z historii tylko wiersze ich rodziny i nie ładuje
+cache Go, więc krótka komenda płaci mało: owinięty skrypt, który kończy się od razu, oddaje
+wynik po kilkudziesięciu ms (pętla `run` patrzy co 10 ms przez pierwsze pół sekundy).
+
+Rezerwa na wzrost (`reserved_gb`) znika dla joba, który biegnie dłużej niż 3 × przewidywany czas
+i dłużej niż 10 minut: to zwykle serwer albo watcher, który skrypt zostawił na pierwszym planie,
+a jego pamięć jest już w tym, co widzi jądro.
+
+Natywny build w drzewie innego joba (`make ios`, skrypt z xcodebuild, `swift build`) należy do
+tego joba: zajmuje miejsce na natywny build (`native.owner`), ale nie dokłada rezerwy jak build
+spoza schedulera, bo wzrost tego joba jest już w jego przewidywaniu.
+
+### Job w jobie
+
+`run` daje dziecku `CLAUDE_ACC_SCHED_JOB=<id joba>`. `sched.py run` z tą zmienną (skrypt, który
+sam woła scheduler, jak `sm-heavy.sh` albo `plock.py`) uruchamia komendę od razu: jej pamięć liczy
+się w drzewie zewnętrznego joba, a drugie czekanie na tę samą pamięć mogłoby czekać na siebie.
+
+### `git grep`
+
+Hook dokłada `-I` (pomiń pliki binarne) do `git grep` agenta, który nie ma `-I`, `-a`, `--text`
+ani `--binary-files`. 2026-10-08 pętla agenta z `git grep -nE ... <commit>` w repo z 368 MB filmów
+i obrazów w historii urosła do 10 GB w 2 sekundy: wyrażenie `-E` idzie przez regex macOS, a plik
+binarny to dla niego jedna linia długości megabajtów. Z `-I` ta sama komenda ma szczyt ~270 MB.
+
+### Codex
+
+`sched.py codex install` dopisuje do `~/.codex/hooks.json` (albo `$CODEX_HOME/hooks.json`) hook
+PreToolUse z matcherem `Bash`: `claude-acc-hook codex`, a bez natywnego frontu `devguard admit
+--codex`. Cudze wpisy (rtk, Orca) zostają, drugi `install` niczego nie dubluje, `uninstall` zdejmuje
+tylko nasz. Codex uruchamia nowy hook dopiero po zaufaniu mu w `/hooks`. Przepisaną komendę przyjmuje
+tylko z `permissionDecision: "allow"`, więc owinięte komendy nie pytają o zgodę (Orka i tak
+uruchamia Codeksa z `--dangerously-bypass-approvals-and-sandbox`).
+
+## Hamulec strażnika
+
+Strażnik (`devguard.py`, `lastresort.py`) liczy co przebieg stopień hamulca: `tight` (ciasno),
+`brake` (hamulec), `emergency` (awaria); szczegóły i progi w README, sekcja Dev server guard.
+Scheduler czyta go ze świeżego (do 30 s) stanu strażnika: przy `tight` i `brake` startuje tylko to,
+co się mieści, bez furtki „sam na Macu” (przy `brake` także bez rezerwy na samotny job ponad
+dostępną pamięć), a przy `emergency` nie startuje nic; joby w kolejce czekają (`reason.code`
+`pressure`), nikt nie dostaje odmowy. Hamulec może zgasić biegnący job schedulera: agent dostaje
+kod wyjścia sygnału, a log strażnika komendę do wznowienia.
+
 ## `sched.py wait`
 
 `sched.py wait [--max S] [--every S] -- 'WARUNEK'` sprawdza WARUNEK (komendę powłoki) co `--every`
@@ -357,6 +436,12 @@ stringów), nie rusza: kończy się kodem 1 i plik zostaje, jaki był. Test piln
 co scheduler owija, i nic więcej (rtk dalej skraca `pnpm install` czy `git`). Jeden wyjątek od
 „nic więcej”: rtk czyta wzorce crate'em `regex` bez lookaroundów, więc `xcodebuild` idzie w wyjątki
 cały, także `-version` i `-list`, których scheduler nie owija.
+Test pyta też samo rtk: każda komenda, którą scheduler owija, zostaje przez rtk nieprzepisana, a
+te, których nie owija (`git status`, `cargo fmt`, `docker ps`, `pnpm install`), rtk dalej skraca.
+rtk porównuje wyjątki z komendą po swojej normalizacji (`uv run pytest` i `python -m pytest` to dla
+niego `pytest`) i ignoruje cały plik z niepełną sekcją. Komenda złożona z członu, który rtk
+przepisuje, i członu, który owija scheduler (`git status && cargo test`), dalej daje dwa
+przepisania naraz; wtedy wygrywa jedno z nich.
 
 W środku opakowania `with_rtk` pyta `rtk rewrite` o tę samą komendę z pustym `HOME`, czyli bez
 naszych wyjątków, więc reguły rtk mają jedno źródło i agent dalej dostaje krótkie wyjście. Gdy rtk
