@@ -820,8 +820,19 @@ def save_attachment(addr, message_id, filename, raw):
     return path
 
 
-def build_message(addr, to, cc, subject, body, reply=None):
-    """RFC 5322: odpowiedź dziedziczy In-Reply-To, References, temat i adresata oryginału."""
+def html_body(body, signature):
+    """Treść jako HTML Gmaila ze stopką w bloku gmail_signature (Gmail zwija go w wątku)."""
+    text = html.escape(body.rstrip()).replace("\n", "<br>\n")
+    return (
+        f'<div dir="ltr">{text}<br clear="all"><br>'
+        f'<div dir="ltr" class="gmail_signature" data-smartmail="gmail_signature">{signature}</div></div>'
+    )
+
+
+def build_message(addr, to, cc, subject, body, reply=None, signature=None):
+    """RFC 5322: odpowiedź dziedziczy In-Reply-To, References, temat i adresata oryginału.
+
+    Ze stopką (HTML) wiadomość ma dwie wersje: tekst ze stopką jako tekstem i HTML ze stopką w oryginale."""
     msg = EmailMessage()
     msg["From"] = addr
     if reply:
@@ -844,7 +855,15 @@ def build_message(addr, to, cc, subject, body, reply=None):
     msg["Subject"] = subject or "(no subject)"
     msg["Date"] = email.utils.formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=addr.split("@")[-1])
-    msg.set_content(body or "")
+    body = body or ""
+    if not signature:
+        msg.set_content(body)
+        return msg, recipients
+    sig_text, _ = html_to_text(signature)
+    # komórki tabel stopki dają pusty wiersz po każdej linii
+    sig_text = "\n".join(line.strip() for line in sig_text.splitlines() if line.strip())
+    msg.set_content(body.rstrip() + "\n\n" + sig_text + "\n")
+    msg.add_alternative(html_body(body, signature), subtype="html")
     return msg, recipients
 
 
@@ -1091,6 +1110,11 @@ class GmailProvider:
             "from": h.get("from", ""),
             "reply_to": h.get("reply-to"),
         }
+
+    def signature(self, addr):
+        """Stopka z ustawień Gmaila (send-as): API, w przeciwieństwie do Gmaila w przeglądarce, nie dokleja jej sam."""
+        resp = self.call(addr, "read", "GET", f"/settings/sendAs/{urllib.parse.quote(addr)}")
+        return resp.get("signature") or None
 
     def draft(self, addr, msg, reply):
         message = {"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode()}
@@ -1608,6 +1632,9 @@ class ImapProvider:
             "reply_to": str(msg.get("Reply-To", "") or "") or None,
         }
 
+    def signature(self, addr):
+        return None  # IMAP nie przechowuje stopki
+
     def draft(self, addr, msg, reply):
         folder = self.folder("drafts_folder", "Drafts")
         conn = self.connect()
@@ -1882,7 +1909,7 @@ TOOLS = [
     {
         "name": "mail_draft",
         "title": "Create draft",
-        "description": "Creates a draft in the mailbox (nothing is sent). With reply_to_message_id it threads as a reply and defaults the recipient and 'Re:' subject. Drafts need no confirmation.",
+        "description": "Creates a draft in the mailbox (nothing is sent). With reply_to_message_id it threads as a reply and defaults the recipient and 'Re:' subject. The mailbox's own signature (Gmail send-as) is appended, so do not write one into the body. Drafts need no confirmation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -2110,6 +2137,7 @@ class Gateway:
                 args.get("subject"),
                 args.get("body", ""),
                 reply,
+                prov.signature(addr),
             )
             return dict(
                 base,
