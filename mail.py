@@ -16,7 +16,7 @@
     claude-acc mail send <skrzynka> <id szkicu>
     claude-acc mail google --service-account SA [--key | --aws-audience A --aws-profile P [--aws-region R]]
     claude-acc mail key-create --service-account SA [--gcloud-account KONTO]
-    claude-acc mail add <adres> gmail [read|modify|draft] [--send ask|auto]
+    claude-acc mail add <adres> gmail [read|modify|draft] [--send ask|auto] [--token-command CMD]
     claude-acc mail add <adres> imap [read|modify|draft] [--send ask|auto] --host H [--port 993] [--user U]
                         [--smtp-host H] [--smtp-port 465|587] [--xoauth2-command CMD]
     claude-acc mail remove <adres>
@@ -30,6 +30,8 @@ Dostawcy:
           `aws`     bez klucza: poświadczenia AWS podpisują GetCallerIdentity, Google STS wymienia
                     je w puli Workload Identity, a token federacyjny podpisuje JWT (signJwt).
           `gcloud`  Application Default Credentials użytkownika z roles/iam.serviceAccountTokenCreator.
+          Bez delegacji (cudza domena, brak admina): `--token-command` drukuje access token OAuth
+          ze zgody właściciela skrzynki (np. przez gws); bramka sprawdza jego zakresy w tokeninfo.
   imap    dowolny serwer IMAP (TLS) i SMTP do wysyłki. Hasło (albo hasło aplikacji) leży w Pęku
           kluczy pod usługą "claude-acc-mail" i kontem = adres; albo XOAUTH2 z tokenem z polecenia
           (`--xoauth2-command`, np. Microsoft 365). Wątki z nagłówków References, etykiety to
@@ -86,6 +88,7 @@ ADC_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.path.join(
     HOME, ".config/gcloud/application_default_credentials.json"
 )
 KEYCHAIN_SERVICE = "claude-acc-mail"
+KEEP_IMAP_S = 120  # tyle czeka bezczynne połączenie IMAP; serwery zrywają po ~30 min, NAT bywa szybszy
 KEYCHAIN_SA = "google-service-account"
 OPENSSL = "/usr/bin/openssl"
 
@@ -102,6 +105,15 @@ SCOPES = {
     "modify": "https://www.googleapis.com/auth/gmail.modify",
     "draft": "https://www.googleapis.com/auth/gmail.compose",
 }
+FULL_GMAIL = "https://mail.google.com/"
+# które zakresy zgody pokrywają zakres potrzebny operacji (token z --token-command)
+COVERED_BY = {
+    SCOPES["read"]: {SCOPES["read"], SCOPES["modify"], FULL_GMAIL},
+    SCOPES["modify"]: {SCOPES["modify"], FULL_GMAIL},
+    SCOPES["draft"]: {SCOPES["draft"], FULL_GMAIL},
+}
+TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
+COMMAND_TOKEN_S = 600  # access token Google żyje godzinę; komenda (gws) odświeża go sama
 LEVELS = ("read", "modify", "draft")
 PROVIDERS = ("gmail", "imap")
 SEND_MODES = ("off", "ask", "auto")
@@ -190,7 +202,7 @@ def load_config(path=None):
         raise MailError(
             f"brak skrzynek w {path}: claude-acc mail add <adres> gmail|imap ..."
         )
-    if any(s["provider"] == "gmail" for s in boxes.values()) and not (
+    if any(s["provider"] == "gmail" and not s.get("token_command") for s in boxes.values()) and not (
         cfg.get("google") or {}
     ).get("service_account"):
         raise MailError(
@@ -892,6 +904,35 @@ def gmail_extract(payload, prefer_html=False):
     return text, links, attachments
 
 
+class CommandTokens:
+    """Token OAuth ze zgody właściciela skrzynki zamiast delegacji domenowej: komenda drukuje access token."""
+
+    def __init__(self, command):
+        self.command = command
+        self.lock = threading.Lock()
+        self.hit = None  # (token, zakresy, ważny do)
+
+    def caller(self):
+        return "command"
+
+    def mailbox(self, addr, scope):
+        with self.lock:
+            if not self.hit or self.hit[2] < time.time():
+                out = subprocess.run(self.command, shell=True, capture_output=True, text=True, timeout=60)
+                token = out.stdout.strip()
+                if out.returncode != 0 or not token:
+                    raise MailError(f"token_command: {out.stderr.strip()[:300] or 'pusty wynik'}")
+                info = http("GET", TOKENINFO_URL + "?" + urllib.parse.urlencode({"access_token": token}))
+                self.hit = (token, set((info.get("scope") or "").split()), time.time() + COMMAND_TOKEN_S)
+            token, granted, _ = self.hit
+        if not granted & COVERED_BY[scope]:
+            raise MailError(
+                f"token z token_command dla {addr} nie ma zakresu {scope}: zaloguj go ponownie z tym zakresem "
+                f"albo obniż poziom skrzynki (claude-acc mail add {addr} gmail <poziom> --token-command ...)"
+            )
+        return token
+
+
 class GmailProvider:
     kind = "gmail"
 
@@ -1237,7 +1278,9 @@ def parts_of(msg, prefer_html):
 
 
 class ImapProvider:
-    """Jedno połączenie na operację: agent pyta rzadko, a długo żyjące IMAP zrywa NAT i serwer."""
+    """Połączenia wracają do puli na KEEP_IMAP_S: seria wywołań agenta (szukaj, czytaj, wątek) loguje się
+    raz, a TLS z logowaniem to większość czasu wywołania. Przed ponownym użyciem NOOP, bo długo
+    żyjące IMAP zrywa NAT i serwer."""
 
     kind = "imap"
 
@@ -1245,6 +1288,8 @@ class ImapProvider:
         self.addr = addr
         self.spec = spec
         self.limit = limit
+        self.idle = []  # (połączenie, time.monotonic() oddania)
+        self.lock = threading.Lock()  # serwer MCP woła narzędzia z kilku wątków
 
     def secret(self):
         command = self.spec.get("xoauth2_command")
@@ -1263,6 +1308,36 @@ class ImapProvider:
         return ("password", password)
 
     def connect(self):
+        while True:
+            with self.lock:
+                if not self.idle:
+                    break
+                conn, since = self.idle.pop()
+            if time.monotonic() - since < KEEP_IMAP_S:
+                try:
+                    if conn.noop()[0] == "OK":
+                        return conn
+                except (OSError, imaplib.IMAP4.error):
+                    pass
+            self.close(conn)
+        return self.login()
+
+    def release(self, conn):
+        """Wołane w finally: zdrowe połączenie wraca do puli, po wyjątku w locie zostaje zamknięte."""
+        if sys.exc_info()[0] is None:
+            with self.lock:
+                self.idle.append((conn, time.monotonic()))
+        else:
+            self.close(conn)
+
+    @staticmethod
+    def close(conn):
+        try:
+            conn.logout()
+        except (OSError, imaplib.IMAP4.error):
+            pass
+
+    def login(self):
         ctx = ssl.create_default_context()
         try:
             conn = imaplib.IMAP4_SSL(
@@ -1283,15 +1358,16 @@ class ImapProvider:
                 )
             else:
                 conn.login(user, secret)
-        except imaplib.IMAP4.error as exc:
-            raise MailError(f"IMAP logowanie {user}@{self.spec['host']}: {exc}")
+        except (OSError, imaplib.IMAP4.error) as exc:
+            # Dovecot po złym haśle przetrzymuje odpowiedź, więc timeout też znaczy nieudane logowanie
+            raise MailError(f"IMAP logowanie {user}@{self.spec['host']}: {exc or type(exc).__name__}")
         return conn
 
     def session(self, folder, readonly=True):
         conn = self.connect()
         typ, data = conn.select(imap_quote(folder), readonly=readonly)
         if typ != "OK":
-            conn.logout()
+            self.release(conn)
             raise MailError(
                 f"IMAP: brak folderu {folder!r} ({data[0].decode(errors='replace') if data else ''})"
             )
@@ -1361,7 +1437,7 @@ class ImapProvider:
                 "result_size_estimate": len(uids),
             }
         finally:
-            conn.logout()
+            self.release(conn)
 
     def message(self, message_id):
         folder, uid = self.split_id(message_id)
@@ -1369,7 +1445,7 @@ class ImapProvider:
         try:
             _, flags, raw = self.fetch(conn, uid, "(UID FLAGS BODY.PEEK[])")
         finally:
-            conn.logout()
+            self.release(conn)
         return (
             folder,
             uid,
@@ -1433,7 +1509,7 @@ class ImapProvider:
                             email.message_from_bytes(raw, policy=email.policy.default),
                         )
             finally:
-                conn.logout()
+                self.release(conn)
 
         def when(item):
             try:
@@ -1503,7 +1579,7 @@ class ImapProvider:
                 if target:
                     self.move(conn, uidset, target)
             finally:
-                conn.logout()
+                self.release(conn)
 
     def move(self, conn, uidset, target):
         if "MOVE" in conn.capabilities:
@@ -1554,7 +1630,7 @@ class ImapProvider:
                 found = (data[0] or b"").split() if typ == "OK" else []
                 uid = found[-1].decode() if found else None
         finally:
-            conn.logout()
+            self.release(conn)
         return {
             "draft_id": f"{folder}:{uid}" if uid else None,
             "message_id": f"{folder}:{uid}" if uid else None,
@@ -1626,7 +1702,7 @@ class ImapProvider:
             if "UIDPLUS" in conn.capabilities:
                 conn.uid("EXPUNGE", uid)
         finally:
-            conn.logout()
+            self.release(conn)
         return {
             "sent_message_id": str(msg.get("Message-ID", "")),
             "recipients": recipients,
@@ -1647,7 +1723,7 @@ class ImapProvider:
                 else "signed in"
             )
         finally:
-            conn.logout()
+            self.release(conn)
 
 
 # ---------- audyt ----------
@@ -1858,10 +1934,20 @@ TOOLS = [
             "idempotentHint": False,
             "openWorldHint": True,
         },
-        # Claude Code pyta człowieka przy KAŻDYM wywołaniu, także w bypassPermissions
-        "_meta": {"anthropic/requiresUserInteraction": True},
     },
 ]
+
+
+
+def tool_list(cfg):
+    """Okno zgody Claude Code przy mail_send jest zgodą dla skrzynek 'ask'; same 'auto' wysyłają bez okna."""
+    tools = json.loads(json.dumps(TOOLS))
+    if any(spec["send"] == "ask" for spec in cfg["mailboxes"].values()):
+        send = next(t for t in tools if t["name"] == "mail_send")
+        # Claude Code pyta człowieka przy KAŻDYM wywołaniu, także w bypassPermissions
+        send.setdefault("_meta", {})["anthropic/requiresUserInteraction"] = True
+    return tools
+
 
 # długie wątki i wiadomości nie lądują w pliku zamiast w odpowiedzi
 for _tool in TOOLS:
@@ -1917,7 +2003,9 @@ class Gateway:
         if addr in self.providers:
             return self.providers[addr]
         spec = self.cfg["mailboxes"][addr]
-        if spec["provider"] == "gmail":
+        if spec["provider"] == "gmail" and spec.get("token_command"):
+            prov = GmailProvider(self.cfg.get("google") or {}, self.limit, tokens=CommandTokens(spec["token_command"]))
+        elif spec["provider"] == "gmail":
             if self.gmail is None:
                 self.gmail = GmailProvider(self.cfg["google"], self.limit)
             prov = self.gmail
@@ -2098,12 +2186,18 @@ class McpServer(mcpbase.McpServer):
     title = "Mail gateway (claude-acc)"
     version = VERSION
     instructions = INSTRUCTIONS
-    tools = TOOLS
 
     def __init__(self, cfg_loader=load_config, out=None, gateway=None):
         super().__init__(out=out)
         self.cfg_loader = cfg_loader
         self.gateway = gateway
+
+    @property
+    def tools(self):
+        try:
+            return tool_list(self.gw().cfg)
+        except MailError:
+            return tool_list({"mailboxes": {}})
 
     def gw(self):
         if self.gateway is None:
@@ -2258,6 +2352,7 @@ def cmd_add(args):
     host, port, user = flag(args, "--host"), flag(args, "--port"), flag(args, "--user")
     smtp_host, smtp_port = flag(args, "--smtp-host"), flag(args, "--smtp-port")
     xoauth2 = flag(args, "--xoauth2-command")
+    token_command = flag(args, "--token-command")
     if len(args) < 2 or args[1] not in PROVIDERS or send not in SEND_MODES:
         print(
             "usage: claude-acc mail add <adres> gmail|imap [read|modify|draft] [--send off|ask|auto] [--host H ...]",
@@ -2270,6 +2365,8 @@ def cmd_add(args):
         print(f"zły poziom {level}: {', '.join(LEVELS)}", file=sys.stderr)
         return 2
     spec = {"provider": provider, "access": level, "send": send}
+    if provider == "gmail" and token_command:
+        spec["token_command"] = token_command
     if provider == "imap":
         if not host:
             print("imap wymaga --host", file=sys.stderr)
@@ -2343,12 +2440,11 @@ def doctor(cfg, quiet=False):
     ok = True
     gw = Gateway(cfg, client="doctor")
     health, identity = {}, None
-    if any(s["provider"] == "gmail" for s in cfg["mailboxes"].values()):
+    delegated = [a for a, s in cfg["mailboxes"].items() if s["provider"] == "gmail" and not s.get("token_command")]
+    if delegated:
         kind = cfg["google"].get("identity", {}).get("type", "gcloud")
         try:
-            gw.provider(
-                next(a for a, s in cfg["mailboxes"].items() if s["provider"] == "gmail")
-            ).tokens.caller()
+            gw.provider(delegated[0]).tokens.caller()
             identity = {
                 "type": kind,
                 "ok": True,
@@ -2365,7 +2461,7 @@ def doctor(cfg, quiet=False):
         try:
             detail = gw.provider(addr).ping(addr, spec["access"])
             health[addr] = {"ok": True, "detail": detail, "checked_at": time.time()}
-        except MailError as exc:
+        except (MailError, OSError) as exc:  # zerwane połączenie jednej skrzynki nie przerywa sprawdzania reszty
             ok = False
             health[addr] = {
                 "ok": False,
