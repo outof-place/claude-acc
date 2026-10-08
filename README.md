@@ -367,6 +367,12 @@ claude-acc guard unpin :3747
 
 A pinned server is never stopped: not as idle, a duplicate, an orphan, over budget or under pressure. When it bloats over `max_server_gb` it is still restarted in its terminal (it is back in seconds), and a restart loop only warns. `--no-restart` holds even that, until memory is critical: then the biggest pinned server is restarted, never stopped, and only when nothing unpinned is left to free. Pins last 12 hours unless you say `--for 90m`, `--for 2d` or `--forever`, live in `~/.local/share/claude-acc/devguard-pins.json`, take effect on the next pass without restarting the guard, and show up in `guard status` with their reason and expiry. Expired ones are ignored.
 
+### iOS simulators and Metro
+
+A booted iOS simulator holds 3-4 GB (measured 2026-10-08: 3.3-4.2 GB and 150-180 processes for one with a React Native app), and agents leave them booted after their session ends. The guard sees each one by its `launchd_sim` and the UDID in its arguments, and counts it in use while a live session holds its `portivo-mobile` lease (`~/.cache/portivo-mobile/leases`, the session's pid and start time), while a process outside it names its UDID (maestro's driver, a build with `-destination id=UDID`, `serve-sim`), or when it isn't from the agents' `Portivo-*` pool, which makes it yours. A pool simulator nobody uses is shut down with `xcrun simctl shutdown` after `simulator_idle_minutes` of quiet (an idle simulator uses 0.01 of a core, one maestro drives 0.4-0.7, so quiet means under `simulator_busy_cores`), and after `simulator_quiet_minutes` when more than `max_booted_simulators` are booted or memory is tight. Never while Simulator is the frontmost app, never within `grace_minutes` of boot, and the lease is read again under `portivo-mobile`'s own lock right before, so a session taking the device wins. Over the cap with nothing safe to shut down, it warns once an hour. `portivo-mobile up` from a session without a simulator waits in the build scheduler while the simulators in use are at the cap.
+
+An app in a simulator keeps a connection to its Metro, which made a Metro whose session died look watched forever. A client in a simulator nobody uses no longer counts as a viewer, so that Metro goes as an orphan or idle server like any other; it isn't stopped while Simulator is the frontmost app.
+
 `claude-acc-hook` is a `PreToolUse` hook for Claude Code. When an agent is about to start a dev server (also through `orca terminal create --command`, `cd`, `pnpm -C`, `--filter`), it refuses a second server of an app that already runs and gives the agent its URL instead, and refuses a new one when memory is critical or the servers are over budget. It denies even under `--dangerously-skip-permissions`. `DEVGUARD_ALLOW=1` in front of the command lets it through. Add it to `~/.claude/settings.json`:
 
 ```json
@@ -375,7 +381,7 @@ A pinned server is never stopped: not as idle, a duplicate, an orphan, over budg
 ] } ] } }
 ```
 
-The hook runs before every Bash command of every agent, and most commands neither start a dev server nor bring Go or JS work for the scheduler. `claude-acc-hook` is a small native binary that answers those in about 5 ms; a command where one of the words that matter stands as a whole word goes on to `devguard.py admit` with the same input, which decides everything. The words and the pattern come from `devguard.py words`, written to `hook-words.json` at setup. The scheduler knows a program by its whole token and a dev server start always follows whitespace, so `2>/dev/null`, `export`, `main_test.go` or `tsconfig.json` no longer start Python: on a day of real commands, 16% went to Python instead of 45%, and none of the commands Python acts on was lost. Before, Python started for every command: 44 ms each, and hundreds when the Mac is loaded. `python3 devguard.py admit` still works as the hook on its own.
+The hook runs before every Bash command of every agent, and most commands neither start a dev server nor bring Go, JS or native build work for the scheduler ([docs/sched.md](docs/sched.md)). `claude-acc-hook` is a small native binary that answers those in about 5 ms; a command where one of the words that matter stands as a whole word goes on to `devguard.py admit` with the same input, which decides everything. The words and the pattern come from `devguard.py words`, written to `hook-words.json` at setup. The scheduler knows a program by its whole token and a dev server start always follows whitespace, so `2>/dev/null`, `export`, `main_test.go` or `tsconfig.json` no longer start Python: on a day of real commands, 16% went to Python instead of 45%, and none of the commands Python acts on was lost. Before, Python started for every command: 44 ms each, and hundreds when the Mac is loaded. `python3 devguard.py admit` still works as the hook on its own.
 
 Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is optional.
 
@@ -398,6 +404,12 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `scope` | `[]` | When set, the guard only sees servers under these paths |
 | `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
 | `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |
+| `max_booted_simulators` | `2` | Booted iOS simulators at once; over it, unused pool ones go after `simulator_quiet_minutes` and `portivo-mobile up` waits; `0` turns the cap off |
+| `simulator_idle_minutes` / `simulator_quiet_minutes` | `30` / `5` | When an unused pool simulator goes, under and over the cap |
+| `simulator_busy_cores` | `0.15` | CPU of the whole simulator that counts as use |
+| `simulator_pool_prefix` | `Portivo-` | Names of the agents' simulators; others are yours and never shut down |
+| `simulator_leases` | `~/.cache/portivo-mobile/leases` | Where `portivo-mobile` keeps its leases |
+| `simulator_protect` | `[]` | Simulator names or UDIDs the guard never shuts down |
 
 ## fseventsd guard
 

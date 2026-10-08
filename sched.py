@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Scheduler komend Go i JS agentów: wpuszcza joby po pamięci zamiast jednego zamka na wszystko.
+"""Scheduler komend Go, JS i natywnych buildów mobilnych agentów: wpuszcza joby po pamięci
+zamiast jednego zamka na wszystko.
 
   sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli]
                (--shell 'KOMENDA' | -- ARGV...)
@@ -17,6 +18,11 @@ czas z historii, a potem:
     scripts/depot-exec.sh w repo), jeśli jest trasa;
   - musi czekać: zostaje w kolejce, chyba że czekanie + bieg lokalnie minus czas na Depot jest
     warte więcej niż λ × jednostki Depot.
+Natywne buildy (`portivo-mobile up`, xcodebuild, `expo run:ios|android`, `eas build --local`)
+nie idą na Depot i biegną po jednym naraz na całym Macu; build spoza schedulera (xcodebuild
+z kompilatorami pod nim) też zajmuje to miejsce i rezerwuje swój wzrost. `pod install` jest
+lekki i biegnie obok. `portivo-mobile up` sesji bez symulatora czeka też, gdy symulatory
+w użyciu są na limicie strażnika (`max_booted_simulators` w devguard.json).
 Komenda biegnie jako dziecko tego procesu: agent widzi jej wyjście na żywo i dostaje jej kod
 wyjścia. Stan dla panelu: sched/state.json, historia: sched/history.jsonl (docs/sched.md).
 Hook PreToolUse (devguard.py admit) owija komendy agentów przez hook_rewrite().
@@ -277,15 +283,137 @@ def job_pids(root):
     return seen
 
 
-def job_usage(root):
-    """(GB, CPU s) wszystkich żywych procesów joba."""
+def pids_usage(pids):
+    """(GB, CPU s) tych procesów, które jeszcze żyją."""
     footprint, cpu = 0, 0.0
-    for pid in job_pids(root):
+    for pid in pids:
         u = proc_usage(pid)
         if u:
             footprint += u[0]
             cpu += u[1]
     return footprint / GB, cpu
+
+
+def job_usage(root):
+    """(GB, CPU s) wszystkich żywych procesów joba."""
+    return pids_usage(job_pids(root))
+
+
+PROC_ALL_PIDS = 1
+PROC_PIDTBSDINFO = 3
+BSDINFO_SIZE = 136  # struct proc_bsdinfo
+BSD_PPID, BSD_START = 16, 120  # pbi_ppid, pbi_start_tvsec
+
+
+def all_pids():
+    k = kernel()
+    need = k.libc.proc_listpids(PROC_ALL_PIDS, 0, None, 0)
+    if need <= 0:
+        return []
+    buf = (k.ctypes.c_int * (need // 4 + 256))()
+    n = k.libc.proc_listpids(PROC_ALL_PIDS, 0, buf, k.ctypes.sizeof(buf))
+    return [p for p in buf[: max(n, 0) // 4] if p > 0]
+
+
+def proc_name(pid):
+    """Nazwa procesu (p_comm, do 32 znaków), bez argumentów: jedno wywołanie jądra."""
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(64)
+    n = k.libc.proc_name(pid, buf, 64)
+    return buf.raw[:n].decode(errors="replace") if n > 0 else ""
+
+
+def proc_path(pid):
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(4096)
+    n = k.libc.proc_pidpath(pid, buf, 4096)
+    return buf.raw[:n].decode(errors="replace") if n > 0 else ""
+
+
+def proc_bsd(pid, offset, size=4):
+    """Pole struct proc_bsdinfo procesu (ppid, start) albo None."""
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(BSDINFO_SIZE)
+    got = k.libc.proc_pidinfo(pid, PROC_PIDTBSDINFO, k.ctypes.c_uint64(0), buf, BSDINFO_SIZE)
+    if got != BSDINFO_SIZE:
+        return None
+    return int.from_bytes(buf.raw[offset : offset + size], "little")
+
+
+KERN_PROCARGS2 = 49
+
+
+def proc_args(pid):
+    """argv procesu z KERN_PROCARGS2 albo None (cudzy proces, zombie)."""
+    k = kernel()
+    mib = (k.ctypes.c_int * 3)(1, KERN_PROCARGS2, pid)
+    size = k.ctypes.c_size_t(0)
+    if k.libc.sysctl(mib, 3, None, k.ctypes.byref(size), None, 0) or not size.value:
+        return None
+    buf = k.ctypes.create_string_buffer(size.value)
+    if k.libc.sysctl(mib, 3, buf, k.ctypes.byref(size), None, 0):
+        return None
+    raw = buf.raw[: size.value]
+    if len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], "little")
+    _exe, _, rest = raw[4:].partition(b"\0")
+    return [a.decode(errors="replace") for a in rest.lstrip(b"\0").split(b"\0")[:argc]]
+
+
+def descendants(root):
+    seen, todo = set(), [root]
+    while todo:
+        pid = todo.pop()
+        if pid not in seen:
+            seen.add(pid)
+            todo.extend(_listpids(PROC_PPID_ONLY, pid))
+    return seen
+
+
+# Pod tymi procesami biegnie natywny build: xcodebuild z wiersza poleceń i swift-build; usługa
+# buildów Xcode (stara i nowa nazwa) tylko wtedy, gdy ma dzieci: przy otwartym Xcode żyje bez
+# przerwy, a build to dopiero jej kompilatory. Po nazwie, a nie po ścieżce do Xcode: clang i ld,
+# które linkują testy Go z cgo, nie są natywnym buildem. xcodebuild tylko z akcją, która
+# kompiluje: maestro trzyma na symulatorze `xcodebuild test-without-building` przez całą sesję.
+NATIVE_DRIVERS = ("xcodebuild", "swift-build")
+NATIVE_SERVICES = ("XCBBuildService", "SWBBuildService")
+NATIVE_QUIET_S = 30  # tyle sekund bez kompilatorów po buildzie: faza buildu skończona
+
+
+def native_scan(sims_since=None):
+    """Natywne buildy na tym Macu: {gb, active, pids} z phys_footprint ich drzew procesów.
+
+    `portivo-mobile up` buduje w procesie odczepionym od sesji (własna sesja, rodzic launchd), a
+    symulator włącza CoreSimulatorService: żadne z nich nie leży w drzewie joba. Z sims_since
+    liczą się też symulatory (launchd_sim z drzewem) włączone od tej chwili. Kilka ms: nazwy
+    procesów bez argumentów. SCHED_FAKE_MEMORY z kluczem `native` w testach."""
+    fake = fake_memory()
+    if fake is not None and "native" in fake:
+        n = fake.get("native") or {}
+        return {"gb": float(n.get("gb", 0)), "active": bool(n.get("active")), "pids": set()}
+    roots, services, idle, sims = [], [], set(), []
+    for pid in all_pids():
+        name = proc_name(pid)
+        if name == "xcodebuild":
+            if native_tool(proc_args(pid) or [name], "/"):
+                roots.append(pid)
+            else:
+                idle.add(pid)
+        elif name in NATIVE_DRIVERS:
+            roots.append(pid)
+        elif name in NATIVE_SERVICES and _listpids(PROC_PPID_ONLY, pid):
+            services.append(pid)
+        elif sims_since is not None and name == "launchd_sim":
+            start = proc_bsd(pid, BSD_START, 8)
+            if start and start >= sims_since - 2:
+                sims.append(pid)
+    # usługa buildów pod xcodebuild, który nic nie kompiluje, też nie jest buildem
+    roots += [p for p in services if proc_bsd(p, BSD_PPID) not in idle]
+    tree = set()
+    for root in roots + sims:
+        tree |= descendants(root)
+    return {"gb": pids_usage(tree)[0], "active": bool(roots), "pids": tree}
 
 
 def alive(pid):
@@ -300,21 +428,31 @@ def alive(pid):
     return True
 
 
+def fake_memory():
+    """Pamięć z pliku SCHED_FAKE_MEMORY (testy) albo None."""
+    path = os.environ.get("SCHED_FAKE_MEMORY")
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def probe_memory():
     """Pamięć systemu: level jądra, RAM, swap, presja. SCHED_FAKE_MEMORY (plik JSON) w testach."""
-    fake = os.environ.get("SCHED_FAKE_MEMORY")
-    if fake:
-        try:
-            with open(fake) as f:
-                data = json.load(f)
-            return {
-                "level": float(data.get("level", 60)),
-                "ram_gb": float(data.get("ram_gb", 48)),
-                "swap_gb": float(data.get("swap_gb", 0)),
-                "pressure": data.get("pressure", "normal"),
-            }
-        except (OSError, ValueError):
-            pass
+    data = fake_memory()
+    if data is not None:
+        out = {
+            "level": float(data.get("level", 60)),
+            "ram_gb": float(data.get("ram_gb", 48)),
+            "swap_gb": float(data.get("swap_gb", 0)),
+            "pressure": data.get("pressure", "normal"),
+        }
+        if "native" in data:
+            out["native"] = data["native"] or {}
+        return out
     ram = (sysctl_int("hw.memsize") or 16 * GB) / GB
     level = sysctl_int("kern.memorystatus_level")
     kernel = sysctl_int("kern.memorystatus_vm_pressure_level") or 1
@@ -327,23 +465,58 @@ def probe_memory():
     }
 
 
-def devserver_reserve_gb():
-    """Miejsce na jeszcze jeden dev serwer: min(max_server_gb, budżet devguarda - zajęte)."""
+def devguard_snapshot():
+    """Ostatni pomiar strażnika (devguard-state.json), gdy ma najwyżej 2 minuty; inaczej None."""
+    try:
+        with open(DEVGUARD_STATE) as f:
+            snap = json.load(f).get("snapshot") or {}
+        if time.time() - float(snap.get("at", 0)) < 120:
+            return snap
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def devserver_reserve_gb(snap=False):
+    """Miejsce na dev serwery: na jeszcze jeden (min(max_server_gb, budżet devguarda - zajęte)),
+    a co najmniej na powrót serwerów, których strażnik nie zatrzyma (chronione i przypięte), do
+    ich zmierzonego szczytu (lifetime_max_phys_footprint). Chroniony stos ponad budżetem dawał
+    rezerwę 0, choć rośnie dalej."""
     max_server = 4.0
     try:
         with open(DEVGUARD_CONFIG) as f:
             max_server = float(json.load(f).get("max_server_gb", max_server))
     except (OSError, ValueError, TypeError, AttributeError):
         pass
+    snap = devguard_snapshot() if snap is False else snap
+    if not snap:
+        return max_server
     try:
-        with open(DEVGUARD_STATE) as f:
-            snap = json.load(f).get("snapshot") or {}
-        if time.time() - float(snap.get("at", 0)) < 120:
-            room = (float(snap.get("budget", 0)) - float(snap.get("total", 0))) / GB
-            return round(max(0.0, min(max_server, room)), 2)
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass
-    return max_server
+        room = (float(snap.get("budget", 0)) - float(snap.get("total", 0))) / GB
+        regrow = sum(
+            max(0.0, float(u.get("peak") or 0) - float(u.get("footprint") or 0))
+            for u in snap.get("units") or []
+            if u.get("protected")
+        ) / GB
+    except (ValueError, TypeError, AttributeError):
+        return max_server
+    return round(max(0.0, min(max_server, room), regrow), 2)
+
+
+def simulators_info(snap):
+    """Symulatory z pomiaru strażnika: ile włączonych, ile w użyciu (dzierżawa żywej sesji, ktoś
+    patrzy, symulator człowieka) i limit; None bez świeżego pomiaru (wtedy bez limitu)."""
+    if not snap or "simulators" not in snap:
+        return None
+    sims = [s for s in snap.get("simulators") or [] if isinstance(s, dict)]
+    used = [s for s in sims if s.get("in_use")]
+    return {
+        "booted": len(sims),
+        "in_use": len(used),
+        "cap": int(snap.get("simulator_cap") or 0),
+        "gb": round(sum(float(s.get("footprint") or 0) for s in sims) / GB, 2),
+        "holders": [s.get("name") or s.get("udid") for s in used][:4],
+    }
 
 
 # ---------- klasyfikacja komendy ----------
@@ -551,6 +724,15 @@ RTK_EXCLUDES = (
     "govulncheck",
     r"^(npx( -y| --yes)? |bunx |(pnpm|yarn|bun) (exec |dlx |x )?|npm exec (-- )?|\S*node_modules/\.bin/)?(vitest|jest|playwright|next|tsc|vue-tsc|eslint|turbo|vite)(\s|$)",
     r"^(pnpm|yarn|npm|bun)( (-r|--recursive|-ws|--workspaces|-s|--silent|--if-present|--\S+=\S+|(-C|--dir|--prefix|--cwd|-F|--filter|--workspace|-w) \S+|-w))* ((run|run-script) )?(t|tst|test|tests|unit|e2e|integration|playwright|build|lint|typecheck|type-check|check-types|types|tsc|check|verify|validate)([:_-]\S*)?(\s|$)",
+    # natywne buildy: xcodebuild, portivo-mobile up, pod install, eas build --local, expo run:ios
+    # (także przez npx i skrypt `ios`/`android` z package.json)
+    "xcodebuild",
+    "portivo-mobile",
+    "pod",
+    "eas",
+    r"^bundle exec pod ",
+    r"^(npx( -y| --yes)? |bunx |(pnpm|yarn|bun) (exec |dlx |x )?|npm exec (-- )?|\S*node_modules/\.bin/)?(expo run:|(eas|eas-cli)(@\S+)? build |react-native run-|@react-native-community/cli(@\S+)? run-|pod-install)",
+    r"^(pnpm|yarn|npm|bun)( (-s|--silent|--\S+=\S+|(-C|--dir|--prefix|--cwd|-F|--filter|--workspace|-w) \S+))* ((run|run-script) )?(ios|android)([:_-]\S*)?(\s|$)",
 )
 
 
@@ -591,17 +773,18 @@ def node_tool(words, base):
     return dict(base, kind=kind, tool=tool, filtered=filtered)
 
 
-def parse_node(words, here):
-    """Człon komendy z pracą JS: surowy job {kind, tool, dir, filtered, all, filter} albo None."""
+def npx_rest(words):
+    """Argumenty `npx`/`bunx` bez ich własnych opcji: od nazwy narzędzia."""
+    rest = words[1:]
+    while rest and rest[0].startswith("-"):
+        rest = rest[2:] if rest[0] in ("-p", "--package") else rest[1:]
+    return rest
+
+
+def pm_split(words, here):
+    """`pnpm|yarn|npm|bun [opcje] reszta`: (baza joba z katalogiem z -C/--dir, filtrem i -r, reszta)."""
     prog = os.path.basename(words[0])
     base = {"dir": here, "filtered": False, "all": False, "filter": None, "lang": "node"}
-    if prog in ("npx", "bunx"):
-        rest = words[1:]
-        while rest and rest[0].startswith("-"):
-            rest = rest[2:] if rest[0] in ("-p", "--package") else rest[1:]
-        return node_tool(rest, base)
-    if prog not in ("pnpm", "yarn", "npm", "bun"):
-        return node_tool(words, base) if (prog in NODE_TOOLS or "node_modules/.bin/" in words[0]) else None
     i = 1
     while i < len(words) and words[i].startswith("-"):
         opt, _, val = words[i].partition("=")
@@ -618,7 +801,19 @@ def parse_node(words, here):
         elif opt in ("-r", "--recursive", "--workspaces", "-ws"):
             base["all"] = True
         i += 1
-    rest = words[i:]
+    return base, words[i:]
+
+
+def parse_node(words, here):
+    """Człon komendy z pracą JS: surowy job {kind, tool, dir, filtered, all, filter} albo None."""
+    prog = os.path.basename(words[0])
+    if prog in ("npx", "bunx"):
+        base = {"dir": here, "filtered": False, "all": False, "filter": None, "lang": "node"}
+        return node_tool(npx_rest(words), base)
+    if prog not in ("pnpm", "yarn", "npm", "bun"):
+        base = {"dir": here, "filtered": False, "all": False, "filter": None, "lang": "node"}
+        return node_tool(words, base) if (prog in NODE_TOOLS or "node_modules/.bin/" in words[0]) else None
+    base, rest = pm_split(words, here)
     if not rest:
         return None
     cmd, args = rest[0], rest[1:]
@@ -652,7 +847,7 @@ def finish_node(raw):
     repo = find_repo(pkg_dir) or pkg_dir
     rel = os.path.relpath(pkg_dir, repo)
     detail = f"filter={raw['filter']}" if raw["filter"] else rel
-    cls = f"{os.path.basename(repo)}:{raw['kind']}:{detail}:{raw['tool']}"
+    cls = f"{project_name(repo)}:{raw['kind']}:{detail}:{raw['tool']}"
     cls += ":all" if raw["all"] else ""
     cls += ":filtered" if raw["filtered"] else ""
     label = " ".join(
@@ -693,8 +888,187 @@ def node_prior(job):
     return round(gb, 2), round(s)
 
 
+def project_name(repo):
+    """Nazwa projektu dla klasy joba: worktree (`.git` to plik `gitdir: <repo>/.git/worktrees/x`)
+    dostaje nazwę głównego repo, więc wszystkie drzewa uczą się z jednej historii. Z nazwą
+    katalogu worktree każdy nowy zaczynał od priora (lint 2 GB zamiast zmierzonych 4)."""
+    try:
+        with open(os.path.join(repo, ".git")) as f:
+            line = f.readline().strip()
+    except OSError:  # katalog .git: zwykłe repo
+        return os.path.basename(repo)
+    gitdir = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
+    parts = os.path.normpath(gitdir).split(os.sep)
+    if len(parts) >= 3 and parts[-3:-1] == [".git", "worktrees"]:
+        return os.path.basename(os.sep.join(parts[:-3])) or os.path.basename(repo)
+    return os.path.basename(repo)
+
+
+# ---------- natywne buildy: iOS i Android ----------
+
+# Natywny build (xcodebuild, swift-frontend, clang) to 8-15 GB i wszystkie rdzenie przez 5-20 min;
+# udane buildy dev clienta w logach portivo-mobile z 2026-10-05..08 trwały 5-12 min. Szczytu
+# pamięci nikt jeszcze nie zmierzył, więc prior jest ostrożny, a historia klasy go poprawia (p90).
+NATIVE_PRIORS = {"build": (12.0, 600), "up": (12.0, 600), "pods": (1.5, 180)}
+# programy, od których zaczyna się natywny build; bramka hooka (devguard.GATE_PROGRAMS) zna każdy
+NATIVE_PROGRAMS = ("portivo-mobile", "xcodebuild", "pod", "pod-install", "eas", "eas-cli", "react-native", "expo")
+XCODE_BUILD_ACTIONS = {"build", "build-for-testing", "test", "archive", "analyze", "docbuild", "install"}
+XCODE_OTHER_ACTIONS = {"clean", "test-without-building", "installsrc"}
+# flagi, z którymi xcodebuild niczego nie kompiluje
+XCODE_INFO = {
+    "-list", "-showBuildSettings", "-showBuildSettingsForIndex", "-version", "-showsdks",
+    "-showdestinations", "-showTestPlans", "-help", "-usage", "-license", "-checkFirstLaunchStatus",
+    "-runFirstLaunch", "-downloadPlatform", "-downloadAllPlatforms", "-importPlatform",
+    "-exportArchive", "-exportLocalizations", "-importLocalizations",
+    "-resolvePackageDependencies", "-create-xcframework", "-showComponent", "-exportNotarizedApp",
+}  # fmt: skip
+
+
+def package_tool(word):
+    """`eas-cli@latest` -> `eas-cli`, `@react-native-community/cli@14` -> `@react-native-community/cli`,
+    `./node_modules/.bin/expo` -> `expo`."""
+    if word.startswith("@"):
+        scope, _, rest = word.partition("/")
+        return f"{scope}/{rest.split('@', 1)[0]}"
+    return os.path.basename(word).split("@", 1)[0]
+
+
+def native_tool(words, here):
+    """Wywołanie narzędzia, które buduje natywnie: surowy job {kind, tool, target, dir} albo None.
+    Tylko to, co naprawdę kompiluje: `xcodebuild -list`, `expo run:ios --binary`, `eas build`
+    w chmurze czy `portivo-mobile status` niczego nie budują i nie czekają w kolejce."""
+    if not words:
+        return None
+    tool, args = package_tool(words[0]), words[1:]
+    positional = [a for a in args if not a.startswith("-")]
+    first = positional[0] if positional else None
+    if tool == "portivo-mobile":
+        # `up` buduje dev client, gdy zmienił się natywny odcisk; inaczej dzierżawi i włącza symulator
+        if first != "up":
+            return None
+        tree = next((v for k, v in zip(args, args[1:]) if k == "--tree"), None)
+        apps = [a for i, a in enumerate(args) if not a.startswith("-") and (i == 0 or args[i - 1] != "--tree")]
+        target = apps[1] if len(apps) > 1 else "?"
+        d = os.path.normpath(os.path.join(here, os.path.expanduser(tree))) if tree else here
+        return {"kind": "up", "tool": tool, "target": target, "dir": d}
+    if tool == "xcodebuild":
+        if any(a.split("=", 1)[0] in XCODE_INFO for a in args):
+            return None
+        actions = {a for a in positional if a in XCODE_BUILD_ACTIONS | XCODE_OTHER_ACTIONS}
+        if actions and not actions & XCODE_BUILD_ACTIONS:
+            return None
+        values = dict(zip(args, args[1:]))
+        name = values.get("-scheme") or values.get("-target")
+        place = values.get("-workspace") or values.get("-project")
+        if not name and place:
+            name = os.path.splitext(os.path.basename(place.rstrip("/")))[0]
+        return {"kind": "build", "tool": "xcodebuild", "target": name or os.path.basename(here), "dir": here}
+    if tool == "expo" and first in ("run:ios", "run:android"):
+        # --binary instaluje gotową aplikację; bez --no-bundler po buildzie zostaje Metro
+        if any(a.split("=", 1)[0] in ("--binary", "--help", "-h") for a in args):
+            return None
+        return {"kind": "build", "tool": "expo-" + first.split(":")[1], "dir": here}
+    if tool in ("react-native", "@react-native-community/cli") and first in ("run-ios", "run-android"):
+        if any(a.split("=", 1)[0] in ("--binary-path", "--help", "-h") for a in args):
+            return None
+        return {"kind": "build", "tool": "react-native-" + first.split("-")[1], "dir": here}
+    if tool in ("eas", "eas-cli") and first == "build" and "--local" in args:
+        platform = next((v for k, v in zip(args, args[1:]) if k in ("--platform", "-p")), "all")
+        return {"kind": "build", "tool": f"eas-{platform}", "dir": here}
+    if (tool == "pod" and first in ("install", "update")) or tool == "pod-install":
+        return {"kind": "pods", "tool": "pod", "dir": here}
+    return None
+
+
+def parse_native(words, here, depth=0):
+    """Człon komendy z natywnym buildem: wprost, przez npx, `pnpm exec`, `bundle exec` albo skrypt
+    z package.json (`"ios": "expo run:ios"`, wtedy `pnpm ios`). Surowy job albo None."""
+    if not words or depth > 2:
+        return None
+    prog = os.path.basename(words[0])
+    if prog == "bundle" and words[1:2] == ["exec"]:
+        return parse_native(words[2:], here, depth)
+    if prog in ("npx", "bunx"):
+        return native_tool(npx_rest(words), here)
+    if prog not in ("pnpm", "yarn", "npm", "bun"):
+        return native_tool(words, here)
+    base, rest = pm_split(words, here)
+    if not rest:
+        return None
+    cmd, args = rest[0], rest[1:]
+    if cmd in ("exec", "dlx", "x"):
+        return native_tool([a for a in args if a != "--"], base["dir"])
+    if cmd in ("run", "run-script"):
+        script = args[0] if args else None
+    elif prog == "npm":
+        return None
+    else:
+        found = native_tool(rest, base["dir"])  # `pnpm expo run:ios`: program z node_modules/.bin
+        if found:
+            return found
+        script = cmd
+    if not script or base["filter"]:
+        return None  # --filter: katalog pakietu znałby dopiero pnpm
+    pkg_dir = find_up(base["dir"], "package.json", stop_at_git=True) if os.path.isdir(base["dir"]) else None
+    try:
+        with open(os.path.join(pkg_dir, "package.json")) as f:
+            body = (json.load(f).get("scripts") or {}).get(script)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    for segment, _sep in split_segments(body or "") or []:
+        _env, inner = strip_prefix(segment)
+        found = inner and parse_native(inner, pkg_dir, depth + 1)
+        if found:
+            return found
+    return None
+
+
+def finish_native(raw):
+    here = raw["dir"] if os.path.isdir(raw["dir"]) else os.getcwd()
+    repo = find_repo(here) or here
+    if raw["kind"] in ("up",):
+        target = raw["target"]
+    elif raw["tool"] == "xcodebuild":
+        target = f"{raw['target']}:xcodebuild"
+    elif raw["kind"] == "pods":
+        target = os.path.relpath(here, repo)
+    else:
+        pkg = find_up(here, "package.json", stop_at_git=True) or here
+        target = f"{os.path.relpath(pkg, repo)}:{raw['tool']}"
+    label = " ".join(
+        shlex.quote(a) if re.search(r"[\s'\"$^*|&;]", a) else a for a in raw["argv"]
+    )
+    return {
+        "lang": "native",
+        "kind": raw["kind"],
+        "tool": raw["tool"],
+        "class": f"{project_name(repo)}:native:{raw['kind']}:{target}",
+        # jeden natywny build naraz na tym Macu; pod install obok buildu nie przeszkadza
+        "exclusive": raw["kind"] in ("build", "up"),
+        "module_name": os.path.basename(here),
+        "module": os.path.relpath(here, repo),
+        "module_dir": here,
+        "repo_dir": repo,
+        "repo": os.path.basename(repo),
+        "scope": "native",
+        "scope_detail": target,
+        "compile": False,
+        "filtered": False,
+        "all": False,
+        "race": False,
+        "p_explicit": None,
+        "count1": False,
+        "flags": {},
+        "pkgs": [],
+        "argv": raw["argv"],
+        "go_dir": here,
+        "label": label,
+    }
+
+
 def classify(command, cwd, argv=None):
-    """Job z komendy powłoki albo argv; None, gdy nie ma w niej pracy Go ani JS dla schedulera."""
+    """Job z komendy powłoki albo argv; None, gdy nie ma w niej pracy Go, JS ani natywnego
+    buildu dla schedulera."""
     if argv is not None:
         if (
             len(argv) >= 3
@@ -712,7 +1086,8 @@ def classify(command, cwd, argv=None):
             return None
     here = cwd
     found = []
-    node_on = bool(load_config().get("node", True))
+    cfg = load_config()
+    node_on, native_on = bool(cfg.get("node", True)), bool(cfg.get("native", True))
     for words, _sep in segments:
         if not words:
             continue
@@ -761,13 +1136,18 @@ def classify(command, cwd, argv=None):
                 "pkgs": [w for w in words[1:] if not w.startswith("-")],
                 "dir": here,
             }
-        elif node_on:
-            job = parse_node(words, here)
+        else:
+            job = parse_node(words, here) if node_on else None
+            if job is None and native_on:
+                job = parse_native(words, here)
+                if job:
+                    job["lang"] = "native"
         if job:
             job["argv"] = words
             job["env"] = env
             found.append(job)
-    jobs = [j for j in ((finish_node if j.get("lang") == "node" else finish_job)(j) for j in found) if j]
+    finishers = {"node": finish_node, "native": finish_native}
+    jobs = [j for j in (finishers.get(j.get("lang"), finish_job)(j) for j in found) if j]
     if not jobs:
         return None
     main = max(jobs, key=lambda j: prior(j, 4)[0])
@@ -939,6 +1319,8 @@ def prior(job, p):
     """(GB, s) z pomiarów albo ostrożne wartości ogólne."""
     if job.get("lang") == "node":
         return node_prior(job)
+    if job.get("lang") == "native":
+        return NATIVE_PRIORS.get(job["kind"], NATIVE_PRIORS["build"])
     name, kind, scope, comp = (
         job["module_name"],
         job["kind"],
@@ -1147,8 +1529,8 @@ def local_path_in(job):
 
 def depot_target(job, gb, wall, cfg, cache):
     """Dokąd na Depot i za ile: {target, job, cores, eta_s, units, cost_usd, argv, cwd} albo None."""
-    if job.get("lang") == "node":
-        return None  # Depot tu to tylko joby Go portivo
+    if job.get("lang") in ("node", "native"):
+        return None  # Depot tu to tylko joby Go portivo; natywny build potrzebuje Xcode i symulatora
     if depot_blocker(job):
         return None
     repo = job["repo_dir"]
@@ -1571,8 +1953,22 @@ def refresh_memory(state, cfg, mem=None):
         for j in local
         if not j.get("paused")
     )
-    dev = devserver_reserve_gb()
+    snap = devguard_snapshot()
+    dev = devserver_reserve_gb(snap)
     internal = state["_internal"]
+    # natywny build spoza schedulera (sesja, która go zostawiła; Xcode): zajmuje miejsce na
+    # natywny build i urośnie do szczytu buildu, więc jego wzrost idzie do rezerwy jak wzrost jobów
+    nat = internal.get("native") or {}
+    if "native" in mem:
+        nat = {"at": now, "gb": float(mem["native"].get("gb", 0)), "active": bool(mem["native"].get("active"))}
+    elif now - float(nat.get("at", 0)) >= 5:
+        scan = native_scan()
+        nat = {"at": now, "gb": round(scan["gb"], 2), "active": scan["active"]}
+    internal["native"] = nat
+    owner = native_owner(state)
+    outside = bool(nat.get("active")) and owner is None
+    native_reserve = max(0.0, native_build_gb(internal) - nat["gb"]) if outside else 0.0
+    reserved += native_reserve
     swap = [s for s in internal.get("swap", []) if now - s[0] <= 120]
     swap.append([now, mem["swap_gb"]])
     internal["swap"] = swap[-240:]
@@ -1605,6 +2001,15 @@ def refresh_memory(state, cfg, mem=None):
         "swap_used_gb": round(mem["swap_gb"], 2),
         "swap_growth_2m_gb": round(mem["swap_gb"] - swap[0][1], 2),
         "pressure": mem["pressure"],
+        "native": {
+            "build_gb": round(nat["gb"], 2),
+            "active": bool(nat.get("active")),
+            "outside": outside,
+            "reserve_gb": round(native_reserve, 2),
+            "owner": owner["id"] if owner else None,
+            "owner_label": owner["label"] if owner else None,
+        },
+        "simulators": simulators_info(snap),
     }
     today = state["today"]
     today["max_reserved_gb"] = round(max(today.get("max_reserved_gb", 0), reserved), 1)
@@ -1616,6 +2021,52 @@ def refresh_memory(state, cfg, mem=None):
 
 def queue_order(state):
     return sorted(state["queue"], key=lambda j: j["enqueued_at"])
+
+
+def native_owner(state):
+    """Lokalny job, który trzyma miejsce na natywny build (jedno na Maca), albo None."""
+    return next(
+        (
+            j
+            for j in state["running"]
+            if j.get("where") == "local" and j.get("exclusive") and not j.get("native_done")
+        ),
+        None,
+    )
+
+
+def native_build_gb(internal):
+    """Przewidywany szczyt natywnego buildu: p90 × 1,15 ostatnich zmierzonych buildów (pamięć
+    drzew xcodebuild i jobu), do pierwszych trzech nie mniej niż 80% priora."""
+    peaks = [p for p in internal.get("native_peaks", []) if p]
+    base = NATIVE_PRIORS["build"][0]
+    if not peaks:
+        return base
+    gb = percentile(peaks, 0.9) * 1.15
+    if len(peaks) < 3:
+        gb = max(gb, base * 0.8)
+    return round(gb, 2)
+
+
+def track_native(me, native, now, internal, now_gb):
+    """Faza buildu natywnego joba. Gdy wstaje xcodebuild, prognoza rośnie do szczytu buildu (klasa
+    `up` z samych trafień w cache przewidziałaby 1 GB). Gdy kompilatory milkną na NATIVE_QUIET_S
+    (albo nic się nie kompiluje przez dwa przewidywane czasy), job oddaje miejsce na natywny build
+    i rezerwację: `expo run:ios` po buildzie zostaje z Metro na godziny."""
+    if me.get("native_done"):
+        return
+    if native.get("active"):
+        me["native_seen"] = True
+        me["native_active_at"] = now
+        me["mem_predicted_gb"] = max(me.get("mem_predicted_gb") or 0.0, native_build_gb(internal))
+        return
+    seen = me.get("native_seen")
+    quiet = seen and now - me.get("native_active_at", now) >= NATIVE_QUIET_S
+    stale = not seen and now - me.get("started_at", now) > 2 * max(me.get("predicted_wall_s") or 0, 300)
+    if quiet or stale:
+        me["native_done"] = True
+        me["native_done_at"] = now
+        me["mem_predicted_gb"] = round(now_gb, 2)
 
 
 def plan(state, cfg, now):
@@ -1643,10 +2094,17 @@ def plan(state, cfg, now):
     blocked = None
     reserve = 0.0
     strict = False
+    # jeden natywny build naraz: trzyma go job w fazie buildu albo build spoza schedulera
+    slot = native_owner(state) is not None or bool((mem.get("native") or {}).get("outside"))
     if pressure == "critical":
         return admitted
     for job in queue_order(state):
         if (job.get("route") or {}).get("choice") == "depot":
+            continue
+        # czeka na swoją kolej, nie na pamięć: nie blokuje jobów za sobą i nic nie rezerwuje
+        if job.get("exclusive") and slot:
+            continue
+        if sim_wait(job, mem):
             continue
         need = job["mem_predicted_gb"]
         quick = bool(job.get("small")) and not strict and need <= now_free - reserve
@@ -1656,13 +2114,16 @@ def plan(state, cfg, now):
             # sam na Macu: bez rezerwy na dev serwer, a po 30 s czekania nawet ponad pamięć
             # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP).
             # Przy „warn” bez tego ostatniego: macOS trzyma go tu godzinami przy połowie wolnej
-            # pamięci, więc startuje to, co się mieści, ale nic ponad dostępną pamięć.
-            overcommit = pressure != "warn" and now - job["enqueued_at"] >= 30
+            # pamięci, więc startuje to, co się mieści, ale nic ponad dostępną pamięć. Natywny
+            # build nigdy ponad pamięć: obok żyją symulatory i dev serwery, których scheduler nie
+            # puszcza, a buildu odczepionego od sesji (portivo-mobile) SIGSTOP nie dosięgnie.
+            overcommit = pressure != "warn" and now - job["enqueued_at"] >= 30 and not job.get("native")
             if need <= free or quick or (alone and (need <= spare or overcommit)):
                 admitted[job["id"]] = ("fits", None)
                 free -= need
                 now_free -= need
                 any_local = True
+                slot = slot or bool(job.get("exclusive"))
                 continue
             blocked = job
             if now - job["enqueued_at"] > cfg["starve_s"]:
@@ -1673,7 +2134,21 @@ def plan(state, cfg, now):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
             now_free -= need
+            slot = slot or bool(job.get("exclusive"))
     return admitted
+
+
+def sim_wait(job, mem):
+    """`portivo-mobile up` sesji bez symulatora czeka, gdy symulatorów w użyciu jest tyle, ile
+    pozwala strażnik (`max_booted_simulators`): każdy to 2-4 GB, a cudzego, używanego nikt nie
+    wyłączy. Nieużywane wyłącza strażnik; bez jego świeżego pomiaru limitu nie ma."""
+    sims = mem.get("simulators") or {}
+    return (
+        job.get("native_kind") == "up"
+        and not job.get("sim_lease")
+        and bool(sims.get("cap"))
+        and sims.get("in_use", 0) >= sims["cap"]
+    )
 
 
 def blockers_eta(state, job):
@@ -1792,14 +2267,41 @@ def update_queue_view(state, cfg):
     labels = {j["id"]: j["label"] for j in state["running"] + state["queue"]}
     now = time.time()
     head_blocked = None
+    owner = native_owner(state)
+    native = mem.get("native") or {}
     for pos, job in enumerate(queue_order(state), start=1):
         job["position"] = pos
         job["waited_s"] = round(now - job["enqueued_at"], 1)
         wait, after = blockers_eta(state, job)
         job["eta_start_s"] = round(wait) if wait < 3600 else None
         free = max(0.0, mem["free_for_admission_gb"])
+        waits_turn = False
         if mem.get("pressure") == "critical":
             code, text = "pressure", "paused: memory pressure is critical"
+        elif job.get("exclusive") and (owner or native.get("outside")):
+            waits_turn = True
+            code = "native"
+            if owner:
+                left = (owner.get("predicted_wall_s") or 600) - (now - owner.get("started_at", now))
+                job["eta_start_s"] = round(max(5.0, left))
+                after = [owner["id"]]
+                text = f"waiting: one native build at a time, {owner['label']} is building"
+            else:
+                job["eta_start_s"] = None
+                text = (
+                    f"waiting: a native build outside the scheduler is running "
+                    f"({native.get('build_gb', 0):.1f} GB, xcodebuild)"
+                )
+        elif sim_wait(job, mem):
+            waits_turn = True
+            sims = mem.get("simulators") or {}
+            job["eta_start_s"] = None
+            code = "simulators"
+            text = (
+                f"waiting: {sims['in_use']} simulators in use, cap {sims['cap']} "
+                f"({', '.join(str(h) for h in sims.get('holders') or [])}); "
+                "unused ones are shut down by the guard"
+            )
         elif (
             head_blocked is not None
             and now - head_blocked["enqueued_at"] > cfg["starve_s"]
@@ -1823,7 +2325,7 @@ def update_queue_view(state, cfg):
             "after": after,
             "text": text,
         }
-        if head_blocked is None:
+        if head_blocked is None and not waits_turn:
             head_blocked = job
 
 
@@ -1841,7 +2343,9 @@ def safety(state, cfg):
         "pressure"
     ) == "critical"
     if swapping:
-        heavy = [j for j in local if not j.get("paused") and not j.get("small")]
+        # natywny build nie: jego kompilatory leżą zwykle poza grupą procesów joba (portivo-mobile
+        # buduje w odczepionym procesie), a SIGSTOP samego czekającego wrappera nic nie zwalnia
+        heavy = [j for j in local if not j.get("paused") and not j.get("small") and not j.get("native")]
         if len(local) - len(paused) > 1 and heavy:
             victim = max(heavy, key=lambda j: j.get("started_at", 0))
             try:
@@ -1870,6 +2374,39 @@ def new_id():
     import random
 
     return f"j-{int(time.time())}-{random.randrange(16**4):04x}"
+
+
+PORTIVO_LEASES = os.path.join(HOME, ".cache/portivo-mobile/leases")
+
+
+def session_lease():
+    """Czy sesja Claude nad tym procesem ma już symulator z portivo-mobile (dzierżawa
+    leases/<udid>.json z jej pid): wtedy `up` nic nowego nie włączy. Sesję szuka jak
+    portivo-mobile: pierwszy proces `claude` w górę drzewa."""
+    pid, claude = os.getppid(), None
+    for _ in range(40):
+        if not pid or pid <= 1:
+            break
+        path = proc_path(pid)
+        if proc_name(pid) == "claude" or os.path.basename(path) == "claude" or "/claude/versions/" in path:
+            claude = pid
+            break
+        pid = proc_bsd(pid, BSD_PPID)
+    if not claude:
+        return False
+    try:
+        names = os.listdir(PORTIVO_LEASES)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(PORTIVO_LEASES, name)) as f:
+                owner = (json.load(f).get("owner") or {})
+        except (OSError, ValueError, AttributeError):
+            continue
+        if owner.get("pid") == claude:
+            return True
+    return False
 
 
 def agent_info(session, name):
@@ -1955,6 +2492,9 @@ def new_entry(job, command, argv, opts):
         "route": None,
         "small": False,
         "count1_dropped": False,
+        "native": job.get("lang") == "native",
+        "exclusive": bool(job.get("exclusive")),
+        "native_kind": job["kind"] if job.get("lang") == "native" else None,
         "pid": os.getpid(),
         "via": opts.get("via", "cli"),
         "enqueued_at": time.time(),
@@ -1991,9 +2531,11 @@ def cmd_run(args):
             log(
                 "bez -count=1: testy nie uruchamiają innych programów, wynik może przyjść z cache testów"
             )
+    if job.get("lang") == "native" and job["kind"] == "up":
+        entry["sim_lease"] = session_lease()
     if job["kind"] == "test" and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
         job["uses_pg"] = uses_pg(job, cache)
-    if likely_heavy(job) and job.get("lang") != "node":
+    if likely_heavy(job) and job.get("lang") not in ("node", "native"):
         refresh_depot_eta(cache, job["repo_dir"])
     save_cache(cache)
     return schedule(entry, job, command, argv, opts, cfg, history, cache)
@@ -2212,15 +2754,27 @@ def run_local(entry, job, command, argv, cfg):
         signal.signal(sig, forward)
     started = time.time()
     peak, cpu_live, last_beat = 0.0, 0.0, 0.0
+    # natywny build: do pamięci joba dochodzą drzewa xcodebuild na Macu (jeden build naraz, więc
+    # to jego) i symulator, który `portivo-mobile up` włączył; oba poza drzewem procesów joba
+    native = job.get("lang") == "native" and job.get("exclusive")
+    sims_since = started if job.get("kind") == "up" else None
+    pool, pool_at = None, 0.0
     while True:
         pid, status, rusage = os.wait4(child.pid, os.WNOHANG)
         if pid == child.pid:
             break
-        now_gb, cpu_live = job_usage(child.pid)
+        own = job_pids(child.pid)
+        if native and time.time() - pool_at >= 2.0:
+            pool, pool_at = native_scan(sims_since), time.time()
+        if pool and pool["pids"]:
+            now_gb, cpu_live = pids_usage(own | pool["pids"])
+        else:
+            now_gb, cpu_live = pids_usage(own)
+            now_gb += pool["gb"] if pool else 0.0
         peak = max(peak, now_gb)
         if time.time() - last_beat >= 1.0:
             last_beat = time.time()
-            heartbeat(jid, cfg, now_gb, peak, cpu_live, started)
+            heartbeat(jid, cfg, now_gb, peak, cpu_live, started, native=pool)
         time.sleep(0.25)
     rc = os.waitstatus_to_exitcode(status)
     cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
@@ -2228,7 +2782,7 @@ def run_local(entry, job, command, argv, cfg):
     return rc if rc >= 0 else 128 - rc
 
 
-def heartbeat(jid, cfg, now_gb, peak, cpu, started):
+def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None):
     with Locked(block=False) as lk:
         if not lk.ok:
             return
@@ -2236,6 +2790,8 @@ def heartbeat(jid, cfg, now_gb, peak, cpu, started):
         me = next((j for j in state["running"] if j["id"] == jid), None)
         if me is None:
             return
+        if native is not None and me.get("exclusive"):
+            track_native(me, native, time.time(), state["_internal"], now_gb)
         elapsed = time.time() - started
         wall = me.get("predicted_wall_s") or 60
         me.update(
@@ -2272,6 +2828,12 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
         internal = state["_internal"]
         where = me["where"]
         waited = me.get("waited_s") or 0.0
+        if me.get("native_seen"):
+            # szczyt z drzewami xcodebuild: z tego scheduler przewiduje każdy natywny build
+            internal["native_peaks"] = (internal.get("native_peaks", []) + [round(peak, 2)])[-10:]
+        if me.get("native_done_at") and me.get("started_at"):
+            # `expo run:ios` zostaje z Metro: czas buildu, a nie czas życia Metro
+            wall = min(wall, me["native_done_at"] - me["started_at"])
         today["wait_s"] = round(today["wait_s"] + waited, 1)
         units = cost = None
         if where == "local":
@@ -2347,6 +2909,8 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
             "predicted_wall_s": me.get("local_wall_s") or me.get("predicted_wall_s"),
             "count1_dropped": me.get("count1_dropped", False),
         }
+        if me.get("native"):
+            row["native_built"] = bool(me.get("native_seen"))
         with open(HISTORY_PATH, "a") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         refresh_memory(state, cfg)
@@ -2538,14 +3102,23 @@ def hook_rewrite(event):
     updated["command"] = (
         " ".join(shlex.quote(p) for p in parts) + " --shell " + shlex.quote(with_rtk(command))
     )
+    if job.get("lang") == "native":
+        context = (
+            f"claude-acc sched: `{job['label']}` runs through the memory scheduler. Native builds run "
+            "one at a time on this Mac and wait for memory (and `portivo-mobile up` for a simulator "
+            "slot), so it may queue first; `claude-acc sched status` says why. The output and exit "
+            "code are the command's own."
+        )
+    else:
+        context = (
+            f"claude-acc sched: `{job['label']}` runs through the memory scheduler. It may wait for "
+            "memory, pick -p or run on Depot; the output and exit code are the command's own."
+        )
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "updatedInput": updated,
-            "additionalContext": (
-                f"claude-acc sched: `{job['label']}` runs through the memory scheduler. It may wait for "
-                "memory, pick -p or run on Depot; the output and exit code are the command's own."
-            ),
+            "additionalContext": context,
         }
     }
 
@@ -2852,6 +3425,24 @@ def cmd_status(args):
         f"zapas {pl_gb(mem['headroom_gb'])}, dev serwer {pl_gb(mem['devserver_reserve_gb'])}, "
         f"joby urosną jeszcze o {pl_gb(mem['reserved_gb'])}); pusty Mac zmieści {pl_gb(mem['idle_max_gb'])}"
     )
+    native = mem.get("native") or {}
+    if native.get("owner"):
+        slot = f"zajęte: {native['owner_label']}"
+    elif native.get("outside"):
+        slot = (
+            f"zajęte przez build spoza schedulera ({pl_gb(native['build_gb'])}, "
+            f"urośnie jeszcze o {pl_gb(native['reserve_gb'])})"
+        )
+    else:
+        slot = "wolne"
+    sims = mem.get("simulators")
+    sims_text = (
+        f"; symulatory: {sims['booted']} włączone ({pl_gb(sims['gb'])}), w użyciu {sims['in_use']}"
+        f" z limitu {sims['cap']}"
+        if sims
+        else ""
+    )
+    print(f"Natywny build (jeden naraz): {slot}{sims_text}")
     if not state["running"] and not state["queue"]:
         print("Nic nie biegnie.")
     for j in state["running"]:

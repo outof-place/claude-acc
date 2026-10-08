@@ -57,11 +57,13 @@ import os
 import sys
 
 DEV_WORDS = ("dev", "vite", "expo", "serve")
-# słowa, bez których komenda nie ma pracy dla schedulera (Go i JS); fałszywy alarm to tylko
-# klasyfikacja w sched.py, która odpowie None
+# słowa, bez których komenda nie ma pracy dla schedulera (Go, JS i natywne buildy); fałszywy
+# alarm to tylko klasyfikacja w sched.py, która odpowie None
 SCHED_WORDS = (
     "go ", "golangci-lint", "make", "govulncheck", "vitest", "jest", "playwright", "next ",
     "tsc", "eslint", "turbo", "pnpm", "npm ", "npx ", "yarn", "bun ", "bunx", "node_modules/.bin/",
+    "portivo-mobile", "xcodebuild", "run:ios", "run:android", "run-ios", "run-android",
+    "eas build", "eas-cli", "pod install", "pod update", "pod-install",
 )  # fmt: skip
 # Bramka natywnego frontu (claude-acc-hook): komenda idzie do Pythona tylko wtedy, gdy słowo
 # stoi w niej jako całe słowo, a nie kawałek ścieżki albo innego słowa. Scheduler rozpoznaje
@@ -74,6 +76,7 @@ SCHED_WORDS = (
 GATE_PROGRAMS = (
     "go", "golangci-lint", "make", "govulncheck", "npx", "bunx", "pnpm", "yarn", "npm", "bun",
     "vitest", "jest", "playwright", "next", "tsc", "vue-tsc", "eslint", "turbo", "vite", "expo",
+    "portivo-mobile", "xcodebuild", "pod", "pod-install", "eas", "eas-cli", "react-native",
 )  # fmt: skip
 # Sekrety bramki pocztowej (klucz konta serwisowego Google, hasła IMAP) leżą w Pęku kluczy pod
 # usługą claude-acc-mail. Agent korzysta z poczty przez narzędzia mail, a komendy, która je

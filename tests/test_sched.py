@@ -54,6 +54,17 @@ echo "fake go done: $*"
 exit "${FAKE_GO_RC:-0}"
 """
 
+FAKE_NATIVE = r"""#!/bin/bash
+# podróbka portivo-mobile i xcodebuild: start i koniec do dziennika, wyjście na oba strumienie
+now() { /usr/bin/python3 -c 'import time; print(time.time())'; }
+echo "start $$ $(now) ARGS=$(basename "$0") $*" >> "$FAKE_GO_LOG"
+echo "building the dev client" >&2
+sleep "${FAKE_GO_SLEEP:-0.3}"
+echo "end $$ $(now)" >> "$FAKE_GO_LOG"
+echo "{\"device\": \"Portivo-1\", \"args\": \"$*\"}"
+exit "${FAKE_GO_RC:-0}"
+"""
+
 FAKE_DEPOT_CI = r"""#!/bin/bash
 echo "[depot-ci] run abcd1234efgh: go-heavy.yml $*" >&2
 echo "depot-ci output $*"
@@ -135,10 +146,12 @@ class Paths(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.cfg = dict(S.DEFAULTS)
 
-    def set_memory(self, level, swap=1.0, pressure="normal", ram=48):
+    def set_memory(self, level, swap=1.0, pressure="normal", ram=48, native=None):
+        # native: drzewa xcodebuild na Macu; bez tego test zależałby od buildów, które akurat biegną
+        native = native or {"gb": 0.0, "active": False}
         with open(self.memfile, "w") as f:
             json.dump(
-                {"level": level, "ram_gb": ram, "swap_gb": swap, "pressure": pressure},
+                {"level": level, "ram_gb": ram, "swap_gb": swap, "pressure": pressure, "native": native},
                 f,
             )
 
@@ -1155,6 +1168,305 @@ class NodeTest(Paths):
         self.assertEqual(argv[:4], ["/usr/bin/python3", S.SELF, "run", "--via"])
         self.assertEqual(argv[-1], "cd apps/web && pnpm test 2>&1 | tail -5")
 
+    def test_worktrees_learn_from_the_same_history(self):
+        """Pomyłka, którą ten test łapie: klasa z nazwą katalogu worktree. Każdy nowy worktree
+        zaczynał od priora (lint 2 GB) zamiast z historii projektu (portivo 2026-10-08: `pnpm lint`
+        z trzech worktree przewidziany na 2,0 GB, zmierzony 3,6-4,4 GB, razem dwa razy więcej,
+        niż scheduler zarezerwował)."""
+        wt = os.path.join(self.dir, "wt-lint")
+        os.makedirs(os.path.join(self.shop, ".git/worktrees/wt-lint"))
+        write(os.path.join(wt, ".git"), f"gitdir: {self.shop}/.git/worktrees/wt-lint\n")
+        write(os.path.join(wt, "package.json"), '{"name": "shop"}')
+        write(os.path.join(wt, "apps/web/package.json"), '{"name": "web"}')
+        main = S.classify("pnpm lint", self.shop)
+        other = S.classify("pnpm lint", wt)
+        self.assertEqual(main["class"], "shop:lint:.:lint")
+        self.assertEqual(other["class"], main["class"])
+        self.assertEqual(other["repo"], "wt-lint")  # panel dalej pokazuje, z którego drzewa
+        rows = [{"where": "local", "class": main["class"], "peak_gb": 4.0, "wall_s": 30.0}] * 3
+        self.assertEqual(S.predict(other, 4, rows)[:2], (4.6, 30.0))
+
+
+def make_native_repo(root):
+    os.makedirs(os.path.join(root, ".git"))
+    write(os.path.join(root, "package.json"), '{"name": "mono", "private": true}')
+    app = os.path.join(root, "apps/storefront-mobile")
+    write(
+        os.path.join(app, "package.json"),
+        json.dumps({"name": "storefront-mobile", "scripts": {
+            "dev": "expo start --port 8085",
+            "ios": "TENANT=demo expo run:ios --port 8085",
+            "android": "expo run:android --port 8085",
+            "prebuild": "expo prebuild",
+            "test": "vitest run",
+        }}),
+    )
+    write(os.path.join(app, "ios/Podfile"), "")
+    os.makedirs(os.path.join(app, "ios/App.xcworkspace"))
+
+
+class NativeTest(Paths):
+    """Natywne buildy iOS i Androida idą przez scheduler jak Go i JS. Pomyłki, które ten test
+    łapie: `portivo-mobile up` (xcodebuild i swift-frontend, 8-15 GB przez 10-20 min) puszczony
+    obok wszystkiego bez pytania o pamięć (2026-10-08 18:48, Mac zamarł o 18:55); komenda, która
+    nic nie buduje (`-list`, `--binary`, `eas build` w chmurze, `portivo-mobile status`), czekająca
+    w kolejce na 12 GB; i natywny build wysłany na Depot."""
+
+    WRAPPED = {
+        "portivo-mobile up storefront-mobile": "mono:native:up:storefront-mobile",
+        "rtk portivo-mobile up charter-mobile 2>&1 | tail -40": "mono:native:up:charter-mobile",
+        "cd apps/storefront-mobile && npx expo run:ios": "mono:native:build:apps/storefront-mobile:expo-ios",
+        "cd apps/storefront-mobile && pnpm exec expo run:android --variant debug": "mono:native:build:apps/storefront-mobile:expo-android",
+        "cd apps/storefront-mobile && ./node_modules/.bin/expo run:ios --device generic --no-bundler": "mono:native:build:apps/storefront-mobile:expo-ios",
+        "pnpm -C apps/storefront-mobile ios": "mono:native:build:apps/storefront-mobile:expo-ios",
+        "cd apps/storefront-mobile && npm run android": "mono:native:build:apps/storefront-mobile:expo-android",
+        "cd apps/storefront-mobile/ios && xcodebuild -workspace App.xcworkspace -scheme App -sdk iphonesimulator build": "mono:native:build:App:xcodebuild",
+        "cd apps/storefront-mobile/ios && xcodebuild -workspace App.xcworkspace": "mono:native:build:App:xcodebuild",
+        "cd apps/storefront-mobile && npx eas-cli@latest build --local --platform ios": "mono:native:build:apps/storefront-mobile:eas-ios",
+        "cd apps/storefront-mobile && npx react-native run-ios": "mono:native:build:apps/storefront-mobile:react-native-ios",
+        "cd apps/storefront-mobile/ios && pod install": "mono:native:pods:apps/storefront-mobile/ios",
+        "cd apps/storefront-mobile/ios && bundle exec pod install --repo-update": "mono:native:pods:apps/storefront-mobile/ios",
+    }
+    LEFT_ALONE = (
+        "portivo-mobile status",
+        "portivo-mobile open storefront-mobile --port 8183",
+        "portivo-mobile release",
+        "xcodebuild -list",
+        "xcodebuild -showBuildSettings -scheme App",
+        "xcodebuild -version",
+        "cd apps/storefront-mobile/ios && xcodebuild clean -scheme App",
+        "cd apps/storefront-mobile/ios && xcodebuild test-without-building -scheme App",
+        "cd apps/storefront-mobile && npx expo run:ios --binary build/App.app",
+        "cd apps/storefront-mobile && npx expo start --dev-client --port 8183",
+        "cd apps/storefront-mobile && npx expo prebuild --platform ios",
+        "cd apps/storefront-mobile && pnpm prebuild",
+        "cd apps/storefront-mobile && pnpm dev",
+        "cd apps/storefront-mobile && npx eas-cli build --platform ios",
+        "pod --version",
+        "pod repo update",
+        "echo 'xcodebuild build'",
+        "SCHED_OFF=1 portivo-mobile up storefront-mobile",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.mono = os.path.join(self.dir, "mono")
+        make_native_repo(self.mono)
+
+    def test_native_builds_are_classified(self):
+        for command, cls in self.WRAPPED.items():
+            j = S.classify(command, self.mono)
+            self.assertIsNotNone(j, command)
+            self.assertEqual(j["class"], cls, command)
+            self.assertEqual(j["lang"], "native", command)
+
+    def test_commands_that_build_nothing_stay_out(self):
+        # te same programy, tylko z budowaniem: w kolejce
+        self.assertIsNotNone(S.classify("xcodebuild -scheme App build", self.mono))
+        self.assertIsNotNone(S.classify("cd apps/storefront-mobile && npx expo run:ios", self.mono))
+        for command in self.LEFT_ALONE:
+            self.assertIsNone(S.classify(command, self.mono), command)
+
+    def test_one_build_at_a_time_but_pods_run_beside(self):
+        self.assertTrue(S.classify("portivo-mobile up storefront-mobile", self.mono)["exclusive"])
+        self.assertTrue(S.classify("cd apps/storefront-mobile && npx expo run:ios", self.mono)["exclusive"])
+        self.assertFalse(S.classify("cd apps/storefront-mobile/ios && pod install", self.mono)["exclusive"])
+
+    def test_priors_and_no_depot(self):
+        up = S.classify("portivo-mobile up storefront-mobile", self.mono)
+        self.assertEqual(S.prior(up, 4), (12.0, 600))
+        build = S.classify("cd apps/storefront-mobile && npx expo run:ios", self.mono)
+        self.assertEqual(S.prior(build, 4), (12.0, 600))
+        pods = S.classify("cd apps/storefront-mobile/ios && pod install", self.mono)
+        self.assertEqual(S.prior(pods, 4), (1.5, 180))
+        self.assertIsNone(S.depot_target(up, 12.0, 600, self.cfg, {}))
+        # build przed testem w jednej komendzie: liczy się cięższy, czyli build
+        both = S.classify("cd apps/storefront-mobile && npx expo run:ios && pnpm test", self.mono)
+        self.assertEqual(both["lang"], "native")
+        rows = [{"where": "local", "class": up["class"], "peak_gb": 9.0, "wall_s": 400.0}] * 3
+        self.assertEqual(S.predict(up, 4, rows)[:2], (10.35, 400.0))
+
+    def test_switch_off_in_config(self):
+        self.assertIsNotNone(S.classify("portivo-mobile up storefront-mobile", self.mono))
+        with open(S.CONFIG_PATH, "w") as f:
+            json.dump({"native": False}, f)
+        self.assertIsNone(S.classify("portivo-mobile up storefront-mobile", self.mono))
+        self.assertIsNotNone(S.classify("cd apps/storefront-mobile && pnpm test", self.mono))
+
+    def test_rtk_exclusions_cover_native_builds(self):
+        for command in self.WRAPPED:
+            for words, _ in S.split_segments(command):
+                _, w = S.strip_prefix(words)
+                if w and S.parse_native(w, self.mono):
+                    self.assertTrue(NodeTest.rtk_excluded(None, " ".join(w)), " ".join(w))
+        for command in ("npx expo start", "npx expo prebuild", "pnpm install", "git status"):
+            self.assertFalse(NodeTest.rtk_excluded(None, command), command)
+
+    def test_only_compiling_xcode_processes_are_a_native_build(self):
+        """maestro trzyma na symulatorze `xcodebuild test-without-building` przez całą sesję, a
+        otwarty Xcode bezczynną usługę buildów: żadne z nich nie zajmuje miejsca na build ani nie
+        dostaje 12 GB rezerwy (2026-10-08 19:30: maestro i symulator, zero kompilacji)."""
+        procs = {
+            10: ("xcodebuild", ["xcodebuild", "test-without-building", "-xctestrun", "/tmp/x.xctestrun"]),
+            11: ("SWBBuildService", None),  # dziecko powyższego
+            12: ("swift-frontend", None),
+            20: ("SWBBuildService", None),  # Xcode otwarty, nic nie buduje
+            30: ("launchd_sim", None),
+        }
+        parents = {11: 10, 12: 11, 20: 1, 30: 1}
+        children = {}
+        for pid, ppid in parents.items():
+            children.setdefault(ppid, []).append(pid)
+
+        def scan(extra=None):
+            table = {**procs, **(extra or {})}
+            kids = {k: list(v) for k, v in children.items()}
+            for pid, (_n, _a) in (extra or {}).items():
+                kids.setdefault(1, []).append(pid)
+            with mock.patch.dict(os.environ, {"SCHED_FAKE_MEMORY": ""}), \
+                    mock.patch.object(S, "all_pids", return_value=list(table)), \
+                    mock.patch.object(S, "proc_name", side_effect=lambda p: table[p][0]), \
+                    mock.patch.object(S, "proc_args", side_effect=lambda p: table[p][1]), \
+                    mock.patch.object(S, "proc_bsd", side_effect=lambda p, off, size=4: parents.get(p, 1)), \
+                    mock.patch.object(S, "_listpids", side_effect=lambda kind, p: kids.get(p, [])), \
+                    mock.patch.object(S, "pids_usage", side_effect=lambda pids: (len(pids) * 1.0, 0.0)):
+                return S.native_scan()
+
+        idle = scan()
+        self.assertFalse(idle["active"])
+        self.assertEqual(idle["pids"], set())
+        building = scan({40: ("xcodebuild", ["xcodebuild", "-workspace", "App.xcworkspace", "-scheme", "App", "build"])})
+        self.assertTrue(building["active"])
+        self.assertEqual(building["pids"], {40})
+
+    def test_hook_wraps_a_background_up(self):
+        event = {
+            "tool_name": "Bash",
+            "cwd": self.mono,
+            "tool_input": {"command": "portivo-mobile up storefront-mobile", "run_in_background": True},
+        }
+        with mock.patch.object(S, "with_rtk", side_effect=lambda c: c):
+            out = S.hook_rewrite(event)["hookSpecificOutput"]
+        updated = out["updatedInput"]
+        self.assertTrue(updated["run_in_background"])
+        argv = shlex.split(updated["command"])
+        self.assertEqual(argv[2:5], ["run", "--via", "hook"])
+        self.assertEqual(argv[-2:], ["--shell", "portivo-mobile up storefront-mobile"])
+        self.assertIn("one at a time", out["additionalContext"])
+
+
+class NativePlanTest(Paths):
+    """Jeden natywny build naraz na tym Macu, także gdy obok biegnie build spoza schedulera.
+    Pomyłki, które ten test łapie: dwa buildy wpuszczone, bo każdy z osobna mieści się w pamięci;
+    natywny job czekający na swoją kolej, który blokuje joby Go i JS za sobą; build spoza
+    schedulera (sesja, która go zostawiła, Xcode) niewidoczny w rezerwie; build wpuszczony
+    „sam na Macu” ponad dostępną pamięć; i build, który po skompilowaniu (expo run:ios zostaje
+    z Metro) trzyma miejsce i rezerwację w nieskończoność."""
+
+    def entry(self, jid, gb, ago=0, small=False, **extra):
+        return dict(
+            {
+                "id": jid,
+                "label": jid,
+                "mem_predicted_gb": gb,
+                "predicted_wall_s": 600,
+                "small": small,
+                "enqueued_at": time.time() - ago,
+                "route": {"choice": "local"},
+            },
+            **extra,
+        )
+
+    def native(self, jid, gb=12.0, ago=0, **extra):
+        return self.entry(jid, gb, ago, **dict({"native": True, "exclusive": True, "native_kind": "build"}, **extra))
+
+    def running_native(self, jid="a", now_gb=3.0, **extra):
+        return dict(
+            {"id": jid, "where": "local", "label": jid, "mem_predicted_gb": 12.0, "mem_now_gb": now_gb,
+             "predicted_wall_s": 600, "started_at": time.time(), "native": True, "exclusive": True},
+            **extra,
+        )
+
+    def test_one_native_build_at_a_time(self):
+        self.set_memory(90)  # 43,2 GB dostępne: oba buildy z osobna się mieszczą
+        st = self.state()
+        st["running"].append(self.running_native())
+        S.refresh_memory(st, self.cfg)
+        st["queue"] = [self.native("b", ago=100), self.entry("vet", 6.0, ago=50)]
+        # b czeka na swoją kolej, ale nie blokuje vet za sobą
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vet": ("fits", None)})
+        S.update_queue_view(st, self.cfg)
+        self.assertEqual(st["queue"][0]["reason"]["code"], "native")
+        st["running"][0]["native_done"] = True  # skompilował; zostało Metro
+        S.refresh_memory(st, self.cfg)
+        self.assertIn("b", S.plan(st, self.cfg, time.time()))
+        st["running"] = []
+        st["queue"] = [self.native("b", ago=10), self.native("c", ago=5)]
+        S.refresh_memory(st, self.cfg)
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"b": ("fits", None)})
+
+    def test_build_outside_the_scheduler_holds_the_slot_and_its_growth(self):
+        self.set_memory(80)
+        free = self.state()["memory"]["free_for_admission_gb"]
+        self.set_memory(80, native={"gb": 2.0, "active": True})
+        st = self.state()
+        self.assertTrue(st["memory"]["native"]["outside"])
+        # rośnie do przewidywanego szczytu buildu: 12 GB, teraz 2
+        self.assertAlmostEqual(st["memory"]["free_for_admission_gb"], free - 10.0, places=1)
+        st["queue"] = [self.native("b", ago=60), self.entry("tiny", 0.5, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"tiny": ("fits", None)})
+
+    def test_native_never_overcommits_alone(self):
+        self.set_memory(30)  # 14,4 GB dostępne, 10,4 po zapasie
+        st = self.state()
+        st["queue"] = [self.native("b", ago=120)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        st["queue"] = [self.entry("vet", 12.0, ago=120)]  # Go: sam na Macu po 30 s tak
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vet": ("fits", None)})
+
+    def test_up_waits_while_simulators_in_use_are_at_the_cap(self):
+        def snapshot(in_use):
+            sims = [{"udid": f"U{i}", "name": f"Portivo-{i}", "in_use": i < in_use, "footprint": 2 * S.GB}
+                    for i in range(2)]
+            with open(S.DEVGUARD_STATE, "w") as f:
+                json.dump({"snapshot": {"at": time.time(), "budget": 12 * S.GB, "total": 0,
+                                        "simulators": sims, "simulator_cap": 2}}, f)
+
+        self.set_memory(90)
+        snapshot(2)
+        st = self.state()
+        self.assertEqual(st["memory"]["simulators"]["in_use"], 2)
+        st["queue"] = [self.native("up", native_kind="up", sim_lease=False, ago=5)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        S.update_queue_view(st, self.cfg)
+        self.assertEqual(st["queue"][0]["reason"]["code"], "simulators")
+        st["queue"][0]["sim_lease"] = True  # sesja ma już swój symulator: nic nowego nie wstanie
+        self.assertIn("up", S.plan(st, self.cfg, time.time()))
+        snapshot(1)
+        st = self.state()
+        st["queue"] = [self.native("up", native_kind="up", sim_lease=False, ago=5)]
+        self.assertIn("up", S.plan(st, self.cfg, time.time()))
+
+    def test_build_phase_end_frees_slot_and_reservation(self):
+        st = self.state()
+        st["running"].append(dict(self.running_native("a", now_gb=0.4, mem_predicted_gb=1.0), pid=os.getpid()))
+        S.save_state(st)
+        started = time.time()
+        # xcodebuild wstaje: prognoza rośnie do szczytu buildu, choć klasa znała tylko lekkie biegi
+        S.heartbeat("a", self.cfg, 3.0, 3.0, 10.0, started, native={"active": True, "gb": 2.6})
+        me = S.load_state(self.cfg)["running"][0]
+        self.assertEqual(me["mem_predicted_gb"], 12.0)
+        self.assertTrue(me["native_seen"])
+        self.assertFalse(me.get("native_done"))
+        with mock.patch.object(S.time, "time", return_value=time.time() + 31):
+            S.heartbeat("a", self.cfg, 1.5, 9.0, 300.0, started, native={"active": False, "gb": 0.0})
+        st = S.load_state(self.cfg)
+        me = st["running"][0]
+        self.assertTrue(me["native_done"])
+        self.assertEqual(me["mem_predicted_gb"], 1.5)  # dalej tylko to, co zajmuje (Metro)
+        S.refresh_memory(st, self.cfg)
+        self.assertEqual(st["memory"]["reserved_gb"], 0.0)
+
 
 class StateTest(Paths):
     def test_kernel_reads_load_on_first_use(self):
@@ -1226,6 +1538,20 @@ class StateTest(Paths):
         with open(S.DEVGUARD_CONFIG, "w") as f:
             json.dump({"max_server_gb": 1.0}, f)
         self.assertEqual(S.devserver_reserve_gb(), 1.0)
+
+    def test_devserver_reserve_keeps_room_for_servers_the_guard_never_stops(self):
+        """Chroniony stos (`pnpm dev` z korzenia portivo) ponad budżetem dawał rezerwę 0, choć
+        rośnie dalej: strażnik go nie zatrzyma. Rezerwa to wtedy jego zmierzony powrót do szczytu
+        (lifetime_max_phys_footprint), a nie zgadywany wzrost."""
+        units = [
+            {"protected": True, "footprint": 6 * S.GB, "peak": 9 * S.GB},
+            {"protected": True, "footprint": 5 * S.GB, "peak": 5 * S.GB},
+            {"protected": False, "footprint": 2 * S.GB, "peak": 7 * S.GB},  # ten strażnik przytnie
+        ]
+        with open(S.DEVGUARD_STATE, "w") as f:
+            json.dump({"snapshot": {"at": time.time(), "budget": 12 * S.GB, "total": 13 * S.GB,
+                                    "units": units}}, f)
+        self.assertEqual(S.devserver_reserve_gb(), 3.0)
 
     def test_today_rolls_over_and_reap(self):
         st = self.state()
@@ -1410,6 +1736,7 @@ class RunTest(unittest.TestCase):
         make_repo(self.repo)
         self.bin = os.path.join(self.dir, "bin")
         write(os.path.join(self.bin, "go"), FAKE_GO, 0o755)
+        write(os.path.join(self.bin, "portivo-mobile"), FAKE_NATIVE, 0o755)
         self.log = os.path.join(self.dir, "go.log")
         self.memfile = os.path.join(self.dir, "mem.json")
         self.set_memory(60)
@@ -1434,7 +1761,9 @@ class RunTest(unittest.TestCase):
     def set_memory(self, level, swap=1.0, pressure="normal"):
         with open(self.memfile, "w") as f:
             json.dump(
-                {"level": level, "ram_gb": 48, "swap_gb": swap, "pressure": pressure}, f
+                {"level": level, "ram_gb": 48, "swap_gb": swap, "pressure": pressure,
+                 "native": {"gb": 0.0, "active": False}},
+                f,
             )
 
     def start(self, command, sleep="0.3", rc="0", via="cli", extra=(), **env):
@@ -1683,6 +2012,33 @@ class RunTest(unittest.TestCase):
         )
         args = [r[3] for r in self.go_log() if r[0] == "start"][-1]
         self.assertIn("-count=1", args)
+
+    def test_native_up_streams_output_and_returns_its_code(self):
+        """`portivo-mobile up` agenci puszczają w tle: wyjście i kod mają być jego własne."""
+        rc, out, err = self.done(self.start("portivo-mobile up storefront-mobile", rc="3", via="hook"))
+        self.assertEqual(rc, 3)
+        self.assertIn('"device": "Portivo-1"', out)
+        self.assertIn("building the dev client", err)
+        row = self.history()[-1]
+        self.assertEqual((row["class"], row["rc"], row["where"]), ("repo:native:up:storefront-mobile", 3, "local"))
+        self.assertFalse(row["native_built"])
+
+    def test_two_native_builds_never_overlap(self):
+        self.set_memory(90)  # 43 GB dostępne: oba po 12 GB zmieściłyby się naraz
+        first = self.start("portivo-mobile up storefront-mobile", sleep="1.5")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        second = self.start("portivo-mobile up charter-mobile", sleep="0.3")
+        go = self.start("cd apps/charter-service && go test ./internal/moneyfmt/", sleep="0.2")
+        self.assertEqual(self.done(go)[0], 0)  # Go nie czeka za natywnym w kolejce
+        for p in (first, second):
+            self.assertEqual(self.done(p)[0], 0)
+        log = self.go_log()
+        first_pid = [r[1] for r in log if r[0] == "start" and "storefront-mobile" in r[3]][0]
+        first_end = [r[2] for r in log if r[0] == "end" and r[1] == first_pid][0]
+        second_start = [r[2] for r in log if r[0] == "start" and "charter-mobile" in r[3]][0]
+        go_start = [r[2] for r in log if r[0] == "start" and "moneyfmt" in r[3]][0]
+        self.assertGreaterEqual(second_start, first_end - 0.05)
+        self.assertLess(go_start, first_end)
 
     def test_status_command(self):
         self.done(self.start("cd apps/charter-service && go test ./internal/moneyfmt/"))

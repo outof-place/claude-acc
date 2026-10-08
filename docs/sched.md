@@ -1,8 +1,9 @@
-# Scheduler Go i JS: stan dla panelu i historia biegów
+# Scheduler Go, JS i buildów natywnych: stan dla panelu i historia biegów
 
 `sched.py` wpuszcza ciężkie komendy agentów po pamięci zamiast jednego zamka na wszystko: Go
-(build, vet, test, lint, cele make) i JS (testy, e2e, buildy, typecheck, lint, w każdym projekcie z
-`package.json`). Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse (`devguard.py admit`)
+(build, vet, test, lint, cele make), JS (testy, e2e, buildy, typecheck, lint, w każdym projekcie z
+`package.json`) i natywne buildy aplikacji mobilnych (`portivo-mobile up`, xcodebuild, `expo
+run:ios|android`, `eas build --local`, `pod install`; sekcja niżej). Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse (`devguard.py admit`)
 sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje. Pomiary, z których wzięły się
 liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
 
@@ -78,14 +79,16 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `level_pct` | `kern.memorystatus_level`: procent pamięci, który jądro uważa za dostępny |
 | `available_gb` | `level_pct / 100 × ram_gb` |
 | `headroom_gb` | zapas, którego scheduler nie rusza (`config.headroom_gb`) |
-| `devserver_reserve_gb` | miejsce na jeszcze jeden dev serwer: `min(max_server_gb, budżet devguarda - dev serwery teraz)`, z `devguard-state.json` |
+| `devserver_reserve_gb` | miejsce na dev serwery, z `devguard-state.json`: `min(max_server_gb, budżet devguarda - dev serwery teraz)`, ale nie mniej niż powrót chronionych i przypiętych serwerów (których strażnik nie zatrzyma) do ich zmierzonego szczytu: suma `max(0, peak - footprint)` |
 | `jobs_now_gb` | suma `mem_now_gb` lokalnych jobów |
-| `reserved_gb` | o ile lokalne joby jeszcze urosną: suma `max(0, mem_predicted_gb - mem_now_gb)` |
+| `reserved_gb` | o ile lokalne joby jeszcze urosną: suma `max(0, mem_predicted_gb - mem_now_gb)`, plus `native.reserve_gb` |
 | `others_gb` | `ram_gb - available_gb - jobs_now_gb`: inne aplikacje i system |
 | `free_for_admission_gb` | `available_gb - headroom_gb - devserver_reserve_gb - reserved_gb` |
 | `idle_max_gb` | ile zmieściłoby się na pustym Macu: najwyższy `available_gb` z ostatnich 7 dni minus `headroom_gb`; większe joby idą zawsze na Depot |
 | `swap_used_gb`, `swap_growth_2m_gb` | swap teraz i jego przyrost w 2 minuty |
 | `pressure` | `normal`, `warn`, `critical` (devguard) |
+| `native` | `{build_gb, active, outside, reserve_gb, owner, owner_label}`: natywny build na Macu teraz. `active`: xcodebuild z akcją budującą (albo usługa XCBBuildService z dziećmi); `outside`: build spoza schedulera (nikt z `running[]` nie trzyma miejsca); `reserve_gb`: dla buildu z zewnątrz `max(0, przewidywany szczyt buildu - build_gb)`; `owner`: id joba, który trzyma miejsce |
+| `simulators` | `{booted, in_use, cap, gb, holders[]}` z pomiaru devguarda albo `null` bez świeżego pomiaru; `in_use`: żywa dzierżawa portivo-mobile, widz albo symulator człowieka |
 
 ### Job w `running[]` i `queue[]`
 
@@ -106,6 +109,7 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `predicted_wall_s` | przewidywany czas biegu lokalnie |
 | `small` | czy job jest mały (`mem_predicted_gb ≤ small_gb` i `predicted_wall_s ≤ small_wall_s`): może wyprzedzać |
 | `count1_dropped` | scheduler zdjął `-count=1` (wynik może przyjść z cache testów), patrz niżej |
+| `native`, `native_kind`, `exclusive` | build natywny: rodzaj (`up`, `build`, `pods`) i czy zajmuje jedyne miejsce na natywny build |
 
 Tylko w `running[]`:
 
@@ -125,7 +129,7 @@ Tylko w `queue[]`:
 | `position` | 1 = następny do wpuszczenia |
 | `enqueued_at`, `waited_s` | kiedy się zgłosił i ile już czeka |
 | `eta_start_s` | przewidywane sekundy do startu |
-| `reason` | `{code, need_gb, free_gb, after[], text}`; `code`: `memory` (czeka na pamięć), `head` (pamięć zarezerwowana dla joba, który czeka najdłużej), `pressure` (devguard: presja), `deciding` (scheduler jeszcze liczy trasę); `after` to id jobów, na których koniec czeka |
+| `reason` | `{code, need_gb, free_gb, after[], text}`; `code`: `memory` (czeka na pamięć), `head` (pamięć zarezerwowana dla joba, który czeka najdłużej), `pressure` (devguard: presja), `deciding` (scheduler jeszcze liczy trasę), `native` (inny natywny build trzyma miejsce), `simulators` (`portivo-mobile up` czeka na wolny symulator); `after` to id jobów, na których koniec czeka |
 
 ### `route`
 
@@ -217,8 +221,12 @@ Jeden wiersz JSON na skończony bieg, dopisywany na końcu pliku. Wiersze `where
 ```
 ts, id, where (local|depot), class, module, repo, label, p, peak_gb, sys_drop_gb, wall_s, cpu_s,
 wait_s, rc, agent, worktree, depot_run_id, runner, units, cost_usd,
-choice, why, local_eta_s, depot_eta_s, lambda, predicted_gb, predicted_wall_s, count1_dropped
+choice, why, local_eta_s, depot_eta_s, lambda, predicted_gb, predicted_wall_s, count1_dropped,
+native_built
 ```
+
+`native_built` (tylko joby natywne): czy w trakcie biegu naprawdę ruszyła kompilacja; `portivo-mobile
+up` z gotowym klientem w cache jej nie ma.
 
 `class` dla wierszy z Depot CI to `go-heavy/<job>`, dla `depot-exec` to `depot-exec-<cores>/exec`.
 Z tych wierszy scheduler uczy się przewidywań (p90 szczytu i mediana czasu na klasę i `-p`) i
@@ -240,6 +248,7 @@ depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (
 count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
 depot_org            ""     organizacja Depot dla `sched.py depot`; pusta: domyślna organizacja CLI
 node                 true   testy, buildy i typecheck JS w kolejce
+native               true   natywne buildy mobilne w kolejce
 ```
 
 ## JS
@@ -254,12 +263,46 @@ skrypty i flagi, które się nie kończą albo czekają na człowieka (`dev`, `w
 `package.json` (szukanym w górę, do `.git`).
 
 Klasa: `<repo>:<rodzaj>:<pakiet albo filter=X>:<narzędzie>[:all][:filtered]`, np.
-`shop:test:apps/web:vitest`. `all` to bieg na całym monorepo (`-r`, `--workspaces`, każde
+`shop:test:apps/web:vitest`. `<repo>` to nazwa głównego repo także w jego worktree (z pliku `.git`
+worktree), więc każde drzewo uczy się z tej samej historii. `all` to bieg na całym monorepo (`-r`, `--workspaces`, każde
 `turbo run`), `filtered` to wybrane testy (`-t`, `--grep`, `--project`, pliki w argumentach). Do pierwszych
 biegów klasy przewidywanie bierze się z tabeli (GB, sekundy): `test` 3,0/90, `e2e` 3,5/180, `build`
 4,0/180, `typecheck` 2,5/60, `lint` 2,0/60, `check` 3,0/120; `all` razy 1,5 GB i 2 czasu, `filtered`
 połowa GB (najmniej 1) i 0,4 czasu. Potem p90 z historii, jak w Go. Joby JS biegną tylko lokalnie:
 nie idą na Depot i nie dostają Postgresa. `"node": false` w `config.json` wyłącza całą tę część.
+
+## Natywne buildy (iOS, Android)
+
+2026-10-08 Mac stanął: natywny build iOS spoza schedulera, kilka symulatorów po 2-4 GB, Metro
+i kilka `pnpm lint` naraz, a scheduler widział z tego tylko swoje joby. Teraz hook owija:
+
+- `portivo-mobile up <app>` (build klienta dev, instalacja, symulator z puli);
+- `xcodebuild` z akcją budującą (`build`, `test`, `archive`, `build-for-testing`, `analyze`,
+  `docbuild`, `install`); bez akcji to też build, ale `-list`, `-version`, `-showBuildSettings`,
+  `clean` i `test-without-building` nie (maestro trzyma ten ostatni przez całą sesję);
+- `expo run:ios|android` (bez `--binary`), `react-native run-ios|android` (bez `--binary-path`),
+  `eas build --local`,
+  także przez `npx`, `bunx`, `pnpm|yarn|bun exec|dlx`, `npm exec` i skrypty `package.json`, które je
+  wołają (`pnpm ios`);
+- `pod install|update`, `npx pod-install`, `bundle exec pod install`: lekkie, biegną obok buildu.
+
+Klasa: `<repo>:native:<rodzaj>:<cel>`, np. `portivo:native:up:storefront-mobile`. Do pierwszych biegów
+przewidywanie z tabeli: build i `up` 12 GB / 600 s, pody 1,5 GB / 180 s; potem p90 z historii.
+Joby natywne nie idą na Depot, nie dostają SIGSTOP przy swapie i nie korzystają z furtki „sam na
+Macu po 30 s ponad pamięć”.
+
+Jeden natywny build naraz na całym Macu. Miejsce trzyma job z `running[]` tylko w fazie
+kompilacji: 30 s po ostatnim kompilatorze (albo po 2 × przewidywany czas bez kompilacji) zwalnia
+je i swoją rezerwację, więc `expo run:ios`, który dalej trzyma Metro, nie blokuje następnego. Build
+spoza schedulera (xcodebuild z kompilatorami pod sobą, np. odłączony builder portivo-mobile albo
+Xcode) też zajmuje miejsce, a jego wzrost do przewidywanego szczytu idzie do `reserved_gb`. Pomiar
+joba obejmuje procesy buildu poza jego drzewem (portivo-mobile buduje w odłączonym procesie), a dla
+`up` także symulator, który włączył.
+
+`portivo-mobile up` sesji, która nie ma jeszcze dzierżawy, czeka (`reason.code = simulators`), gdy
+symulatory w użyciu są na limicie devguarda (`max_booted_simulators`). Nieużywane symulatory
+wyłącza strażnik (README, sekcja o strażniku dev serwerów). `"native": false` w `config.json`
+wyłącza całą tę część.
 
 ## `sched.py wait`
 
