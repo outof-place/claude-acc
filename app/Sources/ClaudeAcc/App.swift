@@ -5,7 +5,7 @@ struct ClaudeAccApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
     init() {
-        // `ClaudeAcc --render panel.png [--snapshot accounts.json]`: the panel as a picture,
+        // `ClaudeAcc --render panel.png [--snapshot accounts.json] [--live]`: the panel as a picture,
         // to look at without clicking. With --snapshot it uses that file instead of live data,
         // and demo-guard.json / demo-janitor.json / demo-updates.json next to it, if they exist (README screenshots).
         let args = CommandLine.arguments
@@ -13,7 +13,10 @@ struct ClaudeAccApp: App {
             let data = args.firstIndex(of: "--snapshot").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
             let open = args.firstIndex(of: "--open").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
             let hover = args.firstIndex(of: "--hover").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
-            exit(Self.render(to: args[i + 1], from: data, open: open, hover: hover) ? 0 : 1)
+            // --live keeps the panel's fixed height, so a column that overflows shows up as it does on
+            // screen (lists that scroll inside their cards render empty: ImageRenderer skips ScrollView)
+            let live = args.contains("--live")
+            exit(Self.render(to: args[i + 1], from: data, open: open, hover: hover, live: live) ? 0 : 1)
         }
         // a second copy would put a second ring in the menu bar
         let mine = Bundle.main.bundleIdentifier ?? ""
@@ -27,7 +30,7 @@ struct ClaudeAccApp: App {
         Settings { EmptyView() }
     }
 
-    private static func render(to path: String, from snapshotFile: String?, open: String?, hover: String?) -> Bool {
+    private static func render(to path: String, from snapshotFile: String?, open: String?, hover: String?, live: Bool) -> Bool {
         let output: CLIResult
         var guardState: GuardState?
         var janitor: JanitorState?
@@ -83,7 +86,7 @@ struct ClaudeAccApp: App {
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
         let panel = PanelView(store: store, frozenNow: frozen)
             .fixedSize()
-            .environment(\.renderingToFile, true)
+            .environment(\.renderingToFile, !live)
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, .dark)
         let renderer = ImageRenderer(content: panel)

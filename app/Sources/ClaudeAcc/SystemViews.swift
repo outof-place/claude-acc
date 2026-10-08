@@ -341,7 +341,8 @@ private struct ThermalChart: View {
         }
         .chartYScale(domain: 30...110)
         .chartLegend(position: .bottom, alignment: .leading, spacing: 4)
-        .frame(height: 92)
+        // the last card of its column: the chart gives up height before the card spills out
+        .frame(minHeight: 44, idealHeight: 92, maxHeight: 92)
         .accessibilityLabel("CPU and GPU temperature over the last 20 minutes")
     }
 }
