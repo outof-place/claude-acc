@@ -20,6 +20,7 @@ It rotates your Claude subscriptions before one hits the wall, keeps the agents'
 brew install outof-place/tap/claude-acc
 claude-acc-setup          # scripts, launchd jobs and the menu bar app, into your account
 claude-acc fans install   # optional: fan control, a small root helper (asks for Touch ID)
+claude-acc hotspot on     # optional: Hotspot turbo, a small root helper (asks for Touch ID)
 ```
 
 Or from source:
@@ -43,7 +44,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 | **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. When no account is left, it can [use up the last few percent of every account](#using-up-every-account) (`claude-acc drain on`), then tells you once; with the optional [limit pause](#how-the-pause-works) (`claude-acc pause on`) it also stops your sessions at a checkpoint instead of letting agents run into the wall, and wakes them when limits come back. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
 | **Dev server guard** | Agents in [Orca](https://github.com/stablyai/orca) each run their own `next dev` with a preview tab, and Turbopack grows to 6-9 GB per server under their edits. The guard watches every dev server's real memory (the number macOS kills by), knows who is looking at it, restarts a bloated one in its own Orca terminal in seconds, stops duplicates, orphans and loops, and turns away an agent about to start a second server of the same app. |
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
-| **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. |
+| **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. With [Hotspot turbo](#hotspot-turbo) on, an iPhone hotspot stops queueing every session's requests behind one session's upload. |
 | **Load & heat** | CPU load split into performance and efficiency cores, GPU load, and P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
 | **Updates** | Everything on the Mac brought to its newest version every 3 days: Homebrew formulae and casks, global npm packages, Go programs, Python packages (rolled back if anything conflicts or stops importing), Python itself, Claude Code with its plugins and skills. Pins are respected and hand-edited skills are left alone. The panel shows when it last worked, what each part did and why something failed, and an Update button runs it now. |
 | **Mail gateway** | Your agents read and answer the company mail without a password or key on disk: several mailboxes, Google Workspace through domain-wide delegation and any IMAP/SMTP server, behind one [MCP server](#mail-gateway) every Claude Code session gets. Each mailbox has its own level (read, modify, draft) and sending is off unless you allow it, so an agent leaves a draft for you. What an email says is treated as untrusted data, and every call lands in an audit log. |
@@ -212,6 +213,9 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
 | `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
 | `claude-acc fans install\|uninstall` | Install the fan daemon, or remove it and give the fans back to macOS |
+| `claude-acc hotspot on\|off` | Hotspot turbo on or off (the first `on` installs the root helper) |
+| `claude-acc hotspot status [--json]` | Whether it shapes now, the upload cap, and the queue delay it sees |
+| `claude-acc hotspot install\|uninstall` | Install the hotspot daemon, or remove it and lift the cap |
 | `claude-acc perf ultra on\|off\|status` | Turn Ultra on or off, or show what it changed and the numbers |
 | `claude-acc perf bench network\|cpu\|gpu\|fs` | Measure: queueing in the network vs inside the connection, P-core share and wake-up latency, GPU time per app, the file cache |
 | `claude-acc perf list` / `apply` / `undo <name>` | Every tweak on its own, with what it changes and how it was measured |
@@ -482,6 +486,16 @@ Polish banks, Revolut, Wise and PayPal are `read` out of the box, because a paym
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
 
 With **Auto on any hotspot** it switches itself on whenever the Mac joins a network that macOS marks as expensive: an iPhone or Android hotspot over Wi-Fi or USB, or a cellular modem. It turns off again when you leave that network, unless you turned it on yourself. **Keep the hotspot alive** sends one small request every 25 seconds, so a phone doesn't drop a hotspot it thinks nobody uses. The settings live in the app's preferences.
+
+## Hotspot turbo
+
+An iPhone hotspot is fast downstream and narrow upstream: measured on an iPhone 16 Pro Max over USB on 5G, about 280 Mb/s down and 40 Mb/s up, with the phone's modem holding up to 0.8 s of upload in its queue (`networkQuality` gives 74 RPM while uploading). Claude Code sends the whole conversation on every turn, 1-2 MB in a long session, so with a few sessions open one session's upload sits in front of every other session's new request, of every ACK for a streaming answer and of every DNS lookup.
+
+Turning **Hotspot turbo** on (the switch in the Stay Awake card, or `claude-acc hotspot on`) starts a small root daemon that wakes up only while the default route goes through an iPhone hotspot, over USB or Wi-Fi. It caps the Mac's upload with `ifconfig <interface> tbr` just under what the uplink carries right now, so the queue forms on the Mac, where macOS's FQ-CoDel sends small flows ahead of bulk uploads, instead of in the modem's FIFO. 5G capacity moves from minute to minute, so the cap follows round-trip probes the way [cake-autorate](https://github.com/lynxthecat/cake-autorate) does on OpenWrt routers: 20 small pings a second across six public resolvers. While the upload is busy and the probes stay clean, the cap rises by about a third per second. When every probe for 200 ms sits 30 ms above its baseline and the Mac's own upload is the cause, the cap drops by 10%, at most once a second. Single latency spikes from the radio don't count. If no probe comes back for 5 seconds, the cap is lifted rather than steered blind. The probes also keep the phone's radio connected, so the first request after a pause doesn't wait for the modem to wake.
+
+Measured with three 40-second rounds off and three on, alternating, with other sessions' traffic going on as usual: ping p90 fell from 95 to 53 ms and p99 from 367 to 274 ms, a small request to api.anthropic.com went from 608 to 550 ms at p90, and a 2 MB upload got no slower (1.01 to 0.90 s at p50). It can't help the download direction, and the ~200 ms an API request spends in Anthropic's backend isn't the link's to win.
+
+The daemon is a copy of `hotspot.py` in `/usr/local/libexec/claude-acc-hotspot`, owned by root. It reads the switch from `~/.local/share/claude-acc/hotspot.json`, where `min_mbps` and `max_mbps` can bound the cap (6 and 150 by default), and writes what it does to `hotspot-state.json` next to it every 2 seconds; its log is `/var/log/claude-acc-hotspot.log`. After an upgrade that changes it, `claude-acc hotspot status` says so and `claude-acc hotspot install` refreshes it.
 
 ## Load & heat
 

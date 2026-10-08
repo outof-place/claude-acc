@@ -36,6 +36,10 @@ enum CLI {
     static let schedState = directory + "/sched/state.json"
     static let depotState = directory + "/sched/depot.json"
     static let updatesState = directory + "/updates-state.json"
+    /// Hotspot turbo: the panel writes the switch, the root daemon its state every 2 seconds.
+    static let hotspotConfig = directory + "/hotspot.json"
+    static let hotspotState = directory + "/hotspot-state.json"
+    static let hotspotDaemon = "/usr/local/libexec/claude-acc-hotspot"
     static let mailPanel = directory + "/mail/panel.json"
     static let browserPanel = directory + "/browser/panel.json"
     static let switchLog = directory + "/switch.log"

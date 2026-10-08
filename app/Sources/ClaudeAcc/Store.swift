@@ -55,6 +55,9 @@ final class Store {
     private(set) var ultraPick: Bool?
     /// The fan mode just picked, until the daemon's state file shows it.
     private(set) var fanPick: String?
+    private(set) var hotspot: HotspotState?
+    /// The hotspot switch just flipped, until the daemon's state file shows it.
+    private(set) var hotspotPick: Bool?
     /// The value asked of a watcher setting's command, shown until a reading confirms it.
     private(set) var settingPicks: [Setting: Bool] = [:]
     private(set) var settingBusy: Setting?
@@ -165,6 +168,10 @@ final class Store {
             fanState = Self.decode(FanState.self, from: data)
         }
         if let pick = fanPick, pick == fanMode { fanPick = nil }
+        if let data = changedFile(CLI.hotspotState) {
+            hotspot = Self.decode(HotspotState.self, from: data)
+        }
+        if let pick = hotspotPick, pick == hotspot?.enabled { hotspotPick = nil }
         if let data = changedFile(CLI.schedState) {
             sched = Self.decode(SchedState.self, from: data)
         }
@@ -527,6 +534,41 @@ final class Store {
             fanPick = mode
         } catch {
             notice = Notice(text: "Couldn't save the fan mode: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    // MARK: Hotspot turbo
+
+    var hotspotInstalled: Bool { FileManager.default.fileExists(atPath: CLI.hotspotDaemon) }
+
+    /// The daemon writes every 2 seconds; much older than that means it isn't running.
+    var hotspotLive: HotspotState? {
+        guard let state = hotspot, Date.now.timeIntervalSince1970 - state.at < 15 else { return nil }
+        return state
+    }
+
+    var hotspotEnabled: Bool {
+        if let pick = hotspotPick { return pick }
+        if let state = hotspotLive { return state.enabled }
+        return Self.hotspotConfig()["enabled"] as? Bool ?? false
+    }
+
+    private static func hotspotConfig() -> [String: Any] {
+        guard let data = FileManager.default.contents(atPath: CLI.hotspotConfig),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return object
+    }
+
+    /// The root daemon reads this file every 2 seconds; other keys (min_mbps, max_mbps) stay.
+    func setHotspot(_ on: Bool) {
+        var config = Self.hotspotConfig()
+        config["enabled"] = on
+        do {
+            let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: CLI.hotspotConfig), options: .atomic)
+            hotspotPick = on
+        } catch {
+            notice = Notice(text: "Couldn't save the hotspot switch: \(error.localizedDescription)", isError: true)
         }
     }
 
