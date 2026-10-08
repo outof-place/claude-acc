@@ -2495,14 +2495,17 @@ class HubClient:
 
     def close(self):
         """Koniec rozmowy także dla demona: sam close() gniazda nie zamyka deskryptora, póki wątek
-        czytający trzyma makefile(), więc demon uważałby sesję (driver SDK) za wciąż połączoną."""
-        if self.sock is not None:
+        czytający trzyma makefile(), więc demon uważałby sesję (driver SDK) za wciąż połączoną.
+        Gniazdo zdejmujemy pod blokadą: po shutdown() wątek czytający dostaje EOF i sam zeruje self.sock."""
+        with self.lock:
+            sock, self.sock = self.sock, None
+        if sock is not None:
             try:
-                self.sock.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             try:
-                self.sock.close()
+                sock.close()
             except OSError:
                 pass
 
