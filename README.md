@@ -343,6 +343,8 @@ What it does, gentlest first:
 | stop | a second server of the same app nobody watches, a server whose agent or terminal is gone, a server nobody watched or used for `idle_minutes` (twice that while an agent works in its worktree), and a server restarted `max_recycles_per_hour` times within an hour, which is the HMR loop again |
 | free the biggest | dev servers over `budget_percent` of RAM, or memory pressure. With a warning only servers without a preview or bloated ones; when critical, also ones agents watch. The server you watch is never stopped, at most restarted |
 
+**Last resort.** On 2026-10-08 a 48 GB Mac froze with 18 GB of swap while no dev server was left to stop: the memory went to what the guard did not see, 55 node processes (MCP servers, vitest, tsc), four gopls and agents' headless Chromes. So when memory is critical and the guard took no action this pass, `lastresort.py` stops one helper tree, least painful first: an orphan (a node, bun, deno or gopls process adopted by launchd whose owner is gone, over 100 MB and 10 minutes old), a headless browser (over 300 MB), gopls (over 800 MB), a test or compile run of an agent (vitest, jest, tsc, playwright, a `go test` binary, the Go compiler, over 1 GB). Parent 1 alone does not make an orphan: an agent that starts a job with `&` or `nohup` keeps waiting for it after its shell exits, so the owner comes from `CLAUDE_PID` in the process environment (Claude Code sets it for every command) and, without it, from the process group leader. Agents, shells, Orca, your browser, apps under `/Applications`, Docker and claude-acc itself are never touched. Every stop goes to the log as `ostatnia linia: ...` and to a notification; `"last_resort": false` turns it off.
+
 One action at a time, then `cooldown_seconds` to let memory settle, and the swap growth window starts over so an old trend can't trigger the next one. A server younger than `grace_minutes` is left alone. After a stop the guard closes the server's background preview tabs in Orca (they would only keep reloading), writes a `devguard: ...` comment on the worktree card when the card has no comment of someone else's, sends a notification, and logs the command to bring the server back.
 
 ### Pins: exceptions for a while
@@ -389,6 +391,7 @@ Configuration lives in `~/.local/share/claude-acc/devguard.json`. Every key is o
 | `scope` | `[]` | When set, the guard only sees servers under these paths |
 | `runtimes` | `node`, `bun`, `deno` | Interpreters dev servers run under |
 | `caps_minutes` | `10` | How often the guard applies the janitor's `caps`, `0` turns it off |
+| `last_resort` | `true` | Under critical pressure with no dev server left to free, stop one orphan, headless browser, gopls or agent test run per pass |
 
 ## fseventsd guard
 
