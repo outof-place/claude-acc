@@ -26,7 +26,15 @@ if args[:3] == ["plugin", "list", "--json"]:
     print(json.dumps([{k: v for k, v in p.items() if k != "latest" and k != "confirm"} for p in c["plugins"]]))
     sys.exit(0)
 
+if os.environ.get("CLAUDE_CODE_PLUGIN_PREFER_HTTPS"):
+    _world.record("claude-env", ["CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1"])
+
 if args[:3] == ["plugin", "marketplace", "update"]:
+    # wolne łącze do GitHuba: klon nie mieści się w domyślnych 120 s
+    if world.get("slow_github") and int(os.environ.get("CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS", "120000")) <= 120000:
+        print("Updating marketplaces...1 marketplace could not be refreshed (see --debug): caveman")
+        print("\u2718 Updated 2 marketplaces, but not all")
+        sys.exit(1)
     print("Successfully updated 3 marketplaces")
     sys.exit(0)
 
@@ -36,6 +44,13 @@ if args[:2] == ["plugin", "update"]:
     p = next(p for p in c["plugins"] if p["id"] == plugin_id and p["scope"] == scope
              and (scope == "user" or os.path.realpath(p["projectPath"]) == os.path.realpath(where)))
     old = p["version"]
+    # źródło github: update klonuje tylko po SSH, chyba że ktoś wymusi HTTPS
+    if p.get("ssh_only") and not world.get("ssh_github") and not os.environ.get("CLAUDE_CODE_PLUGIN_PREFER_HTTPS"):
+        print(json.dumps({"command": "update", "outcome": "failed", "plugin": plugin_id, "scope": scope,
+                          "message": "Failed to clone repository: Cloning into 'temp_github'...\n"
+                                     "git@github.com: Permission denied (publickey).",
+                          "failureCode": "error_permission"}))
+        sys.exit(1)
     if p.get("confirm"):
         print(json.dumps({"command": "update", "outcome": "error", "pluginId": plugin_id, "scope": scope,
                           "message": "The marketplace declares a command to run", "oldVersion": old,

@@ -459,6 +459,25 @@ class UpdatesTest(unittest.TestCase):
         [stripe] = claude["held"]
         self.assertEqual((stripe["name"], stripe["why"]), ("stripe plugin", "confirm"))
 
+    def test_plugins_clone_over_https_without_a_github_ssh_key(self):
+        # plugin update klonuje źródło github tylko po SSH, a klon marketplace'u ucina po 120 s
+        def plugins(world):
+            world["claude"]["plugins"].append({"id": "cache-tax@claude-code-mods", "scope": "user",
+                                               "version": "2.2.1", "latest": "2.3.0", "ssh_only": True})
+
+        env = Env(self, edit=plugins, slow_github=True)
+        env.run("run", "--force")
+        claude = step(env.state(), "claude")
+        self.assertEqual(claude["failed"], [])
+        self.assertIn("cache-tax plugin", names(claude["updated"]))
+        self.assertIn("claude-env CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1", env.calls())
+
+    def test_plugins_stay_on_ssh_when_github_takes_the_key(self):
+        env = Env(self, ssh_github=True)
+        env.run("run", "--force")
+        self.assertEqual(step(env.state(), "claude")["failed"], [])
+        self.assertNotIn("claude-env CLAUDE_CODE_PLUGIN_PREFER_HTTPS=1", env.calls())
+
     def test_a_skill_edited_by_hand_is_not_overwritten(self):
         env = Env(self, skills={"kept": "v2 from GitHub", "mine": "v2 from GitHub"})
         lock = {"version": 3, "skills": {}}
