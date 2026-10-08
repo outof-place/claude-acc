@@ -341,6 +341,8 @@ class FakeImap:
 
     def select(self, folder, readonly=True):
         self.log.append(("select", folder, readonly))
+        if getattr(self, "dropped", False):
+            raise mail.imaplib.IMAP4.abort("socket error: EOF")
         return (
             ("OK", [b"2"])
             if folder in ('"INBOX"', '"Drafts"', '"Sent"')
@@ -373,8 +375,63 @@ class FakeImap:
     def status(self, folder, what):
         return "OK", [b'"INBOX" (MESSAGES 2 UNSEEN 1)']
 
+    def noop(self):
+        self.log.append(("noop",))
+        if getattr(self, "dropped", False):  # serwer albo NAT zerwał bezczynne połączenie
+            raise mail.imaplib.IMAP4.abort("socket error: EOF")
+        return "OK", [b"done"]
+
     def logout(self):
         self.log.append(("logout",))
+
+
+class TokenCommand(unittest.TestCase):
+    """Skrzynka Gmail bez delegacji: token ze zgody właściciela drukuje komenda (np. gws)."""
+
+    SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+
+    def setUp(self):
+        self.calls = []
+
+        def fake_http(method, url, headers=None, **kw):
+            self.calls.append((method, url.split("?")[0], (headers or {}).get("Authorization")))
+            if url.startswith(mail.TOKENINFO_URL):
+                return {"scope": "email " + self.SCOPE}
+            return {"messagesTotal": 12, "messages": []}
+
+        patch = mock.patch.object(mail, "http", fake_http)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def config(self, level="read", command="printf tok-123"):
+        path = os.path.join(TMP, "cmd.json")
+        with open(path, "w") as f:
+            json.dump({"mailboxes": {"me@corp.example": {"provider": "gmail", "access": level, "token_command": command}}}, f)
+        return mail.load_config(path)
+
+    def test_gmail_with_command_needs_no_service_account(self):
+        gw = mail.Gateway(self.config(), client="test")
+        gw.run("mail_search", {"mailbox": "me@corp.example", "query": "is:unread"})
+        gmail = [c for c in self.calls if "gmail.googleapis.com" in c[1]]
+        self.assertTrue(gmail)
+        self.assertEqual({c[2] for c in gmail}, {"Bearer tok-123"})
+
+    def test_token_without_needed_scope_is_refused_by_name(self):
+        gw = mail.Gateway(self.config(level="draft"), client="test")
+        with self.assertRaisesRegex(mail.MailError, "nie ma zakresu .*gmail.compose"):
+            gw.provider("me@corp.example").ping("me@corp.example", "draft")
+
+    def test_failing_command_is_a_mailbox_error(self):
+        gw = mail.Gateway(self.config(command="echo 'not logged in' >&2; exit 3"), client="test")
+        with self.assertRaisesRegex(mail.MailError, "token_command: not logged in"):
+            gw.run("mail_search", {"mailbox": "me@corp.example", "query": ""})
+
+    def test_token_reused_until_it_ages(self):
+        gw = mail.Gateway(self.config(command="date +%s%N"), client="test")
+        for _ in range(3):
+            gw.run("mail_search", {"mailbox": "me@corp.example", "query": ""})
+        self.assertEqual(len({c[2] for c in self.calls if "gmail.googleapis.com" in c[1]}), 1)
+        self.assertEqual(len([c for c in self.calls if c[1] == mail.TOKENINFO_URL]), 1)
 
 
 class Imap(unittest.TestCase):
@@ -389,6 +446,22 @@ class Imap(unittest.TestCase):
             self.addCleanup(p.stop)
         self.gw = mail.Gateway(config(), client="test")
 
+    def test_login_timeout_is_a_mailbox_error(self):
+        # Dovecot po złym haśle wstrzymuje odpowiedź na LOGIN; doctor ma to zgłosić, a nie paść
+        def slow_login(conn, user, password):
+            raise TimeoutError("The read operation timed out")
+
+        cfg = config()
+        cfg["mailboxes"] = {"info@own.example": cfg["mailboxes"]["info@own.example"]}
+        with mock.patch.object(FakeImap, "login", slow_login):
+            with self.assertRaisesRegex(mail.MailError, "IMAP logowanie info@own.example"):
+                self.gw.run("mail_search", {"mailbox": "info@own.example", "query": ""})
+            self.assertEqual(mail.doctor(cfg, quiet=True), 1)
+        with open(mail.state_path()) as f:
+            health = json.load(f)["health"]["info@own.example"]
+        self.assertFalse(health["ok"])
+        self.assertEqual(health["reason"], "IMAP sign-in failed")
+
     def test_search_newest_first_with_flags(self):
         out = self.gw.run(
             "mail_search",
@@ -400,7 +473,46 @@ class Imap(unittest.TestCase):
         conn = FakeImap.instances[-1]
         self.assertIn(("login", "info@own.example", "s3cret"), conn.log)
         self.assertIn(("select", '"INBOX"', True), conn.log)
-        self.assertEqual(conn.log[-1], ("logout",))
+        self.assertNotIn(("logout",), conn.log)  # czeka w puli na następne wywołanie
+
+    def search(self):
+        return self.gw.run("mail_search", {"mailbox": "info@own.example", "query": ""})
+
+    def test_calls_in_a_row_sign_in_once(self):
+        self.search()
+        self.gw.run("mail_read", {"mailbox": "info@own.example", "message_id": "INBOX:9"})
+        self.search()
+        self.assertEqual(len(FakeImap.instances), 1)
+        conn = FakeImap.instances[0]
+        self.assertEqual([e for e in conn.log if e[0] in ("login", "noop")],
+                         [("login", "info@own.example", "s3cret"), ("noop",), ("noop",)])
+
+    def test_dropped_idle_connection_is_replaced(self):
+        self.search()
+        FakeImap.instances[0].dropped = True
+        out = self.search()
+        self.assertEqual(out["messages"][0]["id"], "INBOX:9")
+        self.assertEqual(len(FakeImap.instances), 2)
+        self.assertIn(("logout",), FakeImap.instances[0].log)
+
+    def test_idle_too_long_reconnects_without_noop(self):
+        self.search()
+        with mock.patch.object(mail, "KEEP_IMAP_S", 0):
+            self.search()
+        self.assertEqual(len(FakeImap.instances), 2)
+        self.assertNotIn(("noop",), FakeImap.instances[0].log)
+        self.assertIn(("logout",), FakeImap.instances[0].log)
+
+    def test_connection_broken_mid_call_is_not_reused(self):
+        def broken(conn, command, *args):
+            raise TimeoutError("The read operation timed out")
+
+        with mock.patch.object(FakeImap, "uid", broken):
+            with self.assertRaises(TimeoutError):
+                self.search()
+        self.assertIn(("logout",), FakeImap.instances[0].log)
+        self.search()
+        self.assertEqual(len(FakeImap.instances), 2)
 
     def test_read_body_links_attachment(self):
         out = self.gw.run(
@@ -605,9 +717,22 @@ class AskMode(unittest.TestCase):
         gw.confirm = lambda text: "Subject: Re: SIDO number" in text
         self.assertEqual(gw.run("mail_send", {"mailbox": "ask@example.com", "draft_id": "d1"})["approved_by"], "user (confirmation dialog)")
 
-    def test_send_tool_always_prompts_in_claude_code(self):
-        tool = next(t for t in mail.TOOLS if t["name"] == "mail_send")
-        self.assertIs(tool["_meta"]["anthropic/requiresUserInteraction"], True)
+    def send_meta(self, cfg):
+        out = io.StringIO()
+        server = mail.McpServer(out=out, gateway=mail.Gateway(cfg, client="test"))
+        server.serve(io.StringIO(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n"))
+        tools = {t["name"]: t for t in json.loads(out.getvalue())["result"]["tools"]}
+        self.assertIn("anthropic/maxResultSizeChars", tools["mail_read"]["_meta"])
+        return tools["mail_send"].get("_meta", {})
+
+    def test_ask_mailbox_makes_claude_code_prompt_on_send(self):
+        self.assertIs(self.send_meta(config())["anthropic/requiresUserInteraction"], True)
+
+    def test_auto_and_off_mailboxes_send_without_prompt(self):
+        # send auto ma wysłać od razu; okno Claude Code w bypassPermissions zatrzymałoby agenta
+        cfg = config()
+        del cfg["mailboxes"]["ask@example.com"]
+        self.assertNotIn("anthropic/requiresUserInteraction", self.send_meta(cfg))
 
 
 class ModernMcp(unittest.TestCase):
