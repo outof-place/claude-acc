@@ -89,6 +89,9 @@ DEFAULT_CONFIG = {
     "runtimes": ["node", "bun", "deno"],
     # limity katalogów z wynikami agentów (janitor caps) sprawdzane co tyle minut; 0 wyłącza
     "caps_minutes": 10,
+    # przy krytycznej presji, gdy żaden dev serwer nie zostaje do zatrzymania: sieroty,
+    # headless przeglądarki, gopls i przebiegi testów agentów (lastresort.py)
+    "last_resort": True,
 }
 
 SERVER_KINDS = [
@@ -248,6 +251,35 @@ _args = ctypes.create_string_buffer(64 * 1024)
 
 def procargs(pid):
     """Argumenty procesu z KERN_PROCARGS2: [argc, ścieżka, argv...]; None dla cudzego albo zombie."""
+    raw = _procargs_raw(pid)
+    if raw is None:
+        return None
+    argc = int.from_bytes(raw[:4], "little")
+    _exe, _, rest = raw[4:].partition(b"\0")
+    return [argc] + rest.lstrip(b"\0").split(b"\0")[:argc]
+
+
+def proc_env(pid):
+    """Środowisko procesu ({nazwa: wartość}) z tego samego bloku KERN_PROCARGS2, który trzyma
+    argumenty; {} dla cudzego albo zombie. Po środowisku jądro dokłada własne zmienne Apple
+    (executable_path=...) za pustym wpisem, więc czytamy tylko do niego."""
+    raw = _procargs_raw(pid)
+    if raw is None:
+        return {}
+    argc = int.from_bytes(raw[:4], "little")
+    _exe, _, rest = raw[4:].partition(b"\0")
+    env = {}
+    for item in rest.lstrip(b"\0").split(b"\0")[argc:]:
+        if not item:
+            break
+        name, sep, value = item.partition(b"=")
+        if sep:
+            env[name.decode(errors="replace")] = value.decode(errors="replace")
+    return env
+
+
+def _procargs_raw(pid):
+    """Surowy blok KERN_PROCARGS2 (argc, ścieżka, argv, środowisko); None dla cudzego albo zombie."""
     mib = (ctypes.c_int * 3)(1, KERN_PROCARGS2, pid)
     size = ctypes.c_size_t(len(_args))
     if _libc.sysctl(mib, 3, _args, ctypes.byref(size), None, 0):
@@ -263,11 +295,7 @@ def procargs(pid):
         if _libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0):
             return None
         raw = buf[: size.value]
-    if len(raw) < 4:
-        return None
-    argc = int.from_bytes(raw[:4], "little")
-    _exe, _, rest = raw[4:].partition(b"\0")
-    return [argc] + rest.lstrip(b"\0").split(b"\0")[:argc]
+    return raw if len(raw) >= 4 else None
 
 
 def proc_argv(pid):
@@ -1557,6 +1585,20 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
             # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
             state["swap_history"] = []
             acted = plan
+    reaped = None
+    if (
+        enforce
+        and acted is None
+        and cfg.get("last_resort", True)
+        and world.pressure.level >= 2
+        and now - state.get("last_action", 0) >= cfg["cooldown_seconds"]
+    ):
+        import lastresort
+
+        reaped = lastresort.reap(world, state, sys.modules[__name__])
+        if reaped:
+            state["last_action"] = now
+            state["swap_history"] = []
     history = state.setdefault("history", [])
     if not history or now - history[-1][0] >= 30:
         p = world.pressure
@@ -1583,6 +1625,7 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
         "units": [u.summary() for u in sorted(world.units, key=lambda u: -u.footprint)],
         "plans": [p.summary() for p in plans],
         "acted": acted.summary() if acted else None,
+        "last_resort": reaped,
     }
     return world, plans, acted
 
