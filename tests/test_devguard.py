@@ -206,6 +206,28 @@ PIN_KEEP = {"target": ":3747", "level": "keep", "until": None, "reason": "film"}
 PIN_HOLD = {"target": ":3747", "level": "hold", "until": None, "reason": "film"}
 
 
+class RegrowTest(unittest.TestCase):
+    """Ile stos może jeszcze urosnąć: każdy proces do swojego szczytu. Scheduler trzyma na to
+    miejsce, więc niedoszacowanie oznacza wpuszczenie roboty, która potem wypycha serwery do swapu."""
+
+    def test_each_process_can_grow_back_to_its_own_peak(self):
+        stats = {
+            1: {"footprint": 2 * GB, "peak": 5 * GB},  # turbopack po odśnieżeniu cache
+            2: {"footprint": 1 * GB, "peak": 1 * GB},
+            3: {"footprint": GB // 2, "peak": 3 * GB},  # worker, który spuchł przy buildzie trasy
+        }
+        fake = lambda pid: dict(stats[pid], cpu=0.0, written=0, start=NOW) if pid in stats else None
+        table = {1: (99, "pnpm dev"), 99: (1, "-zsh")}
+        with mock.patch.object(dg, "usage", fake), mock.patch.object(dg, "proc_cwd", lambda pid: "/w/app"), \
+                mock.patch.object(dg, "proc_argv", lambda pid: ["pnpm", "dev"]):
+            server = dg.Server(1, "next", "next dev", [1, 2, 3])
+            # 3 GB pierwszego i 2,5 GB trzeciego; sam szczyt największego minus suma dałby 1,5 GB
+            self.assertEqual(server.regrow, 5.5 * GB)
+            other = dg.Server(2, "next", "next dev", [2])
+            stack = dg.Unit(1, [server, other], table, {1: [2, 3]})
+        self.assertEqual(stack.summary()["regrow"], 5.5 * GB)
+
+
 class PinTest(unittest.TestCase):
     """Przypięcia z `pin`: wyjątek na czas, którego strażnik nie zatrzymuje."""
 
@@ -427,6 +449,64 @@ class SimulatorTest(unittest.TestCase):
         self.assertEqual(s.watchers, [200])
         self.assertTrue(s.lease_alive and s.watched and s.in_use)
 
+    def discover(self, rows, names, leases=None, **extra):
+        import plistlib
+
+        root = os.path.realpath(tempfile.mkdtemp(prefix="devguard-sims-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        devices, lease_dir = os.path.join(root, "Devices"), os.path.join(root, "leases")
+        os.makedirs(lease_dir)
+        for udid, name in names.items():
+            os.makedirs(os.path.join(devices, udid))
+            with open(os.path.join(devices, udid, "device.plist"), "wb") as f:
+                plistlib.dump({"name": name, "UDID": udid}, f)
+        for udid, lease in (leases or {}).items():
+            with open(os.path.join(lease_dir, udid + ".json"), "w") as f:
+                json.dump(lease, f)
+        with mock.patch.object(dg, "SIM_DEVICES", devices):
+            return {s.udid: s for s in dg.discover_simulators(cfg(simulator_leases=lease_dir, **extra), rows)}
+
+    def test_who_uses_a_simulator(self):
+        """Nikt nie trzyma i nikt nie patrzy: tylko wtedy symulator z puli jest nieużywany. Twój
+        (spoza puli) i chroniony w configu zawsze są w użyciu; serve-sim bez UDID i `simctl ...
+        booted` patrzą na każdy włączony."""
+        other = "0F6A3C2B-1111-4222-8333-944455556666"
+        names = {UDID: "Portivo-Auto-1", other: "iPhone 17 Pro"}
+        rows = [
+            (100, 1, f"launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/{UDID}/data/var/run/launchd_bootstrap.plist"),
+            (110, 1, f"launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/{other}/data/var/run/launchd_bootstrap.plist"),
+            (300, 1, "/bin/zsh -l"),
+        ]
+        found = self.discover(rows, names)
+        self.assertFalse(found[UDID].in_use)
+        self.assertTrue(found[other].in_use)
+        self.assertTrue(self.discover(rows, names, simulator_protect=["Portivo-Auto-1"])[UDID].in_use)
+        for viewer in ("/opt/homebrew/bin/serve-sim", "xcrun simctl io booted recordVideo /tmp/a.mov"):
+            found = self.discover(rows + [(400, 1, viewer)], names)
+            self.assertEqual(found[UDID].watchers, [400], viewer)
+            self.assertTrue(found[UDID].in_use, viewer)
+
+    def test_quiet_counts_from_the_last_use(self):
+        """Cisza rośnie tylko, gdy CPU całego symulatora jest pod `simulator_busy_cores`, a nikt
+        go nie trzyma i nikt nie patrzy (pomiar 2026-10-08: bezczynny 0,01 rdzenia)."""
+        s = sim("A")
+        state = {}
+
+        def tick(at, cpu, **flags):
+            s.start, s.cpu = 7, cpu
+            s.lease_alive = flags.get("lease_alive", False)
+            s.watched = flags.get("watched", False)
+            dg.track_simulators(cfg(), state, [s], NOW + at)
+            return s.quiet
+
+        self.assertEqual(tick(0, 10.0), 0)
+        self.assertEqual(tick(60, 10.6), 60)  # 0,01 rdzenia: bezczynny
+        self.assertEqual(tick(120, 40.6), 0)  # 0,5 rdzenia: ktoś go używa
+        self.assertEqual(tick(180, 41.2), 60)
+        self.assertEqual(tick(240, 41.8, lease_alive=True), 0)  # sesja go trzyma
+        self.assertEqual(tick(300, 42.4, watched=True), 0)  # maestro patrzy
+        self.assertEqual(tick(900, 42.5), 600)
+
     def test_metro_counts_a_simulator_as_a_viewer_only_while_it_is_in_use(self):
         """Metro, któremu sesja umarła, zostaje przy życiu przez aplikację w symulatorze, którego
         nikt już nie używa. Ten widz się nie liczy; symulator sesji, która żyje, tak."""
@@ -440,7 +520,9 @@ class SimulatorTest(unittest.TestCase):
         dg.drop_unused_simulator_clients(metro, commands, {UDID: sim(UDID, lease="alive")})
         self.assertEqual(metro.clients, [(42, "simulator", "Shop")])
 
-    def run_shutdown(self, front, lease=None):
+    SHUTDOWN = ["xcrun", "simctl", "shutdown", "B"]
+
+    def run_shutdown(self, front, lease=None, apps=()):
         target = sim("B", quiet=20 * 60)
         plan = dg.Plan(target, "shutdown", 85, "ponad limit", "simulator_cap")
         state = {}
@@ -453,9 +535,16 @@ class SimulatorTest(unittest.TestCase):
             with open(os.path.join(leases, "B.json"), "w") as f:
                 json.dump(lease, f)
 
+        # `launchctl list` w symulatorze: aplikacje użytkownika i systemowe, jak w prawdziwym
+        listing = "PID\tStatus\tLabel\n" + "".join(
+            f"{100 + i}\t0\tUIKitApplication:{app}[3f2a][rb-legacy]\n"
+            for i, app in enumerate(("com.apple.Spotlight",) + tuple(apps))
+        )
+
         def fake_run(argv, **_kw):
             calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            out = listing if argv[:3] == ["xcrun", "simctl", "spawn"] else ""
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
         with mock.patch.object(dg, "frontmost_bundle", return_value=front), \
                 mock.patch.object(dg.subprocess, "run", side_effect=fake_run), \
@@ -465,18 +554,52 @@ class SimulatorTest(unittest.TestCase):
 
     def test_shutdown_goes_through_simctl_and_never_while_you_look_at_simulator(self):
         calls, state = self.run_shutdown("com.stablyai.orca")
-        self.assertEqual(calls, [["xcrun", "simctl", "shutdown", "B"]])
+        self.assertEqual(calls[-1], self.SHUTDOWN)
         self.assertEqual(state["events"][-1]["action"], "shutdown")
-        calls, state = self.run_shutdown("com.apple.iphonesimulator")
-        self.assertEqual(calls, [])
+        for front in ("com.apple.iphonesimulator", None):  # None: lsappinfo nie odpowiedział
+            calls, state = self.run_shutdown(front)
+            self.assertNotIn(self.SHUTDOWN, calls, front)
+            self.assertNotIn("events", state)
+
+    def test_an_app_running_without_a_live_session_keeps_the_simulator(self):
+        """Symulator z puli bez dzierżawy, w którym działa aplikacja, ktoś używa poza
+        portivo-mobile (2026-10-08: Portivo-Perf-iPhone pod skryptem perf przez idb). Po martwej
+        sesji zostają jej aplikacja i sterownik maestro: te nie trzymają symulatora."""
+        calls, state = self.run_shutdown("com.stablyai.orca", apps=("eu.portivo.app",))
+        self.assertNotIn(self.SHUTDOWN, calls)
         self.assertNotIn("events", state)
+        dead = {"owner": {"pid": 0, "start": ""}, "bundle": "eu.portivo.app"}
+        calls, _ = self.run_shutdown("com.stablyai.orca", lease=dead,
+                                     apps=("eu.portivo.app", dg.MAESTRO_DRIVER))
+        self.assertEqual(calls[-1], self.SHUTDOWN)
+        calls, _ = self.run_shutdown("com.stablyai.orca", lease=dead, apps=("com.example.other",))
+        self.assertNotIn(self.SHUTDOWN, calls)
+
+    def test_a_held_shutdown_does_not_block_the_plans_below_it(self):
+        """Tick robi pierwszy plan, który coś zrobił: wyłączenie wstrzymane, bo patrzysz na
+        Simulator, nie może co 5 s zasłaniać zatrzymania serwera przy presji."""
+        held = dg.Plan(sim("B"), "shutdown", 85, "ponad limit", "simulator_cap")
+        server = unit("srv", 3)
+        stop = dg.Plan(server, "stop", 80, "brak pamięci", "pressure", level=1)
+        fake = world(server, simulators=[held.unit])
+        fake.pressure.summary = lambda: {"level": 1}
+        fake.pressure.swap_used = fake.pressure.compressed = 0
+        fake.orca = None
+        server.summary = held.unit.summary = lambda: {}
+        done = []
+        with mock.patch.object(dg, "World", return_value=fake), mock.patch.object(dg, "check_pending"), \
+                mock.patch.object(dg, "decide", return_value=[held, stop]), \
+                mock.patch.object(dg, "execute", side_effect=lambda c, p, w, s: done.append(p.action) or p.action != "shutdown"):
+            _w, _p, acted = dg.tick(cfg(last_resort=False), {}, orca=None, now=NOW)
+        self.assertEqual(done, ["shutdown", "stop"])
+        self.assertIs(acted, stop)
 
     def test_shutdown_rereads_the_lease_a_session_may_have_just_taken(self):
         calls, state = self.run_shutdown("com.stablyai.orca", lease={"owner": {"pid": os.getpid(), "start": ""}})
-        self.assertEqual(calls, [])
+        self.assertNotIn(self.SHUTDOWN, calls)
         self.assertNotIn("events", state)
         calls, _state = self.run_shutdown("com.stablyai.orca", lease={"owner": {"pid": 0, "start": ""}})
-        self.assertEqual(calls, [["xcrun", "simctl", "shutdown", "B"]])
+        self.assertEqual(calls[-1], self.SHUTDOWN)
 
     def test_metro_with_an_app_in_a_simulator_waits_while_you_look_at_simulator(self):
         metro = unit("metro", idle_sim_clients=[(42, "simulator", "Shop")], argv=None, launch_cwd="/w")
@@ -928,6 +1051,10 @@ class GuardTest(unittest.TestCase):
             "available_critical_percent": 0,
             "available_warn_percent": 0,
             "budget_percent": 1000,
+            # ostatnia linia i symulatory patrzą na całą tabelę procesów, nie na `scope`: w teście
+            # nie mogą zatrzymać niczego prawdziwego na tym Macu
+            "last_resort": False,
+            "simulator_pool_prefix": "devguard-test-pool-",
         }
         data.update(extra)
         with open(os.path.join(self.state_dir, "devguard.json"), "w") as f:

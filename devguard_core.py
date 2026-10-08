@@ -149,6 +149,10 @@ SIM_DEVICE = re.compile(rf"/CoreSimulator/Devices/({UDID.pattern})/")
 LAUNCHD_SIM = re.compile(r"(^|/)launchd_sim(\s|$)")
 # podgląd symulatora w Orce; bez UDID w argumentach ogląda każdy włączony
 SERVE_SIM = re.compile(r"(^|/)serve-sim(\s|$)")
+# `simctl io booted recordVideo`, `simctl spawn booted log stream`: alias każdego włączonego
+SIMCTL_BOOTED = re.compile(r"(^|/|\s)simctl\s.*\bbooted\b")
+# zostaje na urządzeniu po maestro; tak jak portivo-mobile nie liczymy go jako aplikacji w użyciu
+MAESTRO_DRIVER = "dev.mobile.maestro-driver-iosUITests.xctrunner"
 SIM_DEVICES = os.path.join(janitor.HOME, "Library/Developer/CoreSimulator/Devices")
 SIMULATOR_APP = "com.apple.iphonesimulator"
 
@@ -831,6 +835,8 @@ class Server:
         stats = [s for s in (usage(p) for p in tree) if s]
         self.footprint = sum(s["footprint"] for s in stats)
         self.peak = max((s["peak"] for s in stats), default=0)
+        # o ile procesy serwera mogą jeszcze urosnąć: każdy do swojego zmierzonego szczytu
+        self.regrow = sum(max(0, s["peak"] - s["footprint"]) for s in stats)
         self.cpu = sum(s["cpu"] for s in stats)
         self.written = sum(s["written"] for s in stats)
         self.ports = []
@@ -866,6 +872,7 @@ class Unit:
         self.biggest = max(s.footprint for s in servers)
         # szczyt pojedynczego procesu; suma drzewa bywa od niego większa
         self.peak = max(max(s.peak for s in servers), self.footprint)
+        self.regrow = sum(getattr(s, "regrow", 0) for s in servers)
         self.background = False
         self.cpu = sum(s.cpu for s in servers)
         self.ports = sorted({p for s in servers for p in s.ports})
@@ -940,6 +947,7 @@ class Unit:
             "footprint": self.footprint,
             "biggest": self.biggest,
             "peak": self.peak,
+            "regrow": self.regrow,
             "host": self.host,
             "command": shlex.join(self.argv) if self.argv else None,
             "terminal": (self.terminal or {}).get("title"),
@@ -1170,7 +1178,8 @@ def discover_simulators(cfg, rows):
     viewers = [
         pid
         for pid, command in outside
-        if SERVE_SIM.search(command) and not UDID.search(command)
+        if not UDID.search(command)
+        and (SERVE_SIM.search(command) or SIMCTL_BOOTED.search(command))
     ]
     sims = []
     for root, udid in roots.items():
@@ -1773,7 +1782,8 @@ def note(cfg, orca, unit, text):
 
 
 def held_back(state, key, now, text):
-    """Akcja wstrzymana, bo patrzysz na okno Simulatora: wpis w logu najwyżej co 10 minut."""
+    """Akcja wstrzymana (Simulator z przodu, sesja wzięła symulator, działa w nim aplikacja):
+    wpis w logu najwyżej co 10 minut na jednostkę, bo pętla pyta co kilka sekund."""
     seen = state.setdefault("held", {})
     if now - seen.get(key, 0) >= 10 * MINUTE:
         seen[key] = now
@@ -1795,20 +1805,53 @@ def portivo_lock(cfg):
     return handle
 
 
+def running_apps(udid):
+    """Bundle id aplikacji użytkownika działających w symulatorze (`launchctl list` w nim, jak
+    portivo-mobile); systemowe com.apple.* działają w każdym. None, gdy nie da się sprawdzić."""
+    try:
+        out = subprocess.run(
+            ["xcrun", "simctl", "spawn", udid, "launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return {
+        m.group(1)
+        for m in re.finditer(r"UIKitApplication:([\w.\-]+)\[", out.stdout)
+        if not m.group(1).startswith("com.apple.")
+    }
+
+
 def shutdown_simulator(cfg, plan, world, state):
     """`simctl shutdown`, ale nigdy, gdy okno Simulatora jest na pierwszym planie, ani gdy
     sesja właśnie wzięła ten symulator (dzierżawa czytana od nowa pod zamkiem portivo-mobile)."""
     sim, now = plan.unit, world.now
     size = janitor.human(sim.footprint)
-    if frontmost_bundle() == SIMULATOR_APP:
-        held_back(state, sim.key, now, f"czekam z wyłączeniem {sim.label}: patrzysz na Simulator")
+    front = frontmost_bundle()
+    if front in (SIMULATOR_APP, None):
+        why = "patrzysz na Simulator" if front else "nie wiem, co jest na pierwszym planie"
+        held_back(state, sim.key, now, f"czekam z wyłączeniem {sim.label}: {why}")
         return False
     lock = portivo_lock(cfg)
     if lock is False:
         return False  # `portivo-mobile up` właśnie dzierżawi; następny pomiar
     try:
-        if lease_alive(read_lease(cfg, sim.udid)):
-            log(f"nie wyłączam {sim.label}: sesja właśnie go wzięła")
+        lease = read_lease(cfg, sim.udid)
+        if lease_alive(lease):
+            held_back(state, sim.key, now, f"nie wyłączam {sim.label}: sesja właśnie go wzięła")
+            return False
+        # jak portivo-mobile: symulator po martwej sesji z jej aplikacją (i sterownikiem maestro)
+        # jest wolny, a bez dzierżawy żadna aplikacja użytkownika nie może w nim działać, bo ktoś
+        # go używa spoza dzierżaw (skrypty perf przez idb, Ty)
+        allowed = {lease.get("bundle"), MAESTRO_DRIVER} if lease else set()
+        apps = running_apps(sim.udid)
+        if apps is None or apps - allowed:
+            what = ", ".join(sorted(apps - allowed)) if apps else "nie wiem, co w nim działa"
+            held_back(state, sim.key, now, f"nie wyłączam {sim.label}: działa w nim {what}")
             return False
         try:
             done = subprocess.run(
@@ -1979,12 +2022,17 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
         and enforce
         and now - state.get("last_action", 0) >= cfg["cooldown_seconds"]
     ):
-        plan = plans[0]
-        if execute(cfg, plan, world, state) is not False and plan.action != "warn":
-            state["last_action"] = now
-            # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
-            state["swap_history"] = []
-            acted = plan
+        # pierwszy plan, który coś zrobił: wstrzymany (patrzysz na Simulator, `up` dzierżawi)
+        # nie może blokować tych pod nim, np. zatrzymania serwera przy presji
+        for plan in plans:
+            if execute(cfg, plan, world, state) is False:
+                continue
+            if plan.action != "warn":
+                state["last_action"] = now
+                # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
+                state["swap_history"] = []
+                acted = plan
+            break
     reaped = None
     if (
         enforce
