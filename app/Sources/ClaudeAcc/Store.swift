@@ -35,6 +35,7 @@ final class Store {
     private(set) var mailChecking = false
     private(set) var browser: BrowserPanel?
     private(set) var browserBusy = false
+    private(set) var desktop: DesktopPanel?
     private(set) var guardState: GuardState?
     /// Unit the panel is restarting or stopping right now.
     private(set) var guardBusy: String?
@@ -77,6 +78,8 @@ final class Store {
     @ObservationIgnored private var depotSyncing = false
     @ObservationIgnored private var browserSyncing = false
     @ObservationIgnored private var browserSyncedAt = Date.distantPast
+    @ObservationIgnored private var desktopSyncing = false
+    @ObservationIgnored private var desktopSyncedAt = Date.distantPast
     @ObservationIgnored private var live: Task<Void, Never>?
     /// The state files as last read: a file that didn't change costs one stat and wakes no view.
     @ObservationIgnored private var files: [String: StateFile] = [:]
@@ -91,7 +94,7 @@ final class Store {
     init(
         preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
         ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil, depot: DepotRuns? = nil,
-        updates: UpdatesState? = nil
+        updates: UpdatesState? = nil, desktop: DesktopPanel? = nil
     ) {
         awake = Awake(preview: true)
         snapshot = preview
@@ -104,6 +107,7 @@ final class Store {
         if let sched { self.sched = sched }
         if let depot { self.depot = depot }
         if let updates { self.updates = updates }
+        if let desktop { self.desktop = desktop }
     }
 
     init() {
@@ -187,6 +191,9 @@ final class Store {
         if let data = changedFile(CLI.browserPanel) {
             browser = Self.decode(BrowserPanel.self, from: data)
         }
+        if let data = changedFile(CLI.desktopPanel) {
+            desktop = Self.decode(DesktopPanel.self, from: data)
+        }
         let level = Self.kernelMemoryLevel()
         if level != memoryLevel { memoryLevel = level }
         if let data = changedFile(CLI.perfState) {
@@ -235,6 +242,7 @@ final class Store {
                 self?.sampleLoad()
                 self?.syncDepot()
                 self?.syncBrowser()
+                self?.syncDesktop()
                 // the scheduler rewrites its state every second while builds run
                 try? await Task.sleep(for: .seconds(self?.sched?.busy == true ? 1 : 3))
             }
@@ -266,6 +274,27 @@ final class Store {
             self?.browserSyncedAt = .now
             self?.readLocal()
         }
+    }
+
+    /// Uprawnienia i wyświetlacze bramy pulpitu zmieniają się poza sesją agenta (przyznanie w
+    /// Ustawieniach, podłączony ekran), więc odświeżamy przez `status` co 5 s, gdy panel otwarty.
+    private func syncDesktop() {
+        guard !desktopSyncing, desktop?.installed == true, Date.now.timeIntervalSince(desktopSyncedAt) > 5 else { return }
+        desktopSyncing = true
+        Task { [weak self] in
+            _ = await CLI.run(["status", "--json"], script: CLI.desktop)
+            self?.desktopSyncing = false
+            self?.desktopSyncedAt = .now
+            self?.readLocal()
+        }
+    }
+
+    // MARK: Desktop gateway
+
+    /// Otwiera panel Ustawień (Dostępność albo Nagrywanie ekranu), gdzie człowiek zaznacza binarkę pomocnika.
+    func openDesktopPermissions() async {
+        _ = await CLI.run(["doctor", "--open"], script: CLI.desktop)
+        notice = Notice(text: "Opened System Settings: add the helper binary and tick it")
     }
 
     func panelDisappeared() {

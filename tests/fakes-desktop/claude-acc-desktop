@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Udawany pomocnik pulpitu do testów: nie dotyka ekranu ani wejścia. Odpowiada deterministycznie
+i zapisuje każde żądanie do pliku z FAKE_LOG, żeby test sprawdził zmapowane współrzędne. Deny
+egzekwuje jak prawdziwy pomocnik (op w DENY_OPS + aplikacja na wierzchu z FAKE_FRONT na liście)."""
+
+import base64
+import json
+import os
+import sys
+
+# 1x1 przezroczysty PNG
+PNG = base64.b64encode(base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)).decode()
+
+DENY_OPS = {"screenshot", "zoom", "click", "mouse_down", "mouse_up", "drag", "scroll", "type", "key", "hold_key"}
+FRONT = os.environ.get("FAKE_FRONT", "com.apple.finder")
+LOG = os.environ.get("FAKE_LOG")
+
+# geometria zrzutu: punkty 1440x900, piksele 720x450 (jak Retina 2x zbite do 1x)
+SHOT = {"png": PNG, "px_w": 720, "px_h": 450, "origin_x": 0.0, "origin_y": 0.0,
+        "pt_w": 1440.0, "pt_h": 900.0, "display": 1}
+CURSOR_PT = {"x": 200.0, "y": 100.0}
+
+
+def record(req):
+    if LOG:
+        with open(LOG, "a") as f:
+            f.write(json.dumps(req) + "\n")
+
+
+def handle(req):
+    op = req.get("op")
+    record(req)
+    deny = set(req.get("deny") or [])
+    marks = [m.lower() for m in (req.get("deny_window") or [])]
+    if op in DENY_OPS:
+        if FRONT in deny:
+            return {"ok": False, "error": f"refused: {FRONT} is a protected app", "protected": True}
+        if FRONT == "com.apple.systempreferences":
+            w = os.environ.get("FAKE_FRONT_WINDOW", "").lower()
+            if any(m in w for m in marks):
+                return {"ok": False, "error": "refused: System Settings protected pane", "protected": True}
+    if op == "init":
+        return {"ok": True}
+    if op == "probe":
+        return {"ok": True, "ax": True, "screen": True, "post": True, "path": __file__,
+                "displays": [{"id": 1, "x": 0, "y": 0, "w": 1440, "h": 900, "scale": 2, "main": True}],
+                "frontmost": {"bundle": FRONT, "window": os.environ.get("FAKE_FRONT_WINDOW", "")}}
+    if op == "screenshot":
+        return {"ok": True, **SHOT}
+    if op == "zoom":
+        return {"ok": True, **SHOT, "origin_x": req.get("x", 0), "origin_y": req.get("y", 0),
+                "pt_w": req.get("w", 0), "pt_h": req.get("h", 0)}
+    if op == "cursor_position":
+        return {"ok": True, **CURSOR_PT}
+    if op == "frontmost":
+        return {"ok": True, "bundle": FRONT, "window": os.environ.get("FAKE_FRONT_WINDOW", "")}
+    if op == "ax_allow":
+        # udaje: liczba arkuszy z FAKE_SHEETS, wciska gdy dokładnie jeden
+        sheets = int(os.environ.get("FAKE_SHEETS", "1"))
+        return {"ok": True, "sheets": sheets, "pressed": sheets == 1}
+    if op in ("move", "click", "mouse_down", "mouse_up", "drag", "scroll", "type", "key", "hold_key"):
+        return {"ok": True}
+    return {"ok": False, "error": f"unknown op: {op}"}
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["serve"]:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except ValueError:
+                print(json.dumps({"ok": False, "error": "bad json"}), flush=True)
+                continue
+            print(json.dumps(handle(req)), flush=True)
+        return 0
+    if args:
+        req = json.loads(args[0])
+        out = handle(req)
+        print(json.dumps(out))
+        return 0 if out.get("ok") else 1
+    print(json.dumps({"ok": False, "error": "usage"}))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

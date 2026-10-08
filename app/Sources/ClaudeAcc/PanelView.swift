@@ -40,6 +40,9 @@ struct PanelView: View {
                         if store.browser?.installed == true {
                             BrowserCard(store: store).fixedSize(horizontal: false, vertical: true)
                         }
+                        if store.desktop?.installed == true {
+                            DesktopCard(store: store).fixedSize(horizontal: false, vertical: true)
+                        }
                         FansCard(store: store)
                     }
                     Column(width: 300) {
