@@ -92,6 +92,9 @@ DEFAULT_CONFIG = {
     # przy krytycznej presji, gdy żaden dev serwer nie zostaje do zatrzymania: sieroty,
     # headless przeglądarki, gopls i przebiegi testów agentów (lastresort.py)
     "last_resort": True,
+    # serwer zatrzymany z braku pamięci zostaje zatrzymany najwyżej tyle minut: hook nie wpuszcza
+    # go z powrotem, dopóki presja nie zejdzie do zera, a swap pod próg ostrzeżenia
+    "restart_hold_minutes": 10,
 }
 
 SERVER_KINDS = [
@@ -1337,8 +1340,11 @@ def decide(cfg, world, state):
 # ---------- akcje ----------
 
 
-def terminate(unit, table, grace=10):
-    """SIGTERM do całego drzewa naraz, po `grace` sekundach SIGKILL dla tych, które zostały."""
+def terminate(unit, table, grace=10, reap=10):
+    """SIGTERM do całego drzewa naraz, po `grace` sekundach SIGKILL dla tych, które zostały, i do
+    `reap` sekund na ich koniec. Pod presją proces po SIGKILL kończy się sekundami (jądro zwalnia
+    jego strony, także te w swapie i w kompresorze), więc żywy tuż po sygnale nie znaczy, że
+    przeżył: 2026-10-08 log mówił „nie chcą zginąć” o Metro, które za chwilę zniknęło."""
     targets = []
     for pid in unit.pids:
         command = table.get(pid, (0, ""))[1]
@@ -1356,13 +1362,17 @@ def terminate(unit, table, grace=10):
         if not left:
             return []
         time.sleep(0.25)
-    for pid, start in targets:
-        if alive(pid, start):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-    return [p for p, s in targets if alive(p, s)]
+    left = [(p, s) for p, s in targets if alive(p, s)]
+    for pid, _start in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + reap
+    while left and time.time() < deadline:
+        time.sleep(0.25)
+        left = [(p, s) for p, s in left if alive(p, s)]
+    return [p for p, _s in left]
 
 
 def shell_idle(shell):
@@ -1498,6 +1508,7 @@ def execute(cfg, plan, world, state):
             "data": plan.data,
             "ports": unit.ports,
             "cwd": unit.launch_cwd,
+            "apps": sorted({s.cwd for s in unit.servers}),
             "result": result,
             "ok": ok,
         }
@@ -2006,6 +2017,51 @@ def cmd_admit(cfg, _args):
     return 0
 
 
+def memory_refusal(cfg, world, state, app=None):
+    """Dlaczego pamięć nie wpuści teraz nowego dev serwera (aplikacji w katalogu `app`), albo None.
+
+    Dwa powody, oba mijają z czasem, więc odmowa podaje agentowi warunek do czekania (`room`):
+    presja krytyczna, także gdy nie działa już żaden dev serwer (strażnik właśnie zatrzymał
+    ostatni), i serwer tej aplikacji, który strażnik zatrzymał z braku pamięci mniej niż
+    `restart_hold_minutes` temu, póki Mac nie odetchnął. Bez tego drugiego zatrzymany serwer
+    wracał od razu: po akcji strażnik mierzy przyrost swapu od nowa, więc przez chwilę presja
+    wygląda na mniejszą (2026-10-08: Metro zatrzymane o 18:45 przy 11,2 GB swapu, agent postawił
+    je znowu, o 18:52 swap 17,9 GB, o 18:57 Mac zamarzł)."""
+    pressure = world.pressure
+    if pressure.level == 2:
+        return "pamięć na krytycznym poziomie (" + ", ".join(pressure.reasons) + ")"
+    if app is None:
+        return None
+    if pressure.level == 0 and pressure.swap_used < cfg["swap_warn_percent"] / 100 * pressure.ram:
+        return None
+    hold = cfg["restart_hold_minutes"] * MINUTE
+    for event in reversed(state.get("events", [])):
+        if world.now - event.get("at", 0) >= hold:
+            break
+        if event.get("action") != "stop" or event.get("code") != "pressure":
+            continue
+        paths = [event.get("cwd")] + list(event.get("apps") or [])
+        if not any(p and os.path.realpath(p) == app for p in paths):
+            continue
+        now_why = ", ".join(pressure.reasons) or f"swap {janitor.human(pressure.swap_used)}"
+        return (
+            f"strażnik zatrzymał serwer {short(app)} o "
+            f"{time.strftime('%H:%M', time.localtime(event['at']))} z braku pamięci "
+            f"({event.get('reason', '').removeprefix('brak pamięci: ')}), a Mac jeszcze nie "
+            f"odetchnął ({now_why})"
+        )
+    return None
+
+
+def wait_hint(app):
+    """Dokładna komenda, którą agent czeka, aż pamięć wpuści serwer."""
+    condition = f"claude-acc guard room {shlex.quote(app)}"
+    return (
+        f"Poczekaj: `claude-acc sched wait -- {shlex.quote(condition)}` (kod 75: zawołaj jeszcze "
+        "raz), potem uruchom komendę ponownie."
+    )
+
+
 def devserver_refusal(cfg, event):
     """Powód odmowy startu dev serwera albo None."""
     command = (event.get("tool_input") or {}).get("command") or ""
@@ -2017,9 +2073,13 @@ def devserver_refusal(cfg, event):
         return None
     state = janitor.load_json(STATE_PATH, {})
     world = World(cfg, state, Orca(), time.time(), use_orca=False)
-    for target, package, stack in starts:
+    apps = []
+    for target, package, stack, reuses in starts:
         app = package_dir(target, package) if package else target
         app = os.path.realpath(app or target)
+        apps.append(app)
+        if reuses:
+            continue  # `expo run:ios` sam weźmie Metro, które już serwuje tę aplikację
         same = [
             u
             for u in world.units
@@ -2032,23 +2092,35 @@ def devserver_refusal(cfg, event):
                 "Użyj tego adresu, nie stawiaj drugiego serwera tej samej aplikacji: "
                 "drugi zjada kolejne gigabajty i dubluje rekompilacje przy każdej edycji."
             )
+    allow = "Tylko na wyraźne polecenie użytkownika poprzedź komendę DEVGUARD_ALLOW=1."
+    listing = "; ".join(
+        describe(u) for u in sorted(world.units, key=lambda u: -u.footprint)[:5]
+    )
+    for app in apps:
+        why = memory_refusal(cfg, world, state, app)
+        if why:
+            running = f" Działają: {listing}; użyj któregoś z nich albo poczekaj." if listing else ""
+            return f"Strażnik dev serwerów: {why}.{running} {wait_hint(app)} {allow}"
     total = sum(u.footprint for u in world.units)
     budget = cfg["budget_percent"] / 100 * world.pressure.ram
-    if world.units and (world.pressure.level == 2 or total + 1.5 * GB > budget):
-        listing = "; ".join(
-            describe(u) for u in sorted(world.units, key=lambda u: -u.footprint)[:5]
-        )
-        why = (
-            "pamięć na krytycznym poziomie (" + ", ".join(world.pressure.reasons) + ")"
-            if world.pressure.level == 2
-            else f"dev serwery zajmują już {janitor.human(total)} z budżetu {janitor.human(budget)}"
-        )
+    if world.units and total + 1.5 * GB > budget:
         return (
-            f"Strażnik dev serwerów: {why}. Działają: {listing}. Użyj któregoś z nich albo poproś "
+            f"Strażnik dev serwerów: dev serwery zajmują już {janitor.human(total)} z budżetu "
+            f"{janitor.human(budget)}. Działają: {listing}. Użyj któregoś z nich albo poproś "
             "użytkownika o zgodę; do zrzutów ekranu i pomiarów wystarczy `next build && next start`. "
-            "Tylko na wyraźne polecenie użytkownika poprzedź komendę DEVGUARD_ALLOW=1."
+            + allow
         )
     return None
+
+
+def cmd_room(cfg, args):
+    """Kod 0, gdy pamięć wpuści nowy dev serwer (aplikacji w podanym katalogu), 1 z powodem."""
+    app = os.path.realpath(os.path.expanduser(args[0])) if args else None
+    state = janitor.load_json(STATE_PATH, {})
+    world = World(cfg, state, Orca(), time.time(), use_orca=False)
+    why = memory_refusal(cfg, world, state, app)
+    print(why or "jest miejsce")
+    return 1 if why else 0
 
 
 COMMANDS = {
@@ -2061,6 +2133,7 @@ COMMANDS = {
     "unpin": cmd_unpin,
     "pins": cmd_pins,
     "admit": cmd_admit,
+    "room": cmd_room,
 }
 
 
@@ -2074,6 +2147,10 @@ def main(argv):
     except Exception as err:
         if cmd == "admit":
             return 0  # hook nigdy nie blokuje agenta przez własny błąd
+        if cmd == "room":
+            # agent czeka na tym w pętli: własny błąd go nie zatrzymuje, hook i tak oceni komendę
+            print(f"błąd: {err}", file=sys.stderr)
+            return 0
         log(f"{cmd}: błąd {err!r}")
         print(f"błąd: {err}", file=sys.stderr)
         return 1

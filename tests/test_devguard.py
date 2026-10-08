@@ -14,6 +14,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -370,29 +371,29 @@ class AdmitParserTest(unittest.TestCase):
             "PORT=3001 npx next dev",
             "nohup pnpm exec next dev > /tmp/log 2>&1 &",
         ):
-            self.assertEqual(self.starts(command), [("/w/mono", None, False)], command)
+            self.assertEqual(self.starts(command), [("/w/mono", None, False, False)], command)
 
     def test_cd_and_dir_flags_move_the_target(self):
         self.assertEqual(
             self.starts("cd apps/web && pnpm exec next dev"),
-            [("/w/mono/apps/web", None, False)],
+            [("/w/mono/apps/web", None, False, False)],
         )
         self.assertEqual(
             self.starts("pnpm -C apps/web exec next dev"),
-            [("/w/mono/apps/web", None, False)],
+            [("/w/mono/apps/web", None, False, False)],
         )
 
     def test_scripts_and_filters(self):
-        self.assertEqual(self.starts("pnpm dev"), [("/w/mono", None, True)])
-        self.assertEqual(self.starts("npm run dev:landing"), [("/w/mono", None, True)])
+        self.assertEqual(self.starts("pnpm dev"), [("/w/mono", None, True, False)])
+        self.assertEqual(self.starts("npm run dev:landing"), [("/w/mono", None, True, False)])
         self.assertEqual(
             self.starts("pnpm --filter landing-page dev"),
-            [("/w/mono", "landing-page", False)],
+            [("/w/mono", "landing-page", False, False)],
         )
 
     def test_dev_server_started_through_orca_terminal(self):
         command = 'orca terminal create --worktree active --command "cd apps/web && pnpm exec next dev"'
-        self.assertEqual(self.starts(command), [("/w/mono/apps/web", None, False)])
+        self.assertEqual(self.starts(command), [("/w/mono/apps/web", None, False, False)])
 
     def test_not_a_dev_server(self):
         for command in (
@@ -407,9 +408,110 @@ class AdmitParserTest(unittest.TestCase):
 
     def test_vite_forms(self):
         self.assertEqual(
-            self.starts("npx vite --port 5173"), [("/w/mono", None, False)]
+            self.starts("npx vite --port 5173"), [("/w/mono", None, False, False)]
         )
-        self.assertEqual(self.starts("vite dev"), [("/w/mono", None, False)])
+        self.assertEqual(self.starts("vite dev"), [("/w/mono", None, False, False)])
+
+    def test_every_way_to_start_metro(self):
+        """2026-10-08 18:52: przy krytycznej presji agent postawił Metro przez
+        `./node_modules/.bin/expo start`, którego hook nie uznał za dev serwer (znał tylko
+        `npx expo start` i `pnpm exec expo start`), i o 18:57 Mac zamarzł. Każda droga do CLI expo
+        i do Metro to start dev serwera."""
+        app = "/w/mono/apps/mobile"
+        for command in (
+            "./node_modules/.bin/expo start --dev-client --port 8199",
+            "node_modules/.bin/expo start --port 8183",
+            "TTP_DEV_ENTITLEMENT=1 ./node_modules/.bin/expo start --dev-client --port 8183 > /tmp/m.log 2>&1",
+            "/w/mono/apps/mobile/node_modules/.bin/expo start",
+            "node /w/mono/node_modules/.pnpm/expo@58.0.3_0823/node_modules/expo/bin/cli start --port 8183",
+            "npx expo start",
+            "npx expo@latest start --port 8085",
+            "pnpm exec expo start --port 8085",
+            "bunx expo start",
+            "pnpm expo start",
+            "npx react-native start",
+        ):
+            self.assertEqual(self.starts(command, app), [(app, None, False, False)], command)
+        self.assertEqual(
+            self.starts(
+                "cd /w/wt/apps/storefront-mobile && ./node_modules/.bin/expo start --dev-client --port 8183"
+            ),
+            [("/w/wt/apps/storefront-mobile", None, False, False)],
+        )
+        self.assertEqual(
+            self.starts("pnpm --filter mobile exec expo start"), [("/w/mono", "mobile", False, False)]
+        )
+
+    def test_restart_commands_the_guard_logs(self):
+        """Komendę wznowienia z logu strażnika (node i ścieżka skryptu CLI) agent kopiuje 1:1."""
+        self.assertEqual(
+            self.starts("node /w/x/node_modules/next/dist/bin/next dev -p 3292"),
+            [("/w/mono", None, False, False)],
+        )
+        self.assertEqual(
+            self.starts("cd /w/avatar && node /opt/homebrew/bin/pnpm --filter whale dev"),
+            [("/w/avatar", "whale", False, False)],
+        )
+
+    def test_expo_run_starts_metro_unless_no_bundler(self):
+        """`expo run:ios` po buildzie stawia Metro (albo bierze to, które już serwuje aplikację),
+        `--no-bundler` tylko buduje; pomoc, prebuild, export i config niczego nie stawiają."""
+        self.assertEqual(self.starts("npx expo run:ios"), [("/w/mono", None, False, True)])
+        self.assertEqual(
+            self.starts("./node_modules/.bin/expo run:android --device emulator-5554"),
+            [("/w/mono", None, False, True)],
+        )
+        for command in (
+            "npx expo run:ios --no-bundler",
+            "npx expo start --help",
+            "./node_modules/.bin/expo run:ios --help",
+            "npx expo prebuild --platform ios",
+            "npx expo export --platform ios",
+            "./node_modules/.bin/expo config --json",
+        ):
+            self.assertEqual(self.starts(command), [], command)
+
+
+class TerminateTest(unittest.TestCase):
+    """Proces po SIGKILL pod presją kończy się sekundami (jądro zwalnia jego strony ze swapu i
+    kompresora). 2026-10-08 log strażnika dwa razy mówił „nie chcą zginąć” o Metro, które za
+    chwilę zniknęło: terminate() sprawdzał je tuż po sygnale."""
+
+    def terminate(self, dies_after_kill_s):
+        clock, sent, killed_at = [0.0], [], {}
+
+        def kill(pid, sig):
+            sent.append(sig)
+            if sig == signal.SIGKILL:
+                killed_at[pid] = clock[0]
+
+        def alive(pid, _start):
+            if pid not in killed_at:
+                return True  # SIGTERM go nie rusza
+            return dies_after_kill_s is None or clock[0] - killed_at[pid] < dies_after_kill_s
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        unit = types.SimpleNamespace(pids=[4242])
+        with (
+            mock.patch.object(dg, "usage", return_value={"start": 1}),
+            mock.patch.object(dg, "alive", side_effect=alive),
+            mock.patch.object(dg.os, "kill", side_effect=kill),
+            mock.patch.object(dg.time, "time", side_effect=lambda: clock[0]),
+            mock.patch.object(dg.time, "sleep", side_effect=sleep),
+        ):
+            left = dg.terminate(unit, {4242: (1, "node expo/bin/cli start")}, grace=1)
+        return left, sent
+
+    def test_killed_process_that_exits_slowly_is_dead(self):
+        left, sent = self.terminate(dies_after_kill_s=3)
+        self.assertEqual(left, [])
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+
+    def test_process_that_outlives_the_wait_is_still_reported(self):
+        left, _ = self.terminate(dies_after_kill_s=None)
+        self.assertEqual(left, [4242])
 
 
 BUILT_HOOK = os.path.join(ROOT, "app/.build/release/claude-acc-hook")
@@ -429,6 +531,10 @@ DEV_STARTS = (
     "npx expo start",
     "npx webpack serve",
     "npx astro dev",
+    "./node_modules/.bin/expo start --dev-client --port 8199",
+    "node /w/node_modules/.pnpm/expo@58/node_modules/expo/bin/cli start --port 8183",
+    "npx react-native start",
+    "npx expo run:ios",
 )
 # ...albo idą do schedulera (w katalogu z go.mod i package.json)
 SCHEDULED = (
@@ -761,6 +867,68 @@ class GuardTest(unittest.TestCase):
         verdict = self.admit("pnpm exec next dev", self.app("blog"))
         self.assertEqual(verdict["permissionDecision"], "deny")
         self.assertIn("budżetu", verdict["permissionDecisionReason"])
+
+    def room(self, app):
+        done = subprocess.run(
+            ["/usr/bin/python3", SCRIPT, "room", app],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, HOME=self.home, DEVGUARD_ORCA=""),
+            timeout=60,
+        )
+        return done.returncode, done.stdout.strip()
+
+    def metro_app(self, name="mobile"):
+        path = os.path.join(self.home, name)
+        os.makedirs(os.path.join(path, "node_modules/.bin"), exist_ok=True)
+        return path
+
+    METRO = "./node_modules/.bin/expo start --dev-client --port 8199"
+
+    def test_admit_refuses_metro_under_critical_pressure_with_no_server_left(self):
+        """2026-10-08 18:52: strażnik zatrzymał ostatni dev serwer, więc hook liczył presję tylko
+        „gdy coś działa” i wpuścił nowe Metro przy krytycznej presji. Teraz odmowa z dokładną
+        komendą czekania, a ta sama komenda puszcza, gdy pamięć odpuści."""
+        app = self.metro_app()
+        self.config(available_critical_percent=101)  # każdy odczyt to presja krytyczna
+        verdict = self.admit(self.METRO, app)
+        self.assertEqual(verdict["permissionDecision"], "deny")
+        reason = verdict["permissionDecisionReason"]
+        self.assertIn("krytycznym", reason)
+        self.assertIn(f"`claude-acc sched wait -- 'claude-acc guard room {app}'`", reason)
+        self.assertEqual(self.room(app)[0], 1)
+        self.config()
+        self.assertIsNone(self.admit(self.METRO, app))
+        self.assertEqual(self.room(app), (0, "jest miejsce"))
+
+    def test_server_stopped_for_memory_stays_stopped(self):
+        """Po akcji strażnik mierzy przyrost swapu od nowa, więc tuż po zatrzymaniu presja wygląda
+        na mniejszą. Serwer zatrzymany z braku pamięci nie wraca, póki Mac nie odetchnął, przez
+        `restart_hold_minutes`; inna aplikacja i spokojny Mac przechodzą."""
+        app = self.metro_app()
+        stopped = {
+            "at": time.time() - 120,
+            "action": "stop",
+            "code": "pressure",
+            "cwd": app,
+            "apps": [app],
+            "reason": "brak pamięci: swap 11,2 GB i rośnie",
+            "ok": False,
+        }
+        with open(os.path.join(self.state_dir, "devguard-state.json"), "w") as f:
+            json.dump({"events": [stopped]}, f)
+        self.config(available_warn_percent=101)  # ostrzeżenie: jeszcze nie odetchnął
+        verdict = self.admit(self.METRO, app)
+        self.assertEqual(verdict["permissionDecision"], "deny")
+        self.assertIn("zatrzymał serwer", verdict["permissionDecisionReason"])
+        self.assertIn("swap 11,2 GB i rośnie", verdict["permissionDecisionReason"])
+        self.assertIn("claude-acc guard room", verdict["permissionDecisionReason"])
+        self.assertEqual(self.room(app)[0], 1)
+        self.assertIsNone(self.admit(self.METRO, self.metro_app("other")))
+        self.config(available_warn_percent=101, restart_hold_minutes=1)  # zatrzymany 2 min temu
+        self.assertIsNone(self.admit(self.METRO, app))
+        self.config()  # presja zero, swap pod progiem
+        self.assertIsNone(self.admit(self.METRO, app))
 
     def go_module(self, name):
         root = os.path.join(self.home, name)
