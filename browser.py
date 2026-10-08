@@ -412,6 +412,9 @@ def load_config(path=None):
         "idle_minutes": int(raw.get("idle_minutes") or IDLE_MINUTES),
         "sites": sites,
         "browsers": browsers,
+        # auto-Allow okna "Allow remote debugging?": domyślnie wyłączone (narzędzie publiczne),
+        # włącza je użytkownik; wciska Allow natywnym pomocnikiem pulpitu tylko w oknie własnego handshake'u
+        "auto_allow": bool(raw.get("auto_allow")),
     }
     if cfg["mode"] not in MODES:
         raise BrowserError(f"{path}: mode musi być jednym z {', '.join(MODES)}")
@@ -500,6 +503,65 @@ def port_alive(port):
         return True
     except OSError:
         return False
+
+
+def listening_pid(port):
+    """Pid procesu nasłuchującego na porcie debugowania: to proces przeglądarki, który zapisał
+    DevToolsActivePort. Pusto, gdy nie wiadomo. Przez lsof (jest na macOS)."""
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+                             capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.stdout.splitlines():
+        if line.startswith("p"):
+            try:
+                return int(line[1:])
+            except ValueError:
+                return None
+    return None
+
+
+def desktop_helper():
+    """Ścieżka natywnego pomocnika pulpitu (ten sam, którego używa desktop.py): do auto-Allow."""
+    env = os.environ.get("CLAUDE_ACC_DESKTOP_HELPER")
+    if env:
+        return env
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(STATE, "claude-acc-desktop"), os.path.join(here, "claude-acc-desktop")):
+        if os.path.exists(path):
+            return path
+    for arch in ("arm64-apple-macosx", "x86_64-apple-macosx"):
+        for conf in ("release", "debug"):
+            p = os.path.join(here, "app", ".build", arch, conf, "claude-acc-desktop")
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def press_allow(pid):
+    """Wciska Allow w oknie 'Allow remote debugging?' procesu pid, gdy jest dokładnie jedno.
+    Zwraca True, gdy wciśnięto. Natywny pomocnik sam odmawia, gdy arkuszy nie jest dokładnie jeden,
+    i nigdy nie wciska 'Turn off in settings' ani 'Cancel'."""
+    helper = desktop_helper()
+    if not helper or not pid:
+        return False
+    try:
+        out = subprocess.run([helper, json.dumps({"op": "ax_allow", "pid": pid})],
+                             capture_output=True, text=True, timeout=5)
+        reply = json.loads(out.stdout.strip() or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+    return bool(reply.get("pressed"))
+
+
+def auto_allow_worker(pid, stop):
+    """W oknie własnego handshake'u co ~0.5 s próbuje wcisnąć Allow, aż się uda albo stop."""
+    deadline = time.time() + APPROVE_TIMEOUT
+    while not stop.is_set() and time.time() < deadline:
+        if press_allow(pid):
+            return
+        stop.wait(0.5)
 
 
 def pref_enabled(cfg, name):
@@ -1081,6 +1143,13 @@ class Hub:
                 )
             c.state, c.error, c.since = "connecting", None, time.time()
             self.publish()
+            # auto-Allow tylko w oknie TEGO handshake'u i tylko dla prawdziwej przeglądarki
+            # (pid właściciela portu z DevToolsActivePort); wątek gaśnie, gdy handshake się kończy
+            stop = threading.Event()
+            if cfg.get("auto_allow"):
+                pid = listening_pid(found[0])
+                if pid:
+                    threading.Thread(target=auto_allow_worker, args=(pid, stop), daemon=True, name="auto-allow").start()
             try:
                 ws = Ws.connect(found[0], found[1], APPROVE_TIMEOUT)
             except (WsClosed, OSError) as exc:
@@ -1090,6 +1159,8 @@ class Hub:
                     f"{title}: {exc}. After each browser start {title} asks 'Allow remote debugging?': the user clicks "
                     "Allow, then retry."
                 )
+            finally:
+                stop.set()
             cdp = Cdp(ws)
             cdp.on_event = lambda msg: self.on_event(c, msg)
             cdp.on_close = lambda: self.on_close(c, cdp)
