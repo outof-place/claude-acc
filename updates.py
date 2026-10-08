@@ -166,12 +166,12 @@ def error_line(text):
     return (lines[-1] if lines else "unknown error")[:300]
 
 
-def call(cmd, timeout=600, codes=(0,), quiet=False, merge=False, cwd=HOME):
+def call(cmd, timeout=600, codes=(0,), quiet=False, merge=False, cwd=HOME, env=None):
     """(udało się, stdout, opis błędu); z merge=True drugie pole to stdout i stderr razem.
     Polecenia, które coś zmieniają, trafiają do logu w całości."""
     try:
         done = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=ENV, cwd=cwd, stdin=subprocess.DEVNULL
+            cmd, capture_output=True, text=True, timeout=timeout, env=env or ENV, cwd=cwd, stdin=subprocess.DEVNULL
         )
     except subprocess.TimeoutExpired:
         log(f"$ {' '.join(cmd)}: przekroczony czas {timeout} s")
@@ -780,6 +780,8 @@ def step_pip(st, cfg, dry):
 
 SKILLS_DIR = os.path.join(HOME, ".agents/skills")
 SKILLS_LOCK = os.path.join(HOME, ".agents/.skill-lock.json")
+# Claude Code ucina klon wtyczki po 120 s; updater działa w tle, przy terminalu nikt nie czeka
+PLUGIN_GIT_TIMEOUT = 600
 
 
 def claude_version():
@@ -807,15 +809,30 @@ def plugin_installs():
     return live
 
 
+def plugin_env():
+    """Środowisko dla `claude plugin`. Claude Code (2.1.294) przy `plugin update` klonuje wtyczkę ze źródła
+    github tylko po SSH; zapasowy HTTPS ma jedynie `plugin install`. Bez klucza SSH do GitHuba każda taka
+    aktualizacja pada na Permission denied (publickey), więc wtedy HTTPS wymuszamy sami."""
+    env = dict(ENV)
+    env.setdefault("CLAUDE_CODE_PLUGIN_GIT_TIMEOUT_MS", str(PLUGIN_GIT_TIMEOUT * 1000))
+    ok, out, _ = call(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes",
+                       "git@github.com"], timeout=15, codes=(1,), quiet=True, merge=True)
+    if not (ok and "successfully authenticated" in out):
+        env.setdefault("CLAUDE_CODE_PLUGIN_PREFER_HTTPS", "1")
+    return env
+
+
 def update_plugins(st):
-    ok, _, err = call(["claude", "plugin", "marketplace", "update"], timeout=600)
+    env = plugin_env()
+    # marketplace'y klonują się po kolei, każdy dostaje do PLUGIN_GIT_TIMEOUT
+    ok, _, err = call(["claude", "plugin", "marketplace", "update"], timeout=3 * PLUGIN_GIT_TIMEOUT, env=env)
     if not ok:
         st.failed.append(pkg("plugin marketplaces", None, None, error=err))
     for plugin_id, scope, where in plugin_installs():
         name = plugin_id.split("@")[0]
         # bez -y: polecenie z katalogu wtyczki potwierdza człowiek
         ok, out, err = call(["claude", "plugin", "update", plugin_id, "-s", scope, "--json"],
-                            timeout=300, cwd=where, quiet=True)
+                            timeout=PLUGIN_GIT_TIMEOUT + 300, cwd=where, quiet=True, env=env)
         try:
             result = json.loads(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
