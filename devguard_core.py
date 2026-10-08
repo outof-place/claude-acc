@@ -1993,12 +1993,15 @@ def deny(reason):
     return 0
 
 
-def describe(unit):
-    url = f"http://localhost:{unit.ports[0]}" if unit.ports else f"pid {unit.root}"
+def describe(unit, app=None):
+    """Adres i katalog jednego serwera jednostki: z `app` tego, który serwuje tę aplikację, bo w
+    stosie `pnpm dev` pierwszy port i pierwszy katalog to zwykle dwie różne, inne aplikacje."""
+    server = next((s for s in unit.servers if app and s.cwd == app), unit.servers[0])
+    ports = server.ports or unit.ports
+    url = f"http://localhost:{ports[0]}" if ports else f"pid {unit.root}"
+    more = f", w stosie {len(unit.servers)} serwerów" if len(unit.servers) > 1 else ""
     where = f", terminal Orki „{unit.terminal.get('title')}”" if unit.terminal else ""
-    return (
-        f"{url} ({short(unit.servers[0].cwd)}, {janitor.human(unit.footprint)}{where})"
-    )
+    return f"{url} ({short(server.cwd)}, {janitor.human(unit.footprint)}{more}{where})"
 
 
 def cmd_admit(cfg, _args):
@@ -2088,7 +2091,7 @@ def devserver_refusal(cfg, event):
         ]
         if same:
             return (
-                f"Strażnik dev serwerów: dla {short(app)} już działa {describe(same[0])}. "
+                f"Strażnik dev serwerów: dla {short(app)} już działa {describe(same[0], app)}. "
                 "Użyj tego adresu, nie stawiaj drugiego serwera tej samej aplikacji: "
                 "drugi zjada kolejne gigabajty i dubluje rekompilacje przy każdej edycji."
             )

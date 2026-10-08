@@ -472,6 +472,33 @@ class AdmitParserTest(unittest.TestCase):
             self.assertEqual(self.starts(command), [], command)
 
 
+class DuplicateRefusalTest(unittest.TestCase):
+    def test_refusal_inside_a_stack_names_the_server_of_this_app(self):
+        """2026-10-08, hook na żywo: `./node_modules/.bin/expo start` w apps/mobile, gdy stos
+        `pnpm dev` serwuje Metro tej aplikacji na :8083, dostał w odmowie http://localhost:3000
+        i katalog innej aplikacji (pierwszy port i pierwszy serwer stosu). Agent szedłby pod
+        zły adres."""
+        root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        landing, mobile = (os.path.join(root, name) for name in ("landing", "mobile"))
+        for path in (landing, mobile):
+            os.makedirs(os.path.join(path, "node_modules/.bin"))
+        servers = [
+            types.SimpleNamespace(cwd=landing, ports=[3000]),
+            types.SimpleNamespace(cwd=mobile, ports=[8083]),
+        ]
+        stack = unit(
+            "stack", 6.3, servers=servers, ports=[3000, 8083], root=4242, terminal=None,
+            launch_cwd=root,
+        )
+        event = {"tool_input": {"command": "./node_modules/.bin/expo start --port 8199"}, "cwd": mobile}
+        with mock.patch.object(dg, "World", return_value=world(stack)), \
+                mock.patch.object(dg.janitor, "load_json", return_value={}):
+            why = dg.devserver_refusal(cfg(), event)
+        self.assertIn(f"już działa http://localhost:8083 ({dg.short(mobile)}", why)
+        self.assertNotIn("localhost:3000", why)
+
+
 class TerminateTest(unittest.TestCase):
     """Proces po SIGKILL pod presją kończy się sekundami (jądro zwalnia jego strony ze swapu i
     kompresora). 2026-10-08 log strażnika dwa razy mówił „nie chcą zginąć” o Metro, które za
