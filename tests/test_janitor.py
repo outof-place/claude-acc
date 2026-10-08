@@ -361,12 +361,13 @@ class CompressCandidatesTest(unittest.TestCase):
         path = self.write("a.jsonl")
         cfg = dict(self.janitor.DEFAULT_CONFIG, compress={"paths": [self.root], "min_age_minutes": 0})
         sw = self.janitor.Sweep(cfg, dry_run=False)
-        original = self.janitor.which
+        original = self.janitor.which, self.janitor.log
         self.janitor.which = lambda name: None
+        self.janitor.log = lambda line, path=None: None  # nie do prawdziwego janitor.log
         try:
             self.janitor.task_compress(sw, None)
         finally:
-            self.janitor.which = original
+            self.janitor.which, self.janitor.log = original
         self.assertTrue(any("afsctool" in w for w in sw.warnings))
         self.assertFalse(compressed(path))
 
