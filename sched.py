@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Scheduler komend Go i JS agentów: wpuszcza joby po pamięci zamiast jednego zamka na wszystko.
+"""Scheduler komend Go, JS i natywnych buildów agentów: wpuszcza joby po pamięci zamiast jednego
+zamka na wszystko. Natywne to buildy iOS i Androida (xcodebuild, expo run, eas build --local,
+gradle, pod install) i start symulatora; jeden taki build to 6-12 GB, więc czeka jak ciężki Go.
 
   sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli]
                (--shell 'KOMENDA' | -- ARGV...)
@@ -52,6 +54,7 @@ DEPOT_PATH = os.path.join(SCHED_DIR, "depot.json")
 DEPOT_LOCK = os.path.join(SCHED_DIR, "depot.lock")
 DEVGUARD_STATE = os.path.join(STATE_DIR, "devguard-state.json")
 DEVGUARD_CONFIG = os.path.join(STATE_DIR, "devguard.json")
+GUARD_FRESH_S = 60  # strażnik pisze stan co 5 s; starszy niż minuta to strażnik, który stoi
 SELF = os.path.join(STATE_DIR, "sched.py")
 
 GB = 1024**3
@@ -74,6 +77,7 @@ DEFAULTS = {
     # organizacja Depot dla `depot` (pusta: domyślna organizacja CLI; potrzebna przy kilku)
     "depot_org": "",
     "node": True,  # testy, buildy i typecheck JS w kolejce; false wyłącza
+    "native": True,  # buildy iOS i Androida, pody i start symulatora w kolejce; false wyłącza
 }
 PUBLIC_CONFIG = (
     "headroom_gb",
@@ -327,7 +331,29 @@ def probe_memory():
     }
 
 
-def devserver_reserve_gb():
+def devguard_snapshot():
+    """Ostatni pomiar strażnika dev serwerów (devguard-state.json) albo {}."""
+    try:
+        with open(DEVGUARD_STATE) as f:
+            snap = json.load(f).get("snapshot") or {}
+        return snap if isinstance(snap, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def guard_level(snap):
+    """Presja wg strażnika (0, 1, 2) z jego świeżego pomiaru, albo None. Strażnik liczy ją także ze
+    swapu, który rośnie: poziom jądra potrafi mówić „normal” przy pełnym swapie (README, Dev
+    server guard), a tylko ten widzi scheduler sam."""
+    try:
+        if time.time() - float(snap.get("at", 0)) < GUARD_FRESH_S:
+            return int((snap.get("pressure") or {}).get("level"))
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def devserver_reserve_gb(snap=None):
     """Miejsce na jeszcze jeden dev serwer: min(max_server_gb, budżet devguarda - zajęte)."""
     max_server = 4.0
     try:
@@ -335,13 +361,12 @@ def devserver_reserve_gb():
             max_server = float(json.load(f).get("max_server_gb", max_server))
     except (OSError, ValueError, TypeError, AttributeError):
         pass
+    snap = devguard_snapshot() if snap is None else snap
     try:
-        with open(DEVGUARD_STATE) as f:
-            snap = json.load(f).get("snapshot") or {}
         if time.time() - float(snap.get("at", 0)) < 120:
             room = (float(snap.get("budget", 0)) - float(snap.get("total", 0))) / GB
             return round(max(0.0, min(max_server, room)), 2)
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError):
         pass
     return max_server
 
@@ -551,6 +576,16 @@ RTK_EXCLUDES = (
     "govulncheck",
     r"^(npx( -y| --yes)? |bunx |(pnpm|yarn|bun) (exec |dlx |x )?|npm exec (-- )?|\S*node_modules/\.bin/)?(vitest|jest|playwright|next|tsc|vue-tsc|eslint|turbo|vite)(\s|$)",
     r"^(pnpm|yarn|npm|bun)( (-r|--recursive|-ws|--workspaces|-s|--silent|--if-present|--\S+=\S+|(-C|--dir|--prefix|--cwd|-F|--filter|--workspace|-w) \S+|-w))* ((run|run-script) )?(t|tst|test|tests|unit|e2e|integration|playwright|build|lint|typecheck|type-check|check-types|types|tsc|check|verify|validate)([:_-]\S*)?(\s|$)",
+    # natywne: rtk ma filtry xcodebuild i gradle, a regex rtk (crate regex) nie zna lookaroundów,
+    # więc xcodebuild idzie w wyjątki cały, także `-version` (krótkie wyjście, nic nie traci)
+    r"^(xcrun )?xcodebuild(\s|$)",
+    r"^((npx|bunx)( -y| --yes)? |(pnpm|yarn|bun|npm)( (-C|--dir|--prefix|--cwd|--filter|-F) \S+)*( (exec|dlx|x)( --)?)? |\S*node_modules/\.bin/)?(expo(@\S+)? (run:\S+|prebuild)|react-native (run|build)-(ios|android)|pod-install)(\s|$)",
+    r"^((npx|bunx)( -y| --yes)? |(pnpm|yarn|bun|npm) ((exec|dlx|x)( --)? )?)?eas(-cli)? build( \S+)* --local(\s|$)",
+    r"^(arch -\S+ )?(bundle exec )?pod (install|update)(\s|$)",
+    r"^(\S*/)?gradlew? (\S+ )*(\S*:)?(assemble\S*|bundle\S*|install\S*|build)(\s|$)",
+    r"^xcrun simctl (boot|bootstatus( \S+)* -b)(\s|$)",
+    r'^open( \S+)* (-a "?Simulator(\.app)?"?|\S*/Simulator\.app)(\s|$)',
+    r"^portivo-mobile up(\s|$)",
 )
 
 
@@ -693,8 +728,157 @@ def node_prior(job):
     return round(gb, 2), round(s)
 
 
+# ---------- natywne buildy i symulatory ----------
+
+# narzędzie -> (rodzaj, GB, s, pamięć poza drzewem procesów). Liczby to wartości na pierwsze biegi
+# klasy, potem p90 z historii jak w Go. Build aplikacji Expo xcodebuildem z pełną równoległością
+# to 6-12 GB (2026-10-08: Release build iOS i build klienta deweloperskiego, oba wpuszczone przy
+# rosnącym swapie, Mac zamarzł o 18:57); uruchomiony symulator z aplikacją to ~0,5 GB w procesach,
+# które widać w raportach JetsamEvent tego Maca, a footprint całego symulatora z aplikacją RN
+# bierzemy z zapasem. „Poza drzewem”: pamięć ląduje w procesach, których scheduler nie mierzy
+# (symulator pod launchd_sim, demon Gradle, odczepiony build `portivo-mobile`), więc historia może
+# prognozę podnieść, ale nie zbić poniżej tej z tabeli: inaczej trzy szybkie starty nauczyłyby ją
+# zera, a scheduler wpuszczałby symulatory i buildy na pustą pamięć
+NATIVE = {
+    "xcodebuild": ("build", 10.0, 600, False),
+    "expo-run": ("build", 10.0, 900, True),
+    "react-native-run": ("build", 10.0, 900, True),
+    "eas-local": ("build", 10.0, 1500, False),
+    "gradle": ("build", 6.0, 600, True),
+    # skrypt Portivo na tym Macu: dzierżawa i start symulatora, a gdy natywna strona się zmieniła,
+    # 10-20 min buildu klienta deweloperskiego w odczepionym procesie
+    "portivo-mobile": ("build", 10.0, 900, True),
+    "pod": ("pods", 1.5, 180, False),
+    "expo-prebuild": ("pods", 2.0, 180, False),
+    "simulator": ("simulator", 2.5, 30, True),
+}
+# xcodebuild bez buildu: informacje, eksport, pobieranie platform
+XCODE_INFO = {
+    "-version", "-usage", "-help", "-license", "-list", "-showsdks", "-showdestinations",
+    "-showTestPlans", "-showBuildSettings", "-showBuildSettingsForIndex", "-find-executable",
+    "-find-library", "-checkFirstLaunchStatus", "-runFirstLaunch", "-downloadPlatform",
+    "-downloadAllPlatforms", "-importPlatform", "-downloadComponent", "-importComponent",
+    "-deleteComponent", "-showComponent", "-exportArchive", "-exportNotarizedApp",
+    "-exportLocalizations", "-importLocalizations", "-resolvePackageDependencies",
+    "-create-xcframework",
+}  # fmt: skip
+XCODE_ACTIONS = ("build", "test", "archive", "analyze", "build-for-testing", "test-without-building", "docbuild", "install", "installsrc", "clean")  # fmt: skip
+GRADLE_TASK = re.compile(r"^(?::?[\w-]+:)*(?:(?:assemble|bundle|install)\w*|build)$")
+HELP_FLAGS = {"--help", "-h", "-help", "-usage", "--version", "-version"}
+# programy natywnej pracy; bramka natywnego hooka (devguard.GATE_PROGRAMS) musi znać każdy, a
+# xcrun i open przepuszcza tylko przy starcie symulatora (GATE_NATIVE); pilnują tego testy
+NATIVE_PROGRAMS = ("xcodebuild", "expo", "react-native", "eas", "eas-cli", "pod", "pod-install", "gradlew", "gradle", "portivo-mobile")  # fmt: skip
+PACKAGE_BINS = ("expo", "react-native", "eas", "eas-cli", "pod-install")  # `pnpm expo run:ios`
+
+
+def parse_native(words, here):
+    """Człon komendy z natywnym buildem albo startem symulatora: surowy job albo None."""
+    prog, args = os.path.basename(words[0]), words[1:]
+    if prog in ("arch", "npx", "bunx") or (prog == "bundle" and args[:1] == ["exec"]):
+        # arch -arm64 pod install, bundle exec pod install, npx expo run:ios
+        rest = list(args[1:] if prog == "bundle" else args)
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in ("-p", "--package") else rest[1:]
+        return parse_native(rest, here) if rest else None
+    if prog in ("pnpm", "yarn", "npm", "bun"):
+        rest = [a for a in args if a != "--"]
+        while rest and rest[0].startswith("-"):
+            opt, _, val = rest[0].partition("=")
+            if opt in ("-C", "--dir", "--prefix", "--cwd", "--filter", "-F", "--workspace"):
+                if not val and len(rest) > 1:
+                    val, rest = rest[1], rest[1:]
+                if opt in ("-C", "--dir", "--prefix", "--cwd") and val:
+                    here = os.path.normpath(os.path.join(here, os.path.expanduser(val)))
+            rest = rest[1:]
+        if rest[:1] in (["exec"], ["dlx"], ["x"]):
+            rest = rest[1:]
+        if rest and rest[0].split("@")[0] in PACKAGE_BINS:
+            return parse_native(rest, here)
+        return None
+    if any(a in HELP_FLAGS for a in args):
+        return None
+    raw = None
+    tool = prog.split("@")[0]
+    first = next((a for a in args if not a.startswith("-")), None)
+    if prog == "xcrun":
+        if args[:1] == ["xcodebuild"]:
+            return parse_native(args, here)
+        if args[:2] == ["simctl", "boot"] or (args[:2] == ["simctl", "bootstatus"] and "-b" in args):
+            raw = ("simulator", None)
+    elif prog == "xcodebuild":
+        actions = [a for a in args if a in XCODE_ACTIONS]
+        if not XCODE_INFO.intersection(args) and not (actions and set(actions) == {"clean"}):
+            raw = ("xcodebuild", next((a for a in actions if a != "clean"), "build"))
+    elif tool == "expo" and first in ("run:ios", "run:android"):
+        raw = ("expo-run", first.split(":")[1])
+    elif tool == "expo" and first == "prebuild":
+        raw = ("expo-prebuild", None)
+    elif tool == "react-native" and re.match(r"^(run|build)-(ios|android)$", first or ""):
+        raw = ("react-native-run", first.split("-")[1])
+    elif tool in ("eas", "eas-cli") and first == "build" and "--local" in args:
+        raw = ("eas-local", None)
+    elif prog == "pod" and first in ("install", "update"):
+        raw = ("pod", None)
+    elif prog == "pod-install":
+        raw = ("pod", None)
+    elif prog in ("gradlew", "gradle") and any(GRADLE_TASK.match(a) for a in args):
+        raw = ("gradle", None)
+    elif prog == "open" and any(
+        a in ("Simulator", "Simulator.app") or a.endswith("/Simulator.app")
+        for a in args
+    ):
+        raw = ("simulator", None)
+    elif prog == "portivo-mobile" and first == "up":
+        raw = ("portivo-mobile", next((a for a in args[1:] if not a.startswith("-")), None))
+    if raw is None:
+        return None
+    tool, detail = raw
+    return {"lang": "native", "tool": tool, "detail": detail, "dir": here}
+
+
+def finish_native(raw):
+    tool, detail = raw["tool"], raw["detail"]
+    kind, gb, wall, outside = NATIVE[tool]
+    here = raw["dir"]
+    repo = find_repo(here) if os.path.isdir(here) else None
+    repo = repo or here
+    # symulator to ten sam koszt z każdego repo; build to aplikacja, więc klasa jest per repo
+    owner = "mac" if tool == "simulator" else os.path.basename(repo)
+    cls = f"{owner}:native:{tool}" + (f":{detail}" if detail else "")
+    label = " ".join(
+        shlex.quote(a) if re.search(r"[\s'\"$^*|&;]", a) else a for a in raw["argv"]
+    )
+    rel = os.path.relpath(here, repo)
+    return {
+        "lang": "native",
+        "kind": kind,
+        "tool": tool,
+        "class": cls,
+        "module_name": os.path.basename(repo),
+        "module": "." if rel.startswith("..") else rel,
+        "module_dir": here,
+        "repo_dir": repo,
+        "repo": os.path.basename(repo),
+        "scope": "native",
+        "scope_detail": detail or tool,
+        "compile": False,
+        "filtered": False,
+        "all": False,
+        "race": False,
+        "p_explicit": None,
+        "count1": False,
+        "flags": {},
+        "pkgs": [],
+        "argv": raw["argv"],
+        "go_dir": here,
+        "label": label,
+        "native_prior": (gb, wall),
+        "outside": outside,
+    }
+
+
 def classify(command, cwd, argv=None):
-    """Job z komendy powłoki albo argv; None, gdy nie ma w niej pracy Go ani JS dla schedulera."""
+    """Job z komendy powłoki albo argv; None, gdy nie ma w niej pracy Go, JS ani natywnej."""
     if argv is not None:
         if (
             len(argv) >= 3
@@ -712,7 +896,8 @@ def classify(command, cwd, argv=None):
             return None
     here = cwd
     found = []
-    node_on = bool(load_config().get("node", True))
+    cfg = load_config()
+    node_on, native_on = bool(cfg.get("node", True)), bool(cfg.get("native", True))
     for words, _sep in segments:
         if not words:
             continue
@@ -761,13 +946,16 @@ def classify(command, cwd, argv=None):
                 "pkgs": [w for w in words[1:] if not w.startswith("-")],
                 "dir": here,
             }
-        elif node_on:
-            job = parse_node(words, here)
+        else:
+            job = parse_native(words, here) if native_on else None
+            if job is None and node_on:
+                job = parse_node(words, here)
         if job:
             job["argv"] = words
             job["env"] = env
             found.append(job)
-    jobs = [j for j in ((finish_node if j.get("lang") == "node" else finish_job)(j) for j in found) if j]
+    finishers = {"node": finish_node, "native": finish_native}
+    jobs = [j for j in (finishers.get(j.get("lang"), finish_job)(j) for j in found) if j]
     if not jobs:
         return None
     main = max(jobs, key=lambda j: prior(j, 4)[0])
@@ -939,6 +1127,8 @@ def prior(job, p):
     """(GB, s) z pomiarów albo ostrożne wartości ogólne."""
     if job.get("lang") == "node":
         return node_prior(job)
+    if job.get("lang") == "native":
+        return tuple(job["native_prior"])
     name, kind, scope, comp = (
         job["module_name"],
         job["kind"],
@@ -1040,6 +1230,8 @@ def predict(job, p, history):
     s = percentile([r["wall_s"] for r in rows], 0.5)
     if len(rows) < 3:
         gb = max(gb, base_gb * 0.8)  # jeden czy dwa biegi to jeszcze nie statystyka
+    if job.get("outside"):
+        gb = max(gb, base_gb)  # pamięć poza drzewem: zmierzony szczyt to tylko jej część
     return round(gb, 2), round(s, 1), f"history:{len(rows)}"
 
 
@@ -1147,7 +1339,7 @@ def local_path_in(job):
 
 def depot_target(job, gb, wall, cfg, cache):
     """Dokąd na Depot i za ile: {target, job, cores, eta_s, units, cost_usd, argv, cwd} albo None."""
-    if job.get("lang") == "node":
+    if job.get("lang") in ("node", "native"):
         return None  # Depot tu to tylko joby Go portivo
     if depot_blocker(job):
         return None
@@ -1404,7 +1596,7 @@ def count1_safe(job, cache):
 
 def uses_pg(job, cache):
     """Czy testy joba sięgają po Postgresa (dla depot-exec --with pg)."""
-    if job["kind"] != "test" or job.get("lang") == "node":
+    if job["kind"] != "test" or job.get("lang") in ("node", "native"):
         return False
     if job["scope"] == "tree":
         return os.path.isdir(os.path.join(job["module_dir"], "internal/testhelpers"))
@@ -1571,7 +1763,8 @@ def refresh_memory(state, cfg, mem=None):
         for j in local
         if not j.get("paused")
     )
-    dev = devserver_reserve_gb()
+    snap = devguard_snapshot()
+    dev = devserver_reserve_gb(snap)
     internal = state["_internal"]
     swap = [s for s in internal.get("swap", []) if now - s[0] <= 120]
     swap.append([now, mem["swap_gb"]])
@@ -1605,6 +1798,7 @@ def refresh_memory(state, cfg, mem=None):
         "swap_used_gb": round(mem["swap_gb"], 2),
         "swap_growth_2m_gb": round(mem["swap_gb"] - swap[0][1], 2),
         "pressure": mem["pressure"],
+        "guard_level": guard_level(snap),
     }
     today = state["today"]
     today["max_reserved_gb"] = round(max(today.get("max_reserved_gb", 0), reserved), 1)
@@ -1629,7 +1823,12 @@ def plan(state, cfg, now):
     dostępnej teraz: rezerwy długich jobów na wzrost, którego jeszcze nie ma, go nie blokują.
     Liczą się tylko prognozy świeżo wpuszczonych małych jobów, bo te zajmą pamięć za chwilę.
     Głowa czekająca dłużej niż starve_s zostawia sobie miejsce i w pamięci dostępnej teraz, a po
-    2 × starve_s rezerwacja jest twarda: strumień krótkich jobów nie zagłodzi dużego."""
+    2 × starve_s rezerwacja jest twarda: strumień krótkich jobów nie zagłodzi dużego.
+
+    Natywny build i start symulatora startują tylko w pamięci wolnej po rezerwach (sam na Macu:
+    w dostępnej minus zapas), nigdy ponad nią i nigdy, gdy strażnik dev serwerów mówi o presji
+    krytycznej. Jego pamięć leży częściowo poza drzewem procesów (symulator, demon Gradle), więc
+    SIGSTOP nic by tu nie uratował, a rosnący swap jądro zgłasza jako „normal” do samego końca."""
     mem = state["memory"]
     free = mem["free_for_admission_gb"]
     now_free = mem["available_gb"] - cfg["headroom_gb"] - sum(
@@ -1639,6 +1838,7 @@ def plan(state, cfg, now):
     )
     any_local = any(j["where"] == "local" for j in state["running"])
     pressure = mem.get("pressure", "normal")
+    guard_critical = mem.get("guard_level") == 2
     admitted = {}
     blocked = None
     reserve = 0.0
@@ -1649,7 +1849,9 @@ def plan(state, cfg, now):
         if (job.get("route") or {}).get("choice") == "depot":
             continue
         need = job["mem_predicted_gb"]
-        quick = bool(job.get("small")) and not strict and need <= now_free - reserve
+        native = job.get("lang") == "native"
+        held = native and guard_critical
+        quick = bool(job.get("small")) and not strict and not native and need <= now_free - reserve
         if blocked is None:
             spare = mem["available_gb"] - cfg["headroom_gb"]
             alone = not any_local and not admitted
@@ -1657,8 +1859,8 @@ def plan(state, cfg, now):
             # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP).
             # Przy „warn” bez tego ostatniego: macOS trzyma go tu godzinami przy połowie wolnej
             # pamięci, więc startuje to, co się mieści, ale nic ponad dostępną pamięć.
-            overcommit = pressure != "warn" and now - job["enqueued_at"] >= 30
-            if need <= free or quick or (alone and (need <= spare or overcommit)):
+            overcommit = pressure != "warn" and not native and now - job["enqueued_at"] >= 30
+            if not held and (need <= free or quick or (alone and (need <= spare or overcommit))):
                 admitted[job["id"]] = ("fits", None)
                 free -= need
                 now_free -= need
@@ -1669,7 +1871,7 @@ def plan(state, cfg, now):
                 reserve = need
                 strict = now - job["enqueued_at"] > 2 * cfg["starve_s"]
             continue
-        if job.get("small") and (need <= free - reserve or quick):
+        if job.get("small") and not held and (need <= free - reserve or quick):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
             now_free -= need
@@ -1800,6 +2002,8 @@ def update_queue_view(state, cfg):
         free = max(0.0, mem["free_for_admission_gb"])
         if mem.get("pressure") == "critical":
             code, text = "pressure", "paused: memory pressure is critical"
+        elif job.get("lang") == "native" and mem.get("guard_level") == 2:
+            code, text = "pressure", "paused: the dev server guard sees critical memory pressure"
         elif (
             head_blocked is not None
             and now - head_blocked["enqueued_at"] > cfg["starve_s"]
@@ -1939,6 +2143,7 @@ def new_entry(job, command, argv, opts):
     return {
         "id": new_id(),
         "class": job["class"],
+        "lang": job.get("lang", "go"),
         "kind": job["kind"],
         "label": job["label"],
         "module": job["module"],
@@ -1993,7 +2198,7 @@ def cmd_run(args):
             )
     if job["kind"] == "test" and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
         job["uses_pg"] = uses_pg(job, cache)
-    if likely_heavy(job) and job.get("lang") != "node":
+    if likely_heavy(job) and job.get("lang") not in ("node", "native"):
         refresh_depot_eta(cache, job["repo_dir"])
     save_cache(cache)
     return schedule(entry, job, command, argv, opts, cfg, history, cache)
@@ -2034,6 +2239,11 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
         log(
             f"czeka: {entry.get('reason', {}).get('text') or 'na pamięć'} · {entry['route']['text']}"
         )
+        if job.get("lang") == "native":
+            log(
+                f"natywny build albo symulator (~{pl_gb(entry['mem_predicted_gb'])}) wystartuje sam, "
+                "gdy zmieści się w pamięci; nie przerywaj go. Kolejka: claude-acc sched status"
+            )
         while entry.get("where") is None:
             time.sleep(0.5)
             if timeout and time.time() - start > timeout:

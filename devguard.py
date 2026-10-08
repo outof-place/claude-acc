@@ -59,11 +59,12 @@ import os
 import sys
 
 DEV_WORDS = ("dev", "vite", "expo", "serve", "react-native")
-# słowa, bez których komenda nie ma pracy dla schedulera (Go i JS); fałszywy alarm to tylko
-# klasyfikacja w sched.py, która odpowie None
+# słowa, bez których komenda nie ma pracy dla schedulera (Go, JS i natywne buildy z symulatorami);
+# fałszywy alarm to tylko klasyfikacja w sched.py, która odpowie None
 SCHED_WORDS = (
     "go ", "golangci-lint", "make", "govulncheck", "vitest", "jest", "playwright", "next ",
     "tsc", "eslint", "turbo", "pnpm", "npm ", "npx ", "yarn", "bun ", "bunx", "node_modules/.bin/",
+    "xcodebuild", "simctl", "pod", "eas", "gradle", "portivo-mobile", "Simulator",
 )  # fmt: skip
 # Bramka natywnego frontu (claude-acc-hook): komenda idzie do Pythona tylko wtedy, gdy słowo
 # stoi w niej jako całe słowo, a nie kawałek ścieżki albo innego słowa. Scheduler rozpoznaje
@@ -76,8 +77,12 @@ SCHED_WORDS = (
 GATE_PROGRAMS = (
     "go", "golangci-lint", "make", "govulncheck", "npx", "bunx", "pnpm", "yarn", "npm", "bun",
     "vitest", "jest", "playwright", "next", "tsc", "vue-tsc", "eslint", "turbo", "vite", "expo",
-    "react-native",
+    "react-native", "xcodebuild", "pod", "pod-install", "eas", "eas-cli", "gradle", "gradlew",
+    "portivo-mobile",
 )  # fmt: skip
+# natywne komendy, których nie poznać po samym programie: xcrun i open robią też wiele lekkich
+# rzeczy, a do schedulera idzie tylko start symulatora
+GATE_NATIVE = r"(?<![\w.-])simctl\s+boot|(?<![\w.-])-a\s+[\"']?Simulator(?![\w-])"
 # Sekrety bramki pocztowej (klucz konta serwisowego Google, hasła IMAP) leżą w Pęku kluczy pod
 # usługą claude-acc-mail. Agent korzysta z poczty przez narzędzia mail, a komendy, która je
 # wyciąga (`security find-generic-password ... -w`, `dump-keychain`), strażnik nie przepuszcza.
@@ -90,6 +95,7 @@ SECRET_WORDS = ("claude-acc-mail", "claude-acc-browser", "claude-acc-credits", "
 HOOK_GATE = (
     r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
     r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
+    r"|" + GATE_NATIVE +
     r"|(?<![\w.-])(?:" + "|".join(SECRET_WORDS) + r")(?![\w.-])"
 )
 SECRET_DENY = (

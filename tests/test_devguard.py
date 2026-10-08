@@ -593,6 +593,18 @@ SCHEDULED = (
     "eslint .",
     "turbo run build",
     "govulncheck ./...",
+    # natywne buildy i start symulatora
+    "xcodebuild -scheme X build",
+    "cd ios && xcodebuild -workspace A.xcworkspace -scheme A",
+    "xcrun xcodebuild -scheme X test",
+    "xcrun simctl boot 1234-ABCD",
+    "pod install",
+    "./gradlew assembleDebug",
+    "eas build --platform ios --local",
+    "npx expo run:ios --no-bundler",
+    "npx expo prebuild",
+    "portivo-mobile up mobile",
+    "open -a Simulator",
 )
 # słowa w ścieżkach i innych słowach: Python nic tu nie robi, więc nie ma po co startować
 QUIET = (
@@ -605,6 +617,11 @@ QUIET = (
     "cat ~/dev/notes.md",
     "sed -n 1,20p cmd/server/main.go",
     "git log --oneline | head",
+    "xcrun simctl list devices booted",
+    "cat ios/Podfile.lock | head",
+    "rg -n easing src/",
+    "ls ~/Library/Developer/CoreSimulator/Devices",
+    "echo pods ready",
 )
 
 
@@ -657,6 +674,7 @@ class HookGateTest(unittest.TestCase):
         import sched as scheduler
 
         self.assertLessEqual(set(scheduler.NODE_TOOLS), set(entry.GATE_PROGRAMS))
+        self.assertLessEqual(set(scheduler.NATIVE_PROGRAMS), set(entry.GATE_PROGRAMS))
 
     @unittest.skipUnless(os.access(BUILT_HOOK, os.X_OK), "brak app/.build/release/claude-acc-hook")
     def test_native_front_reads_the_gate_like_python(self):
@@ -1331,6 +1349,19 @@ class AdmitFastPathTest(unittest.TestCase):
                 # scheduler pyta rtk o przepisanie, więc dochodzi tylko subprocess
                 _, loaded = self.admit_in_clean_python("go test ./...", cwd=root)
                 self.assertEqual(loaded, ["json", "re", "subprocess"])
+
+    def test_native_build_loads_only_the_scheduler(self):
+        """Natywny build idzie szybką ścieżką do schedulera, bez strażnika i bez ctypes."""
+        with tempfile.TemporaryDirectory() as root:
+            path = os.environ.get("PATH", "")
+            no_rtk = os.pathsep.join(
+                d for d in path.split(os.pathsep) if not os.path.exists(os.path.join(d, "rtk"))
+            )
+            out, loaded = self.admit_in_clean_python(
+                "xcodebuild -scheme App build", cwd=root, env=dict(os.environ, PATH=no_rtk)
+            )
+            self.assertIn("updatedInput", json.loads(out)["hookSpecificOutput"])
+            self.assertEqual(loaded, ["json", "re"])
 
     def test_escaped_json_still_reaches_the_dev_server_check(self):
         raw = self.event("pnpm dev").replace("dev", "\\u0064ev")

@@ -1156,6 +1156,187 @@ class NodeTest(Paths):
         self.assertEqual(argv[-1], "cd apps/web && pnpm test 2>&1 | tail -5")
 
 
+class NativeTest(Paths):
+    """Natywne buildy i start symulatora czekają w tej samej kolejce po pamięci. 2026-10-08 build
+    iOS w Release (18:12-18:30) i build klienta deweloperskiego (od 18:48, przy rosnącym swapie)
+    nie przeszły przez żadną bramkę pamięci, a o 18:57 Mac zamarzł. Pomyłki, które ten test łapie:
+    natywna komenda poza kolejką, lekka komenda (wersja, lista, clean) w kolejce, build wpuszczony
+    ponad pamięć, bo nic innego nie biegło, start mimo krytycznej presji strażnika, prognoza
+    symulatora nauczona zera, i wyjątek rtk, który nie pokrywa owiniętej komendy."""
+
+    WRAPPED = {
+        "xcodebuild -scheme App build": "repo:native:xcodebuild:build",
+        "xcodebuild -workspace App.xcworkspace -scheme App -configuration Release": "repo:native:xcodebuild:build",
+        "xcodebuild clean test -scheme App": "repo:native:xcodebuild:test",
+        "rtk proxy xcrun xcodebuild archive -scheme App": "repo:native:xcodebuild:archive",
+        "cd apps/charter-service && xcodebuild build 2>&1 | tail -20": "repo:native:xcodebuild:build",
+        "npx expo run:ios": "repo:native:expo-run:ios",
+        "./node_modules/.bin/expo run:ios --no-bundler --device generic": "repo:native:expo-run:ios",
+        "pnpm exec expo run:android": "repo:native:expo-run:android",
+        "pnpm expo run:ios --configuration Release": "repo:native:expo-run:ios",
+        "npx react-native run-ios": "repo:native:react-native-run:ios",
+        "npx expo prebuild --platform ios": "repo:native:expo-prebuild",
+        "eas build --platform ios --profile development --local": "repo:native:eas-local",
+        "npx eas-cli build --local": "repo:native:eas-local",
+        "pod install": "repo:native:pod",
+        "arch -arm64 bundle exec pod install --repo-update": "repo:native:pod",
+        "npx pod-install": "repo:native:pod",
+        "./gradlew :app:assembleRelease": "repo:native:gradle",
+        "xcrun simctl boot 1234-ABCD": "mac:native:simulator",
+        "xcrun simctl bootstatus 1234-ABCD -b": "mac:native:simulator",
+        "open -a Simulator": "mac:native:simulator",
+        "portivo-mobile up storefront-mobile": "repo:native:portivo-mobile:storefront-mobile",
+    }
+    LEFT_ALONE = (
+        "xcodebuild -version",
+        "xcodebuild -list -workspace App.xcworkspace",
+        "xcodebuild -scheme App -showBuildSettings",
+        "xcodebuild clean",
+        "xcodebuild -help",
+        "xcrun simctl list devices booted",
+        "xcrun simctl shutdown all",
+        "xcrun simctl io booted screenshot /tmp/s.png",
+        "xcrun simctl bootstatus 1234-ABCD",
+        "pod --version",
+        "pod repo update",
+        "eas build --platform ios",  # w chmurze
+        "eas build:list --limit 3",
+        "./gradlew clean",
+        "./gradlew tasks",
+        "npx expo start",
+        "./node_modules/.bin/expo start --port 8199",
+        "npx expo run:ios --help",
+        "npx expo export --platform ios",
+        "portivo-mobile status",
+        "portivo-mobile release",
+        "open -a Safari",
+        "kubectl get pod",
+        "SCHED_OFF=1 xcodebuild -scheme App build",
+    )
+
+    def test_native_work_is_classified(self):
+        for command, cls in self.WRAPPED.items():
+            j = S.classify(command, self.repo)
+            self.assertIsNotNone(j, command)
+            self.assertEqual((j["class"], j["lang"]), (cls, "native"), command)
+
+    def test_light_and_unrelated_commands_stay_out(self):
+        for command in self.LEFT_ALONE:
+            self.assertIsNone(S.classify(command, self.repo), command)
+
+    def test_switch_off_in_config(self):
+        with open(S.CONFIG_PATH, "w") as f:
+            json.dump({"native": False}, f)
+        self.assertIsNone(S.classify("xcodebuild -scheme App build", self.repo))
+        self.assertIsNotNone(S.classify("cd apps/charter-service && go vet ./...", self.repo))
+
+    def test_priors_and_what_history_may_teach(self):
+        build = S.classify("xcodebuild -scheme App build", self.repo)
+        boot = S.classify("xcrun simctl boot X", self.repo)
+        self.assertEqual(S.prior(build, 4), (10.0, 600))
+        self.assertEqual(S.prior(boot, 4), (2.5, 30))
+        self.assertFalse(S.depot_target(build, 30.0, 3000, self.cfg, {}))
+        tiny = {"where": "local", "peak_gb": 0.05, "wall_s": 4.0, "p": None}
+        # build mierzy się w swoim drzewie procesów: historia uczy w obie strony
+        rows = [dict(tiny, **{"class": build["class"], "peak_gb": 7.0})] * 3
+        self.assertEqual(S.predict(build, 4, rows)[0], round(7.0 * 1.15, 2))
+        # symulator żyje pod launchd_sim: szczyt `simctl boot` to tylko xcrun, więc historia
+        # nie zbija prognozy poniżej tabeli (inaczej po trzech startach symulator „nic nie waży”)
+        rows = [dict(tiny, **{"class": boot["class"]})] * 5
+        gb, wall, src = S.predict(boot, 4, rows)
+        self.assertEqual((gb, wall, src), (2.5, 4.0, "history:5"))
+
+    def entry(self, jid, gb, lang="native", small=False, ago=0):
+        return {"id": jid, "label": jid, "lang": lang, "mem_predicted_gb": gb, "small": small,
+                "enqueued_at": time.time() - ago, "route": {"choice": "local"}}
+
+    def test_admitted_only_when_it_fits(self):
+        self.set_memory(30)  # 14,4 GB dostępne: wolne do wpuszczenia 14,4 - 4 - 4 = 6,4
+        st = self.state()
+        st["queue"] = [self.entry("xcb", 10.0, ago=600)]
+        # sam na Macu: dostępne minus zapas to 10,4, więc się mieści
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"xcb": ("fits", None)})
+        self.set_memory(25)  # 12 GB: zapas zostaje nietknięty
+        st = self.state()
+        st["queue"] = [self.entry("xcb", 10.0, ago=600)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        # ten sam rozmiar joba Go startuje po 30 s ponad pamięć (nikt inny jej nie zwolni,
+        # pilnuje go SIGSTOP); natywny nie, bo symulator i demon Gradle są poza zasięgiem SIGSTOP
+        st["queue"] = [self.entry("vet", 10.0, lang="go", ago=600)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vet": ("fits", None)})
+        self.set_memory(60)  # 28,8 GB: wolne 20,8
+        st = self.state()
+        st["queue"] = [self.entry("xcb", 10.0), self.entry("boot", 2.5, small=True)]
+        self.assertEqual(
+            S.plan(st, self.cfg, time.time()), {"xcb": ("fits", None), "boot": ("fits", None)}
+        )
+
+    def test_small_native_job_does_not_use_memory_reserved_for_growth(self):
+        st = self.state()  # 28,8 GB dostępne
+        st["running"].append(
+            {"id": "xcb", "where": "local", "label": "xcodebuild", "mem_predicted_gb": 10.0,
+             "mem_now_gb": 0.5, "predicted_wall_s": 600, "started_at": time.time()}
+        )
+        st["running"].append(
+            {"id": "big", "where": "local", "label": "go test ./...", "mem_predicted_gb": 12.0,
+             "mem_now_gb": 1.0, "predicted_wall_s": 1500, "started_at": time.time()}
+        )
+        S.refresh_memory(st, self.cfg)  # wolne 20,8 - 9,5 - 11 = 0,3
+        st["queue"] = [self.entry("boot", 2.5, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        st["queue"] = [self.entry("vitest", 2.5, lang="node", small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vitest": ("fits", None)})
+
+    def test_guard_critical_pressure_holds_native_jobs(self):
+        """Poziom jądra potrafi mówić „normal” przy pełnym i rosnącym swapie; strażnik liczy
+        presję także ze swapu. Natywny job czeka na jego „critical”, Go i JS jak dotąd."""
+        snap = {"snapshot": {"at": time.time(), "budget": 12 * S.GB, "total": 0,
+                             "pressure": {"level": 2}}}
+        with open(S.DEVGUARD_STATE, "w") as f:
+            json.dump(snap, f)
+        st = self.state()
+        self.assertEqual(st["memory"]["guard_level"], 2)
+        st["queue"] = [self.entry("xcb", 10.0), self.entry("boot", 2.5, small=True)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        S.update_queue_view(st, self.cfg)
+        self.assertEqual(st["queue"][0]["reason"]["code"], "pressure")
+        st["queue"] = [self.entry("vet", 10.0, lang="go")]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"vet": ("fits", None)})
+        snap["snapshot"]["at"] = time.time() - 300  # strażnik stoi: jego zdanie się nie liczy
+        with open(S.DEVGUARD_STATE, "w") as f:
+            json.dump(snap, f)
+        st = self.state()
+        self.assertIsNone(st["memory"]["guard_level"])
+        st["queue"] = [self.entry("xcb", 10.0)]
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"xcb": ("fits", None)})
+
+    def rtk_excluded(self, segment):
+        pats = [re.compile(p if p.startswith("^") else r"^" + re.escape(p) + r"($|\s)") for p in S.RTK_EXCLUDES]
+        return any(r.search(segment) for r in pats)
+
+    def test_rtk_exclusions_cover_what_we_wrap(self):
+        for command in self.WRAPPED:
+            bares = [S.strip_prefix(w)[1] for w, _ in S.split_segments(command) if w]
+            wrapped = [" ".join(b) for b in bares if b and S.parse_native(b, self.repo)]
+            self.assertTrue(wrapped, command)
+            for segment in wrapped:
+                self.assertTrue(self.rtk_excluded(segment), segment)
+        for command in ("./gradlew clean", "pod --version", "xcrun simctl list", "npx expo start",
+                        "eas build:list", "open -a Safari"):
+            self.assertFalse(self.rtk_excluded(command), command)
+
+    def test_hook_wraps_native_commands(self):
+        event = {"tool_name": "Bash", "cwd": self.repo,
+                 "tool_input": {"command": "cd ios && xcodebuild -scheme App build 2>&1 | tail -5",
+                                "run_in_background": True}}
+        with mock.patch.object(S, "with_rtk", side_effect=lambda c: c):
+            out = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+        argv = shlex.split(out["command"])
+        self.assertEqual(argv[2:5], ["run", "--via", "hook"])
+        self.assertEqual(argv[-1], "cd ios && xcodebuild -scheme App build 2>&1 | tail -5")
+        self.assertTrue(out["run_in_background"])
+
+
 class StateTest(Paths):
     def test_kernel_reads_load_on_first_use(self):
         footprint, cpu = S.proc_usage(os.getpid())
@@ -1683,6 +1864,28 @@ class RunTest(unittest.TestCase):
         )
         args = [r[3] for r in self.go_log() if r[0] == "start"][-1]
         self.assertIn("-count=1", args)
+
+    def test_native_build_waits_for_room_then_runs(self):
+        """Natywny build bez miejsca w pamięci nie startuje, czeka w kolejce z powodem, który
+        widzi agent i panel, a gdy pamięć się zwolni, rusza sam: z wyjściem i kodem dla agenta i
+        wierszem w historii, z której scheduler uczy się jego szczytu."""
+        write(os.path.join(self.bin, "xcodebuild"), FAKE_GO, 0o755)
+        self.set_memory(20)  # 9,6 GB dostępne: nawet sam na Macu 10 GB buildu się nie mieści
+        p = self.start("xcodebuild -scheme App build", via="hook")
+        self.wait_for(lambda: len(self.state()["queue"]) == 1)
+        queued = self.state()["queue"][0]
+        self.assertEqual((queued["lang"], queued["reason"]["code"]), ("native", "memory"))
+        self.assertIn("waiting for 10.0 GB", queued["reason"]["text"])
+        time.sleep(1.5)  # kilka obiegów kolejki (co 0,5 s): dalej czeka
+        self.assertEqual(self.go_log(), [])
+        self.set_memory(60)
+        rc, out, err = self.done(p)
+        self.assertEqual(rc, 0)
+        self.assertIn("fake go done: -scheme App build", out)
+        self.assertIn("natywny build albo symulator", err)
+        row = self.history()[-1]
+        self.assertEqual((row["class"], row["where"], row["rc"]), ("repo:native:xcodebuild:build", "local", 0))
+        self.assertGreater(row["wait_s"], 1.0)
 
     def test_status_command(self):
         self.done(self.start("cd apps/charter-service && go test ./internal/moneyfmt/"))

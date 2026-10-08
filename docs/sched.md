@@ -1,8 +1,8 @@
-# Scheduler Go i JS: stan dla panelu i historia biegów
+# Scheduler Go, JS i natywnych buildów: stan dla panelu i historia biegów
 
 `sched.py` wpuszcza ciężkie komendy agentów po pamięci zamiast jednego zamka na wszystko: Go
-(build, vet, test, lint, cele make) i JS (testy, e2e, buildy, typecheck, lint, w każdym projekcie z
-`package.json`). Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse (`devguard.py admit`)
+(build, vet, test, lint, cele make), JS (testy, e2e, buildy, typecheck, lint, w każdym projekcie z
+`package.json`) i natywne buildy iOS i Androida razem ze startem symulatora (sekcja „Natywne”). Każdy bieg przechodzi przez `sched.py run`; hook PreToolUse (`devguard.py admit`)
 sam owija komendy agentów, a `plock.py go` przekazuje do niego swoje. Pomiary, z których wzięły się
 liczby niżej: `docs/perf-research.md`, sekcja o schedulerze.
 
@@ -85,15 +85,17 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `free_for_admission_gb` | `available_gb - headroom_gb - devserver_reserve_gb - reserved_gb` |
 | `idle_max_gb` | ile zmieściłoby się na pustym Macu: najwyższy `available_gb` z ostatnich 7 dni minus `headroom_gb`; większe joby idą zawsze na Depot |
 | `swap_used_gb`, `swap_growth_2m_gb` | swap teraz i jego przyrost w 2 minuty |
-| `pressure` | `normal`, `warn`, `critical` (devguard) |
+| `pressure` | `normal`, `warn`, `critical` z poziomu jądra (`kern.memorystatus_vm_pressure_level`) |
+| `guard_level` | presja wg strażnika dev serwerów (0, 1, 2) z jego pomiaru młodszego niż minuta, albo `null`; liczy też rosnący swap, więc jej `2` wstrzymuje natywne joby |
 
 ### Job w `running[]` i `queue[]`
 
 | pole | znaczenie |
 |---|---|
 | `id` | `j-<epoch>-<4 hex>` |
-| `class` | Go: `<moduł>:<czasownik>:<zakres>[:race][:compile]`, np. `charter-service:vet:tree`, `charter-service:test:pkg:internal/handlers:compile`; JS: patrz sekcja JS |
-| `kind` | `build`, `vet`, `test`, `lint`, `make`, `generate`, `run`, `other` |
+| `class` | Go: `<moduł>:<czasownik>:<zakres>[:race][:compile]`, np. `charter-service:vet:tree`, `charter-service:test:pkg:internal/handlers:compile`; JS i natywne: patrz ich sekcje |
+| `lang` | `go`, `node` albo `native` |
+| `kind` | `build`, `vet`, `test`, `lint`, `make`, `generate`, `run`, `other`; JS i natywne: patrz ich sekcje |
 | `label` | komenda Go bez otoczki (`cd`, `rtk proxy`, potoki), do wyświetlenia |
 | `module` | katalog modułu Go względem repo, np. `apps/charter-service` |
 | `repo` | nazwa repo (katalog z `.git`), np. `Untitled` |
@@ -240,6 +242,7 @@ depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (
 count1_trusted_exec  ["internal/testhelpers/testpg"]   pliki pomocników, których exec nie psuje cache
 depot_org            ""     organizacja Depot dla `sched.py depot`; pusta: domyślna organizacja CLI
 node                 true   testy, buildy i typecheck JS w kolejce
+native               true   natywne buildy, pody i start symulatora w kolejce
 ```
 
 ## JS
@@ -261,6 +264,46 @@ biegów klasy przewidywanie bierze się z tabeli (GB, sekundy): `test` 3,0/90, `
 połowa GB (najmniej 1) i 0,4 czasu. Potem p90 z historii, jak w Go. Joby JS biegną tylko lokalnie:
 nie idą na Depot i nie dostają Postgresa. `"node": false` w `config.json` wyłącza całą tę część.
 
+## Natywne
+
+2026-10-08 Mac zamarzł o 18:57: build iOS w Release (18:12-18:30) i build klienta deweloperskiego
+przez `portivo-mobile up` (od 18:48, przy swapie 11 GB i rosnącym) nie przeszły przez żadną bramkę
+pamięci. Build aplikacji Expo xcodebuildem z pełną równoległością to 6-12 GB. Hook owija więc
+także:
+
+| narzędzie | komendy | rodzaj | GB, s na start | pamięć poza drzewem |
+|---|---|---|---|---|
+| `xcodebuild` | build, test, archive, analyze, build-for-testing, test-without-building, także bez akcji i przez `xcrun` | build | 10, 600 | nie |
+| `expo-run` | `expo run:ios`, `expo run:android` (każda droga do CLI expo) | build | 10, 900 | tak: symulator, demon Gradle |
+| `react-native-run` | `react-native run-ios`, `run-android`, `build-ios`, `build-android` | build | 10, 900 | tak |
+| `eas-local` | `eas build --local` (bez `--local` build idzie w chmurze) | build | 10, 1500 | nie |
+| `gradle` | `./gradlew` i `gradle` z zadaniem assemble*, bundle*, install*, build | build | 6, 600 | tak: demon Gradle |
+| `portivo-mobile` | `portivo-mobile up <app>`: dzierżawa i start symulatora, czasem 10-20 min buildu w odczepionym procesie | build | 10, 900 | tak |
+| `pod` | `pod install`, `pod update`, `pod-install`, także z `arch` i `bundle exec` | pods | 1,5, 180 | nie |
+| `expo-prebuild` | `expo prebuild` (z `pod install` w środku) | pods | 2, 180 | nie |
+| `simulator` | `xcrun simctl boot`, `xcrun simctl bootstatus … -b`, `open -a Simulator` | simulator | 2,5, 30 | tak: launchd_sim |
+
+Klasa: `<repo>:native:<narzędzie>[:<akcja, platforma albo aplikacja>]`, np.
+`portivo:native:xcodebuild:build`, `portivo:native:portivo-mobile:storefront-mobile`; symulator to
+zawsze `mac:native:simulator`. Nigdy: informacje, eksport i pobieranie w xcodebuild (`-version`,
+`-list`, `-showBuildSettings`, `-exportArchive`, `-downloadPlatform`…), sam `clean`, pomoc i wersje,
+`simctl` bez startu, `eas build` w chmurze, inne zadania Gradle, `portivo-mobile status|release`.
+
+Zasady wpuszczania różnią się od Go i JS w trzech miejscach:
+
+- start tylko w pamięci wolnej po rezerwach biegnących jobów (sam na Macu: dostępna minus zapas),
+  nigdy „po 30 s ponad pamięć”, jak samotny job Go: SIGSTOP, który go wtedy pilnuje, nie sięga
+  symulatora ani demona Gradle;
+- mały natywny job (start symulatora) nie korzysta z pamięci „dostępnej teraz” mimo rezerw długich
+  jobów: build, który właśnie wystartował, rośnie do swojej prognozy;
+- `guard_level` 2 wstrzymuje natywne joby, także gdy jądro mówi `normal` (przy pełnym i rosnącym
+  swapie potrafi tak mówić do samego końca). Powód w kolejce: `pressure`.
+
+Prognoza z historii jak w Go (p90 szczytu × 1,15 i mediana czasu), ale dla narzędzi z pamięcią poza
+drzewem procesów historia może ją tylko podnieść: scheduler mierzy `xcrun`, a nie symulator, więc
+trzy szybkie starty nauczyłyby go zera. Natywne joby biegną tylko lokalnie. Agent, którego komenda
+czeka, dostaje na stderr powód i zdanie, że build wystartuje sam.
+
 ## `sched.py wait`
 
 `sched.py wait [--max S] [--every S] -- 'WARUNEK'` sprawdza WARUNEK (komendę powłoki) co `--every`
@@ -275,7 +318,9 @@ Hook rtk (`rtk-rewrite.sh`) też przepisuje komendy, które owija scheduler. Dwa
 `updatedInput` na tej samej komendzie dają losowy wynik, więc na Macu z rtk te komendy idą w jego
 wyjątki, w `~/Library/Application Support/rtk/config.toml`, w sekcji `[hooks]`. Linię
 `exclude_commands` drukuje `sched.py rtk-excludes`; test pilnuje, żeby wyjątki obejmowały wszystko,
-co scheduler owija, i nic więcej (rtk dalej skraca `pnpm install` czy `git`).
+co scheduler owija, i nic więcej (rtk dalej skraca `pnpm install` czy `git`). Jeden wyjątek od
+„nic więcej”: rtk czyta wzorce crate'em `regex` bez lookaroundów, więc `xcodebuild` idzie w wyjątki
+cały, także `-version` i `-list`, których scheduler nie owija.
 
 W środku opakowania `with_rtk` pyta `rtk rewrite` o tę samą komendę z pustym `HOME`, czyli bez
 naszych wyjątków, więc reguły rtk mają jedno źródło i agent dalej dostaje krótkie wyjście. Gdy rtk
