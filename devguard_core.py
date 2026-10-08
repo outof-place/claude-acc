@@ -9,6 +9,7 @@ import ctypes.util
 import fcntl
 import json
 import os
+import plistlib
 import re
 import shlex
 import signal
@@ -95,6 +96,23 @@ DEFAULT_CONFIG = {
     # serwer zatrzymany z braku pamięci zostaje zatrzymany najwyżej tyle minut: hook nie wpuszcza
     # go z powrotem, dopóki presja nie zejdzie do zera, a swap pod próg ostrzeżenia
     "restart_hold_minutes": 10,
+    # symulatory iOS (każdy to 2-4 GB): najwyżej tyle włączonych naraz; ponad limit strażnik
+    # wyłącza nieużywane, a `portivo-mobile up` sesji bez symulatora czeka w schedulerze
+    "max_booted_simulators": 2,
+    # symulator z puli bez żywej dzierżawy i bez widzów wyłączany po tylu minutach
+    "simulator_idle_minutes": 30,
+    # ponad limitem wystarczy tyle minut bez używania
+    "simulator_quiet_minutes": 5,
+    # symulatory agentów (pula portivo-mobile); pozostałe są Twoje: liczą się do limitu, ale
+    # strażnik ich nie wyłącza
+    "simulator_pool_prefix": "Portivo-",
+    # dzierżawy portivo-mobile: <udid>.json z procesem sesji, która trzyma symulator
+    "simulator_leases": "~/.cache/portivo-mobile/leases",
+    # tyle rdzeni CPU całego symulatora to używanie. Pomiar 2026-10-08: bezczynny symulator
+    # z aplikacją RN 0,01 rdzenia, ten sam pod flow maestro 0,4-0,7
+    "simulator_busy_cores": 0.15,
+    # nazwy albo UDID symulatorów, których strażnik nigdy nie wyłącza
+    "simulator_protect": [],
 }
 
 SERVER_KINDS = [
@@ -125,6 +143,14 @@ HEADLESS = re.compile(
     r"Chrome for Testing|HeadlessChrome|headless_shell|ms-playwright|puppeteer"
 )
 LOOPBACK = {"127.0.0.1", "[::1]", "::1", "localhost", "0.0.0.0", "*"}
+# proces z danych symulatora (aplikacja w nim, launchd_sim): UDID urządzenia z jego ścieżki
+UDID = re.compile(r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}")
+SIM_DEVICE = re.compile(rf"/CoreSimulator/Devices/({UDID.pattern})/")
+LAUNCHD_SIM = re.compile(r"(^|/)launchd_sim(\s|$)")
+# podgląd symulatora w Orce; bez UDID w argumentach ogląda każdy włączony
+SERVE_SIM = re.compile(r"(^|/)serve-sim(\s|$)")
+SIM_DEVICES = os.path.join(janitor.HOME, "Library/Developer/CoreSimulator/Devices")
+SIMULATOR_APP = "com.apple.iphonesimulator"
 
 
 def log(line):
@@ -782,6 +808,8 @@ def sockets():
 
 
 def client_kind(command):
+    if SIM_DEVICE.search(command):
+        return "simulator"  # aplikacja w symulatorze iOS, zwykle z Metro
     if "Orca.app" in command:
         return "orca"
     if HEADLESS.search(command):
@@ -842,6 +870,8 @@ class Unit:
         self.cpu = sum(s.cpu for s in servers)
         self.ports = sorted({p for s in servers for p in s.ports})
         self.clients = []  # (pid, rodzaj, nazwa)
+        # aplikacje z symulatorów, których nikt nie używa: połączone, ale to nie widzowie
+        self.idle_sim_clients = []
         self.tabs = []
         self.terminal = None
         self.worktree = None
@@ -915,6 +945,7 @@ class Unit:
             "terminal": (self.terminal or {}).get("title"),
             "worktree": (self.worktree or {}).get("path"),
             "clients": [{"pid": p, "kind": k, "name": n} for p, k, n in self.clients],
+            "idle_sim_clients": len(self.idle_sim_clients),
             "tabs": [
                 {"url": t.get("url"), "focused": t.get("focused")} for t in self.tabs
             ],
@@ -990,6 +1021,220 @@ def discover(cfg, rows):
     return [Unit(root, group, table, children) for root, group in groups.items()], table
 
 
+# ---------- symulatory iOS ----------
+
+# ścieżka device.plist -> nazwa urządzenia; nie zmienia się, dopóki urządzenie istnieje
+_sim_names = {}
+
+
+def sim_name(udid):
+    path = os.path.join(SIM_DEVICES, udid, "device.plist")
+    if path not in _sim_names:
+        try:
+            with open(path, "rb") as f:
+                _sim_names[path] = str(plistlib.load(f).get("name") or udid)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return udid
+    return _sim_names[path]
+
+
+def proc_start_epoch(pid):
+    """Start procesu w sekundach epoki (pbi_start_tvsec z proc_bsdinfo); None, gdy go nie ma
+    albo to zombie."""
+    buf = ctypes.create_string_buffer(BSDINFO_SIZE)
+    got = _libc.proc_pidinfo(
+        pid, PROC_PIDTBSDINFO, ctypes.c_uint64(0), buf, BSDINFO_SIZE
+    )
+    if got != BSDINFO_SIZE or int.from_bytes(buf.raw[4:8], "little") == SZOMB:
+        return None
+    return int.from_bytes(buf.raw[120:128], "little")
+
+
+def read_lease(cfg, udid):
+    path = os.path.join(janitor.expand(cfg["simulator_leases"]), udid + ".json")
+    lease = janitor.load_json(path, None)
+    return lease if isinstance(lease, dict) else None
+
+
+def lease_alive(lease):
+    """Czy sesja z dzierżawy portivo-mobile żyje: ten sam pid i ten sam start, który
+    portivo-mobile zapisał z `ps -o lstart=`. Start w nieznanym formacie (inny język
+    systemu) niczego nie przesądza: wtedy wystarczy żywy pid."""
+    owner = lease.get("owner") if isinstance(lease, dict) else None
+    if not isinstance(owner, dict):
+        return False
+    try:
+        pid = int(owner.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    started = proc_start_epoch(pid) if pid > 0 else None
+    if started is None:
+        return False
+    text = " ".join(str(owner.get("start") or "").split())
+    if not text:
+        return True
+    try:
+        want = time.mktime(time.strptime(text, "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return True
+    return abs(want - started) <= 2
+
+
+class Simulator:
+    """Włączony symulator iOS: jego launchd_sim i wszystko pod nim (aplikacje, demony).
+    W użyciu jest, gdy trzyma go żywa sesja (dzierżawa portivo-mobile), gdy ogląda go
+    proces spoza niego (maestro, build z `-destination id=UDID`, serve-sim) albo gdy nie
+    jest z puli agentów, czyli jest Twój."""
+
+    def __init__(self, cfg, udid, root, tree, watchers):
+        self.udid = udid
+        self.root = root
+        self.pids = sorted(tree)
+        self.name = sim_name(udid)
+        self.key = self.app_key = f"sim:{udid}"
+        self.label = f"symulator {self.name}"
+        self.pool = self.name.startswith(cfg["simulator_pool_prefix"])
+        self.lease = read_lease(cfg, udid)
+        self.lease_alive = lease_alive(self.lease)
+        self.watchers = sorted(watchers)
+        protect = cfg["simulator_protect"]
+        self.protected = udid in protect or self.name in protect
+        stats = [s for s in (usage(p) for p in tree) if s]
+        self.footprint = sum(s["footprint"] for s in stats)
+        self.cpu = sum(s["cpu"] for s in stats)
+        self.start = (usage(root) or {}).get("start", 0)
+        # pola, których oczekują wspólne ścieżki planów i zdarzeń
+        self.ports = []
+        self.argv = None
+        self.launch_cwd = ""
+        # z historii
+        self.age = 0
+        self.quiet = 0
+
+    @property
+    def watched(self):
+        return bool(self.watchers)
+
+    @property
+    def in_use(self):
+        return self.lease_alive or self.watched or not self.pool or self.protected
+
+    def summary(self):
+        owner = (self.lease or {}).get("owner") or {}
+        return {
+            "key": self.key,
+            "udid": self.udid,
+            "name": self.name,
+            "pool": self.pool,
+            "footprint": self.footprint,
+            "processes": len(self.pids),
+            "lease_app": (self.lease or {}).get("app"),
+            "lease_session": owner.get("session") or None,
+            "lease_alive": self.lease_alive,
+            "watchers": self.watchers,
+            "in_use": self.in_use,
+            "protected": self.protected,
+            "age": round(self.age),
+            "quiet": round(self.quiet),
+        }
+
+
+class SimulatorGroup:
+    """Wszystkie włączone symulatory naraz: adresat ostrzeżenia o limicie."""
+
+    key = app_key = "simulators"
+
+    def __init__(self, sims):
+        self.footprint = sum(s.footprint for s in sims)
+        self.label = f"{len(sims)} włączone symulatory"
+        self.ports = []
+
+
+def discover_simulators(cfg, rows):
+    """Włączone symulatory z tabeli procesów: każdy ma własny launchd_sim (dziecko launchd)
+    z UDID urządzenia w argumentach. Widzowie to procesy spoza symulatora z jego UDID."""
+    children = {}
+    for pid, ppid, _command in rows:
+        children.setdefault(ppid, []).append(pid)
+    roots = {}
+    for pid, ppid, command in rows:
+        if ppid == 1 and LAUNCHD_SIM.search(command):
+            found = SIM_DEVICE.search(command)
+            if found:
+                roots[pid] = found.group(1)
+    if not roots:
+        return []
+    trees = {pid: set(descendants(pid, children)) for pid in roots}
+    inside = set().union(*trees.values())
+    outside = [(pid, command) for pid, _ppid, command in rows if pid not in inside]
+    viewers = [
+        pid
+        for pid, command in outside
+        if SERVE_SIM.search(command) and not UDID.search(command)
+    ]
+    sims = []
+    for root, udid in roots.items():
+        watchers = {pid for pid, command in outside if udid in command} | set(viewers)
+        sims.append(Simulator(cfg, udid, root, trees[root], watchers))
+    return sims
+
+
+def track_simulators(cfg, state, sims, now):
+    """Wiek i cisza symulatorów z historii stanu. Cisza liczy się od ostatniego użycia: CPU
+    ponad `simulator_busy_cores`, żywa dzierżawa albo widz."""
+    history = state.setdefault("sims", {})
+    busy_cores = cfg["simulator_busy_cores"]
+    seen = set()
+    for sim in sims:
+        key = f"{sim.udid}:{sim.start}"
+        seen.add(key)
+        h = history.get(key)
+        if h is None:
+            h = history[key] = {"first": now, "cpu": sim.cpu, "at": now, "busy": now}
+        dt = max(now - h["at"], 0.001)
+        if (sim.cpu - h["cpu"]) / dt >= busy_cores or sim.lease_alive or sim.watched:
+            h["busy"] = now
+        h["cpu"], h["at"] = sim.cpu, now
+        sim.age = now - h["first"]
+        sim.quiet = now - h["busy"]
+    for key in list(history):
+        if key not in seen:
+            del history[key]
+
+
+def drop_unused_simulator_clients(unit, commands, sims):
+    """Aplikacja w symulatorze, którego nikt nie używa, trzyma połączenie z Metro i tylko udaje
+    widza: bez tego Metro sesji, która umarła, nigdy nie wypada jako sierota ani bezczynny.
+    Symulator spoza pomiaru zostaje widzem (lepiej nie ruszyć, niż ruszyć cudzy)."""
+    kept, idle = [], []
+    for client in unit.clients:
+        found = SIM_DEVICE.search(commands.get(client[0], "")) if client[1] == "simulator" else None
+        sim = sims.get(found.group(1)) if found else None
+        (idle if sim is not None and not sim.in_use else kept).append(client)
+    unit.clients = kept
+    unit.idle_sim_clients = idle
+
+
+def frontmost_bundle():
+    """Bundle aplikacji na pierwszym planie (lsappinfo); None, gdy nie wiadomo."""
+    try:
+        asn = subprocess.run(
+            ["lsappinfo", "front"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        if not asn:
+            return None
+        out = subprocess.run(
+            ["lsappinfo", "info", "-only", "bundleid", asn],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r'"CFBundleIdentifier"="([^"]*)"', out)
+    return found.group(1) if found else None
+
+
 class World:
     """Wszystko, co strażnik wie w jednej chwili."""
 
@@ -997,6 +1242,9 @@ class World:
         self.now = now
         rows = processes()
         self.units, self.table = discover(cfg, rows)
+        self.simulators = discover_simulators(cfg, rows)
+        track_simulators(cfg, state, self.simulators, now)
+        by_udid = {s.udid: s for s in self.simulators}
         self.pressure = Pressure(cfg, state, now)
         commands = {pid: command for pid, (_ppid, command) in self.table.items()}
         if self.units:
@@ -1024,6 +1272,8 @@ class World:
                     )
                     if entry not in unit.clients:
                         unit.clients.append(entry)
+            for unit in self.units:
+                drop_unused_simulator_clients(unit, commands, by_udid)
         if use_orca and self.units:
             orca.refresh(rows, now, cfg["orca_seconds"])
         self.orca = orca if orca.ok else None
@@ -1084,7 +1334,8 @@ class World:
             busy = max(h["busy"], output / 1000 if output else 0)
             unit.age = now - h["first"]
             unit.started = started_at(unit.start, h["first"], now)
-            unit.quiet = now - busy
+            # wyjście terminala z Orki bywa o kilka sekund nowsze niż `now` z początku pomiaru
+            unit.quiet = max(0.0, now - busy)
             unit.last_watched = h["watched"]
         for key in list(history):
             if key not in seen:
@@ -1100,7 +1351,7 @@ class Plan:
 
     def __init__(self, unit, action, priority, reason, code="manual", **data):
         self.unit = unit
-        self.action = action  # "stop", "recycle", "warn"
+        self.action = action  # "stop", "recycle", "warn"; dla symulatora "shutdown"
         self.priority = priority
         self.reason = reason
         self.code = code
@@ -1317,6 +1568,8 @@ def decide(cfg, world, state):
                 Plan(unit, "recycle", 95, "po restarcie fseventsd nie widzi zmian plików", "fsevents")
             )
 
+    plans += simulator_plans(cfg, getattr(world, "simulators", []), pressure, grace)
+
     for plan in plans:
         if plan.action != "recycle":
             continue
@@ -1335,6 +1588,59 @@ def decide(cfg, world, state):
     for plan in sorted(plans, key=lambda p: -p.priority):
         best.setdefault(plan.unit.key, plan)
     return sorted(best.values(), key=lambda p: -p.priority)
+
+
+def simulator_plans(cfg, sims, pressure, grace):
+    """Wyłączenia symulatorów. Kandydat jest z puli agentów, bez żywej dzierżawy, bez widza,
+    nie chroniony i starszy niż `grace_minutes`. Taki idzie po `simulator_idle_minutes`
+    ciszy; ponad limitem włączonych albo przy braku pamięci już po `simulator_quiet_minutes`
+    (najdłużej cichy). Ponad limitem bez kandydata zostaje ostrzeżenie."""
+    if not sims:
+        return []
+    cap = cfg["max_booted_simulators"]
+    idle = cfg["simulator_idle_minutes"] * MINUTE
+    safe = [s for s in sims if not s.in_use and not s.protected and s.age >= grace]
+    plans = [
+        Plan(
+            s,
+            "shutdown",
+            45,
+            f"nikt go nie używa od {minutes(s.quiet)}",
+            "simulator_idle",
+            minutes=int(s.quiet // MINUTE),
+        )
+        for s in safe
+        if s.quiet >= idle
+    ]
+    over = bool(cap) and len(sims) > cap
+    if not (over or pressure.level):
+        return plans
+    ready = [s for s in safe if s.quiet >= cfg["simulator_quiet_minutes"] * MINUTE]
+    if ready:
+        top = max(ready, key=lambda s: (s.quiet, s.footprint))
+        unused = f"nieużywany od {minutes(top.quiet)}"
+        if over:
+            why = f"{len(sims)} włączone symulatory, limit {cap}; ten {unused}"
+            code, data = "simulator_cap", dict(booted=len(sims), cap=cap)
+        else:
+            why = "brak pamięci: " + ", ".join(pressure.reasons) + f"; symulator {unused}"
+            code, data = "pressure", dict(level=pressure.level)
+        plans.append(Plan(top, "shutdown", 85, why, code, minutes=int(top.quiet // MINUTE), **data))
+    elif over:
+        group = SimulatorGroup(sims)
+        plans.append(
+            Plan(
+                group,
+                "warn",
+                10,
+                f"{len(sims)} włączone symulatory ({janitor.human(group.footprint)}), limit {cap}; "
+                "każdy jest w użyciu albo dopiero wstał",
+                "simulator_cap",
+                booted=len(sims),
+                cap=cap,
+            )
+        )
+    return plans
 
 
 # ---------- akcje ----------
@@ -1466,18 +1772,101 @@ def note(cfg, orca, unit, text):
     )
 
 
+def held_back(state, key, now, text):
+    """Akcja wstrzymana, bo patrzysz na okno Simulatora: wpis w logu najwyżej co 10 minut."""
+    seen = state.setdefault("held", {})
+    if now - seen.get(key, 0) >= 10 * MINUTE:
+        seen[key] = now
+        log(text)
+
+
+def portivo_lock(cfg):
+    """Zamek dzierżaw portivo-mobile (`up` trzyma go, wybierając i dzierżawiąc symulator).
+    Uchwyt, gdy wolny; False, gdy ktoś go trzyma; None, gdy portivo-mobile tu nie ma."""
+    base = os.path.dirname(janitor.expand(cfg["simulator_leases"]).rstrip("/"))
+    if not os.path.isdir(base):
+        return None
+    handle = open(os.path.join(base, "lease.lock"), "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    return handle
+
+
+def shutdown_simulator(cfg, plan, world, state):
+    """`simctl shutdown`, ale nigdy, gdy okno Simulatora jest na pierwszym planie, ani gdy
+    sesja właśnie wzięła ten symulator (dzierżawa czytana od nowa pod zamkiem portivo-mobile)."""
+    sim, now = plan.unit, world.now
+    size = janitor.human(sim.footprint)
+    if frontmost_bundle() == SIMULATOR_APP:
+        held_back(state, sim.key, now, f"czekam z wyłączeniem {sim.label}: patrzysz na Simulator")
+        return False
+    lock = portivo_lock(cfg)
+    if lock is False:
+        return False  # `portivo-mobile up` właśnie dzierżawi; następny pomiar
+    try:
+        if lease_alive(read_lease(cfg, sim.udid)):
+            log(f"nie wyłączam {sim.label}: sesja właśnie go wzięła")
+            return False
+        try:
+            done = subprocess.run(
+                ["xcrun", "simctl", "shutdown", sim.udid],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            ok = done.returncode == 0
+            result = "wyłączony" if ok else f"simctl: {(done.stderr or done.stdout).strip()[:200]}"
+        except (OSError, subprocess.SubprocessError) as err:
+            ok, result = False, f"simctl: {err}"
+    finally:
+        if lock:
+            lock.close()
+    log(f"shutdown {sim.label} {size}: {plan.reason} -> {result}")
+    events = state.setdefault("events", [])
+    events.append(
+        {
+            "at": now,
+            "action": "shutdown",
+            "label": sim.name,
+            "size": sim.footprint,
+            "reason": plan.reason,
+            "code": plan.code,
+            "data": plan.data,
+            "ports": [],
+            "cwd": "",
+            "result": result,
+            "ok": ok,
+        }
+    )
+    del events[:-20]
+    if cfg["notify"]:
+        janitor.notify("Strażnik: wyłączony symulator", f"{sim.name} ({size}): {plan.reason}")
+    return True
+
+
 def execute(cfg, plan, world, state):
+    """Wykonuje plan; False, gdy akcja została wstrzymana i nic się nie stało."""
     unit, now = plan.unit, world.now
     size = janitor.human(unit.footprint)
     if plan.action == "warn":
         warned = state.setdefault("warned", {})
         if now - warned.get(unit.app_key, 0) < HOUR:
-            return
+            return False
         warned[unit.app_key] = now
         log(f"uwaga {unit.label} {size}: {plan.reason}")
         if cfg["notify"]:
-            janitor.notify("Dev serwer puchnie", f"{unit.label}: {plan.reason}")
-        return
+            title = "Za dużo symulatorów" if plan.code == "simulator_cap" else "Dev serwer puchnie"
+            janitor.notify(title, f"{unit.label}: {plan.reason}")
+        return True
+    if plan.action == "shutdown":
+        return shutdown_simulator(cfg, plan, world, state)
+    if getattr(unit, "idle_sim_clients", None) and frontmost_bundle() == SIMULATOR_APP:
+        # Metro z aplikacją w symulatorze: patrzysz na Simulator, więc może na nią
+        held_back(state, unit.key, now, f"czekam z {plan.action} {unit.label}: patrzysz na Simulator")
+        return False
     if plan.action == "recycle":
         ok, result = recycle(unit, world, state)
         if not ok and getattr(unit, "killed", False):
@@ -1521,6 +1910,7 @@ def execute(cfg, plan, world, state):
             else "Strażnik: zatrzymany dev serwer"
         )
         janitor.notify(title, f"{unit.label} ({size}): {plan.reason}")
+    return True
 
 
 def check_pending(world, state):
@@ -1590,8 +1980,7 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
         and now - state.get("last_action", 0) >= cfg["cooldown_seconds"]
     ):
         plan = plans[0]
-        execute(cfg, plan, world, state)
-        if plan.action != "warn":
+        if execute(cfg, plan, world, state) is not False and plan.action != "warn":
             state["last_action"] = now
             # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
             state["swap_history"] = []
@@ -1634,6 +2023,8 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
         "total": sum(u.footprint for u in world.units),
         "orca": world.orca is not None,
         "units": [u.summary() for u in sorted(world.units, key=lambda u: -u.footprint)],
+        "simulators": [s.summary() for s in getattr(world, "simulators", [])],
+        "simulator_cap": cfg["max_booted_simulators"],
         "plans": [p.summary() for p in plans],
         "acted": acted.summary() if acted else None,
         "last_resort": reaped,
@@ -1792,6 +2183,35 @@ def print_status(snap):
             print(f"    -> {verb}: {plan['reason']}")
     if not snap["units"]:
         print("  (żaden dev serwer nie działa)")
+    sims = snap.get("simulators")
+    if sims is None:
+        return
+    print(
+        f"\nSymulatory: {len(sims)} włączone ({h(sum(s['footprint'] for s in sims))})"
+        f", limit {snap.get('simulator_cap') or 'brak'}"
+    )
+    for s in sims:
+        who = []
+        if s["lease_alive"]:
+            who.append(f"dzierżawa {s.get('lease_app') or '?'}")
+        elif s.get("lease_app"):
+            who.append("dzierżawa po martwej sesji")
+        if s["watchers"]:
+            who.append(f"ogląda {len(s['watchers'])} proc.")
+        if not s["pool"]:
+            who.append("Twój")
+        if s["protected"]:
+            who.append("chroniony")
+        print(
+            f"\n  {s['name']}  {h(s['footprint'])}  cisza {s['quiet'] // 60}:{s['quiet'] % 60:02d}"
+            f"  {', '.join(who) or 'nieużywany'}"
+        )
+        plan = plans.get(s["key"])
+        if plan:
+            print(f"    -> wyłączę: {plan['reason']}")
+    group = plans.get("simulators")
+    if group:
+        print(f"    -> ostrzegę: {group['reason']}")
 
 
 # ---------- przypięcia ----------
