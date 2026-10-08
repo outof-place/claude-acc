@@ -37,6 +37,7 @@ struct ClaudeAccApp: App {
         var sched: SchedState?
         var depot: DepotRuns?
         var updates: UpdatesState?
+        var desktop: DesktopPanel?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
             output = CLIResult(status: text.isEmpty ? 1 : 0, stdout: text, stderr: "no file \(snapshotFile)")
@@ -66,6 +67,9 @@ struct ClaudeAccApp: App {
             if let data = try? Data(contentsOf: folder.appending(path: "demo-perf.json")) {
                 ultra = Store.decode(PerfFile.self, from: data)?.ultra
             }
+            if let data = try? Data(contentsOf: folder.appending(path: "demo-desktop.json")) {
+                desktop = Store.decode(DesktopPanel.self, from: data)
+            }
         } else {
             output = CLI.runBlocking(CLI.process(["status", "--json"]))
         }
@@ -73,7 +77,7 @@ struct ClaudeAccApp: App {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, depot: depot, updates: updates)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, depot: depot, updates: updates, desktop: desktop)
         store.previewOpenAccount = open
         store.previewHoverAccount = hover
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
