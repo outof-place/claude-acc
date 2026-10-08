@@ -25,6 +25,8 @@ struct Snapshot: Decodable {
     /// Whether accounts below the switch threshold get used up when none has headroom
     /// (`claude-acc drain on|off`). Missing from scripts before 1.12.
     let drain: Bool?
+    /// The API credits pool (credits.py); nil with no account registered and in older scripts.
+    let credits: CreditsSummary?
     let accounts: [Account]
 
     var active: Account? { accounts.first { $0.active } }
@@ -34,6 +36,25 @@ struct Snapshot: Decodable {
         others.compactMap { account in account.queue.map { (account, $0) } }.min { $0.1 < $1.1 }?.0
     }
     var anyNeedsLogin: Bool { accounts.contains { $0.status == .needsLogin } }
+}
+
+/// Monthly API credits of the Max plans, pooled across their Console organizations. The numbers
+/// are the Console reading (`credits balance`) minus spend callers reported since, so they are
+/// an estimate between readings; `checkedAt` is the oldest reading behind the total.
+struct CreditsSummary: Decodable {
+    let totalRemainingUsd: Double
+    let grantedUsd: Double
+    let linked: Int
+    let pending: Int
+    let error: Int
+    /// Remaining per scope: "own", and one per client whose plan pays only for that client's work.
+    let byScope: [String: Double]
+    /// The soonest cycle end that still has credit on it, and how much expires then.
+    let nextExpiryAt: Double?
+    let nextExpiryUsd: Double?
+    let checkedAt: Double?
+
+    var spentFraction: Double { grantedUsd > 0 ? max(0, min(1, 1 - totalRemainingUsd / grantedUsd)) : 0 }
 }
 
 /// `pause.json` as the script writes it; the hooks in Claude Code sessions read the same file.
