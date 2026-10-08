@@ -297,6 +297,63 @@ class Mcp(unittest.TestCase):
         self.assertEqual(by_id[4]["result"]["content"][0]["text"], "Pressed Return.")
 
 
+class AgentPermissions(unittest.TestCase):
+    """Zgody TCC pomocnika należą do aplikacji, pod którą biegnie (Orca dla agentów, Claude Acc dla
+    panelu). Błąd, który łapią: karta Desktop i podpowiedź mówią „off”, choć brama u agentów działa."""
+
+    GRANTED = {"ok": True, "ax": True, "screen": True, "post": True}
+    MENU = {"ok": True, "ax": False, "screen": False, "post": False}
+
+    def setUp(self):
+        try:
+            os.remove(desktop.panel_path())
+        except OSError:
+            pass
+
+    def publish(self, pr, host):
+        out = desktop.panel_dict(pr=pr, host=host)
+        desktop.write_json(desktop.panel_path(), out)
+        return out
+
+    def test_menu_bar_check_keeps_what_the_agent_saw(self):
+        self.publish(self.GRANTED, "Orca")  # `claude-acc desktop status` w terminalu Orki
+        out = self.publish(self.MENU, desktop.MENU_APP)  # odświeżenie z aplikacji paska menu
+        self.assertTrue(out["ax"] and out["screen"])
+        self.assertEqual(out["agent"]["host"], "Orca")
+        self.assertFalse(out["own"]["ax"])
+
+    def test_without_an_agent_check_the_panel_shows_its_own(self):
+        out = self.publish(self.MENU, desktop.MENU_APP)
+        self.assertIsNone(out["agent"])
+        self.assertFalse(out["ax"])
+
+    def test_mcp_call_records_permissions_as_the_agent_gets_them(self):
+        write_config({})
+        self.publish(self.MENU, desktop.MENU_APP)
+        helper = fake_helper()
+        self.addCleanup(helper.close)
+        server = desktop.McpServer(out=__import__("io").StringIO(), helper=helper)
+        from unittest import mock
+
+        with mock.patch.object(desktop, "host_app", return_value="Orca"):
+            server.call_tool("key", {"text": "Return"})
+        with open(desktop.panel_path()) as f:
+            panel = json.load(f)
+        self.assertEqual((panel["ax"], panel["screen"], panel["agent"]["host"]), (True, True, "Orca"))
+
+    def test_host_is_the_outermost_app_not_python_or_a_helper(self):
+        from unittest import mock
+
+        ps = "\n".join([
+            "500 400 /Library/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+            "400 300 /bin/zsh",
+            "300 200 /Applications/Orca.app/Contents/Frameworks/Orca Helper.app/Contents/MacOS/Orca Helper",
+            "200 1 /Applications/Orca.app/Contents/MacOS/Orca",
+        ])
+        with mock.patch.object(desktop.subprocess, "run", return_value=mock.Mock(stdout=ps)):
+            self.assertEqual(desktop.host_app(500), "Orca")
+
+
 class Hint(unittest.TestCase):
     def test_desktop_triggers_pl_and_en(self):
         for text in ("otwórz aplikację Finder", "kliknij w Finderze", "zrób zrzut ekranu",
@@ -308,9 +365,16 @@ class Hint(unittest.TestCase):
             self.assertIsNone(hint.DESKTOP_TRIGGER.search(text), text)
 
     def test_desktop_context_mentions_tools_and_permissions(self):
-        text = hint.desktop_context("otwórz aplikację Finder", {"ax": False, "screen": True})
+        text = hint.desktop_context("otwórz aplikację Finder", {"ax": False, "screen": True,
+                                                               "agent": {"ax": False, "screen": True, "host": "Orca"}})
         self.assertIn("mcp__desktop__", text)
         self.assertIn("doctor", text)
+        self.assertIn("off in Orca", text)
+
+    def test_menu_bar_probe_alone_does_not_tell_agents_permissions_are_off(self):
+        # panel paska menu sprawdza zgody własnej aplikacji; agent w Orce i tak je ma
+        text = hint.desktop_context("otwórz aplikację Finder", {"ax": False, "screen": False, "agent": None})
+        self.assertNotIn("doctor", text)
 
     def test_context_none_without_trigger(self):
         self.assertIsNone(hint.desktop_context("napisz funkcję w pythonie", {}))

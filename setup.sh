@@ -46,6 +46,8 @@ while [ $# -gt 0 ]; do
       # bramki agentów: MCP, skille i hook podpowiedzi (skrzynki, Pęk kluczy i konfiguracja zostają)
       [ -f "$STATE/mail.py" ] && /usr/bin/python3 "$STATE/mail.py" uninstall >/dev/null 2>&1 || true
       [ -f "$STATE/browser.py" ] && /usr/bin/python3 "$STATE/browser.py" uninstall >/dev/null 2>&1 || true
+      # hook schedulera w Codeksie (claude-acc sched codex install), jeśli był
+      [ -f "$STATE/sched.py" ] && /usr/bin/python3 "$STATE/sched.py" codex uninstall >/dev/null 2>&1 || true
       [ -f "$STATE/desktop.py" ] && /usr/bin/python3 "$STATE/desktop.py" uninstall >/dev/null 2>&1 || true
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
@@ -133,6 +135,8 @@ case "$1" in
   guard) shift; exec "$PY" "$RUN" devguard "$@" ;;
   perf) shift; exec "$PY" "$RUN" perf "$@" ;;
   sched) shift; exec "$PY" "$RUN" sched "$@" ;;
+  # ciężka komenda spoza agentów (terminal, skrypt, automatyzacja Orki) przez scheduler pamięci
+  run) shift; exec "$PY" "$RUN" sched run "$@" ;;
   update) shift; exec "$PY" "$RUN" updates run --force "$@" ;;
   updates) shift; exec "$PY" "$RUN" updates "$@" ;;
   mail) shift; exec "$PY" "$RUN" mail "$@" ;;

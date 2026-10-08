@@ -658,6 +658,15 @@ struct DesktopPanel: Decodable {
         var id: String { "\(at)-\(member)" }
     }
 
+    /// Permissions as an agent gets them: TCC grants belong to the app the helper runs under (Orca for
+    /// agents in its terminals), so the menu bar app's own check would show them off.
+    struct Agent: Decodable {
+        let ax: Bool
+        let screen: Bool
+        let host: String?
+        let at: Double
+    }
+
     let error: String?
     let installed: Bool
     let mcpRegistered: Bool
@@ -671,5 +680,6 @@ struct DesktopPanel: Decodable {
     let frontmost: Front?
     let recent: [Call]
     let probeError: String?
+    let agent: Agent?
     // klucze snake_case (mcp_registered, helper_present, probe_error) mapuje .convertFromSnakeCase dekodera
 }

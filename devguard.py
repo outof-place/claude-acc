@@ -41,9 +41,12 @@ Komendy:
                         nie to, poza krytyczną presją
   unpin <:port|katalog|all>   zdejmij przypięcie
   pins                  przypięcia, ich powody i terminy
-  admit                 hook PreToolUse (Bash) dla Claude Code; zdarzenie czyta z stdin
+  admit [--codex]       hook PreToolUse (Bash) dla Claude Code, z --codex dla Codeksa; zdarzenie
+                        czyta z stdin
   room [katalog]        kod 0, gdy pamięć wpuści nowy dev serwer (w tym katalogu), 1 z powodem;
                         warunek dla `claude-acc sched wait`, który odmowa podaje agentowi
+  brake [--stage N] [--within PID] [--json]
+                        hamulec pamięci: stopień teraz i kogo zgasiłby (bez sygnałów)
   words                 słowa, od których komenda idzie do `admit` dalej niż szybka ścieżka,
                         i bramka całych słów, jako JSON {"dev": [...], "sched": [...],
                         "gate": [wzorzec]} dla natywnego claude-acc-hook
@@ -65,6 +68,12 @@ SCHED_WORDS = (
     "go ", "golangci-lint", "make", "govulncheck", "vitest", "jest", "playwright", "next ",
     "tsc", "eslint", "turbo", "pnpm", "npm ", "npx ", "yarn", "bun ", "bunx", "node_modules/.bin/",
     "xcodebuild", "simctl", "pod", "eas", "gradle", "portivo-mobile", "Simulator",
+    # reszta ciężkiej pracy (sched.py, GENERIC_TOOLS i interpretery) i skrypty po ścieżce
+    "cargo", "swift", "docker", "pytest", "py.test", "tox", "nox", "mypy", "pyright",
+    "deno", "bazel", "mvn", "dotnet", "nx ", "lerna", "webpack", "rollup", "parcel",
+    "tsup", "astro", "nuxt", "nuxi", "svelte-check", "cypress", "mocha", "ava ", "lighthouse",
+    "expo", "react-native", "storybook", "just ", "task ", "python", "node ", "tsx", "ts-node",
+    "uv ", "bash ", "sh ", "zsh ", ".sh", "/", "grep",
 )  # fmt: skip
 # Bramka natywnego frontu (claude-acc-hook): komenda idzie do Pythona tylko wtedy, gdy słowo
 # stoi w niej jako całe słowo, a nie kawałek ścieżki albo innego słowa. Scheduler rozpoznaje
@@ -79,6 +88,13 @@ GATE_PROGRAMS = (
     "vitest", "jest", "playwright", "next", "tsc", "vue-tsc", "eslint", "turbo", "vite", "expo",
     "react-native", "xcodebuild", "pod", "pod-install", "eas", "eas-cli", "gradle", "gradlew",
     "portivo-mobile",
+    # ciężka praca spoza Go i JS (sched.GENERIC_TOOLS); swift, docker, uv i interpretery mają
+    # w HOOK_GATE własne kształty, bo jako samo słowo stoją w co trzeciej komendzie agenta
+    "cargo", "pytest", "py.test", "tox", "nox", "mypy",
+    "pyright", "deno", "bazel", "bazelisk", "mvn", "mvnw", "dotnet", "nx",
+    "lerna", "webpack", "rollup", "parcel", "tsup", "astro", "nuxt", "nuxi", "svelte-check",
+    "cypress", "mocha", "ava", "lighthouse", "unlighthouse", "storybook", "just",
+    "task",
 )  # fmt: skip
 # natywne komendy, których nie poznać po samym programie: xcrun i open robią też wiele lekkich
 # rzeczy, a do schedulera idzie tylko start symulatora
@@ -92,9 +108,27 @@ GATE_NATIVE = r"(?<![\w.-])simctl\s+boot|(?<![\w.-])-a\s+[\"']?Simulator(?![\w-]
 # Klucze API organizacji z kredytami (claude-acc-credits) dostaje tylko dziecko `credits exec`
 # albo Claude Code przez apiKeyHelper (`credits helper`), który nie idzie przez narzędzie Bash.
 SECRET_WORDS = ("claude-acc-mail", "claude-acc-browser", "claude-acc-credits", "credits helper", "google-service-account", "dump-keychain", "Safe Storage", "BraveSoftware", "Google/Chrome")
+# przed programem na początku członu: zmienne (także w cudzysłowie) i programy-opakowania
+COMMAND_PREFIX = (
+    r"""(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|\S*)\s+|(?:rtk\s+proxy|time|nice|env|caffeinate|command|exec|nohup)\s+)*"""
+)
 HOOK_GATE = (
     r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
-    r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
+    r"|(?<![\w.-])(?:" + "|".join(p.replace(".", r"\.") for p in GATE_PROGRAMS) + r")(?![\w.-])"
+    # interpretery tylko ze skryptem z pliku albo modułem: `python3 -c`, heredoc, `node -e` i
+    # `--version` nie budzą Pythona (doba komend 08.10: samo słowo python, node i bash to 4400
+    # z 35 tys. komend, a scheduler i tak by je puścił)
+    r"|(?<![\w.-])python[0-9.]*(?![\w.-])[^;&|\n]*?(?:\.py(?![\w.-])|\s-m\s)"
+    r"|(?<![\w.-])(?:node|tsx|ts-node)(?![\w.-])[^;&|\n]*?(?:\.[cm]?[jt]sx?(?![\w.-])|\s--test(?![\w-]))"
+    r"|(?<![\w.-])(?:ba|z)?sh(?![\w.-])(?:\s+-\w+)*\s+['\"]?" + COMMAND_PREFIX + r"[~.\w-]*(?:/[\w.-]|\.sh(?![\w.-]))"
+    r"|(?<![\w.-])docker(?![\w.-])[^;&|\n]*?\sbuild(?![\w.-])"
+    r"|(?<![\w.-])uv\s+run(?![\w.-])"
+    r"|(?<![\w.-])swift\s+(?:build|test|run)(?![\w.-])"
+    # skrypt po ścieżce albo *.sh na początku członu (./scripts/e2e.sh, bin/verify, e2e.sh);
+    # program systemowy po pełnej ścieżce (/usr/bin/git) nie
+    r"|(?:^|[;&|(\n])\s*" + COMMAND_PREFIX + r"(?!/(?:usr|bin|sbin|opt/homebrew|System|Library|Applications)/)[~.\w-]*/[\w.-]"
+    r"|(?:^|[;&|(\n])\s*" + COMMAND_PREFIX + r"[\w.-]+\.sh(?![\w.-])"
+    r"|(?<![\w.-])git(?:\s+-[Cc]\s+\S+)*\s+grep(?![\w.-])"
     r"|" + GATE_NATIVE +
     r"|(?<![\w.-])(?:" + "|".join(SECRET_WORDS) + r")(?![\w.-])"
 )
@@ -257,6 +291,29 @@ def dev_starts(command, cwd):
     return found
 
 
+def command_text(raw):
+    """Wartość "command" z surowego JSON-u zdarzenia, bez dekodowania (ucieczki zostają), bez
+    importów; "" bez komendy. Słowo, którego nie ma w tym tekście, nie ma się skąd wziąć w
+    komendzie, a cwd i ścieżka transkryptu (zawsze ze „/”) zostają poza nim."""
+    i = raw.find('"command"')
+    if i < 0:
+        return ""
+    j = raw.find('"', raw.find(":", i) + 1)
+    if j < 0:
+        return raw[i:]
+    k = j + 1
+    while True:
+        k = raw.find('"', k)
+        if k < 0:
+            return raw[j + 1 :]
+        slashes = 0
+        while raw[k - 1 - slashes] == "\\":
+            slashes += 1
+        if slashes % 2 == 0:
+            return raw[j + 1 : k]
+        k += 1
+
+
 def admit(raw):
     """Hook PreToolUse dla Basha; `raw` to zdarzenie z stdin.
 
@@ -269,7 +326,8 @@ def admit(raw):
     dalej i odpada na wzorcach; do strażnika (devguard_core) trafia tylko komenda, która
     naprawdę stawia dev serwer.
     """
-    if "\\u" not in raw and not any(w in raw for w in DEV_WORDS + SCHED_WORDS + SECRET_WORDS):
+    text = command_text(raw)
+    if "\\u" not in text and not any(w in text for w in DEV_WORDS + SCHED_WORDS + SECRET_WORDS):
         return 0
     import json
 
@@ -302,6 +360,51 @@ def admit(raw):
     return 0
 
 
+# Codex (od 0.15x) ma hooki PreToolUse jak Claude Code, z dwiema różnicami: komenda powłoki
+# przychodzi pod kilkoma nazwami narzędzia (matcher Bash obejmuje też exec_command), a
+# updatedInput działa tylko razem z permissionDecision "allow". Codex z Orki biegnie i tak z
+# --dangerously-bypass-approvals-and-sandbox, więc "allow" niczego tam nie zmienia; przy Codeksie
+# z pytaniem o zgodę owinięta komenda przechodzi bez pytania (README, Scheduler i Codex).
+CODEX_SHELL_TOOLS = ("Bash", "shell", "exec_command", "local_shell", "container.exec", "unified_exec")
+
+
+def admit_codex(raw):
+    """`admit --codex`: zdarzenie Codeksa na kształt Claude Code, a wyjście z updatedInput
+    dostaje permissionDecision "allow", bez którego Codex przepisania nie przyjmie."""
+    import contextlib
+    import io
+    import json
+
+    try:
+        event = json.loads(raw)
+        tool_input = event.get("tool_input") or {}
+        command = tool_input.get("command", tool_input.get("cmd"))
+    except (ValueError, AttributeError):
+        return 0
+    if event.get("tool_name") not in CODEX_SHELL_TOOLS or not command:
+        return 0
+    if isinstance(command, list):
+        import shlex
+
+        # ["bash", "-lc", "komenda"] albo argv
+        command = command[2] if len(command) == 3 and command[1] in ("-c", "-lc") else shlex.join(command)
+    event["tool_name"] = "Bash"
+    event["tool_input"] = dict(tool_input, command=command)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        admit(json.dumps(event))
+    out = buf.getvalue().strip()
+    if not out:
+        return 0
+    data = json.loads(out)
+    spec = data.get("hookSpecificOutput") or {}
+    if "updatedInput" in spec and "permissionDecision" not in spec:
+        spec["permissionDecision"] = "allow"
+        spec["permissionDecisionReason"] = "claude-acc: memory scheduler"
+    print(json.dumps(data))
+    return 0
+
+
 def core():
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import devguard_core
@@ -312,7 +415,8 @@ def core():
 def main(argv):
     if argv[:1] == ["admit"]:
         try:
-            return admit(sys.stdin.read())
+            raw = sys.stdin.read()
+            return admit_codex(raw) if "--codex" in argv else admit(raw)
         except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
             return 0
     if argv[:1] == ["words"]:
