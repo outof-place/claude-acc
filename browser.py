@@ -56,6 +56,7 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 
 import mcpbase
 
@@ -112,11 +113,18 @@ DEFAULT_SITES = {
     )
 }
 IDLE_MINUTES = 20
+# karty żywej sesji agenta (przerwa na build, testy) przetrzymują tyle razy dłuższą ciszę, zanim demon się rozłączy
+LIVE_TABS_IDLE_FACTOR = 6
 APPROVE_TIMEOUT = 90
 VIEWPORT = (1280, 860)
 SNAPSHOT_CHARS = 24000
 READ_CHARS = 30000
 RECENT = 12
+
+
+# do Pythona 3.10 socket.timeout, a do 3.11 TimeoutError z concurrent.futures to osobne klasy niż
+# wbudowany TimeoutError; Python z Xcode (3.9) to nadal awaryjny interpreter instalacji
+TIMEOUTS = (TimeoutError, socket.timeout, FutureTimeout)
 
 
 class BrowserError(Exception):
@@ -182,7 +190,7 @@ class Ws:
                         "przeglądarka zamknęła połączenie (odmowa albo Cancel w oknie zgody)"
                     )
                 head += chunk
-        except TimeoutError:
+        except TIMEOUTS:
             sock.close()
             raise WsClosed("brak zgody w oknie 'Allow remote debugging?'")
         head, rest = head.split(b"\r\n\r\n", 1)
@@ -318,7 +326,7 @@ class Cdp:
     def result(fut, timeout=30):
         try:
             resp = fut.result(timeout=timeout)
-        except TimeoutError:
+        except TIMEOUTS:
             raise CdpError(f"{getattr(fut, 'method', '?')}: brak odpowiedzi przez {timeout} s")
         if "error" in resp:
             raise CdpError(f"{getattr(fut, 'method', '?')}: {resp['error'].get('message')}")
@@ -888,6 +896,8 @@ KEY_ALIASES = {
 }  # fmt: skip
 MODIFIERS = {"alt": 1, "option": 1, "opt": 1, "ctrl": 2, "control": 2, "meta": 4, "cmd": 4, "command": 4,
              "super": 4, "win": 4, "shift": 8}  # fmt: skip
+# bit modyfikatora z CDP -> (key, code, windowsVirtualKeyCode) jego własnego klawisza
+MODIFIER_KEYS = {1: ("Alt", "AltLeft", 18), 2: ("Control", "ControlLeft", 17), 4: ("Meta", "MetaLeft", 91), 8: ("Shift", "ShiftLeft", 16)}
 EDIT_COMMANDS = {"a": "selectAll", "c": "copy", "x": "cut", "v": "paste", "z": "undo", "y": "redo"}
 BUTTONS = {"left": 1, "right": 2, "middle": 4}
 ACT_MEMBERS = {
@@ -1004,6 +1014,16 @@ def one_line(text):
     return " ".join(_INVISIBLE.sub(" ", str(text or "")).replace("\u2028", " ").replace("\u2029", " ").split())
 
 
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # cudzy proces (EPERM) też żyje
+    return True
+
+
 def is_sensitive(path):
     real = os.path.realpath(path)
     return any(real == os.path.join(HOME, p) or real.startswith(os.path.join(HOME, p) + os.sep) for p in SENSITIVE)
@@ -1023,6 +1043,7 @@ class Hub:
         self.counter = 0
         self.lock = threading.RLock()
         self.clients = {}  # właściciel -> {"client", "persistent", "connected", "gone_at", "browser"}
+        self.owner_pids = {}  # właściciel z wiersza poleceń -> {"pid": proces sesji agenta, "dead_at"}
         self.recent = []
         self.activity = time.time()
         self.busy = 0
@@ -1471,37 +1492,65 @@ class Hub:
                                                                 "clickCount": n, "modifiers": mods})  # fmt: skip
 
     def key_event(self, c, tab, chord, down=True, up=True):
+        """Klawisz albo akord jak z prawdziwej klawiatury: modyfikatory wciśnięte przed klawiszem i puszczone
+        po nim, każdy jako własne zdarzenie; sam modyfikator ("shift" w hold_key) też jest klawiszem."""
         parts = [p for p in str(chord).split("+") if p != ""] or [str(chord)]
         if chord.endswith("++"):
             parts = parts + ["+"]
-        name, mods = parts[-1], 0
+        held = []
         for m in parts[:-1]:
             if m.lower() not in MODIFIERS:
                 raise BrowserError(f"Unknown modifier {m!r} in {chord!r}: use ctrl, shift, alt or cmd.")
-            mods |= MODIFIERS[m.lower()]
+            held.append(MODIFIERS[m.lower()])
+        name = parts[-1]
+        main = None
+        if name.lower() in MODIFIERS:
+            held.append(MODIFIERS[name.lower()])
+        else:
+            main = self.key_spec(name)
+        held = list(dict.fromkeys(held))
+        mods = 0
+        for bit in held:
+            mods |= bit
+        if down:
+            pressed = 0
+            for bit in held:
+                pressed |= bit
+                key, code, vk = MODIFIER_KEYS[bit]
+                self.input(c, tab, "Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": pressed})
+        if main is not None:
+            key, code, vk, text = main
+            if mods & 7:
+                text = None
+            elif mods & 8 and text and text.isalpha():
+                text = text.upper()
+            if down:
+                event = {"type": "keyDown" if text else "rawKeyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": mods}
+                if text:
+                    event.update({"text": text, "unmodifiedText": text})
+                if mods & 6 and key.lower() in EDIT_COMMANDS:  # ctrl+a działa jak cmd+a także na macOS
+                    event["commands"] = [EDIT_COMMANDS[key.lower()]]
+                self.input(c, tab, "Input.dispatchKeyEvent", event)
+            if up:
+                self.input(c, tab, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": mods})
+        if up:
+            for bit in reversed(held):
+                mods &= ~bit
+                key, code, vk = MODIFIER_KEYS[bit]
+                self.input(c, tab, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": mods})
+
+    @staticmethod
+    def key_spec(name):
+        """(key, code, windowsVirtualKeyCode, text) klawisza, który nie jest modyfikatorem."""
         canonical = KEY_ALIASES.get(name.lower(), name)
         if canonical in KEYS:
             vk, text = KEYS[canonical]
-            key, code = (" " if canonical == "Space" else canonical), canonical
-        elif len(name) == 1:
-            key = text = name
+            return (" " if canonical == "Space" else canonical), canonical, vk, text
+        if len(name) == 1:
             vk = ord(name.upper()) if name.isalnum() else ord(name)
             code = f"Key{name.upper()}" if name.isalpha() else (f"Digit{name}" if name.isdigit() else "")
-        else:
-            raise BrowserError(f"Unknown key {name!r}: a key name such as Enter, Tab, Escape, ArrowDown, PageDown, F5, or one character.")
-        if mods & 7:
-            text = None
-        elif mods & 8 and text and text.isalpha():
-            text = text.upper()
-        if down:
-            event = {"type": "keyDown" if text else "rawKeyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": mods}
-            if text:
-                event.update({"text": text, "unmodifiedText": text})
-            if mods & 6 and key.lower() in EDIT_COMMANDS:  # ctrl+a działa jak cmd+a także na macOS
-                event["commands"] = [EDIT_COMMANDS[key.lower()]]
-            self.input(c, tab, "Input.dispatchKeyEvent", event)
-        if up:
-            self.input(c, tab, "Input.dispatchKeyEvent", {"type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": mods})
+            return name, code, vk, name
+        raise BrowserError(f"Unknown key {name!r}: a key name such as Enter, Tab, Escape, ArrowDown, PageDown, F5, shift, or one character.")
 
     def evaluate(self, c, tab, expression, await_promise=False):
         res = c.cdp.call(
@@ -1545,16 +1594,20 @@ class Hub:
         return r.run(tab.session, root), r.entries
 
     def visible_nodes(self, c, tab):
-        """backendNodeId wszystkiego, co leży w oknie strony (jeden zrzut układu zamiast pytania o każdy węzeł)."""
+        """backendNodeId wszystkiego, co leży w oknie strony (jeden zrzut układu zamiast pytania o każdy węzeł).
+        Prostokąty zrzutu są w pikselach urządzenia (ekran Retina: 2 na piksel CSS, także przy emulowanej
+        skali 1), a okno strony w pikselach CSS; skala to stosunek szerokości treści w jednych i drugich."""
         snap = c.cdp.call("DOMSnapshot.captureSnapshot", {"computedStyles": []}, session=tab.session, timeout=20)
-        vv, _ = self.viewport(c, tab)
-        x0, y0 = vv["pageX"], vv["pageY"]
-        x1, y1 = x0 + vv["clientWidth"], y0 + vv["clientHeight"]
+        vv, metrics = self.viewport(c, tab)
         out = set()
         docs = snap.get("documents") or []
         if not docs:
             return out
         doc = docs[0]
+        css_width = (metrics.get("cssContentSize") or {}).get("width") or 0
+        scale = doc["contentWidth"] / css_width if doc.get("contentWidth") and css_width else 1.0
+        x0, y0 = vv["pageX"] * scale, vv["pageY"] * scale
+        x1, y1 = x0 + vv["clientWidth"] * scale, y0 + vv["clientHeight"] * scale
         backend = doc["nodes"]["backendNodeId"]
         layout = doc["layout"]
         for index, (bx, by, bw, bh) in zip(layout["nodeIndex"], layout["bounds"]):
@@ -2067,11 +2120,13 @@ class Hub:
             log(f"{c.name}: rozłączony przez bramkę")
         self.publish()
 
-    def client_seen(self, owner, client, persistent, browser=None):
+    def client_seen(self, owner, client, persistent, browser=None, pid=None):
         with self.lock:
             self.clients[owner] = {"client": client, "persistent": persistent, "connected": True, "gone_at": None}
             if browser in BROWSERS:
                 self.agent(owner).browser = browser
+            if isinstance(pid, int) and pid > 1:
+                self.owner_pids[owner] = {"pid": pid, "dead_at": None}
 
     def client_gone(self, owner):
         with self.lock:
@@ -2089,17 +2144,31 @@ class Hub:
         cfg = self.cfg_loader()
         with self.lock:
             gone = [o for o, e in self.clients.items() if not e["connected"] and now - e["gone_at"] > GRACE]
+            # wywołania z wiersza nie trzymają połączenia: ich sesja kończy się ze śmiercią procesu agenta
+            for owner, entry in list(self.owner_pids.items()):
+                if pid_alive(entry["pid"]):
+                    entry["dead_at"] = None
+                    continue
+                entry["dead_at"] = entry["dead_at"] or now
+                if now - entry["dead_at"] > GRACE:
+                    self.owner_pids.pop(owner, None)
+                    if not (self.clients.get(owner) or {}).get("connected"):
+                        gone.append(owner)
             for owner in gone:
                 self.clients.pop(owner, None)
                 self.agents.pop(owner, None)
             orphans = [t for t in self.tabs.values() if t.owner in gone and not t.handed]
-            idle = self.busy == 0 and now - self.activity > cfg["idle_minutes"] * 60
+            quiet, limit = now - self.activity, cfg["idle_minutes"] * 60
+            sessions = {o for o, e in self.clients.items() if e["connected"] and e["persistent"]}
+            sessions |= {o for o, e in self.owner_pids.items() if e["dead_at"] is None}
+            held = any(t.owner in sessions and not t.handed for t in self.tabs.values())
+            idle = self.busy == 0 and quiet > limit * (LIVE_TABS_IDLE_FACTOR if held else 1)
         for tab in orphans:
             self.release(self.conns[tab.browser], tab)
         if orphans:
             self.publish()
         if idle and any(c.live for c in self.conns.values()):
-            log(f"bezczynność {cfg['idle_minutes']} min: rozłączam")
+            log(f"bezczynność {quiet / 60:.0f} min: rozłączam")
             self.disconnect()
         live = any(c.live for c in self.conns.values()) or any(e["connected"] for e in self.clients.values())
         if live:
@@ -2297,7 +2366,7 @@ class HubServer:
         while not self.hub.stop.is_set():
             try:
                 conn, _ = srv.accept()
-            except TimeoutError:
+            except TIMEOUTS:  # przed OSError: w 3.9 socket.timeout to OSError i pętla by się skończyła
                 continue
             except OSError:
                 break
@@ -2340,7 +2409,7 @@ class HubServer:
         try:
             hello = json.loads(rfile.readline() or b"{}")
             owner = str(hello.get("owner") or "cli")
-            self.hub.client_seen(owner, hello.get("client"), bool(hello.get("persistent")), hello.get("browser"))
+            self.hub.client_seen(owner, hello.get("client"), bool(hello.get("persistent")), hello.get("browser"), hello.get("pid"))
             for line in rfile:
                 try:
                     req = json.loads(line)
@@ -2362,8 +2431,8 @@ class HubServer:
 class HubClient:
     """Rozmowa z demonem; pierwszy klient, który go nie zastanie, uruchamia go w tle."""
 
-    def __init__(self, owner, client, persistent, browser=None):
-        self.owner, self.client, self.persistent, self.browser = owner, client, persistent, browser
+    def __init__(self, owner, client, persistent, browser=None, pid=None):
+        self.owner, self.client, self.persistent, self.browser, self.pid = owner, client, persistent, browser, pid
         self.sock = None
         self.lock = threading.Lock()
         self.pending = {}
@@ -2384,7 +2453,7 @@ class HubClient:
                 time.sleep(0.1)
         else:
             raise BrowserError(f"demon przeglądarki nie wstał: {os.path.join(BROWSER_DIR, 'hub.log')}")
-        hello = {"owner": self.owner, "client": self.client, "persistent": self.persistent, "browser": self.browser}
+        hello = {"owner": self.owner, "client": self.client, "persistent": self.persistent, "browser": self.browser, "pid": self.pid}
         s.sendall((json.dumps(hello) + "\n").encode())
         self.sock = s
         threading.Thread(target=self._reader, args=(s,), daemon=True).start()
@@ -2417,7 +2486,7 @@ class HubClient:
         try:
             sock.sendall((json.dumps({"id": rid, "op": op, "args": args or {}}, ensure_ascii=False) + "\n").encode())
             resp = fut.result(timeout=timeout)
-        except (OSError, TimeoutError) as exc:
+        except (OSError,) + TIMEOUTS as exc:
             self.pending.pop(rid, None)
             raise BrowserError(f"demon przeglądarki: {exc or type(exc).__name__}")
         if not resp.get("ok"):
@@ -2425,9 +2494,18 @@ class HubClient:
         return resp.get("result") or {}
 
     def close(self):
-        if self.sock is not None:
+        """Koniec rozmowy także dla demona: sam close() gniazda nie zamyka deskryptora, póki wątek
+        czytający trzyma makefile(), więc demon uważałby sesję (driver SDK) za wciąż połączoną.
+        Gniazdo zdejmujemy pod blokadą: po shutdown() wątek czytający dostaje EOF i sam zeruje self.sock."""
+        with self.lock:
+            sock, self.sock = self.sock, None
+        if sock is not None:
             try:
-                self.sock.close()
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
             except OSError:
                 pass
 
@@ -2863,6 +2941,35 @@ def cmd_config(cmd, args):
     return 0
 
 
+# sesja agenta, z której przyszło wywołanie z wiersza: zmienna i przedrostek właściciela, od najdokładniejszej
+CLI_SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), ("ORCA_TERMINAL_HANDLE", "orca"), ("TERM_SESSION_ID", "term"))
+
+
+def cli_owner(env=None):
+    """Właściciel kart wywołań `claude-acc browser <członek>`. Każde wywołanie to osobny proces, więc sesję
+    bierze ze środowiska: Claude Code (CLAUDE_CODE_SESSION_ID), terminal Orca, okno terminala. Bez tego
+    dwa agenty dzieliłyby karty: navigate jednego trafiałby w kartę drugiego, a close_tab ją zamykał."""
+    env = os.environ if env is None else env
+    if env.get("CLAUDE_ACC_BROWSER_OWNER"):
+        return env["CLAUDE_ACC_BROWSER_OWNER"]
+    for var, prefix in CLI_SESSION_VARS:
+        if env.get(var):
+            return f"cli:{prefix}:{env[var]}"
+    return "cli"
+
+
+def cli_pid(env=None):
+    """Proces sesji Claude Code (CLAUDE_PID): gdy zniknie, demon zamyka karty tej sesji jak po MCP."""
+    env = os.environ if env is None else env
+    if env.get("CLAUDE_ACC_BROWSER_OWNER") or not env.get("CLAUDE_CODE_SESSION_ID"):
+        return None
+    try:
+        pid = int(env.get("CLAUDE_PID") or 0)
+    except ValueError:
+        return None
+    return pid if pid > 1 else None
+
+
 def cli_member(cmd, args):
     """`claude-acc browser <członek> [JSON]`: to samo wejście co w toolsecie; zrzut ląduje w pliku."""
     out_file = flag(args, "--out")
@@ -2873,8 +2980,7 @@ def cli_member(cmd, args):
         print(f"błąd: wejście to JSON członka toolsetu, np. '{{\"url\": \"example.com\"}}': {exc}", file=sys.stderr)
         return 2
     browser = os.environ.get("CLAUDE_ACC_BROWSER")
-    client = HubClient(os.environ.get("CLAUDE_ACC_BROWSER_OWNER") or "cli", "cli:" + os.environ.get("USER", "?"), False,
-                       browser if browser in BROWSERS else None)  # fmt: skip
+    client = HubClient(cli_owner(), "cli:" + os.environ.get("USER", "?"), False, browser if browser in BROWSERS else None, pid=cli_pid())
     try:
         reply = client.call(cmd, params, timeout=APPROVE_TIMEOUT + 240)
     finally:
