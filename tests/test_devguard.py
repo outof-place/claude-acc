@@ -14,6 +14,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -69,10 +70,37 @@ def unit(key, fp_gb=1.0, cwd=None, **attrs):
     return u
 
 
-def world(*units, level=0, reasons=(), fsevents_restart=0):
+def world(*units, level=0, reasons=(), fsevents_restart=0, simulators=()):
     pressure = types.SimpleNamespace(level=level, ram=48 * GB, reasons=list(reasons))
     return types.SimpleNamespace(
-        now=NOW, pressure=pressure, units=list(units), fsevents_restart=fsevents_restart
+        now=NOW, pressure=pressure, units=list(units), fsevents_restart=fsevents_restart,
+        simulators=list(simulators),
+    )
+
+
+def sim(udid, fp_gb=2.0, name=None, lease=None, watched=False, quiet=3600, age=3600):
+    """Symulator tak, jak widzi go `decide`: domyślnie z puli, bez dzierżawy, cichy od godziny."""
+    name = name or f"Portivo-{udid}"
+    pool = name.startswith("Portivo-")
+    return types.SimpleNamespace(
+        key=f"sim:{udid}",
+        udid=udid,
+        name=name,
+        label=f"symulator {name}",
+        app_key=f"sim:{udid}",
+        footprint=fp_gb * GB,
+        pool=pool,
+        lease=lease,
+        lease_alive=lease == "alive",
+        watched=watched,
+        in_use=lease == "alive" or watched or not pool,
+        quiet=quiet,
+        age=age,
+        protected=False,
+        ports=[],
+        pids=[],
+        argv=None,
+        launch_cwd="",
     )
 
 
@@ -176,6 +204,28 @@ class DecideTest(unittest.TestCase):
 
 PIN_KEEP = {"target": ":3747", "level": "keep", "until": None, "reason": "film"}
 PIN_HOLD = {"target": ":3747", "level": "hold", "until": None, "reason": "film"}
+
+
+class RegrowTest(unittest.TestCase):
+    """Ile stos może jeszcze urosnąć: każdy proces do swojego szczytu. Scheduler trzyma na to
+    miejsce, więc niedoszacowanie oznacza wpuszczenie roboty, która potem wypycha serwery do swapu."""
+
+    def test_each_process_can_grow_back_to_its_own_peak(self):
+        stats = {
+            1: {"footprint": 2 * GB, "peak": 5 * GB},  # turbopack po odśnieżeniu cache
+            2: {"footprint": 1 * GB, "peak": 1 * GB},
+            3: {"footprint": GB // 2, "peak": 3 * GB},  # worker, który spuchł przy buildzie trasy
+        }
+        fake = lambda pid: dict(stats[pid], cpu=0.0, written=0, start=NOW) if pid in stats else None
+        table = {1: (99, "pnpm dev"), 99: (1, "-zsh")}
+        with mock.patch.object(dg, "usage", fake), mock.patch.object(dg, "proc_cwd", lambda pid: "/w/app"), \
+                mock.patch.object(dg, "proc_argv", lambda pid: ["pnpm", "dev"]):
+            server = dg.Server(1, "next", "next dev", [1, 2, 3])
+            # 3 GB pierwszego i 2,5 GB trzeciego; sam szczyt największego minus suma dałby 1,5 GB
+            self.assertEqual(server.regrow, 5.5 * GB)
+            other = dg.Server(2, "next", "next dev", [2])
+            stack = dg.Unit(1, [server, other], table, {1: [2, 3]})
+        self.assertEqual(stack.summary()["regrow"], 5.5 * GB)
 
 
 class PinTest(unittest.TestCase):
@@ -315,6 +365,280 @@ class FseventsRestartTest(unittest.TestCase):
         self.assertEqual(plans(world(unit("old", started=NOW - 600, quiet=0))), [])
 
 
+UDID = "BF23E1F4-BE16-45DA-A285-F01B892F4116"
+SIM_APP = f"/Users/x/Library/Developer/CoreSimulator/Devices/{UDID}/data/Containers/Bundle/Application/7A/Shop.app/Shop"
+
+
+class SimulatorTest(unittest.TestCase):
+    """Symulatory: najwyżej `max_booted_simulators` włączonych naraz, a nieużywane wracają do
+    Shutdown. Pomyłki, które ten test łapie: wyłączenie symulatora sesji, która żyje (dzierżawa
+    portivo-mobile); symulatora, na który ktoś patrzy (serve-sim, maestro z jego UDID) albo
+    człowieka spoza puli Portivo-*; świeżo włączonego; i symulatory po 2-4 GB, które zostają
+    włączone na zawsze po skończonych sesjach (2026-10-08: kilka naraz obok buildu iOS)."""
+
+    def test_over_cap_shuts_down_the_idlest_unused_pool_simulator(self):
+        sims = [sim("A", lease="alive", quiet=10), sim("B", quiet=20 * 60), sim("C", lease="dead", quiet=8 * 60)]
+        self.assertEqual(plans(world(simulators=sims))[0], ("sim:B", "shutdown"))
+
+    def test_sessions_watchers_people_and_young_ones_keep_their_simulators(self):
+        sims = [
+            sim("A", lease="alive"),
+            sim("B", watched=True),
+            sim("C", name="iPhone 17 Pro"),
+            sim("D", age=30, quiet=30),
+        ]
+        got = plans(world(simulators=sims))
+        self.assertEqual([action for _key, action in got], ["warn"])  # ponad limit, nie ma czego wyłączyć
+
+    def test_unused_simulator_goes_after_the_idle_time_even_under_the_cap(self):
+        self.assertEqual(plans(world(simulators=[sim("A", quiet=40 * 60)])), [("sim:A", "shutdown")])
+        self.assertEqual(
+            plans(world(simulators=[sim("A", lease="dead", quiet=40 * 60)])), [("sim:A", "shutdown")]
+        )
+        self.assertEqual(plans(world(simulators=[sim("A", quiet=10 * 60)])), [])
+        self.assertEqual(plans(world(simulators=[sim("A", lease="alive", quiet=5 * 3600)])), [])
+        self.assertEqual(plans(world(simulators=[sim("A", name="iPhone 17", quiet=5 * 3600)])), [])
+
+    def test_cap_and_idle_time_come_from_the_config(self):
+        sims = [sim("A", lease="alive"), sim("B", quiet=6 * 60)]
+        self.assertEqual(plans(world(simulators=sims)), [])  # 2 przy limicie 2
+        self.assertEqual(plans(world(simulators=sims), max_booted_simulators=1), [("sim:B", "shutdown")])
+        self.assertEqual(
+            plans(world(simulators=[sim("A", quiet=6 * 60)]), simulator_idle_minutes=5),
+            [("sim:A", "shutdown")],
+        )
+
+    def test_lease_is_alive_only_while_its_session_process_is(self):
+        lstart = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True, text=True
+        ).stdout.strip()
+        self.assertTrue(dg.lease_alive({"owner": {"pid": os.getpid(), "start": lstart}}))
+        self.assertTrue(dg.lease_alive({"owner": {"pid": os.getpid(), "start": ""}}))
+        self.assertFalse(dg.lease_alive({"owner": {"pid": os.getpid(), "start": "Mon Jan  1 00:00:00 2001"}}))
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.assertFalse(dg.lease_alive({"owner": {"pid": gone.pid, "start": ""}}))
+        self.assertFalse(dg.lease_alive(None))
+
+    def test_booted_simulators_come_from_the_process_table(self):
+        import plistlib
+
+        root = os.path.realpath(tempfile.mkdtemp(prefix="devguard-sims-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        devices, leases = os.path.join(root, "Devices"), os.path.join(root, "leases")
+        os.makedirs(os.path.join(devices, UDID))
+        os.makedirs(leases)
+        with open(os.path.join(devices, UDID, "device.plist"), "wb") as f:
+            plistlib.dump({"name": "Portivo-Auto-1", "UDID": UDID}, f)
+        with open(os.path.join(leases, UDID + ".json"), "w") as f:
+            json.dump({"owner": {"pid": os.getpid(), "start": ""}, "app": "storefront-mobile"}, f)
+        runtime = "/Library/Developer/CoreSimulator/Volumes/iOS_23A343/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.0.simruntime/Contents/Resources/RuntimeRoot"
+        rows = [
+            (100, 1, f"{runtime}/sbin/launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/{UDID}/data/var/run/launchd_bootstrap.plist"),
+            (101, 100, f"{runtime}/System/Library/CoreServices/SpringBoard.app/SpringBoard"),
+            (102, 100, SIM_APP),
+            (200, 1, f"/opt/homebrew/bin/serve-sim --device {UDID}"),
+            (300, 1, "/bin/zsh -l"),
+        ]
+        with mock.patch.object(dg, "SIM_DEVICES", devices):
+            found = dg.discover_simulators(cfg(simulator_leases=leases), rows)
+        self.assertEqual(len(found), 1)
+        s = found[0]
+        self.assertEqual((s.udid, s.name, s.pool), (UDID, "Portivo-Auto-1", True))
+        self.assertEqual(sorted(s.pids), [100, 101, 102])
+        self.assertEqual(s.watchers, [200])
+        self.assertTrue(s.lease_alive and s.watched and s.in_use)
+
+    def discover(self, rows, names, leases=None, **extra):
+        import plistlib
+
+        root = os.path.realpath(tempfile.mkdtemp(prefix="devguard-sims-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        devices, lease_dir = os.path.join(root, "Devices"), os.path.join(root, "leases")
+        os.makedirs(lease_dir)
+        for udid, name in names.items():
+            os.makedirs(os.path.join(devices, udid))
+            with open(os.path.join(devices, udid, "device.plist"), "wb") as f:
+                plistlib.dump({"name": name, "UDID": udid}, f)
+        for udid, lease in (leases or {}).items():
+            with open(os.path.join(lease_dir, udid + ".json"), "w") as f:
+                json.dump(lease, f)
+        with mock.patch.object(dg, "SIM_DEVICES", devices):
+            return {s.udid: s for s in dg.discover_simulators(cfg(simulator_leases=lease_dir, **extra), rows)}
+
+    def test_who_uses_a_simulator(self):
+        """Nikt nie trzyma i nikt nie patrzy: tylko wtedy symulator z puli jest nieużywany. Twój
+        (spoza puli) i chroniony w configu zawsze są w użyciu; serve-sim bez UDID i `simctl ...
+        booted` patrzą na każdy włączony."""
+        other = "0F6A3C2B-1111-4222-8333-944455556666"
+        names = {UDID: "Portivo-Auto-1", other: "iPhone 17 Pro"}
+        rows = [
+            (100, 1, f"launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/{UDID}/data/var/run/launchd_bootstrap.plist"),
+            (110, 1, f"launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/{other}/data/var/run/launchd_bootstrap.plist"),
+            (300, 1, "/bin/zsh -l"),
+        ]
+        found = self.discover(rows, names)
+        self.assertFalse(found[UDID].in_use)
+        self.assertTrue(found[other].in_use)
+        self.assertTrue(self.discover(rows, names, simulator_protect=["Portivo-Auto-1"])[UDID].in_use)
+        for viewer in ("/opt/homebrew/bin/serve-sim", "xcrun simctl io booted recordVideo /tmp/a.mov"):
+            found = self.discover(rows + [(400, 1, viewer)], names)
+            self.assertEqual(found[UDID].watchers, [400], viewer)
+            self.assertTrue(found[UDID].in_use, viewer)
+
+    def test_performance_simulators_are_never_shut_down(self):
+        """Portivo-Perf-* to symulatory sesji, które mierzą wydajność aplikacji iOS: bez dzierżawy
+        i długo bez ruchu między pomiarami. Domyślny config chroni każdy taki (wzorzec, nie jedna
+        nazwa), także po godzinach ciszy, ponad limitem i przy braku pamięci; zwykły symulator puli
+        obok dalej idzie."""
+        perf, ipad, auto = UDID, "0F6A3C2B-1111-4222-8333-944455556666", "6B1D2E3F-AAAA-4BBB-8CCC-DDDDEEEEFFFF"
+        names = {perf: "Portivo-Perf-iPhone", ipad: "Portivo-Perf-iPad-Pro", auto: "Portivo-Auto-1"}
+        rows = [
+            (100 + i, 1, f"launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/{u}/data/var/run/launchd_bootstrap.plist")
+            for i, u in enumerate(names)
+        ]
+        found = self.discover(rows, names)
+        self.assertEqual({u: s.protected for u, s in found.items()}, {perf: True, ipad: True, auto: False})
+        for s in found.values():
+            s.age = s.quiet = 10 * 3600
+        sims = list(found.values())
+        # ponad limitem i przy presji: idzie tylko symulator spoza wzorca
+        self.assertEqual(plans(world(simulators=sims, level=2, reasons=["swap"])), [(f"sim:{auto}", "shutdown")])
+        # same chronione ponad limitem: ostrzeżenie, żadnego wyłączenia
+        got = plans(world(simulators=sims[:2], level=2, reasons=["swap"]), max_booted_simulators=1,
+                    simulator_idle_minutes=1, simulator_quiet_minutes=0)
+        self.assertEqual([action for _key, action in got], ["warn"])
+        # własna lista z innym wzorcem zastępuje domyślną
+        mine = self.discover(rows, names, simulator_protect=["Portivo-Auto-*"])
+        self.assertEqual({u: s.protected for u, s in mine.items()}, {perf: False, ipad: False, auto: True})
+
+    def test_quiet_counts_from_the_last_use(self):
+        """Cisza rośnie tylko, gdy CPU całego symulatora jest pod `simulator_busy_cores`, a nikt
+        go nie trzyma i nikt nie patrzy (pomiar 2026-10-08: bezczynny 0,01 rdzenia)."""
+        s = sim("A")
+        state = {}
+
+        def tick(at, cpu, **flags):
+            s.start, s.cpu = 7, cpu
+            s.lease_alive = flags.get("lease_alive", False)
+            s.watched = flags.get("watched", False)
+            dg.track_simulators(cfg(), state, [s], NOW + at)
+            return s.quiet
+
+        self.assertEqual(tick(0, 10.0), 0)
+        self.assertEqual(tick(60, 10.6), 60)  # 0,01 rdzenia: bezczynny
+        self.assertEqual(tick(120, 40.6), 0)  # 0,5 rdzenia: ktoś go używa
+        self.assertEqual(tick(180, 41.2), 60)
+        self.assertEqual(tick(240, 41.8, lease_alive=True), 0)  # sesja go trzyma
+        self.assertEqual(tick(300, 42.4, watched=True), 0)  # maestro patrzy
+        self.assertEqual(tick(900, 42.5), 600)
+
+    def test_metro_counts_a_simulator_as_a_viewer_only_while_it_is_in_use(self):
+        """Metro, któremu sesja umarła, zostaje przy życiu przez aplikację w symulatorze, którego
+        nikt już nie używa. Ten widz się nie liczy; symulator sesji, która żyje, tak."""
+        self.assertEqual(dg.client_kind(SIM_APP), "simulator")
+        commands = {42: SIM_APP, 43: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}
+        metro = types.SimpleNamespace(clients=[(42, "simulator", "Shop"), (43, "browser", "Google Chrome")])
+        dg.drop_unused_simulator_clients(metro, commands, {UDID: sim(UDID)})
+        self.assertEqual(metro.clients, [(43, "browser", "Google Chrome")])
+        self.assertEqual(metro.idle_sim_clients, [(42, "simulator", "Shop")])
+        metro = types.SimpleNamespace(clients=[(42, "simulator", "Shop")])
+        dg.drop_unused_simulator_clients(metro, commands, {UDID: sim(UDID, lease="alive")})
+        self.assertEqual(metro.clients, [(42, "simulator", "Shop")])
+
+    SHUTDOWN = ["xcrun", "simctl", "shutdown", "B"]
+
+    def run_shutdown(self, front, lease=None, apps=()):
+        target = sim("B", quiet=20 * 60)
+        plan = dg.Plan(target, "shutdown", 85, "ponad limit", "simulator_cap")
+        state = {}
+        calls = []
+        root = tempfile.mkdtemp(prefix="devguard-leases-")
+        self.addCleanup(shutil.rmtree, root, True)
+        leases = os.path.join(root, "leases")
+        os.makedirs(leases)
+        if lease:
+            with open(os.path.join(leases, "B.json"), "w") as f:
+                json.dump(lease, f)
+
+        # `launchctl list` w symulatorze: aplikacje użytkownika i systemowe, jak w prawdziwym
+        listing = "PID\tStatus\tLabel\n" + "".join(
+            f"{100 + i}\t0\tUIKitApplication:{app}[3f2a][rb-legacy]\n"
+            for i, app in enumerate(("com.apple.Spotlight",) + tuple(apps))
+        )
+
+        def fake_run(argv, **_kw):
+            calls.append(argv)
+            out = listing if argv[:3] == ["xcrun", "simctl", "spawn"] else ""
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+        with mock.patch.object(dg, "frontmost_bundle", return_value=front), \
+                mock.patch.object(dg.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(dg, "log"), mock.patch.object(dg.janitor, "notify"):
+            dg.execute(cfg(notify=False, simulator_leases=leases), plan, world(simulators=[target]), state)
+        return calls, state
+
+    def test_shutdown_goes_through_simctl_and_never_while_you_look_at_simulator(self):
+        calls, state = self.run_shutdown("com.stablyai.orca")
+        self.assertEqual(calls[-1], self.SHUTDOWN)
+        self.assertEqual(state["events"][-1]["action"], "shutdown")
+        for front in ("com.apple.iphonesimulator", None):  # None: lsappinfo nie odpowiedział
+            calls, state = self.run_shutdown(front)
+            self.assertNotIn(self.SHUTDOWN, calls, front)
+            self.assertNotIn("events", state)
+
+    def test_an_app_running_without_a_live_session_keeps_the_simulator(self):
+        """Symulator z puli bez dzierżawy, w którym działa aplikacja, ktoś używa poza
+        portivo-mobile (2026-10-08: Portivo-Perf-iPhone pod skryptem perf przez idb). Po martwej
+        sesji zostają jej aplikacja i sterownik maestro: te nie trzymają symulatora."""
+        calls, state = self.run_shutdown("com.stablyai.orca", apps=("eu.portivo.app",))
+        self.assertNotIn(self.SHUTDOWN, calls)
+        self.assertNotIn("events", state)
+        dead = {"owner": {"pid": 0, "start": ""}, "bundle": "eu.portivo.app"}
+        calls, _ = self.run_shutdown("com.stablyai.orca", lease=dead,
+                                     apps=("eu.portivo.app", dg.MAESTRO_DRIVER))
+        self.assertEqual(calls[-1], self.SHUTDOWN)
+        calls, _ = self.run_shutdown("com.stablyai.orca", lease=dead, apps=("com.example.other",))
+        self.assertNotIn(self.SHUTDOWN, calls)
+
+    def test_a_held_shutdown_does_not_block_the_plans_below_it(self):
+        """Tick robi pierwszy plan, który coś zrobił: wyłączenie wstrzymane, bo patrzysz na
+        Simulator, nie może co 5 s zasłaniać zatrzymania serwera przy presji."""
+        held = dg.Plan(sim("B"), "shutdown", 85, "ponad limit", "simulator_cap")
+        server = unit("srv", 3)
+        stop = dg.Plan(server, "stop", 80, "brak pamięci", "pressure", level=1)
+        fake = world(server, simulators=[held.unit])
+        fake.pressure.summary = lambda: {"level": 1}
+        fake.pressure.swap_used = fake.pressure.compressed = 0
+        fake.orca = None
+        server.summary = held.unit.summary = lambda: {}
+        done = []
+        with mock.patch.object(dg, "World", return_value=fake), mock.patch.object(dg, "check_pending"), \
+                mock.patch.object(dg, "decide", return_value=[held, stop]), \
+                mock.patch.object(dg, "execute", side_effect=lambda c, p, w, s: done.append(p.action) or p.action != "shutdown"):
+            _w, _p, acted = dg.tick(cfg(last_resort=False), {}, orca=None, now=NOW)
+        self.assertEqual(done, ["shutdown", "stop"])
+        self.assertIs(acted, stop)
+
+    def test_shutdown_rereads_the_lease_a_session_may_have_just_taken(self):
+        calls, state = self.run_shutdown("com.stablyai.orca", lease={"owner": {"pid": os.getpid(), "start": ""}})
+        self.assertNotIn(self.SHUTDOWN, calls)
+        self.assertNotIn("events", state)
+        calls, _state = self.run_shutdown("com.stablyai.orca", lease={"owner": {"pid": 0, "start": ""}})
+        self.assertEqual(calls[-1], self.SHUTDOWN)
+
+    def test_metro_with_an_app_in_a_simulator_waits_while_you_look_at_simulator(self):
+        metro = unit("metro", idle_sim_clients=[(42, "simulator", "Shop")], argv=None, launch_cwd="/w")
+        plan = dg.Plan(metro, "stop", 50, "sierota", "orphan")
+        stopped = []
+        for front, expected in (("com.apple.iphonesimulator", []), ("com.stablyai.orca", ["metro"])):
+            with mock.patch.object(dg, "frontmost_bundle", return_value=front), \
+                    mock.patch.object(dg, "stop", side_effect=lambda u, _w: (stopped.append(u.key), (True, "zatrzymany"))[1]), \
+                    mock.patch.object(dg, "after_stop"), mock.patch.object(dg, "log"):
+                dg.execute(cfg(notify=False), plan, world(metro), {})
+            self.assertEqual(stopped, expected)
+
+
 class PressureTest(unittest.TestCase):
     def measure(self, swap_gb, history=None, swapouts=100, kernel=1, available=50):
         values = {
@@ -370,29 +694,29 @@ class AdmitParserTest(unittest.TestCase):
             "PORT=3001 npx next dev",
             "nohup pnpm exec next dev > /tmp/log 2>&1 &",
         ):
-            self.assertEqual(self.starts(command), [("/w/mono", None, False)], command)
+            self.assertEqual(self.starts(command), [("/w/mono", None, False, False)], command)
 
     def test_cd_and_dir_flags_move_the_target(self):
         self.assertEqual(
             self.starts("cd apps/web && pnpm exec next dev"),
-            [("/w/mono/apps/web", None, False)],
+            [("/w/mono/apps/web", None, False, False)],
         )
         self.assertEqual(
             self.starts("pnpm -C apps/web exec next dev"),
-            [("/w/mono/apps/web", None, False)],
+            [("/w/mono/apps/web", None, False, False)],
         )
 
     def test_scripts_and_filters(self):
-        self.assertEqual(self.starts("pnpm dev"), [("/w/mono", None, True)])
-        self.assertEqual(self.starts("npm run dev:landing"), [("/w/mono", None, True)])
+        self.assertEqual(self.starts("pnpm dev"), [("/w/mono", None, True, False)])
+        self.assertEqual(self.starts("npm run dev:landing"), [("/w/mono", None, True, False)])
         self.assertEqual(
             self.starts("pnpm --filter landing-page dev"),
-            [("/w/mono", "landing-page", False)],
+            [("/w/mono", "landing-page", False, False)],
         )
 
     def test_dev_server_started_through_orca_terminal(self):
         command = 'orca terminal create --worktree active --command "cd apps/web && pnpm exec next dev"'
-        self.assertEqual(self.starts(command), [("/w/mono/apps/web", None, False)])
+        self.assertEqual(self.starts(command), [("/w/mono/apps/web", None, False, False)])
 
     def test_not_a_dev_server(self):
         for command in (
@@ -407,9 +731,137 @@ class AdmitParserTest(unittest.TestCase):
 
     def test_vite_forms(self):
         self.assertEqual(
-            self.starts("npx vite --port 5173"), [("/w/mono", None, False)]
+            self.starts("npx vite --port 5173"), [("/w/mono", None, False, False)]
         )
-        self.assertEqual(self.starts("vite dev"), [("/w/mono", None, False)])
+        self.assertEqual(self.starts("vite dev"), [("/w/mono", None, False, False)])
+
+    def test_every_way_to_start_metro(self):
+        """2026-10-08 18:52: przy krytycznej presji agent postawił Metro przez
+        `./node_modules/.bin/expo start`, którego hook nie uznał za dev serwer (znał tylko
+        `npx expo start` i `pnpm exec expo start`), i o 18:57 Mac zamarzł. Każda droga do CLI expo
+        i do Metro to start dev serwera."""
+        app = "/w/mono/apps/mobile"
+        for command in (
+            "./node_modules/.bin/expo start --dev-client --port 8199",
+            "node_modules/.bin/expo start --port 8183",
+            "TTP_DEV_ENTITLEMENT=1 ./node_modules/.bin/expo start --dev-client --port 8183 > /tmp/m.log 2>&1",
+            "/w/mono/apps/mobile/node_modules/.bin/expo start",
+            "node /w/mono/node_modules/.pnpm/expo@58.0.3_0823/node_modules/expo/bin/cli start --port 8183",
+            "npx expo start",
+            "npx expo@latest start --port 8085",
+            "pnpm exec expo start --port 8085",
+            "bunx expo start",
+            "pnpm expo start",
+            "npx react-native start",
+        ):
+            self.assertEqual(self.starts(command, app), [(app, None, False, False)], command)
+        self.assertEqual(
+            self.starts(
+                "cd /w/wt/apps/storefront-mobile && ./node_modules/.bin/expo start --dev-client --port 8183"
+            ),
+            [("/w/wt/apps/storefront-mobile", None, False, False)],
+        )
+        self.assertEqual(
+            self.starts("pnpm --filter mobile exec expo start"), [("/w/mono", "mobile", False, False)]
+        )
+
+    def test_restart_commands_the_guard_logs(self):
+        """Komendę wznowienia z logu strażnika (node i ścieżka skryptu CLI) agent kopiuje 1:1."""
+        self.assertEqual(
+            self.starts("node /w/x/node_modules/next/dist/bin/next dev -p 3292"),
+            [("/w/mono", None, False, False)],
+        )
+        self.assertEqual(
+            self.starts("cd /w/avatar && node /opt/homebrew/bin/pnpm --filter whale dev"),
+            [("/w/avatar", "whale", False, False)],
+        )
+
+    def test_expo_run_starts_metro_unless_no_bundler(self):
+        """`expo run:ios` po buildzie stawia Metro (albo bierze to, które już serwuje aplikację),
+        `--no-bundler` tylko buduje; pomoc, prebuild, export i config niczego nie stawiają."""
+        self.assertEqual(self.starts("npx expo run:ios"), [("/w/mono", None, False, True)])
+        self.assertEqual(
+            self.starts("./node_modules/.bin/expo run:android --device emulator-5554"),
+            [("/w/mono", None, False, True)],
+        )
+        for command in (
+            "npx expo run:ios --no-bundler",
+            "npx expo start --help",
+            "./node_modules/.bin/expo run:ios --help",
+            "npx expo prebuild --platform ios",
+            "npx expo export --platform ios",
+            "./node_modules/.bin/expo config --json",
+        ):
+            self.assertEqual(self.starts(command), [], command)
+
+
+class DuplicateRefusalTest(unittest.TestCase):
+    def test_refusal_inside_a_stack_names_the_server_of_this_app(self):
+        """2026-10-08, hook na żywo: `./node_modules/.bin/expo start` w apps/mobile, gdy stos
+        `pnpm dev` serwuje Metro tej aplikacji na :8083, dostał w odmowie http://localhost:3000
+        i katalog innej aplikacji (pierwszy port i pierwszy serwer stosu). Agent szedłby pod
+        zły adres."""
+        root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        landing, mobile = (os.path.join(root, name) for name in ("landing", "mobile"))
+        for path in (landing, mobile):
+            os.makedirs(os.path.join(path, "node_modules/.bin"))
+        servers = [
+            types.SimpleNamespace(cwd=landing, ports=[3000]),
+            types.SimpleNamespace(cwd=mobile, ports=[8083]),
+        ]
+        stack = unit(
+            "stack", 6.3, servers=servers, ports=[3000, 8083], root=4242, terminal=None,
+            launch_cwd=root,
+        )
+        event = {"tool_input": {"command": "./node_modules/.bin/expo start --port 8199"}, "cwd": mobile}
+        with mock.patch.object(dg, "World", return_value=world(stack)), \
+                mock.patch.object(dg.janitor, "load_json", return_value={}):
+            why = dg.devserver_refusal(cfg(), event)
+        self.assertIn(f"już działa http://localhost:8083 ({dg.short(mobile)}", why)
+        self.assertNotIn("localhost:3000", why)
+
+
+class TerminateTest(unittest.TestCase):
+    """Proces po SIGKILL pod presją kończy się sekundami (jądro zwalnia jego strony ze swapu i
+    kompresora). 2026-10-08 log strażnika dwa razy mówił „nie chcą zginąć” o Metro, które za
+    chwilę zniknęło: terminate() sprawdzał je tuż po sygnale."""
+
+    def terminate(self, dies_after_kill_s):
+        clock, sent, killed_at = [0.0], [], {}
+
+        def kill(pid, sig):
+            sent.append(sig)
+            if sig == signal.SIGKILL:
+                killed_at[pid] = clock[0]
+
+        def alive(pid, _start):
+            if pid not in killed_at:
+                return True  # SIGTERM go nie rusza
+            return dies_after_kill_s is None or clock[0] - killed_at[pid] < dies_after_kill_s
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        unit = types.SimpleNamespace(pids=[4242])
+        with (
+            mock.patch.object(dg, "usage", return_value={"start": 1}),
+            mock.patch.object(dg, "alive", side_effect=alive),
+            mock.patch.object(dg.os, "kill", side_effect=kill),
+            mock.patch.object(dg.time, "time", side_effect=lambda: clock[0]),
+            mock.patch.object(dg.time, "sleep", side_effect=sleep),
+        ):
+            left = dg.terminate(unit, {4242: (1, "node expo/bin/cli start")}, grace=1)
+        return left, sent
+
+    def test_killed_process_that_exits_slowly_is_dead(self):
+        left, sent = self.terminate(dies_after_kill_s=3)
+        self.assertEqual(left, [])
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+
+    def test_process_that_outlives_the_wait_is_still_reported(self):
+        left, _ = self.terminate(dies_after_kill_s=None)
+        self.assertEqual(left, [4242])
 
 
 BUILT_HOOK = os.path.join(ROOT, "app/.build/release/claude-acc-hook")
@@ -429,6 +881,10 @@ DEV_STARTS = (
     "npx expo start",
     "npx webpack serve",
     "npx astro dev",
+    "./node_modules/.bin/expo start --dev-client --port 8199",
+    "node /w/node_modules/.pnpm/expo@58/node_modules/expo/bin/cli start --port 8183",
+    "npx react-native start",
+    "npx expo run:ios",
 )
 # ...albo idą do schedulera (w katalogu z go.mod i package.json)
 SCHEDULED = (
@@ -460,6 +916,18 @@ SCHEDULED = (
     "eslint .",
     "turbo run build",
     "govulncheck ./...",
+    # natywne buildy i start symulatora
+    "xcodebuild -scheme X build",
+    "cd ios && xcodebuild -workspace A.xcworkspace -scheme A",
+    "xcrun xcodebuild -scheme X test",
+    "xcrun simctl boot 1234-ABCD",
+    "pod install",
+    "./gradlew assembleDebug",
+    "eas build --platform ios --local",
+    "npx expo run:ios --no-bundler",
+    "npx expo prebuild",
+    "portivo-mobile up mobile",
+    "open -a Simulator",
 )
 # słowa w ścieżkach i innych słowach: Python nic tu nie robi, więc nie ma po co startować
 QUIET = (
@@ -472,6 +940,11 @@ QUIET = (
     "cat ~/dev/notes.md",
     "sed -n 1,20p cmd/server/main.go",
     "git log --oneline | head",
+    "xcrun simctl list devices booted",
+    "cat ios/Podfile.lock | head",
+    "rg -n easing src/",
+    "ls ~/Library/Developer/CoreSimulator/Devices",
+    "echo pods ready",
 )
 
 
@@ -524,6 +997,7 @@ class HookGateTest(unittest.TestCase):
         import sched as scheduler
 
         self.assertLessEqual(set(scheduler.NODE_TOOLS), set(entry.GATE_PROGRAMS))
+        self.assertLessEqual(set(scheduler.NATIVE_PROGRAMS), set(entry.GATE_PROGRAMS))
 
     @unittest.skipUnless(os.access(BUILT_HOOK, os.X_OK), "brak app/.build/release/claude-acc-hook")
     def test_native_front_reads_the_gate_like_python(self):
@@ -603,6 +1077,10 @@ class GuardTest(unittest.TestCase):
             "available_critical_percent": 0,
             "available_warn_percent": 0,
             "budget_percent": 1000,
+            # ostatnia linia i symulatory patrzą na całą tabelę procesów, nie na `scope`: w teście
+            # nie mogą zatrzymać niczego prawdziwego na tym Macu
+            "last_resort": False,
+            "simulator_pool_prefix": "devguard-test-pool-",
         }
         data.update(extra)
         with open(os.path.join(self.state_dir, "devguard.json"), "w") as f:
@@ -761,6 +1239,68 @@ class GuardTest(unittest.TestCase):
         verdict = self.admit("pnpm exec next dev", self.app("blog"))
         self.assertEqual(verdict["permissionDecision"], "deny")
         self.assertIn("budżetu", verdict["permissionDecisionReason"])
+
+    def room(self, app):
+        done = subprocess.run(
+            ["/usr/bin/python3", SCRIPT, "room", app],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, HOME=self.home, DEVGUARD_ORCA=""),
+            timeout=60,
+        )
+        return done.returncode, done.stdout.strip()
+
+    def metro_app(self, name="mobile"):
+        path = os.path.join(self.home, name)
+        os.makedirs(os.path.join(path, "node_modules/.bin"), exist_ok=True)
+        return path
+
+    METRO = "./node_modules/.bin/expo start --dev-client --port 8199"
+
+    def test_admit_refuses_metro_under_critical_pressure_with_no_server_left(self):
+        """2026-10-08 18:52: strażnik zatrzymał ostatni dev serwer, więc hook liczył presję tylko
+        „gdy coś działa” i wpuścił nowe Metro przy krytycznej presji. Teraz odmowa z dokładną
+        komendą czekania, a ta sama komenda puszcza, gdy pamięć odpuści."""
+        app = self.metro_app()
+        self.config(available_critical_percent=101)  # każdy odczyt to presja krytyczna
+        verdict = self.admit(self.METRO, app)
+        self.assertEqual(verdict["permissionDecision"], "deny")
+        reason = verdict["permissionDecisionReason"]
+        self.assertIn("krytycznym", reason)
+        self.assertIn(f"`claude-acc sched wait -- 'claude-acc guard room {app}'`", reason)
+        self.assertEqual(self.room(app)[0], 1)
+        self.config()
+        self.assertIsNone(self.admit(self.METRO, app))
+        self.assertEqual(self.room(app), (0, "jest miejsce"))
+
+    def test_server_stopped_for_memory_stays_stopped(self):
+        """Po akcji strażnik mierzy przyrost swapu od nowa, więc tuż po zatrzymaniu presja wygląda
+        na mniejszą. Serwer zatrzymany z braku pamięci nie wraca, póki Mac nie odetchnął, przez
+        `restart_hold_minutes`; inna aplikacja i spokojny Mac przechodzą."""
+        app = self.metro_app()
+        stopped = {
+            "at": time.time() - 120,
+            "action": "stop",
+            "code": "pressure",
+            "cwd": app,
+            "apps": [app],
+            "reason": "brak pamięci: swap 11,2 GB i rośnie",
+            "ok": False,
+        }
+        with open(os.path.join(self.state_dir, "devguard-state.json"), "w") as f:
+            json.dump({"events": [stopped]}, f)
+        self.config(available_warn_percent=101)  # ostrzeżenie: jeszcze nie odetchnął
+        verdict = self.admit(self.METRO, app)
+        self.assertEqual(verdict["permissionDecision"], "deny")
+        self.assertIn("zatrzymał serwer", verdict["permissionDecisionReason"])
+        self.assertIn("swap 11,2 GB i rośnie", verdict["permissionDecisionReason"])
+        self.assertIn("claude-acc guard room", verdict["permissionDecisionReason"])
+        self.assertEqual(self.room(app)[0], 1)
+        self.assertIsNone(self.admit(self.METRO, self.metro_app("other")))
+        self.config(available_warn_percent=101, restart_hold_minutes=1)  # zatrzymany 2 min temu
+        self.assertIsNone(self.admit(self.METRO, app))
+        self.config()  # presja zero, swap pod progiem
+        self.assertIsNone(self.admit(self.METRO, app))
 
     def go_module(self, name):
         root = os.path.join(self.home, name)
@@ -1136,6 +1676,19 @@ class AdmitFastPathTest(unittest.TestCase):
                 # scheduler pyta rtk o przepisanie, więc dochodzi tylko subprocess
                 _, loaded = self.admit_in_clean_python("go test ./...", cwd=root)
                 self.assertEqual(loaded, ["json", "re", "subprocess"])
+
+    def test_native_build_loads_only_the_scheduler(self):
+        """Natywny build idzie szybką ścieżką do schedulera, bez strażnika i bez ctypes."""
+        with tempfile.TemporaryDirectory() as root:
+            path = os.environ.get("PATH", "")
+            no_rtk = os.pathsep.join(
+                d for d in path.split(os.pathsep) if not os.path.exists(os.path.join(d, "rtk"))
+            )
+            out, loaded = self.admit_in_clean_python(
+                "xcodebuild -scheme App build", cwd=root, env=dict(os.environ, PATH=no_rtk)
+            )
+            self.assertIn("updatedInput", json.loads(out)["hookSpecificOutput"])
+            self.assertEqual(loaded, ["json", "re"])
 
     def test_escaped_json_still_reaches_the_dev_server_check(self):
         raw = self.event("pnpm dev").replace("dev", "\\u0064ev")
