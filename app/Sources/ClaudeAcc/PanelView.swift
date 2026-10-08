@@ -40,13 +40,15 @@ struct PanelView: View {
                         if store.browser?.installed == true {
                             BrowserCard(store: store).fixedSize(horizontal: false, vertical: true)
                         }
+                        FansCard(store: store)
+                    }
+                    // Ultra scrolls inside its card, so this column absorbs the Desktop card;
+                    // the third one cannot: Load & Heat has a fixed chart and would spill out.
+                    Column(width: 300) {
+                        UltraCard(store: store)
                         if store.desktop?.installed == true {
                             DesktopCard(store: store).fixedSize(horizontal: false, vertical: true)
                         }
-                        FansCard(store: store)
-                    }
-                    Column(width: 300) {
-                        UltraCard(store: store)
                         UpdatesCard(store: store).fixedSize(horizontal: false, vertical: true)
                     }
                 }
