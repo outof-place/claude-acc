@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -573,6 +574,92 @@ class Mcp(unittest.TestCase):
         self.assertEqual(replies[2]["result"]["resultType"], "complete")
 
 
+class Keys(unittest.TestCase):
+    """Klawisze jak z prawdziwej klawiatury: modyfikator sam jest klawiszem, akord wciska go pierwszy."""
+
+    def events(self, chord, **kw):
+        hub = browser.Hub(cfg_loader=lambda: config({}))
+        sent = []
+        hub.input = lambda c, tab, method, params: sent.append(params)
+        hub.key_event(None, None, chord, **kw)
+        return [(e["type"], e["key"], e["modifiers"]) for e in sent]
+
+    def test_a_modifier_alone_is_a_key(self):
+        # hold_key "shift" trzyma Shift (np. do zaznaczania kliknięciem), a nie zgłasza nieznanego klawisza
+        self.assertEqual(self.events("shift", up=False), [("rawKeyDown", "Shift", 8)])
+        self.assertEqual(self.events("shift", down=False), [("keyUp", "Shift", 0)])
+        self.assertEqual(self.events("cmd"), [("rawKeyDown", "Meta", 4), ("keyUp", "Meta", 0)])
+
+    def test_chord_presses_modifiers_first_and_releases_them_last(self):
+        self.assertEqual(
+            self.events("ctrl+shift+a"),
+            [("rawKeyDown", "Control", 2), ("rawKeyDown", "Shift", 10), ("rawKeyDown", "a", 10),
+             ("keyUp", "a", 10), ("keyUp", "Shift", 2), ("keyUp", "Control", 0)],
+        )  # fmt: skip
+        self.assertEqual(self.events("Enter"), [("keyDown", "Enter", 0), ("keyUp", "Enter", 0)])
+
+
+class Idle(unittest.TestCase):
+    """Cisza bez wywołań: demon się rozłącza, ale karty żywej sesji agenta czekają dłużej (przerwa na build)."""
+
+    class FakeCdp:
+        closed = False
+
+        def __init__(self):
+            self.calls = []
+
+        def call(self, method, params=None, session=None, timeout=30):
+            self.calls.append(method)
+            return {}
+
+        def close(self):
+            self.closed = True
+
+    def hub_with_tab(self, owner, persistent=True):
+        hub = browser.Hub(cfg_loader=lambda: config({}))
+        hub.publish = lambda: None
+        hub.conns["chrome"].cdp = self.FakeCdp()
+        hub.client_seen(owner, "test", persistent)
+        hub.tabs["tab-1"] = browser.Tab("tab-1", "chrome", "T1", owner, "hidden")
+        return hub
+
+    def test_a_live_session_keeps_its_tabs_through_a_long_pause(self):
+        hub = self.hub_with_tab("mcp:1")
+        start = hub.activity
+        hub.tick(start + 21 * 60)
+        self.assertIn("tab-1", hub.tabs)
+        self.assertTrue(hub.conns["chrome"].live)
+        hub.tick(start + browser.LIVE_TABS_IDLE_FACTOR * browser.IDLE_MINUTES * 60 + 1)
+        self.assertNotIn("tab-1", hub.tabs)  # zapomniana karta nie trzyma połączenia w nieskończoność
+        self.assertFalse(hub.conns["chrome"].live)
+
+    def test_tabs_nobody_holds_go_after_the_usual_idle(self):
+        hub = self.hub_with_tab("cli", persistent=False)
+        hub.client_gone("cli")
+        hub.tick(hub.activity + 21 * 60)
+        self.assertNotIn("tab-1", hub.tabs)
+        self.assertFalse(hub.conns["chrome"].live)
+
+
+class CliOwner(unittest.TestCase):
+    """Wywołania z wiersza to osobne procesy: karty należą do sesji agenta, z której przyszły."""
+
+    def test_each_agent_session_owns_its_own_tabs(self):
+        a = browser.cli_owner({"CLAUDE_CODE_SESSION_ID": "s-a", "ORCA_TERMINAL_HANDLE": "term_1"})
+        b = browser.cli_owner({"CLAUDE_CODE_SESSION_ID": "s-b", "ORCA_TERMINAL_HANDLE": "term_1"})
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, browser.cli_owner({"CLAUDE_CODE_SESSION_ID": "s-a"}))
+        self.assertNotEqual(browser.cli_owner({"ORCA_TERMINAL_HANDLE": "term_1"}),
+                            browser.cli_owner({"ORCA_TERMINAL_HANDLE": "term_2"}))  # fmt: skip
+        self.assertEqual(browser.cli_owner({"CLAUDE_ACC_BROWSER_OWNER": "mine", "CLAUDE_CODE_SESSION_ID": "s-a"}), "mine")
+        self.assertEqual(browser.cli_owner({}), "cli")
+
+    def test_the_session_process_is_watched_only_for_claude_sessions(self):
+        self.assertEqual(browser.cli_pid({"CLAUDE_CODE_SESSION_ID": "s", "CLAUDE_PID": "4321"}), 4321)
+        self.assertIsNone(browser.cli_pid({"CLAUDE_PID": "4321", "CLAUDE_ACC_BROWSER_OWNER": "mine"}))
+        self.assertIsNone(browser.cli_pid({"CLAUDE_CODE_SESSION_ID": "s", "CLAUDE_PID": "x"}))
+
+
 class Hint(unittest.TestCase):
     PANEL = {
         "default": "brave",
@@ -628,9 +715,49 @@ class Hint(unittest.TestCase):
                 "chrome-devtools-mcp ma błąd",
                 "zmień kolor przycisku",
                 "strona główna",
+                "dodaj panel boczny do aplikacji",
+                "otwórz plik i popraw błąd",
+                "open the file and fix the login flow",
+                "the click handler fires twice",
+                "konsola wypisuje warningi przy buildzie",
+                "przenieś strony do katalogu app",
             ]
         ):
             self.assertEqual(self.run_hint(prompt, f"bq{i}"), "", prompt)
+
+    def test_browser_intent_in_polish_and_english(self):
+        for i, prompt in enumerate(
+            [
+                "wejdź na stronę rejestratora i sprawdź rekordy DNS",
+                "wejdz do panelu hostingu",
+                "otwórz tę stronę i pobierz fakturę",
+                "otworz strone banku",
+                "przejdź do panelu admina i dodaj użytkownika",
+                "zajrzyj w panel Vercel, czy deploy przeszedł",
+                "w panelu Stripe zmień webhook",
+                "w konsoli Google Cloud dodaj klucz",
+                "konsola AWS pokazuje alarm, sprawdź",
+                "zaloguj się do Cloudflare",
+                "kliknij Zapisz na stronie ustawień",
+                "wypełnij formularz zgłoszeniowy",
+                "zrób to w przeglądarce",
+                "otwórz to w nowej karcie",
+                "odpisz w Slacku webowym",
+                "sprawdź ticket na acme.atlassian.net",
+                "otwórz app.slack.com i znajdź wątek",
+                "open the AWS console and check the bill",
+                "go to the registrar website and renew the domain",
+                "log in to the Stripe dashboard",
+                "sign in to admin.google.com",
+                "click the Submit button on that page",
+                "fill in the form on their site",
+                "visit https://dash.cloudflare.com and purge the cache",
+                "check it in Chrome",
+            ]
+        ):
+            self.assertIn(
+                "mcp__browser__navigate", self.run_hint(prompt, f"bi{i}"), prompt
+            )
 
 
 class SecretGuard(unittest.TestCase):
@@ -693,6 +820,7 @@ SITE = {
 <p id="out">idle</p>
 <iframe src="http://127.0.0.1:{port}/frame.html" width="400" height="80" title="Payment"></iframe>
 <iframe srcdoc="<button onclick='this.textContent=&quot;same clicked&quot;'>Same origin</button>" title="Local"></iframe>
+<button style="position:absolute;left:1000px;top:600px" onclick="this.textContent='corner clicked'">Far corner</button>
 <p style="margin-top:2000px">Footer far below</p>""",
     "frame.html": "<!doctype html><label>Card <input></label><button onclick=\"this.textContent='paid'\">Pay</button>",
     "other.html": "<!doctype html><title>Other</title><button onclick=\"console.log('asked'); if (confirm('Delete?')) this.textContent='deleted'\">Delete</button>",
@@ -736,23 +864,7 @@ class LiveChrome(unittest.TestCase):
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
         cls.url = f"http://localhost:{port}/index.html"
         cls.profile = os.path.join(TMP, "chrome")
-        cls.chrome = subprocess.Popen(
-            [
-                CHROME,
-                "--headless=new",
-                f"--user-data-dir={cls.profile}",
-                "--remote-debugging-port=0",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "about:blank",
-            ],  # fmt: skip
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        for _ in range(100):
-            if os.path.exists(os.path.join(cls.profile, "DevToolsActivePort")):
-                break
-            time.sleep(0.1)
+        cls.start_chrome()
         with open(os.environ["CLAUDE_ACC_BROWSER_CONFIG"], "w") as f:
             json.dump(
                 {
@@ -769,6 +881,31 @@ class LiveChrome(unittest.TestCase):
                 break
             time.sleep(0.05)
         cls.client = browser.HubClient("mcp:test", "test", True)
+
+    @classmethod
+    def start_chrome(cls):
+        """Chrome bez okna ze skalą 2 jak ekran Retina: zrzut układu podaje wtedy piksele urządzenia."""
+        port_file = os.path.join(cls.profile, "DevToolsActivePort")
+        if os.path.exists(port_file):
+            os.remove(port_file)
+        cls.chrome = subprocess.Popen(
+            [
+                CHROME,
+                "--headless=new",
+                "--force-device-scale-factor=2",
+                f"--user-data-dir={cls.profile}",
+                "--remote-debugging-port=0",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "about:blank",
+            ],  # fmt: skip
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for _ in range(100):
+            if os.path.exists(port_file):
+                break
+            time.sleep(0.1)
 
     @classmethod
     def tearDownClass(cls):
@@ -800,6 +937,11 @@ class LiveChrome(unittest.TestCase):
         self.assertIn(
             "Footer far below", self.call("read_page", filter="all")["result"]["text"]
         )
+        # w oknie strony, ale poza lewą górną ćwiartką: na ekranie Retina zrzut układu liczy piksele urządzenia
+        self.assertIn('button "Far corner" [ref_', page)
+        corner = self.call("read_page", filter="interactive")["result"]["text"]
+        self.call("left_click", target=ref_of(corner, 'button "Far corner"'))
+        self.assertIn('button "corner clicked"', self.call("read_page", filter="interactive")["result"]["text"])
         self.assertTrue(
             self.call("find", query="email field")["result"]["text"].startswith(
                 'textbox "Email" [ref_'
@@ -933,6 +1075,80 @@ class LiveChrome(unittest.TestCase):
                 call("left_click", target={"type": "ref", "ref": "ref_999"})["is_error"]
             )
             self.assertTrue(call("navigate", url="javascript:alert(1)")["is_error"])
+
+    def test_3_daemon_keeps_accepting_when_idle(self):
+        time.sleep(1.5)  # dłużej niż timeout accept: demon nie może po nim skończyć słuchania
+        late = browser.HubClient("mcp:late", "late", True)
+        try:
+            self.assertEqual(late.call("list_tabs", {}, timeout=10, spawn=False)["result"]["tabs"], [])
+        finally:
+            late.close()
+
+    def test_4_tabs_of_a_finished_cli_session_close(self):
+        done = subprocess.Popen(["true"])
+        done.wait()
+        gone = browser.HubClient("cli:claude:gone", "cli:test", False, pid=done.pid)
+        alive = browser.HubClient("cli:claude:alive", "cli:test", False, pid=os.getpid())
+        try:
+            tab_gone = gone.call("navigate", {"url": self.url})["tab_id"]
+            tab_alive = alive.call("navigate", {"url": self.url})["tab_id"]
+        finally:
+            gone.close()
+            alive.close()
+        time.sleep(0.2)
+        # close() kończy rozmowę także po stronie demona (wątek czytający trzyma makefile gniazda)
+        self.assertNotIn("cli:claude:gone", self.hub.clients)
+        now = time.time()
+        self.hub.tick(now)
+        self.assertIn(tab_gone, self.hub.tabs)  # chwila na powrót, jak przy sesjach MCP
+        self.hub.tick(now + browser.GRACE + 1)
+        self.assertNotIn(tab_gone, self.hub.tabs)
+        self.assertIn(tab_alive, self.hub.tabs)  # sesja żyje: jej karta zostaje
+        again = browser.HubClient("cli:claude:alive", "cli:test", False, pid=os.getpid())
+        try:
+            again.call("close_tab", {"tab_id": tab_alive})
+        finally:
+            again.close()
+
+    def test_5_cli_calls_from_two_agent_sessions_keep_apart(self):
+        """Dwa agenty z `claude-acc browser` naraz, każdy z własnego procesu: osobne karty. Demon wstaje sam."""
+        folder = tempfile.mkdtemp(prefix="cli-", dir="/tmp")
+        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_ACC_BROWSER_OWNER", "CLAUDE_CODE_SESSION_ID")}
+        env["CLAUDE_ACC_BROWSER_DIR"] = folder
+
+        def cli(session, *args):
+            run_env = dict(env, CLAUDE_CODE_SESSION_ID=session, CLAUDE_PID=str(os.getpid()))
+            out = subprocess.run([sys.executable, os.path.join(ROOT, "browser.py"), *args],
+                                 env=run_env, capture_output=True, text=True, timeout=90)  # fmt: skip
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return out.stdout
+
+        try:
+            cli("agent-a", "navigate", json.dumps({"url": self.url}))
+            cli("agent-b", "navigate", json.dumps({"url": self.url.replace("index.html", "other.html")}))
+            self.assertIn("Sign in", cli("agent-a", "get_page_text"))
+            for tab_id in re.findall(r"tab_id (tab-\d+)", cli("agent-b", "list_tabs")):
+                cli("agent-b", "close_tab", json.dumps({"tab_id": tab_id}))
+            self.assertIn("Sign in", cli("agent-a", "get_page_text"))  # sprzątanie B nie zamyka karty A
+        finally:
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(os.path.join(folder, "hub.sock"))
+                s.sendall(b'{"owner": "test"}\n{"id": 1, "op": "shutdown"}\n')
+                s.settimeout(10)
+                s.recv(4096)
+                s.close()
+            except OSError:
+                pass
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_6_reconnects_after_the_browser_restarts(self):
+        self.chrome.terminate()
+        self.chrome.wait(10)
+        type(self).start_chrome()
+        nav = self.call("navigate", url=self.url)
+        self.assertEqual((nav["result"]["status"], nav["result"]["title"]), (200, "Test form"))
+        self.assertEqual([t["tab_id"] for t in nav["state"]["tabs"]], [nav["tab_id"]])
 
 
 if __name__ == "__main__":
