@@ -1091,6 +1091,34 @@ class RtkConfigTest(Paths):
             self.assertEqual(f.read(), before)  # kopia sprzed pierwszej zmiany
         self.assertFalse(S.write_rtk_excludes(path))  # drugi zapis niczego nie zmienia
 
+    def test_keeps_your_entries_comments_and_other_keys(self):
+        """Ręcznie dopisany wzorzec zostaje, komentarz za tablicą też, a następny klucz nie
+        znika (wcześniej: linia kończąca się `]` z komentarzem zjadała `transparent_prefixes`);
+        nagłówek z komentarzem to ta sama sekcja, nie druga [hooks]."""
+        before = ("[hooks] # rtk\nexclude_commands = [\n  'go',\n  'my-tool',  # mine\n]  # list\n"
+                  "transparent_prefixes = ['x[0]']\n\n[limits]\ngrep_max_results = 200\n")
+        path = self.config(before)
+        self.assertTrue(S.write_rtk_excludes(path))
+        with open(path) as f:
+            after = f.read()
+        self.assertEqual(after.count("[hooks]"), 1)
+        self.assertEqual(self.excludes(after), list(S.RTK_EXCLUDES) + ["my-tool"])
+        self.assertIn("]  # list\ntransparent_prefixes = ['x[0]']\n\n[limits]\ngrep_max_results = 200\n", after)
+        self.assertFalse(S.write_rtk_excludes(path))
+
+    def test_refuses_a_value_it_cannot_read_and_writes_relative_paths(self):
+        path = self.config("[hooks]\nexclude_commands = ['go'\n")  # tablica bez końca
+        with self.assertRaises(ValueError):
+            S.write_rtk_excludes(path)
+        with open(path) as f:
+            self.assertEqual(f.read(), "[hooks]\nexclude_commands = ['go'\n")
+        here = os.getcwd()
+        os.chdir(self.dir)
+        self.addCleanup(os.chdir, here)
+        self.assertTrue(S.write_rtk_excludes("config.toml"))  # bez katalogu w ścieżce
+        with open(os.path.join(self.dir, "config.toml")) as f:
+            self.assertEqual(self.excludes(f.read()), list(S.RTK_EXCLUDES))
+
     def test_adds_the_hooks_section_when_missing(self):
         path = self.config("[limits]\ngrep_max_results = 200\n")
         self.assertTrue(S.write_rtk_excludes(path))
@@ -1445,12 +1473,18 @@ class NativeSlotTest(Paths):
                      "mem_now_gb": now_gb, "predicted_wall_s": 600, "started_at": time.time(),
                      "exclusive": True}, **extra)
 
-    def test_builds_hold_the_slot_but_pods_and_simulators_do_not(self):
+    def test_ios_builds_hold_the_slot_but_the_rest_runs_beside(self):
+        """Miejsce na build trzymają tylko buildy, których kompilatory native_scan widzi (Xcode):
+        inaczej Android albo `test-without-building` trzymałby je do upływu czasu, nic nie budując."""
         for command, exclusive in (
             ("portivo-mobile up storefront-mobile", True),
             ("npx expo run:ios", True),
             ("xcodebuild -scheme App build", True),
-            ("./gradlew :app:assembleRelease", True),
+            ("eas build --platform ios --local", True),
+            ("xcodebuild test-without-building -xctestrun x.xctestrun", False),
+            ("npx expo run:android", False),
+            ("./gradlew :app:assembleRelease", False),
+            ("eas build --platform android --local", False),
             ("pod install", False),
             ("xcrun simctl boot 1234-ABCD", False),
         ):
@@ -1494,9 +1528,10 @@ class NativeSlotTest(Paths):
             11: ("SWBBuildService", None),  # dziecko powyższego
             12: ("swift-frontend", None),
             20: ("SWBBuildService", None),  # Xcode otwarty, nic nie buduje
+            21: ("SWBBuildServiceHelper", None),  # pomocnik bezczynnej usługi
             30: ("launchd_sim", None),
         }
-        parents = {11: 10, 12: 11, 20: 1, 30: 1}
+        parents = {11: 10, 12: 11, 20: 1, 21: 20, 30: 1}
 
         def scan(extra=None):
             table = {**procs, **(extra or {})}
@@ -1520,11 +1555,31 @@ class NativeSlotTest(Paths):
         building = scan({40: ("xcodebuild", ["xcodebuild", "-workspace", "App.xcworkspace", "-scheme", "App", "build"])})
         self.assertTrue(building["active"])
         self.assertEqual(building["pids"], {40})
+        # Xcode buduje: kompilator pod usługą
+        procs[22] = ("swift-frontend", None)
+        parents[22] = 20
+        xcode = scan()
+        self.assertTrue(xcode["active"])
+        self.assertEqual(xcode["pids"], {20, 21, 22})
+        del procs[22], parents[22]
+
+    def test_build_phase_holds_the_slot_through_a_slow_cold_start(self):
+        """Zimny build (prebuild, pod install) długo nie rusza kompilatorów. Gdy historia `up` to
+        szybkie biegi z klientem w cache (60 s), miejsce nie może wrócić po 10 minutach, bo drugi
+        build wystartowałby przed kompilacją pierwszego: dolna granica to czas z tabeli NATIVE."""
+        now = time.time()
+        me = self.running_native("a", predicted_wall_s=60, native_tool="portivo-mobile", started_at=now)
+        S.track_native(me, {"active": False}, now + 1000, {}, 1.0)
+        self.assertFalse(me.get("native_done"))
+        S.track_native(me, {"active": False}, now + 2 * S.NATIVE["portivo-mobile"][2] + 1, {}, 1.0)
+        self.assertTrue(me["native_done"])
 
     def test_simulator_starts_wait_while_simulators_in_use_are_at_the_cap(self):
         def snapshot(in_use):
-            sims = [{"udid": f"U{i}", "name": f"Portivo-{i}", "in_use": i < in_use, "footprint": 2 * S.GB}
-                    for i in range(2)]
+            sims = [{"udid": f"U{i}", "name": f"Portivo-{i}", "pool": True, "in_use": i < in_use,
+                     "footprint": 2 * S.GB} for i in range(2)]
+            # Twój symulator: liczy się do pamięci, ale nie do limitu agentów (strażnik go nie wyłączy)
+            sims.append({"udid": "H", "name": "iPhone 17", "pool": False, "in_use": True, "footprint": 3 * S.GB})
             with open(S.DEVGUARD_STATE, "w") as f:
                 json.dump({"snapshot": {"at": time.time(), "budget": 12 * S.GB, "total": 0,
                                         "simulators": sims, "simulator_cap": 2}}, f)
@@ -1532,7 +1587,7 @@ class NativeSlotTest(Paths):
         self.set_memory(90)
         snapshot(2)
         st = self.state()
-        self.assertEqual(st["memory"]["simulators"]["in_use"], 2)
+        self.assertEqual(st["memory"]["simulators"]["agents_in_use"], 2)
         st["queue"] = [self.native("up", native_tool="portivo-mobile", sim_lease=False, ago=5),
                        self.entry("boot", 2.5, small=True, lang="native", native_tool="simulator")]
         self.assertEqual(S.plan(st, self.cfg, time.time()), {})
@@ -1641,15 +1696,22 @@ class StateTest(Paths):
         """Chroniony stos (`pnpm dev` z korzenia portivo) ponad budżetem dawał rezerwę 0, choć
         rośnie dalej: strażnik go nie zatrzyma. Rezerwa to wtedy jego zmierzony powrót do szczytu
         (lifetime_max_phys_footprint), a nie zgadywany wzrost."""
+        # stos: szczyt jednostki to suma teraz, a powrót procesów do ich szczytów liczy strażnik
         units = [
-            {"protected": True, "footprint": 6 * S.GB, "peak": 9 * S.GB},
-            {"protected": True, "footprint": 5 * S.GB, "peak": 5 * S.GB},
-            {"protected": False, "footprint": 2 * S.GB, "peak": 7 * S.GB},  # ten strażnik przytnie
+            {"protected": True, "footprint": 6 * S.GB, "peak": 6 * S.GB, "regrow": 2 * S.GB},
+            {"protected": True, "footprint": 5 * S.GB, "peak": 5 * S.GB, "regrow": 1 * S.GB},
+            {"protected": False, "footprint": 2 * S.GB, "peak": 7 * S.GB, "regrow": 5 * S.GB},  # ten strażnik przytnie
         ]
         with open(S.DEVGUARD_STATE, "w") as f:
             json.dump({"snapshot": {"at": time.time(), "budget": 12 * S.GB, "total": 13 * S.GB,
                                     "units": units}}, f)
         self.assertEqual(S.devserver_reserve_gb(), 3.0)
+        # jeden skok nie rezerwuje na zawsze więcej niż jeden serwer
+        units[0]["regrow"] = 20 * S.GB
+        with open(S.DEVGUARD_STATE, "w") as f:
+            json.dump({"snapshot": {"at": time.time(), "budget": 12 * S.GB, "total": 13 * S.GB,
+                                    "units": units}}, f)
+        self.assertEqual(S.devserver_reserve_gb(), 5.0)  # 4 (max_server_gb) + 1
 
     def test_today_rolls_over_and_reap(self):
         st = self.state()

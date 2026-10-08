@@ -376,6 +376,11 @@ def descendants(root):
 # kompiluje: maestro trzyma na symulatorze `xcodebuild test-without-building` przez całą sesję.
 NATIVE_DRIVERS = ("xcodebuild", "swift-build")
 NATIVE_SERVICES = ("XCBBuildService", "SWBBuildService")
+# usługa buildów jest buildem dopiero z jednym z nich pod sobą: bezczynna potrafi trzymać pomocników
+NATIVE_COMPILERS = (
+    "swift-frontend", "swiftc", "swift-driver", "clang", "clang++", "ld", "libtool",
+    "ibtool", "actool", "dsymutil", "codesign",
+)  # fmt: skip
 NATIVE_QUIET_S = 30  # tyle sekund bez kompilatorów po buildzie: faza buildu skończona
 
 
@@ -385,13 +390,14 @@ def xcode_compiles(argv):
     return bool(raw) and raw["detail"] not in ("test-without-building", "installsrc")
 
 
-def native_scan(sims_since=None):
+def native_scan(sims_since=None, builds=True):
     """Natywne buildy na tym Macu: {gb, active, pids} z phys_footprint ich drzew procesów.
 
     `portivo-mobile up` buduje w procesie odczepionym od sesji (własna sesja, rodzic launchd), a
     symulator włącza CoreSimulatorService: żadne z nich nie leży w drzewie joba. Z sims_since
-    liczą się też symulatory (launchd_sim z drzewem) włączone od tej chwili. Kilka ms: nazwy
-    procesów bez argumentów. SCHED_FAKE_MEMORY z kluczem `native` w testach."""
+    liczą się też symulatory (launchd_sim z drzewem) włączone od tej chwili, a z builds=False
+    tylko one (job po swojej fazie buildu nie bierze cudzych). Kilka ms: nazwy procesów bez
+    argumentów. SCHED_FAKE_MEMORY z kluczem `native` w testach."""
     fake = fake_memory()
     if fake is not None and "native" in fake:
         n = fake.get("native") or {}
@@ -399,6 +405,8 @@ def native_scan(sims_since=None):
     roots, services, idle, sims = [], [], set(), []
     for pid in all_pids():
         name = proc_name(pid)
+        if not builds and name != "launchd_sim":
+            continue
         if name == "xcodebuild":
             (roots.append if xcode_compiles(proc_args(pid)) else idle.add)(pid)
         elif name in NATIVE_DRIVERS:
@@ -410,7 +418,12 @@ def native_scan(sims_since=None):
             if start and start >= sims_since - 2:
                 sims.append(pid)
     # usługa buildów pod xcodebuild, który nic nie kompiluje, też nie jest buildem
-    roots += [p for p in services if proc_bsd(p, BSD_PPID) not in idle]
+    roots += [
+        p
+        for p in services
+        if proc_bsd(p, BSD_PPID) not in idle
+        and any(proc_name(c) in NATIVE_COMPILERS for c in descendants(p) - {p})
+    ]
     tree = set()
     for root in roots + sims:
         tree |= descendants(root)
@@ -503,11 +516,13 @@ def devserver_reserve_gb(snap=None):
     try:
         if time.time() - float(snap.get("at", 0)) < 120:
             room = (float(snap.get("budget", 0)) - float(snap.get("total", 0))) / GB
+            # `regrow` strażnik liczy po procesach (lifetime_max - teraz): szczyt całej jednostki
+            # to tylko max(największy proces, suma teraz), więc dla stosu nic by nie mówił
             regrow = sum(
-                max(0.0, float(u.get("peak") or 0) - float(u.get("footprint") or 0))
+                min(max(0.0, float(u.get("regrow") or 0)) / GB, max_server)
                 for u in snap.get("units") or []
                 if u.get("protected")
-            ) / GB
+            )
             return round(max(0.0, min(max_server, room), regrow), 2)
     except (ValueError, TypeError, AttributeError):
         pass
@@ -522,12 +537,16 @@ def simulators_info(snap):
             return None
         sims = [s for s in snap.get("simulators") or [] if isinstance(s, dict)]
         used = [s for s in sims if s.get("in_use")]
+        # limit agentów liczy tylko pulę: Twoich symulatorów strażnik nie wyłączy, więc dwa
+        # Twoje zatrzymałyby każdy `portivo-mobile up` na zawsze
+        agents = [s for s in used if s.get("pool")]
         return {
             "booted": len(sims),
             "in_use": len(used),
+            "agents_in_use": len(agents),
             "cap": int(snap.get("simulator_cap") or 0),
             "gb": round(sum(float(s.get("footprint") or 0) for s in sims) / GB, 2),
-            "holders": [s.get("name") or s.get("udid") for s in used][:4],
+            "holders": [s.get("name") or s.get("udid") for s in agents][:4],
         }
     except (ValueError, TypeError, AttributeError):
         return None
@@ -1014,6 +1033,16 @@ def parse_native(words, here):
     return {"lang": "native", "tool": tool, "detail": detail, "dir": here}
 
 
+def native_exclusive(tool, detail, argv):
+    if tool == "xcodebuild":
+        return detail not in ("test-without-building", "installsrc")
+    if tool in ("expo-run", "react-native-run"):
+        return detail == "ios"
+    if tool == "eas-local":
+        return all(a.split("=")[-1] != "android" for a in argv)
+    return tool == "portivo-mobile"
+
+
 def finish_native(raw):
     tool, detail = raw["tool"], raw["detail"]
     kind, gb, wall, outside = NATIVE[tool]
@@ -1052,8 +1081,9 @@ def finish_native(raw):
         "label": label,
         "native_prior": (gb, wall),
         "outside": outside,
-        # jedno miejsce na natywny build na całym Macu (plan, track_native); pody i symulator obok
-        "exclusive": kind == "build",
+        # jedno miejsce na natywny build na całym Macu (plan, track_native): buildy iOS, bo tylko
+        # ich kompilatory widzi native_scan; pody, symulator i Android (demon Gradle) biegną obok
+        "exclusive": native_exclusive(tool, detail, raw["argv"]),
     }
 
 
@@ -2049,7 +2079,10 @@ def track_native(me, native, now, internal, now_gb):
         return
     seen = me.get("native_seen")
     quiet = seen and now - me.get("native_active_at", now) >= NATIVE_QUIET_S
-    stale = not seen and now - me.get("started_at", now) > 2 * max(me.get("predicted_wall_s") or 0, 300)
+    # zimny build (prebuild, pod install) potrafi długo nie ruszać kompilatorów: czas z tabeli
+    # jako dolna granica, bo historia `up` to głównie szybkie biegi z klientem w cache
+    floor = NATIVE.get(me.get("native_tool"), (None, 0, 0, None))[2]
+    stale = not seen and now - me.get("started_at", now) > 2 * max(me.get("predicted_wall_s") or 0, floor, 300)
     if quiet or stale:
         me["native_done"] = True
         me["native_done_at"] = now
@@ -2057,16 +2090,16 @@ def track_native(me, native, now, internal, now_gb):
 
 
 def sim_wait(job, mem):
-    """Start symulatora czeka, gdy symulatorów w użyciu jest tyle, ile pozwala strażnik
-    (`max_booted_simulators`): każdy to 2-4 GB, a cudzego, używanego nikt nie wyłączy.
-    `portivo-mobile up` sesji, która ma już swój symulator, nic nowego nie włącza. Nieużywane
-    wyłącza strażnik; bez jego świeżego pomiaru limitu nie ma."""
+    """Start symulatora czeka, gdy symulatorów agentów (pula portivo-mobile) w użyciu jest tyle,
+    ile pozwala strażnik (`max_booted_simulators`): każdy to 2-4 GB, a cudzego, używanego nikt
+    nie wyłączy. `portivo-mobile up` sesji, która ma już swój symulator, nic nowego nie włącza.
+    Nieużywane wyłącza strażnik; bez jego świeżego pomiaru limitu nie ma."""
     sims = mem.get("simulators") or {}
     return (
         job.get("native_tool") in ("portivo-mobile", "simulator")
         and not job.get("sim_lease")
         and bool(sims.get("cap"))
-        and sims.get("in_use", 0) >= sims["cap"]
+        and sims.get("agents_in_use", 0) >= sims["cap"]
     )
 
 
@@ -2294,9 +2327,9 @@ def update_queue_view(state, cfg):
             sims = mem.get("simulators") or {}
             job["eta_start_s"] = None
             text = (
-                f"waiting: {sims['in_use']} simulators in use, cap {sims['cap']} "
-                f"({', '.join(str(h) for h in sims.get('holders') or [])}); "
-                "unused ones are shut down by the guard"
+                f"waiting: {sims['agents_in_use']} agent simulators in use, cap {sims['cap']} "
+                f"({', '.join(str(h) for h in sims.get('holders') or [])}); one frees when its "
+                "session runs `portivo-mobile release` or ends"
             )
         elif (
             head_blocked is not None
@@ -2762,14 +2795,14 @@ def run_local(entry, job, command, argv, cfg):
     # to jego) i symulator, który `portivo-mobile up` włączył; oba poza drzewem procesów joba
     native = job.get("lang") == "native" and job.get("exclusive")
     sims_since = started if job.get("tool") == "portivo-mobile" else None
-    pool, pool_at = None, 0.0
+    pool, pool_at, built = None, 0.0, False
     while True:
         pid, status, rusage = os.wait4(child.pid, os.WNOHANG)
         if pid == child.pid:
             break
         own = job_pids(child.pid)
         if native and time.time() - pool_at >= 2.0:
-            pool, pool_at = native_scan(sims_since), time.time()
+            pool, pool_at = native_scan(sims_since, builds=not built), time.time()
         if pool and pool["pids"]:
             now_gb, cpu_live = pids_usage(own | pool["pids"])
         else:
@@ -2778,7 +2811,7 @@ def run_local(entry, job, command, argv, cfg):
         peak = max(peak, now_gb)
         if time.time() - last_beat >= 1.0:
             last_beat = time.time()
-            heartbeat(jid, cfg, now_gb, peak, cpu_live, started, native=pool)
+            built = heartbeat(jid, cfg, now_gb, peak, cpu_live, started, native=pool) or built
         time.sleep(0.25)
     rc = os.waitstatus_to_exitcode(status)
     cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
@@ -2787,6 +2820,7 @@ def run_local(entry, job, command, argv, cfg):
 
 
 def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None):
+    """Pomiar biegnącego joba do stanu; True, gdy natywny job skończył fazę buildu."""
     with Locked(block=False) as lk:
         if not lk.ok:
             return
@@ -2811,6 +2845,8 @@ def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None):
         safety(state, cfg)
         update_queue_view(state, cfg)
         save_state(state)
+        # run_local po fazie buildu przestaje doliczać cudze drzewa xcodebuild
+        return bool(me.get("native_done"))
 
 
 def old_hook_depot(entry):
@@ -3442,8 +3478,8 @@ def cmd_status(args):
         slot = "wolne"
     sims = mem.get("simulators")
     sims_text = (
-        f"; symulatory: {sims['booted']} włączone ({pl_gb(sims['gb'])}), w użyciu {sims['in_use']}"
-        f" z limitu {sims['cap']}"
+        f"; symulatory: {sims['booted']} włączone ({pl_gb(sims['gb'])}), agentów w użyciu "
+        f"{sims.get('agents_in_use', 0)} z limitu {sims['cap']}"
         if sims
         else ""
     )
@@ -3523,47 +3559,93 @@ def cmd_wait(args):
 RTK_CONFIG = os.path.join(HOME, "Library/Application Support/rtk/config.toml")
 
 
-def rtk_excludes_line():
-    """Linia `exclude_commands` do [hooks] w configu rtk: komendy, które owija scheduler.
-    Wzorce idą jako literały TOML ('...'), więc odwrotne ukośniki zostają, jak są."""
+def rtk_excludes_line(extra=()):
+    """Linia `exclude_commands` do [hooks] w configu rtk: komendy, które owija scheduler, plus
+    `extra` (wzorce dopisane ręcznie). Literały TOML ('...'), więc ukośniki zostają, jak są."""
     quote = lambda p: f"'{p}'" if "'" not in p and "\n" not in p else json.dumps(p)  # noqa: E731
-    return "exclude_commands = [" + ", ".join(quote(p) for p in RTK_EXCLUDES) + "]"
+    return "exclude_commands = [" + ", ".join(quote(p) for p in list(RTK_EXCLUDES) + list(extra)) + "]"
+
+
+def toml_string_array(text, pos):
+    """Tablica stringów TOML od `[` na pozycji pos: (stringi, pozycja za `]`), albo None, gdy to
+    nie jest prosta tablica stringów (wtedy nie ruszamy pliku). Komentarze i nowe linie w środku
+    są dozwolone, nawiasy w stringach nie liczą się do zagnieżdżenia."""
+    items, i, depth = [], pos, 0
+    while i < len(text):
+        c = text[i]
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return items, i + 1
+        elif c in "'\"":
+            if text.startswith(c * 3, i):
+                return None  # stringi wieloliniowe: nie zgadujemy
+            j = i + 1
+            while j < len(text) and text[j] != c and text[j] != "\n":
+                j += 2 if c == '"' and text[j] == "\\" else 1
+            if j >= len(text) or text[j] != c:
+                return None
+            if c == "'":
+                items.append(text[i + 1 : j])
+            else:
+                try:
+                    items.append(json.loads(text[i : j + 1]))
+                except ValueError:
+                    return None
+            i = j
+        elif c == "#":
+            nl = text.find("\n", i)
+            i = len(text) if nl < 0 else nl
+            continue
+        elif not (c.isspace() or c == ","):
+            return None
+        i += 1
+    return None
 
 
 def write_rtk_excludes(path=RTK_CONFIG):
-    """Wpisuje `rtk_excludes_line()` w sekcję [hooks] configu rtk (dopisuje sekcję, gdy jej nie
-    ma); reszta pliku zostaje bez zmian, a przed pierwszą zmianą powstaje kopia
-    `config.toml.bak-claude-acc`. True, gdy plik się zmienił."""
+    """Wpisuje wzorce schedulera do `exclude_commands` w sekcji [hooks] configu rtk: najpierw
+    nasze, potem Twoje, których u nas nie ma (nic nie znika). Sekcję dopisuje, gdy jej nie ma;
+    reszta pliku zostaje znak w znak, a przed pierwszą zmianą powstaje kopia
+    `config.toml.bak-claude-acc`. Z tomllib (Python 3.11+) wynik musi się parsować i różnić od
+    starego tylko tą listą. True, gdy plik się zmienił; ValueError, gdy plik jest nie do ruszenia."""
     try:
         with open(path) as f:
             text = f.read()
     except FileNotFoundError:
         text = ""
-    lines, line = text.splitlines(), rtk_excludes_line()
-    start = next((i for i, l in enumerate(lines) if l.strip() == "[hooks]"), None)
-    if start is None:
-        lines += ([""] if lines and lines[-1].strip() else []) + ["[hooks]", line]
-    else:
-        end = next(
-            (i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
-            len(lines),
-        )
-        at = next(
-            (i for i in range(start + 1, end) if re.match(r"\s*exclude_commands\s*=", lines[i])),
-            None,
-        )
-        if at is None:
-            lines.insert(start + 1, line)
+    header = re.search(r"^[ \t]*\[hooks\][ \t]*(#.*)?$", text, re.M)
+    if header is None:
+        if not text.strip() or text.endswith("\n\n"):
+            sep = ""
         else:
-            stop = at
-            # tablica rozpisana na kilka linii: do linii, która ją zamyka
-            while stop < end - 1 and not lines[stop].rstrip().endswith("]"):
-                stop += 1
-            lines[at : stop + 1] = [line]
-    out = "\n".join(lines) + "\n"
+            sep = "\n" if text.endswith("\n") else "\n\n"
+        out = text + sep + "[hooks]\n" + rtk_excludes_line() + "\n"
+    else:
+        tables = re.compile(r"^[ \t]*\[", re.M)
+        nxt = tables.search(text, header.end())
+        stop = nxt.start() if nxt else len(text)
+        key = re.compile(r"^([ \t]*)exclude_commands[ \t]*=[ \t]*", re.M).search(text, header.end(), stop)
+        if key is None:
+            out = text[: header.end()] + "\n" + rtk_excludes_line() + text[header.end() :]
+        else:
+            if text[key.end() : key.end() + 1] != "[":
+                raise ValueError("exclude_commands w configu rtk to nie tablica")
+            parsed = toml_string_array(text, key.end())
+            if parsed is None:
+                raise ValueError("exclude_commands w configu rtk to nie prosta tablica stringów")
+            theirs, after = parsed
+            extra = [p for p in theirs if p not in RTK_EXCLUDES]
+            line = rtk_excludes_line(extra)
+            out = text[: key.start()] + key.group(1) + line + text[after:]
     if out == text:
         return False
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    check_rtk_config(text, out)
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
     backup = path + ".bak-claude-acc"
     if text and not os.path.exists(backup):
         with open(backup, "w") as f:
@@ -3574,6 +3656,27 @@ def write_rtk_excludes(path=RTK_CONFIG):
     return True
 
 
+def check_rtk_config(before, after):
+    """Z tomllib: nowy config się parsuje i różni od starego tylko listą exclude_commands."""
+    try:
+        import tomllib
+    except ImportError:  # Python 3.9 z Xcode: skaner wyżej musi wystarczyć
+        return
+    try:
+        old = tomllib.loads(before)
+        new = tomllib.loads(after)
+    except tomllib.TOMLDecodeError as err:
+        raise ValueError(f"config rtk po zmianie nie jest poprawnym TOML: {err}") from err
+    for data in (old, new):
+        hooks = data.get("hooks")
+        if isinstance(hooks, dict):
+            hooks.pop("exclude_commands", None)
+            if not hooks:
+                data.pop("hooks")
+    if old != new:
+        raise ValueError("zmiana w configu rtk dotknęłaby czegoś poza exclude_commands")
+
+
 def cmd_rtk_excludes(args):
     """Bez argumentów drukuje linię `exclude_commands`; `--write [PATH]` wpisuje ją w config rtk
     (domyślnie RTK_CONFIG). Woła to setup.sh przy każdej instalacji."""
@@ -3581,7 +3684,11 @@ def cmd_rtk_excludes(args):
         print(rtk_excludes_line())
         return 0
     path = args[1] if len(args) > 1 else RTK_CONFIG
-    changed = write_rtk_excludes(path)
+    try:
+        changed = write_rtk_excludes(path)
+    except (OSError, ValueError) as err:
+        print(f"rtk: nie ruszam {path}: {err}", file=sys.stderr)
+        return 1
     print(f"rtk: {'wpisane wyjątki schedulera' if changed else 'wyjątki schedulera bez zmian'} ({path})")
     return 0
 

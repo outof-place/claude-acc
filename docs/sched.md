@@ -78,7 +78,7 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `level_pct` | `kern.memorystatus_level`: procent pamięci, który jądro uważa za dostępny |
 | `available_gb` | `level_pct / 100 × ram_gb` |
 | `headroom_gb` | zapas, którego scheduler nie rusza (`config.headroom_gb`) |
-| `devserver_reserve_gb` | miejsce na dev serwery, z `devguard-state.json`: `min(max_server_gb, budżet devguarda - dev serwery teraz)`, ale nie mniej niż powrót chronionych i przypiętych serwerów (których strażnik nie zatrzyma) do ich zmierzonego szczytu: suma `max(0, peak - footprint)` |
+| `devserver_reserve_gb` | miejsce na dev serwery, z `devguard-state.json`: `min(max_server_gb, budżet devguarda - dev serwery teraz)`, ale nie mniej niż powrót chronionych i przypiętych serwerów (których strażnik nie zatrzyma) do ich zmierzonego szczytu: pole `regrow` strażnika, czyli suma `max(0, szczyt procesu - procesu teraz)` po procesach serwera, najwyżej `max_server_gb` na serwer |
 | `jobs_now_gb` | suma `mem_now_gb` lokalnych jobów |
 | `reserved_gb` | o ile lokalne joby jeszcze urosną: suma `max(0, mem_predicted_gb - mem_now_gb)`, plus `native.reserve_gb` |
 | `others_gb` | `ram_gb - available_gb - jobs_now_gb`: inne aplikacje i system |
@@ -87,7 +87,7 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `swap_used_gb`, `swap_growth_2m_gb` | swap teraz i jego przyrost w 2 minuty |
 | `pressure` | `normal`, `warn`, `critical` z poziomu jądra (`kern.memorystatus_vm_pressure_level`) |
 | `guard_level` | presja wg strażnika dev serwerów (0, 1, 2) z jego pomiaru młodszego niż minuta, albo `null`; liczy też rosnący swap, więc jej `2` wstrzymuje natywne joby |
-| `native` | `{build_gb, active, outside, reserve_gb, owner, owner_label}`: natywny build na Macu teraz. `active`: xcodebuild z akcją budującą (albo usługa XCBBuildService z dziećmi); `outside`: build spoza schedulera (nikt z `running[]` nie trzyma miejsca); `reserve_gb`: dla buildu z zewnątrz `max(0, przewidywany szczyt buildu - build_gb)`; `owner`: id joba, który trzyma miejsce |
+| `native` | `{build_gb, active, outside, reserve_gb, owner, owner_label}`: natywny build na Macu teraz. `active`: xcodebuild z akcją, która kompiluje, albo usługa buildów Xcode, pod którą biegnie kompilator (`swift-frontend`, `clang`, `ld`, `actool`…); sama otwarta usługa z pomocnikami buildem nie jest; `outside`: build spoza schedulera (nikt z `running[]` nie trzyma miejsca); `reserve_gb`: dla buildu z zewnątrz `max(0, przewidywany szczyt buildu - build_gb)`; `owner`: id joba, który trzyma miejsce |
 | `simulators` | `{booted, in_use, cap, gb, holders[]}` z pomiaru devguarda albo `null` bez świeżego pomiaru; `in_use`: żywa dzierżawa portivo-mobile, widz albo symulator człowieka |
 
 ### Job w `running[]` i `queue[]`
@@ -312,9 +312,14 @@ drzewem procesów historia może ją tylko podnieść: scheduler mierzy `xcrun`,
 trzy szybkie starty nauczyłyby go zera. Natywne joby biegną tylko lokalnie. Agent, którego komenda
 czeka, dostaje na stderr powód i zdanie, że build wystartuje sam.
 
-Jeden natywny build naraz na całym Macu (rodzaj `build`; pody i start symulatora biegną obok).
-Miejsce trzyma job z `running[]` tylko w fazie kompilacji: 30 s po ostatnim kompilatorze (albo po
-2 × przewidywany czas bez kompilacji) zwalnia je i swoją rezerwację, więc `expo run:ios`, który
+Jeden natywny build iOS naraz na całym Macu: `xcodebuild` z akcją, która kompiluje, `expo run:ios`,
+`react-native run-ios|build-ios`, `eas build --local` poza Androidem i `portivo-mobile up`. Pody,
+start symulatora i buildy Androida (Gradle, `expo run:android`) biegną obok, dalej tylko przy wolnej
+pamięci: koniec fazy kompilacji scheduler widzi po kompilatorach Xcode, więc build Androida trzymałby
+miejsce do upływu czasu, nic nie budując. Miejsce trzyma job z `running[]` tylko w fazie kompilacji:
+30 s po ostatnim kompilatorze (albo po 2 × przewidywany czas bez kompilacji, nie mniej niż czas z
+tabeli, bo zimny build z prebuildem i podami długo nie rusza kompilatorów) zwalnia je i swoją
+rezerwację, więc `expo run:ios`, który
 dalej trzyma Metro, nie blokuje następnego. Build spoza schedulera (xcodebuild z akcją, która
 kompiluje, albo usługa buildów Xcode z dziećmi: odczepiony builder portivo-mobile, Xcode) też
 zajmuje miejsce, a jego wzrost do przewidywanego szczytu buildu (p90 × 1,15 ostatnich zmierzonych
@@ -324,8 +329,10 @@ poza jego drzewem procesów, a dla `portivo-mobile up` także symulator, który 
 na swoją kolej job (`reason.code = native`) nie blokuje jobów za sobą.
 
 Start symulatora (`xcrun simctl boot`, `open -a Simulator`) i `portivo-mobile up` sesji, która nie
-ma jeszcze dzierżawy, czekają (`reason.code = simulators`), gdy symulatory w użyciu są na limicie
-devguarda (`max_booted_simulators`). Nieużywane symulatory wyłącza strażnik (README, sekcja o
+ma jeszcze dzierżawy, czekają (`reason.code = simulators`), gdy symulatory agentów (z puli
+`simulator_pool_prefix`, `Portivo-*`) w użyciu są na limicie devguarda (`max_booted_simulators`).
+Twoje symulatory spoza puli liczą się do pamięci, ale nie do tego limitu: strażnik ich nie wyłącza,
+więc Twój otwarty iPhone nie może na stałe zablokować agentom startu. Nieużywane symulatory wyłącza strażnik (README, sekcja o
 strażniku dev serwerów); bez jego świeżego pomiaru limitu nie ma.
 
 ## `sched.py wait`
@@ -342,8 +349,10 @@ Hook rtk (`rtk-rewrite.sh`) też przepisuje komendy, które owija scheduler. Dwa
 `updatedInput` na tej samej komendzie dają losowy wynik, więc na Macu z rtk te komendy idą w jego
 wyjątki, w `~/Library/Application Support/rtk/config.toml`, w sekcji `[hooks]`. Linię
 `exclude_commands` drukuje `sched.py rtk-excludes`, a `sched.py rtk-excludes --write` wpisuje ją w
-ten plik (setup.sh woła to przy każdej instalacji na Macu z rtk; reszta pliku zostaje, kopia sprzed
-pierwszej zmiany to `config.toml.bak-claude-acc`). Test pilnuje, żeby wyjątki obejmowały wszystko,
+ten plik (setup.sh woła to przy każdej instalacji na Macu z rtk). Twoje wpisy w `exclude_commands`
+zostają za naszymi, komentarze i reszta pliku zostają znak w znak, kopia sprzed pierwszej zmiany to
+`config.toml.bak-claude-acc`. Wartości, której nie umie przeczytać (nie tablica, tablica nie samych
+stringów), nie rusza: kończy się kodem 1 i plik zostaje, jaki był. Test pilnuje, żeby wyjątki obejmowały wszystko,
 co scheduler owija, i nic więcej (rtk dalej skraca `pnpm install` czy `git`). Jeden wyjątek od
 „nic więcej”: rtk czyta wzorce crate'em `regex` bez lookaroundów, więc `xcodebuild` idzie w wyjątki
 cały, także `-version` i `-list`, których scheduler nie owija.
