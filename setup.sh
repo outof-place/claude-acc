@@ -88,6 +88,12 @@ ln -sfn "$PY" "$STATE/python"
 # the hook's native front reads the words that send a command to Python from here
 "$STATE/python" "$STATE/acc.py" devguard words > "$STATE/hook-words.json.new" 2>/dev/null \
   && mv -f "$STATE/hook-words.json.new" "$STATE/hook-words.json" || rm -f "$STATE/hook-words.json.new"
+# wyjątki rtk: komend, które owija scheduler, hook rtk nie przepisuje (dwa hooki z updatedInput na
+# jednej komendzie dają losowy wynik). Linia w [hooks] configu rtk idzie z tej wersji schedulera
+if command -v rtk >/dev/null 2>&1 || [ -x /opt/homebrew/bin/rtk ]; then
+  "$STATE/python" "$STATE/acc.py" sched rtk-excludes --write \
+    || echo "rtk: wyjątki schedulera niewpisane, szczegóły wyżej" >&2
+fi
 
 # pauza limitów: hooki w sesjach Claude Code dopisane do settings.json obok Twoich
 # (kopia sprzed pierwszej zmiany: settings.json.bak-claude-acc). Paczka bez hook.py

@@ -42,6 +42,8 @@ Komendy:
   unpin <:port|katalog|all>   zdejmij przypięcie
   pins                  przypięcia, ich powody i terminy
   admit                 hook PreToolUse (Bash) dla Claude Code; zdarzenie czyta z stdin
+  room [katalog]        kod 0, gdy pamięć wpuści nowy dev serwer (w tym katalogu), 1 z powodem;
+                        warunek dla `claude-acc sched wait`, który odmowa podaje agentowi
   words                 słowa, od których komenda idzie do `admit` dalej niż szybka ścieżka,
                         i bramka całych słów, jako JSON {"dev": [...], "sched": [...],
                         "gate": [wzorzec]} dla natywnego claude-acc-hook
@@ -56,12 +58,13 @@ Komendy:
 import os
 import sys
 
-DEV_WORDS = ("dev", "vite", "expo", "serve")
-# słowa, bez których komenda nie ma pracy dla schedulera (Go i JS); fałszywy alarm to tylko
-# klasyfikacja w sched.py, która odpowie None
+DEV_WORDS = ("dev", "vite", "expo", "serve", "react-native")
+# słowa, bez których komenda nie ma pracy dla schedulera (Go, JS i natywne buildy z symulatorami);
+# fałszywy alarm to tylko klasyfikacja w sched.py, która odpowie None
 SCHED_WORDS = (
     "go ", "golangci-lint", "make", "govulncheck", "vitest", "jest", "playwright", "next ",
     "tsc", "eslint", "turbo", "pnpm", "npm ", "npx ", "yarn", "bun ", "bunx", "node_modules/.bin/",
+    "xcodebuild", "simctl", "pod", "eas", "gradle", "portivo-mobile", "Simulator",
 )  # fmt: skip
 # Bramka natywnego frontu (claude-acc-hook): komenda idzie do Pythona tylko wtedy, gdy słowo
 # stoi w niej jako całe słowo, a nie kawałek ścieżki albo innego słowa. Scheduler rozpoznaje
@@ -74,7 +77,12 @@ SCHED_WORDS = (
 GATE_PROGRAMS = (
     "go", "golangci-lint", "make", "govulncheck", "npx", "bunx", "pnpm", "yarn", "npm", "bun",
     "vitest", "jest", "playwright", "next", "tsc", "vue-tsc", "eslint", "turbo", "vite", "expo",
+    "react-native", "xcodebuild", "pod", "pod-install", "eas", "eas-cli", "gradle", "gradlew",
+    "portivo-mobile",
 )  # fmt: skip
+# natywne komendy, których nie poznać po samym programie: xcrun i open robią też wiele lekkich
+# rzeczy, a do schedulera idzie tylko start symulatora
+GATE_NATIVE = r"(?<![\w.-])simctl\s+boot|(?<![\w.-])-a\s+[\"']?Simulator(?![\w-])"
 # Sekrety bramki pocztowej (klucz konta serwisowego Google, hasła IMAP) leżą w Pęku kluczy pod
 # usługą claude-acc-mail. Agent korzysta z poczty przez narzędzia mail, a komendy, która je
 # wyciąga (`security find-generic-password ... -w`, `dump-keychain`), strażnik nie przepuszcza.
@@ -87,6 +95,7 @@ SECRET_WORDS = ("claude-acc-mail", "claude-acc-browser", "claude-acc-credits", "
 HOOK_GATE = (
     r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
     r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
+    r"|" + GATE_NATIVE +
     r"|(?<![\w.-])(?:" + "|".join(SECRET_WORDS) + r")(?![\w.-])"
 )
 SECRET_DENY = (
@@ -135,20 +144,30 @@ def secret_read(command):
         return BROWSER_SECRET_DENY
     return None
 
-# komenda stawiająca dev serwer, po zdjęciu opakowań (zmienne, rtk proxy, npx, pnpm exec).
-# Wzorce to tekst: `re` kompiluje je przy pierwszym użyciu, więc komenda bez słowa od dev
-# serwera nie płaci ani za import `re`, ani za kompilację
+# komenda stawiająca dev serwer, po zdjęciu opakowań (zmienne, rtk proxy, npx, pnpm exec) i
+# ścieżki programu. Metro stawia `expo start`, `react-native start` i `expo run:<platforma>`
+# (po buildzie, chyba że --no-bundler; Metro, które już serwuje tę aplikację, expo bierze zamiast
+# nowego, więc dla run nie ma odmowy „drugi serwer”, zostaje tylko pamięć). Wzorce to tekst: `re`
+# kompiluje je przy pierwszym użyciu, więc komenda bez słowa od dev serwera nie płaci ani za
+# import `re`, ani za kompilację
+METRO = r"(?:expo(?:@\S+)?\s+(?:start|(?P<run>run:\w+))|react-native(?:@\S+)?\s+start)"
 START = (
-    r"^(?:next\s+dev|vite(?:\s+(?:dev|serve))?(?=\s+-|\s*$)|expo\s+start"
+    r"^(?:next\s+dev|vite(?:\s+(?:dev|serve))?(?=\s+-|\s*$)|(?:(?:pnpm|yarn|bun)\s+)?" + METRO +
     r"|webpack(?:-cli)?\s+serve|astro\s+dev|nuxi?\s+dev"
     r"|(?:pnpm|yarn)\s+(?:--filter|-F)[\s=](?P<pkg>\S+)\s+(?:run\s+)?dev(?::\S+)?"
     r"|(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?dev(?::\S+)?|turbo\s+(?:run\s+)?dev)(?=\s|$)"
 )
 WRAPPERS = (
     r"^(?:\w+=\S*\s+|(?:rtk\s+proxy|nohup|exec|time|env|caffeinate(?:\s+-\w+)*)\s+"
-    r"|(?:npx|bunx|(?:pnpm|yarn|npm)(?:\s+(?:-C|--dir|--prefix|--cwd)[\s=]\S+)*\s+(?:exec|dlx))"
-    r"\s+(?:--\S+\s+)*)+"
+    r"|(?:npx|bunx|(?:pnpm|yarn|npm)(?:\s+(?:-C|--dir|--prefix|--cwd|--filter|-F)[\s=]\S+)*"
+    r"\s+(?:exec|dlx))\s+(?:--\S+\s+)*)+"
 )
+FILTER_FLAG = r"\s(?:--filter|-F)[\s=](\S+)"
+# skrypt CLI pod node (`node …/expo/bin/cli start`, `node /opt/homebrew/bin/pnpm dev`): takie
+# komendy wznowienia strażnik sam pisze do logu, a agent je kopiuje
+NODE_SCRIPT = r"^node\s+(?:-\S+\s+)*(?=\S*/)"
+# pytanie o pomoc albo wersję niczego nie stawia
+NOT_A_START = r"\s(?:--help|-h|--version)(?=\s|$)"
 DIR_FLAG = r"\s(-C|--dir|--prefix|--cwd)[\s=](\S+)"
 # komenda w cudzysłowie, którą uruchomi ktoś inny: `orca terminal create --command`, `sh -c`
 NESTED = r"""(?:--command|\b(?:ba|z)?sh\s+-c)[\s=](?:"((?:[^"\\]|\\.)*)"|'([^']*)')"""
@@ -173,8 +192,28 @@ def sched_rewrite(event):
         return None
 
 
+def program(path):
+    """Nazwa programu z jego ścieżki: `./node_modules/.bin/expo` i `/opt/homebrew/bin/pnpm` to
+    expo i pnpm, a skrypt CLI paczki (`…/expo/bin/cli`, `…/next/dist/bin/next`,
+    `…/vite/bin/vite.js`, `…/react-native/cli.js`) to nazwa paczki."""
+    parts = path.split("/")
+    name = parts[-1]
+    for ext in (".js", ".cjs", ".mjs"):
+        if name.endswith(ext):
+            name = name[: -len(ext)]
+    if len(parts) > 3 and parts[-2] == "bin":
+        package = parts[-4] if parts[-3] == "dist" else parts[-3]
+        if name == "cli" or package == name or parts[-3] == "dist":
+            return package
+    if name == "cli" and len(parts) > 1:
+        return parts[-2]
+    return name
+
+
 def dev_starts(command, cwd):
-    """[(katalog, filtr pakietu albo None, cały stos?)] dla każdej komendy stawiającej dev serwer."""
+    """[(katalog, filtr pakietu albo None, cały stos?, bierze działające Metro?)] dla każdej
+    komendy stawiającej dev serwer. Ostatnie pole mówi, że komenda (`expo run:ios`) sama użyje
+    Metro, które już serwuje tę aplikację, więc drugi serwer nie powstanie."""
     import re
 
     found = []
@@ -189,9 +228,16 @@ def dev_starts(command, cwd):
             )
             continue
         bare = re.sub(WRAPPERS, "", segment)
+        bare = re.sub(NODE_SCRIPT, "", bare)
+        first, _, rest = bare.partition(" ")
+        if "/" in first:
+            bare = re.sub(WRAPPERS, "", program(first) + " " + rest).rstrip()
         match = re.match(START, bare)
-        if not match:
+        if not match or re.search(NOT_A_START, segment):
             continue
+        run = match.group("run")
+        if run and re.search(r"\s--no-bundler(?=\s|$)", segment):
+            continue  # sam build: czeka w schedulerze, Metro nie stawia
         target = cwd
         flag = re.search(DIR_FLAG, " " + segment)
         if flag:
@@ -199,9 +245,15 @@ def dev_starts(command, cwd):
                 os.path.join(cwd, os.path.expanduser(flag.group(2).strip("'\"")))
             )
         package = match.group("pkg")
+        if not package and bare != segment:
+            # `pnpm --filter mobile exec expo start`: filtr zdjęty razem z exec
+            picked = re.search(FILTER_FLAG, " " + segment)
+            package = picked.group(1) if picked else None
         # skrypt `dev` z package.json albo turbo: stawia to, co zdefiniował projekt
-        stack = not package and bool(re.match(r"^(pnpm|npm|yarn|bun|turbo)\s", bare))
-        found.append((target, package, stack))
+        stack = not package and bool(
+            re.match(r"^(?:(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?dev|turbo)(?:\s|:|$)", bare)
+        )
+        found.append((target, package, stack, bool(run)))
     return found
 
 
