@@ -2250,3 +2250,247 @@ class RunTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def make_generic_repo(root):
+    """Repo spoza Go i JS z ciężkimi komendami: skrypty, CLI projektu, Cargo, package.json."""
+    os.makedirs(os.path.join(root, ".git"))
+    for name in ("scripts/e2e.sh", "scripts/capture.py", "scripts/dev-server.sh", "bin/verify",
+                 "plugins/cli/main.ts", "manage.py", "e2e.sh", "tools/emulator"):
+        write(os.path.join(root, name), "#!/bin/sh\necho ok\n", 0o755)
+    write(os.path.join(root, "Cargo.toml"), "[package]\nname = 'x'\n")
+    write(os.path.join(root, "package.json"), json.dumps({"scripts": {
+        "sm": "node plugins/cli/main.ts", "app": "next dev", "format": "oxfmt",
+        "test": "vitest run", "e2e:ci": "playwright test"}}))
+
+
+class GenericTest(Paths):
+    """Ciężka praca spoza Go i JS: po kształcie komendy, z klasą po podpisie i nauką z historii.
+    Błąd, który łapią: komenda, która stawia przeglądarkę albo kompilator, omija scheduler
+    (08.10: `sm capture`, `sm verify` i skrypty owijające), albo scheduler owija serwer, watcher
+    czy REPL, który nigdy się nie kończy i trzyma swoją rezerwę."""
+
+    WRAPPED = {
+        "cargo test": "shop:test:cargo:test",
+        "RUST_LOG=1 cargo build --release 2>&1 | tail -5": "shop:build:cargo:build",
+        "swift test": "shop:test:swift:test",
+        "docker build .": "shop:build:docker:build",
+        "pytest -x tests": "shop:test:pytest:tests",
+        "python3 -m pytest": "shop:test:pytest",
+        "uv run pytest": "shop:test:pytest",
+        "python3 scripts/capture.py --url http://localhost:3000": "shop:script:python:scripts/capture.py",
+        "uv run python scripts/capture.py": "shop:script:python:scripts/capture.py",
+        "python3 manage.py test": "shop:script:python:manage.py:test",
+        "node plugins/cli/main.ts capture": "shop:script:node:plugins/cli/main.ts:capture",
+        "tsx plugins/cli/main.ts verify": "shop:script:tsx:plugins/cli/main.ts:verify",
+        "./scripts/e2e.sh": "shop:script:script:scripts/e2e.sh",
+        "bash scripts/e2e.sh": "shop:script:bash:scripts/e2e.sh",
+        "e2e.sh": "shop:script:script:e2e.sh",
+        "bin/verify all": "shop:script:script:bin/verify:all",
+        "sh -c 'cargo test'": "shop:test:cargo:test",
+        "pnpm sm capture": "shop:script:pnpm-script:sm:capture",
+        "bun run sm": "shop:script:bun-script:sm",
+        "npx lighthouse http://localhost:3000": "shop:e2e:lighthouse",
+        "pnpm exec cypress run": "shop:e2e:cypress:run",
+        "make e2e": "shop:script:make:e2e",
+        "just test": "shop:script:just:test",
+        "deno test": "shop:test:deno:test",
+    }
+    LEFT_ALONE = (
+        # serwery, watchery, REPL-e: nigdy się nie kończą
+        "python3 manage.py runserver", "python3 -m http.server", "node server.js", "pnpm app",
+        "./scripts/dev-server.sh", "make dev", "just serve", "npx webpack --watch", "expo start",
+        "docker compose up", "cargo watch -x test", "tools/emulator -avd Pixel_9 -no-window",
+        # skrypt projektu, który tylko pyta, i program systemowy po pełnej ścieżce
+        "./scripts/e2e.sh status", "python3 scripts/capture.py help", "/opt/homebrew/opt/postgresql@18/bin/pg_dump -Fc",
+        # chwila liczenia albo informacje
+        "python3 -c 'print(1)'", "python3 - <<EOF", "node -e 1", "node --version", "cargo fmt",
+        "cargo --version", "pnpm format", "pnpm install", "pnpm foo", "python3 missing.py",
+        # zwykłe narzędzia i komendy, które już idą przez scheduler
+        "git status", "ls -la", "gh pr list", "claude-acc sched run -- cargo test",
+        "/Users/x/.local/bin/claude-acc status", "echo cargo test",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.shop = os.path.join(self.dir, "shop")
+        make_generic_repo(self.shop)
+
+    def test_heavy_shapes_are_classified_by_signature(self):
+        for command, cls in self.WRAPPED.items():
+            j = S.classify(command, self.shop)
+            self.assertIsNotNone(j, command)
+            self.assertEqual(j["class"], cls, command)
+            self.assertEqual(j["lang"], "generic", command)
+
+    def test_servers_repls_and_trivial_commands_stay_out(self):
+        for command in self.LEFT_ALONE:
+            self.assertIsNone(S.classify(command, self.shop), command)
+
+    def test_switch_off_in_config(self):
+        with open(S.CONFIG_PATH, "w") as f:
+            json.dump({"generic": False}, f)
+        self.assertIsNone(S.classify("cargo test", self.shop))
+        self.assertIsNotNone(S.classify("cd apps/charter-service && go vet ./...", self.repo))
+
+    def test_first_run_is_conservative_then_learns_from_the_signature(self):
+        job = S.classify("python3 scripts/capture.py", self.shop)
+        gb, s, src = S.predict(job, 4, [])
+        self.assertEqual((gb, src), (S.GENERIC_PRIORS["script"][0], "prior"))
+        rows = [{"where": "local", "lang": "generic", "class": job["class"], "peak_gb": 0.4, "wall_s": 9.0}] * 3
+        gb, s, src = S.predict(job, 4, rows)
+        self.assertEqual(src, "history:3")
+        self.assertLess(gb, 1.0)
+
+    def test_new_script_in_a_known_family_uses_the_family(self):
+        # pięć innych skryptów Pythona w tym repo: nowy nie czeka na 4 GB
+        rows = [{"where": "local", "lang": "generic", "class": f"shop:script:python:scripts/s{i}.py",
+                 "peak_gb": 0.2, "wall_s": 3.0} for i in range(5)]
+        job = S.classify("python3 scripts/capture.py", self.shop)
+        gb, _s, src = S.predict(job, 4, rows)
+        self.assertEqual(src, "family:5")
+        self.assertAlmostEqual(gb, 1.0)  # p90 × 1,5, najmniej 1 GB
+        # rodzina to repo, rodzaj i narzędzie: skrypty node się nie liczą
+        node = S.classify("node plugins/cli/main.ts capture", self.shop)
+        self.assertEqual(S.predict(node, 4, rows)[2], "prior")
+
+    def test_docker_never_predicts_below_its_floor(self):
+        # praca dzieje się w maszynie wirtualnej Dockera: drzewo komendy waży prawie nic
+        job = S.classify("docker build .", self.shop)
+        rows = [{"where": "local", "lang": "generic", "class": job["class"], "peak_gb": 0.05, "wall_s": 60}] * 5
+        self.assertEqual(S.predict(job, 4, rows)[0], S.DOCKER_FLOOR_GB)
+
+    def test_generic_jobs_never_go_to_depot(self):
+        job = S.classify("cargo test", self.shop)
+        self.assertIsNone(S.depot_target(job, 30.0, 3000, self.cfg, {}))
+        self.assertFalse(S.uses_pg(job, {}))
+
+    def test_hook_wraps_generic_commands(self):
+        event = {"tool_name": "Bash", "cwd": self.shop, "tool_input": {"command": "pnpm sm capture --site x"}}
+        with mock.patch.object(S, "with_rtk", side_effect=lambda c: c):
+            out = S.hook_rewrite(event)
+        argv = shlex.split(out["hookSpecificOutput"]["updatedInput"]["command"])
+        self.assertEqual(argv[2:4], ["run", "--via"])
+        self.assertEqual(argv[-1], "pnpm sm capture --site x")
+
+    def test_reservation_ends_for_a_job_that_outlived_its_prediction(self):
+        # job, który biegnie trzy razy dłużej, niż miał (serwer puszczony przez skrypt), nie
+        # trzyma rezerwy na wzrost, który nie przyjdzie
+        now = time.time()
+        job = {"where": "local", "mem_predicted_gb": 4.0, "mem_now_gb": 1.0, "predicted_wall_s": 120,
+               "started_at": now - 60}
+        self.assertEqual(S.growth_left(job, now), 3.0)
+        self.assertEqual(S.growth_left(dict(job, started_at=now - 700), now), 0.0)
+        self.assertEqual(S.growth_left(dict(job, paused=True), now), 0.0)
+
+
+class GitGrepTest(unittest.TestCase):
+    """2026-10-08: `git grep -nE` agenta po commicie z 368 MB binarek urósł do 10 GB w 2 s."""
+
+    def test_agent_git_grep_gets_minus_i(self):
+        cases = {
+            'git grep -nE "(a|b)" 4b0ed7ef1 -- apps': 'git grep -I -nE "(a|b)" 4b0ed7ef1 -- apps',
+            "cd x && git -C y grep foo | head": "cd x && git -C y grep -I foo | head",
+            'for n in a b; do git grep -nE "$n" HEAD; done': 'for n in a b; do git grep -I -nE "$n" HEAD; done',
+            "x=$(git grep -l foo)": "x=$(git grep -I -l foo)",
+            "rtk proxy git grep foo": "rtk proxy git grep -I foo",
+        }
+        for command, want in cases.items():
+            self.assertEqual(S.git_grep_text_only(command), want, command)
+
+    def test_explicit_binary_choice_and_other_text_stay(self):
+        for command in ("git grep -nI foo", "git grep -a foo", "git grep --text foo",
+                        "git grep --binary-files=text foo", "echo git grep", "rg -n 'git grep' docs"):
+            self.assertEqual(S.git_grep_text_only(command), command, command)
+
+
+class RtkExcludesTest(unittest.TestCase):
+    """Hook rtk i hook schedulera nie mogą przepisywać tej samej komendy (wynik losowy): rtk
+    zostawia to, co owija scheduler, i nic więcej. Sprawdza samo rtk, bo ono normalizuje komendy
+    po swojemu (`uv run pytest` to dla niego `pytest`)."""
+
+    NOT_WRAPPED_RTK_REWRITES = ("git status", "cargo fmt", "docker ps", "pnpm install", "ls -la",
+                                "pnpm add -D vitest", "npm ls", "ruff check .", "uv pip list")
+
+    def rtk(self, home, command):
+        r = subprocess.run(["rtk", "rewrite", command], capture_output=True, text=True,
+                           env=dict(os.environ, HOME=home, RTK_TELEMETRY_DISABLED="1"), timeout=10)
+        return r.returncode in (0, 3) and r.stdout.strip() != command
+
+    @unittest.skipUnless(shutil.which("rtk"), "brak rtk")
+    def test_rtk_leaves_alone_exactly_what_the_scheduler_wraps(self):
+        home = tempfile.mkdtemp(prefix="rtk-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        config = os.path.join(home, "Library/Application Support/rtk/config.toml")
+        write(config, "")  # rtk odrzuca cały plik z niepełną sekcją, więc tylko [hooks]
+        self.assertTrue(S.write_rtk_excludes(config))
+        empty = tempfile.mkdtemp(prefix="rtk-empty-")
+        self.addCleanup(shutil.rmtree, empty, True)
+        shop = tempfile.mkdtemp(prefix="rtk-shop-")
+        self.addCleanup(shutil.rmtree, shop, True)
+        make_generic_repo(os.path.join(shop, "shop"))
+        for command in GenericTest.WRAPPED:
+            self.assertIsNotNone(S.classify(command, os.path.join(shop, "shop")), command)
+            self.assertFalse(self.rtk(home, command), f"rtk przepisałby {command}")
+        for command in self.NOT_WRAPPED_RTK_REWRITES:
+            if self.rtk(empty, command):  # rtk umie je skrócić: nasze wyjątki mu nie przeszkadzają
+                self.assertTrue(self.rtk(home, command), command)
+
+
+class CodexHookTest(unittest.TestCase):
+    """`sched.py codex install`: hook obok cudzych (rtk, Orca), bez dubli, zdejmowany tylko nasz."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="codex-home-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.path = os.path.join(self.dir, "hooks.json")
+        others = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk-rewrite.sh"}]}],
+                            "Stop": [{"hooks": [{"type": "command", "command": "orca-hook.sh"}]}]}}
+        write(self.path, json.dumps(others))
+        patcher = mock.patch.dict(os.environ, {"CODEX_HOME": self.dir})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_cmd(self, *args):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return S.cmd_codex(list(args))
+
+    def test_install_twice_then_uninstall(self):
+        self.assertEqual(self.run_cmd("status"), 1)
+        self.assertEqual(self.run_cmd("install"), 0)
+        self.assertEqual(self.run_cmd("install"), 0)
+        data = json.load(open(self.path))
+        pre = data["hooks"]["PreToolUse"]
+        self.assertEqual(len(pre), 2)
+        self.assertEqual(pre[0]["hooks"][0]["command"], "rtk-rewrite.sh")
+        self.assertTrue(S.is_codex_entry(pre[1]))
+        self.assertEqual(self.run_cmd("status"), 0)
+        self.assertEqual(self.run_cmd("uninstall"), 0)
+        data = json.load(open(self.path))
+        self.assertEqual(len(data["hooks"]["PreToolUse"]), 1)
+        self.assertIn("Stop", data["hooks"])
+        before = open(self.path).read()
+        self.run_cmd("uninstall")
+        self.assertEqual(open(self.path).read(), before)
+
+
+class NestedRunTest(unittest.TestCase):
+    """Skrypt w środku wpuszczonego joba woła `sched run` sam (sm-heavy.sh, plock): drugi raz
+    nie czeka na pamięć, którą jego job już ma; bez tego przy ciasnej pamięci czekałby na siebie."""
+
+    setUp, kill_all, set_memory, done = RunTest.setUp, RunTest.kill_all, RunTest.set_memory, RunTest.done
+
+    def test_job_child_sees_its_job_and_inner_run_does_not_queue(self):
+        shop = os.path.join(self.dir, "shop")
+        make_generic_repo(shop)
+        inner = (f"/usr/bin/python3 {SCRIPT} run --via plock -- /bin/sh -c 'echo inner=$CLAUDE_ACC_SCHED_JOB'")
+        write(os.path.join(shop, "scripts/e2e.sh"), f"#!/bin/sh\n{inner}\n", 0o755)
+        p = subprocess.Popen(["/usr/bin/python3", SCRIPT, "run", "--via", "hook", "--shell", "./scripts/e2e.sh"],
+                             cwd=shop, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        rc, out, err = self.done(p)
+        self.assertEqual(rc, 0, err)
+        self.assertRegex(out, r"inner=j-\d+-[0-9a-f]{4}")
+        rows = [json.loads(l) for l in open(os.path.join(self.sched_dir, "history.jsonl"))]
+        self.assertEqual([r["class"] for r in rows], ["shop:script:script:scripts/e2e.sh"])
+        self.assertEqual(rows[0]["lang"], "generic")
