@@ -1,0 +1,22 @@
+{
+  "error": null,
+  "installed": true,
+  "mcp_registered": true,
+  "helper": "/Users/you/.local/share/claude-acc/claude-acc-desktop",
+  "helper_present": true,
+  "ax": true,
+  "screen": true,
+  "post": true,
+  "mode": "full",
+  "displays": [
+    {"id": 1, "x": 0, "y": 0, "w": 1728, "h": 1117, "scale": 2, "main": true},
+    {"id": 2, "x": 1728, "y": 0, "w": 2560, "h": 1440, "scale": 1, "main": false}
+  ],
+  "frontmost": {"bundle": "com.apple.finder", "window": "Downloads"},
+  "recent": [
+    {"at": 1791470000, "owner": "mcp:900", "member": "left_click", "ok": true, "app": "com.apple.TextEdit"},
+    {"at": 1791469990, "owner": "mcp:900", "member": "screenshot", "ok": true, "app": "com.apple.TextEdit"}
+  ],
+  "probe_error": null,
+  "generated_at": 1791470001
+}

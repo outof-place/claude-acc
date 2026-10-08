@@ -20,11 +20,13 @@ JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.dev
 APP_SRC=""
 FANCTL=""
 HOOK=""
+DESKTOP=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --app) APP_SRC="$2"; shift 2 ;;
     --fanctl) FANCTL="$2"; shift 2 ;;
     --hook) HOOK="$2"; shift 2 ;;
+    --desktop) DESKTOP="$2"; shift 2 ;;
     --uninstall)
       for job in $JOBS; do
         launchctl bootout "gui/$(id -u)" "$AGENTS/$job.plist" 2>/dev/null || true
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
       # bramki agentów: MCP, skille i hook podpowiedzi (skrzynki, Pęk kluczy i konfiguracja zostają)
       [ -f "$STATE/mail.py" ] && /usr/bin/python3 "$STATE/mail.py" uninstall >/dev/null 2>&1 || true
       [ -f "$STATE/browser.py" ] && /usr/bin/python3 "$STATE/browser.py" uninstall >/dev/null 2>&1 || true
+      [ -f "$STATE/desktop.py" ] && /usr/bin/python3 "$STATE/desktop.py" uninstall >/dev/null 2>&1 || true
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -59,6 +62,8 @@ rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$S
 # drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
 [ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
+# natywny pomocnik bramy pulpitu; podpis (stabilny designated requirement) trzyma uprawnienia TCC
+[ -n "$DESKTOP" ] && cp "$DESKTOP" "$STATE/claude-acc-desktop.new" && mv -f "$STATE/claude-acc-desktop.new" "$STATE/claude-acc-desktop"
 [ -n "$HOOK" ] && cp "$HOOK" "$STATE/claude-acc-hook.new" && mv -f "$STATE/claude-acc-hook.new" "$STATE/claude-acc-hook"
 # hooki pauzy w C leżą obok claude-acc-hook (install.sh: katalog builda, formuła: libexec);
 # bez niego hook.py wpisuje `claude-acc-hook pause`, a bez obu krótki skrypt w powłoce
@@ -103,6 +108,7 @@ echo "$SRC" > "$STATE/source"
 if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
   "$STATE/python" "$STATE/acc.py" mail install --refresh >/dev/null 2>&1 || true
   "$STATE/python" "$STATE/acc.py" browser install --refresh >/dev/null 2>&1 || true
+  "$STATE/python" "$STATE/acc.py" desktop install --refresh >/dev/null 2>&1 || true
   "$STATE/python" "$STATE/acc.py" hint sync >/dev/null 2>&1 || true
 fi
 
@@ -125,6 +131,7 @@ case "$1" in
   updates) shift; exec "$PY" "$RUN" updates "$@" ;;
   mail) shift; exec "$PY" "$RUN" mail "$@" ;;
   browser) shift; exec "$PY" "$RUN" browser "$@" ;;
+  desktop) shift; exec "$PY" "$RUN" desktop "$@" ;;
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;

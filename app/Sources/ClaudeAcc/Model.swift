@@ -633,3 +633,43 @@ struct BrowserPanel: Decodable {
     let clients: Int
     let recent: [Call]
 }
+
+// MARK: - Desktop gateway (`desktop/panel.json`, written by desktop.py's status and tool calls)
+
+struct DesktopPanel: Decodable {
+    struct Display: Decodable, Identifiable {
+        let id: Int
+        let w: Double
+        let h: Double
+        let main: Bool
+    }
+
+    struct Front: Decodable {
+        let bundle: String?
+        let window: String?
+    }
+
+    struct Call: Decodable, Identifiable {
+        let at: Double
+        let member: String
+        let ok: Bool
+        let app: String?
+
+        var id: String { "\(at)-\(member)" }
+    }
+
+    let error: String?
+    let installed: Bool
+    let mcpRegistered: Bool
+    let helper: String
+    let helperPresent: Bool
+    let ax: Bool
+    let screen: Bool
+    let post: Bool
+    let mode: String
+    let displays: [Display]
+    let frontmost: Front?
+    let recent: [Call]
+    let probeError: String?
+    // klucze snake_case (mcp_registered, helper_present, probe_error) mapuje .convertFromSnakeCase dekodera
+}
