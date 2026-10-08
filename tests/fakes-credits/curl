@@ -1,0 +1,41 @@
+#!/usr/bin/python3
+"""Atrapa curl -K - dla credits.py: GET /v1/models odpowiada nagłówkiem anthropic-organization-id
+organizacji klucza, tak jak prawdziwe API. Klucze i organizacje: $HOME/fake/credits-api.json."""
+import json, os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fakes"))
+import _store
+
+os.makedirs(_store.ROOT, exist_ok=True)
+with open(os.path.join(_store.ROOT, "curl-argv.log"), "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+conf, headers = {}, {}
+for line in sys.stdin.read().splitlines():
+    k, _, v = line.partition(" = ")
+    v = v.strip().strip('"')
+    if k == "header":
+        hk, _, hv = v.partition(": ")
+        headers[hk.lower()] = hv
+    else:
+        conf[k.strip()] = v
+api = _store.load("credits-api.json", {})
+if api.get("offline"):
+    sys.stdout.write("\n000\n")
+    sys.exit(7)
+
+
+def reply(code, obj, org=""):
+    sys.stdout.write(json.dumps(obj) + f"\n{code}\n{org}")
+    sys.exit(0)
+
+
+key = headers.get("x-api-key", "")
+if conf.get("url", "").endswith("/v1/models"):
+    if headers.get("anthropic-version") != "2023-06-01":
+        reply(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "anthropic-version required"}})
+    if key in api.get("unscoped", []):
+        reply(400, {"type": "error", "error": {"type": "invalid_request_error", "message": "anthropic-workspace-id is required when authenticating with an identity-linked API key; send the id of the workspace this request acts in."}})
+    org = api.get("keys", {}).get(key)
+    if not org:
+        reply(401, {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}})
+    reply(200, {"data": [{"id": "claude-opus-5-5", "type": "model"}], "has_more": False}, org)
+reply(404, {"type": "error", "error": {"type": "not_found_error", "message": "unknown url"}})
