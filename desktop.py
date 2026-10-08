@@ -335,13 +335,85 @@ def probe(path=None):
         return {"ok": False, "error": str(exc)}
 
 
-def panel_dict(pr=None):
-    """Stan bramy dla karty Desktop w panelu i `status`."""
+# aplikacja paska menu: jej własne zgody TCC nic nie mówią o tym, co dostają agenci
+MENU_APP = "Claude Acc"
+AGENT_PROBE_EVERY = 60
+
+
+def host_app(pid=None):
+    """Aplikacja, pod którą biegnie ten proces: najwyższy przodek w pakiecie .app (Orca dla agenta w
+    jej terminalu, Claude Acc dla panelu), albo None (launchd, ssh). Zgody TCC pomocnika liczą się
+    dla tej aplikacji, nie dla binarki pomocnika, więc ta sama binarka ma je w Orce, a w panelu nie."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    rows = {}
+    for line in out.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[2])
+    pid, found = pid or os.getpid(), None
+    for _ in range(64):
+        if pid not in rows or pid <= 1:
+            break
+        ppid, comm = rows[pid]
+        app = re.search(r"([^/]+)\.app/", comm)  # pierwszy .app w ścieżce: pakiet zewnętrzny, nie Helper
+        if app:
+            found = app.group(1)
+        pid = ppid
+    return found
+
+
+def agent_probe(pr, host):
+    """Zgody z probe pomocnika jako wpis `agent` panelu: co dostaje agent w aplikacji `host`."""
+    return {"ax": bool(pr.get("ax")), "screen": bool(pr.get("screen")), "post": bool(pr.get("post")),
+            "host": host, "at": time.time()}  # fmt: skip
+
+
+def saved_agent():
+    try:
+        with open(panel_path()) as f:
+            agent = json.load(f).get("agent")
+        return agent if isinstance(agent, dict) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def record_agent(agent):
+    """Dopisuje do panelu zgody widziane z kontekstu agenta (serwer MCP, `status` z terminala)."""
+    try:
+        with open(panel_path()) as f:
+            panel = json.load(f)
+    except (OSError, ValueError):
+        panel = None
+    if not isinstance(panel, dict):
+        _publish_panel()
+        return
+    panel["agent"] = agent
+    panel["ax"], panel["screen"], panel["post"] = agent["ax"], agent["screen"], agent["post"]
+    try:
+        write_json(panel_path(), panel)
+    except OSError:
+        pass
+
+
+def panel_dict(pr=None, host=False):
+    """Stan bramy dla karty Desktop w panelu i `status`.
+
+    `ax`, `screen` i `post` to zgody, które dostaje agent: z wpisu `agent` (probe z serwera MCP albo
+    `status` w terminalu agenta), a bez niego z własnego probe. Probe z aplikacji paska menu widzi
+    zgody tej aplikacji, więc pokazywał „off”, choć agenci w Orce mieli obie."""
     try:
         cfg, error = load_config(), None
     except DesktopError as exc:
         cfg, error = {"mode": "full", "max_px": DEFAULT_MAX_PX}, str(exc)
     pr = pr if pr is not None else probe()
+    host = host_app() if host is False else host
+    agent = saved_agent()
+    if host and host != MENU_APP and pr.get("ok", True) and "ax" in pr:
+        agent = agent_probe(pr, host)
+    seen = agent or {"ax": bool(pr.get("ax")), "screen": bool(pr.get("screen")), "post": bool(pr.get("post"))}
     helper = helper_path()
     return {
         "error": error,
@@ -349,9 +421,11 @@ def panel_dict(pr=None):
         "mcp_registered": mcp_registered(),
         "helper": helper,
         "helper_present": os.path.exists(helper),
-        "ax": bool(pr.get("ax")),
-        "screen": bool(pr.get("screen")),
-        "post": bool(pr.get("post")),
+        "ax": seen["ax"],
+        "screen": seen["screen"],
+        "post": seen["post"],
+        "agent": agent,
+        "own": {"ax": bool(pr.get("ax")), "screen": bool(pr.get("screen")), "host": host},
         "mode": cfg["mode"],
         "displays": pr.get("displays") or [],
         "frontmost": pr.get("frontmost") or {},
@@ -453,6 +527,7 @@ class McpServer(mcpbase.McpServer):
         self.helper = helper
         self.session = Session()
         self._lock = threading.Lock()
+        self._probed_at = 0.0
 
     @property
     def tools(self):
@@ -472,10 +547,23 @@ class McpServer(mcpbase.McpServer):
             self.helper = Helper(deny=deny)
         return self.helper
 
+    def _probe_as_agent(self, helper):
+        """Co najwyżej raz na minutę: zgody pomocnika tak, jak widzi je agent (ta sesja), do panelu."""
+        if time.time() - self._probed_at < AGENT_PROBE_EVERY:
+            return
+        self._probed_at = time.time()
+        try:
+            pr = helper.call("probe", timeout=10)
+        except DesktopError:
+            return
+        record_agent(agent_probe(pr, host_app()))
+
     def call_tool(self, name, args):
         owner = f"mcp:{os.getpid()}"
         try:
-            return run_member(self._helper(), self.session, name, dict(args or {}), owner, self._lock)
+            helper = self._helper()
+            self._probe_as_agent(helper)
+            return run_member(helper, self.session, name, dict(args or {}), owner, self._lock)
         except DesktopError as exc:
             text = str(exc)
             return {"content": [{"type": "text", "text": text if text.startswith("Error") else f"Error: {text}"}], "isError": True}
