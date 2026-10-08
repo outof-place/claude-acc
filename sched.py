@@ -2748,13 +2748,22 @@ def hook_rewrite(event):
     updated["command"] = (
         " ".join(shlex.quote(p) for p in parts) + " --shell " + shlex.quote(with_rtk(command))
     )
+    if job.get("lang") == "native":
+        # kolejka natywnych potrafi czekać minutami, dłużej niż domyślny timeout Basha
+        how = (
+            f"It waits until about {job['native_prior'][0]:g} GB fit in memory and then starts by "
+            "itself, which can take minutes: run it with run_in_background and do not kill it "
+            "while it waits"
+        )
+    else:
+        how = "It may wait for memory, pick -p or run on Depot"
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "updatedInput": updated,
             "additionalContext": (
-                f"claude-acc sched: `{job['label']}` runs through the memory scheduler. It may wait for "
-                "memory, pick -p or run on Depot; the output and exit code are the command's own."
+                f"claude-acc sched: `{job['label']}` runs through the memory scheduler. {how}; "
+                "the output and exit code are the command's own."
             ),
         }
     }

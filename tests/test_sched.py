@@ -1330,11 +1330,17 @@ class NativeTest(Paths):
                  "tool_input": {"command": "cd ios && xcodebuild -scheme App build 2>&1 | tail -5",
                                 "run_in_background": True}}
         with mock.patch.object(S, "with_rtk", side_effect=lambda c: c):
-            out = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+            hook = S.hook_rewrite(event)["hookSpecificOutput"]
+        out = hook["updatedInput"]
         argv = shlex.split(out["command"])
         self.assertEqual(argv[2:5], ["run", "--via", "hook"])
         self.assertEqual(argv[-1], "cd ios && xcodebuild -scheme App build 2>&1 | tail -5")
         self.assertTrue(out["run_in_background"])
+        # build w kolejce czeka minutami: agent z komendą na pierwszym planie dostałby timeout
+        # Basha (2 min) w trakcie czekania, a o -p i Depot nie ma tu mowy
+        self.assertIn("run_in_background", hook["additionalContext"])
+        self.assertIn("10 GB", hook["additionalContext"])
+        self.assertNotIn("Depot", hook["additionalContext"])
 
 
 class StateTest(Paths):
