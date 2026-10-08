@@ -2,7 +2,7 @@
 """Miesięczne kredyty API z planów Max i Team: pula kluczy z wielu organizacji Console.
 
     claude-acc credits status [--json]
-    claude-acc credits add <email> --scope own|KLIENT [--org ID] [--granted-usd 200] [--resets-at DATA] [--new-key]
+    claude-acc credits add <email> --scope own|KLIENT [--org ID] [--granted-usd 200] [--resets-at DATA] [--new-key] [--from-keychain USŁUGA/KONTO]
     claude-acc credits pending <email> [--scope own|KLIENT]
     claude-acc credits remove <email>
     claude-acc credits balance <email> --remaining-usd KWOTA [--expires-at DATA]
@@ -31,6 +31,12 @@ klucz oknem systemowym z ukrytym polem, zapisuje go przez stdin `security -i` i 
 (GET /v1/models, nagłówek anthropic-organization-id), że należy do podanej organizacji. Klucz
 nie trafia do argumentów procesu, na wyjście (poza helperem), do logu ani do plików, a `key`
 oddaje referencję do Pęku kluczy, nie klucz.
+
+Przyjmujemy zwykłe klucze organizacji (sk-ant-api...) i klucze powiązane z użytkownikiem
+(sk-ant-usr...), które wydaje teraz Console; klucze Admin API odpadają. Klucz, który już leży w
+innym wpisie Pęku kluczy, `add --from-keychain USŁUGA/KONTO` czyta stamtąd zamiast z okna
+(przez `security -w`: wpis założony tym samym narzędziem nie pyta o zgodę), sprawdza w API tak
+samo i zapisuje pod usługą "claude-acc-credits". Wpis źródłowy zostaje nietknięty.
 
 Saldo: API nie podaje salda kredytów promocyjnych (Admin API nie działa dla kont indywidualnych
 i nie ma endpointu salda), więc prawdą jest Console: Settings > Billing > Promotional credits.
@@ -80,7 +86,8 @@ OVERRIDING_ENV = (
     "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
 )  # fmt: skip
 PURPOSE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
-API_KEY_RE = re.compile(r"sk-ant-api[0-9A-Za-z_-]+")
+# zwykły klucz organizacji (sk-ant-api03-...) albo klucz powiązany z użytkownikiem (sk-ant-usr-...)
+API_KEY_RE = re.compile(r"sk-ant-(?:api|usr)[0-9A-Za-z_-]+")
 # komunikat API ("Your credit balance is too low...") i Claude Code ("Credit balance is too low")
 EXHAUSTED_RE = re.compile(rb"credit balance (?:is )?too low", re.IGNORECASE)
 
@@ -398,10 +405,26 @@ def key_exists(email):
     return security(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", email]).returncode == 0
 
 
-def key_read(email):
-    out = security(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", email, "-w"])
+def key_read(email, service=KEYCHAIN_SERVICE):
+    out = security(["find-generic-password", "-s", service, "-a", email, "-w"])
     value = out.stdout.strip() if out.returncode == 0 else ""
     return value or None
+
+
+def key_read_foreign(service, account):
+    """Klucz z wpisu Pęku kluczy, który założył kto inny (np. Polid). Do `security` idzie tylko
+    nazwa usługi i konta, klucz wraca rurą do tego procesu. Wpis założony przez inną aplikację
+    może wywołać okno z prośbą o dostęp; wtedy `security` czeka, więc po limicie czasu mówimy,
+    na co."""
+    try:
+        key = key_read(account, service)
+    except subprocess.TimeoutExpired:
+        raise CreditsError(
+            f"Pęk kluczy nie oddał wpisu {service}/{account} w 30 s (czeka na zgodę w oknie dostępu?); nic nie zapisano"
+        )
+    if not key:
+        raise CreditsError(f"nie można odczytać wpisu {service}/{account} z Pęku kluczy (brak albo odmowa dostępu); nic nie zapisano")
+    return key
 
 
 def key_store(email, key):
@@ -440,9 +463,9 @@ def ask_key(email):
 
 def check_key_shape(key):
     if key.startswith("sk-ant-admin"):
-        raise CreditsError("to klucz Admin API; potrzebny zwykły klucz API organizacji (sk-ant-api...)")
+        raise CreditsError("to klucz Admin API; potrzebny zwykły klucz API organizacji (sk-ant-api... albo sk-ant-usr...)")
     if not API_KEY_RE.fullmatch(key):
-        raise CreditsError("to nie wygląda na klucz API (zaczyna się od sk-ant-api); nic nie zapisano")
+        raise CreditsError("to nie wygląda na klucz API (zaczyna się od sk-ant-api albo sk-ant-usr); nic nie zapisano")
 
 
 def verify_key(key):
@@ -525,6 +548,14 @@ def scope_of(text, default=None):
     return value
 
 
+def keychain_source(text):
+    """USŁUGA/KONTO z opcji `--from-keychain`; konto może mieć własne ukośniki (e-mail ich nie ma)."""
+    service, _, account = (text or "").partition("/")
+    if not service.strip() or not account.strip():
+        raise UsageError("--from-keychain: USŁUGA/KONTO wpisu w Pęku kluczy, np. polid/klucz@example.com")
+    return service, account
+
+
 def email_of(args):
     if not args or "@" not in args[0]:
         raise UsageError("podaj e-mail konta Claude, np. a@example.com")
@@ -571,13 +602,18 @@ def cmd_add(args):
     granted = flag(args, "--granted-usd")
     resets = flag(args, "--resets-at")
     new_key = switch(args, "--new-key")
+    from_keychain = flag(args, "--from-keychain")
+    source = keychain_source(from_keychain) if from_keychain is not None else None
     email = email_of(args)
     no_leftovers(args)
     if resets:
         parse_when(resets)
     stored = key_exists(email)
-    fresh = new_key or not stored
-    key = ask_key(email) if fresh else key_read(email)
+    fresh = new_key or bool(source) or not stored
+    if source:
+        key = key_read_foreign(*source)
+    else:
+        key = ask_key(email) if fresh else key_read(email)
     if fresh:
         check_key_shape(key)
     if not key:
@@ -610,9 +646,12 @@ def cmd_add(args):
         spec.pop("checked_at", None)
         registry["accounts"][email] = spec
         save_registry(registry)
-    log(f"add: {email} -> {spec['org_id']} ({scope}, ${spec['granted_usd']:.0f})")
+    origin = f", klucz ze wpisu {source[0]}/{source[1]}" if source else ""
+    log(f"add: {email} -> {spec['org_id']} ({scope}, ${spec['granted_usd']:.0f}){origin}")
     note = "" if found else f" (bez sprawdzenia w API: {problem})"
     print(f"połączone: {email}, organizacja {spec['org_id']}, {scope}, {money(spec['granted_usd'])} na cykl{note}")
+    if source:
+        print(f"klucz skopiowany do Pęku kluczy (usługa {KEYCHAIN_SERVICE}); wpis {source[0]}/{source[1]} zostaje, jak był")
     if not spec.get("resets_at") and email not in known_accounts():
         print("nie znam cyklu tego konta: podaj datę z Console, claude-acc credits balance <email> --remaining-usd KWOTA --expires-at DATA")
     return 0
