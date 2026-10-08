@@ -20,6 +20,8 @@ let package = Package(
         .executableTarget(name: "claude-acc-hook", path: "Sources/hook", swiftSettings: settings),
         // the limit pause hooks after every tool call; plain C, so it starts without a runtime
         .executableTarget(name: "claude-acc-pause", path: "Sources/pause"),
+        // natywny pomocnik bramy pulpitu: CGEvent, ScreenCaptureKit, AX dla desktop.py
+        .executableTarget(name: "claude-acc-desktop", path: "Sources/desktop", swiftSettings: settings),
     ],
     swiftLanguageModes: [.v6]
 )
