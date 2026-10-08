@@ -9,7 +9,7 @@ gradle, pod install) i start symulatora; jeden taki build to 6-12 GB, więc czek
   sched.py classify (--shell 'KOMENDA' | -- ARGV...)
   sched.py depot [--max-age S] [--json]
   sched.py wait [--max S] [--every S] -- 'WARUNEK'
-  sched.py rtk-excludes
+  sched.py rtk-excludes [--write [PATH]]
 
 `run` klasyfikuje komendę (moduł, czasownik, zakres pakietów), przewiduje jej szczyt pamięci i
 czas z historii, a potem:
@@ -281,15 +281,140 @@ def job_pids(root):
     return seen
 
 
-def job_usage(root):
-    """(GB, CPU s) wszystkich żywych procesów joba."""
+def pids_usage(pids):
+    """(GB, CPU s) tych procesów, które jeszcze żyją."""
     footprint, cpu = 0, 0.0
-    for pid in job_pids(root):
+    for pid in pids:
         u = proc_usage(pid)
         if u:
             footprint += u[0]
             cpu += u[1]
     return footprint / GB, cpu
+
+
+def job_usage(root):
+    """(GB, CPU s) wszystkich żywych procesów joba."""
+    return pids_usage(job_pids(root))
+
+
+PROC_ALL_PIDS = 1
+PROC_PIDTBSDINFO = 3
+BSDINFO_SIZE = 136  # struct proc_bsdinfo
+BSD_PPID, BSD_START = 16, 120  # pbi_ppid, pbi_start_tvsec
+
+
+def all_pids():
+    k = kernel()
+    need = k.libc.proc_listpids(PROC_ALL_PIDS, 0, None, 0)
+    if need <= 0:
+        return []
+    buf = (k.ctypes.c_int * (need // 4 + 256))()
+    n = k.libc.proc_listpids(PROC_ALL_PIDS, 0, buf, k.ctypes.sizeof(buf))
+    return [p for p in buf[: max(n, 0) // 4] if p > 0]
+
+
+def proc_name(pid):
+    """Nazwa procesu (p_comm, do 32 znaków), bez argumentów: jedno wywołanie jądra."""
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(64)
+    n = k.libc.proc_name(pid, buf, 64)
+    return buf.raw[:n].decode(errors="replace") if n > 0 else ""
+
+
+def proc_path(pid):
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(4096)
+    n = k.libc.proc_pidpath(pid, buf, 4096)
+    return buf.raw[:n].decode(errors="replace") if n > 0 else ""
+
+
+def proc_bsd(pid, offset, size=4):
+    """Pole struct proc_bsdinfo procesu (ppid, start) albo None."""
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(BSDINFO_SIZE)
+    got = k.libc.proc_pidinfo(pid, PROC_PIDTBSDINFO, k.ctypes.c_uint64(0), buf, BSDINFO_SIZE)
+    if got != BSDINFO_SIZE:
+        return None
+    return int.from_bytes(buf.raw[offset : offset + size], "little")
+
+
+KERN_PROCARGS2 = 49
+
+
+def proc_args(pid):
+    """argv procesu z KERN_PROCARGS2 albo None (cudzy proces, zombie)."""
+    k = kernel()
+    mib = (k.ctypes.c_int * 3)(1, KERN_PROCARGS2, pid)
+    size = k.ctypes.c_size_t(0)
+    if k.libc.sysctl(mib, 3, None, k.ctypes.byref(size), None, 0) or not size.value:
+        return None
+    buf = k.ctypes.create_string_buffer(size.value)
+    if k.libc.sysctl(mib, 3, buf, k.ctypes.byref(size), None, 0):
+        return None
+    raw = buf.raw[: size.value]
+    if len(raw) < 4:
+        return None
+    argc = int.from_bytes(raw[:4], "little")
+    _exe, _, rest = raw[4:].partition(b"\0")
+    return [a.decode(errors="replace") for a in rest.lstrip(b"\0").split(b"\0")[:argc]]
+
+
+def descendants(root):
+    seen, todo = set(), [root]
+    while todo:
+        pid = todo.pop()
+        if pid not in seen:
+            seen.add(pid)
+            todo.extend(_listpids(PROC_PPID_ONLY, pid))
+    return seen
+
+
+# Pod tymi procesami biegnie natywny build: xcodebuild z wiersza poleceń i swift-build; usługa
+# buildów Xcode (stara i nowa nazwa) tylko wtedy, gdy ma dzieci: przy otwartym Xcode żyje bez
+# przerwy, a build to dopiero jej kompilatory. Po nazwie, a nie po ścieżce do Xcode: clang i ld,
+# które linkują testy Go z cgo, nie są natywnym buildem. xcodebuild tylko z akcją, która
+# kompiluje: maestro trzyma na symulatorze `xcodebuild test-without-building` przez całą sesję.
+NATIVE_DRIVERS = ("xcodebuild", "swift-build")
+NATIVE_SERVICES = ("XCBBuildService", "SWBBuildService")
+NATIVE_QUIET_S = 30  # tyle sekund bez kompilatorów po buildzie: faza buildu skończona
+
+
+def xcode_compiles(argv):
+    """Czy ten xcodebuild kompiluje: klasyfikacja jak w hooku, bez akcji, które nic nie budują."""
+    raw = parse_native(argv or ["xcodebuild"], "/")
+    return bool(raw) and raw["detail"] not in ("test-without-building", "installsrc")
+
+
+def native_scan(sims_since=None):
+    """Natywne buildy na tym Macu: {gb, active, pids} z phys_footprint ich drzew procesów.
+
+    `portivo-mobile up` buduje w procesie odczepionym od sesji (własna sesja, rodzic launchd), a
+    symulator włącza CoreSimulatorService: żadne z nich nie leży w drzewie joba. Z sims_since
+    liczą się też symulatory (launchd_sim z drzewem) włączone od tej chwili. Kilka ms: nazwy
+    procesów bez argumentów. SCHED_FAKE_MEMORY z kluczem `native` w testach."""
+    fake = fake_memory()
+    if fake is not None and "native" in fake:
+        n = fake.get("native") or {}
+        return {"gb": float(n.get("gb", 0)), "active": bool(n.get("active")), "pids": set()}
+    roots, services, idle, sims = [], [], set(), []
+    for pid in all_pids():
+        name = proc_name(pid)
+        if name == "xcodebuild":
+            (roots.append if xcode_compiles(proc_args(pid)) else idle.add)(pid)
+        elif name in NATIVE_DRIVERS:
+            roots.append(pid)
+        elif name in NATIVE_SERVICES and _listpids(PROC_PPID_ONLY, pid):
+            services.append(pid)
+        elif sims_since is not None and name == "launchd_sim":
+            start = proc_bsd(pid, BSD_START, 8)
+            if start and start >= sims_since - 2:
+                sims.append(pid)
+    # usługa buildów pod xcodebuild, który nic nie kompiluje, też nie jest buildem
+    roots += [p for p in services if proc_bsd(p, BSD_PPID) not in idle]
+    tree = set()
+    for root in roots + sims:
+        tree |= descendants(root)
+    return {"gb": pids_usage(tree)[0], "active": bool(roots), "pids": tree}
 
 
 def alive(pid):
@@ -304,21 +429,31 @@ def alive(pid):
     return True
 
 
+def fake_memory():
+    """Pamięć z pliku SCHED_FAKE_MEMORY (testy) albo None."""
+    path = os.environ.get("SCHED_FAKE_MEMORY")
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def probe_memory():
     """Pamięć systemu: level jądra, RAM, swap, presja. SCHED_FAKE_MEMORY (plik JSON) w testach."""
-    fake = os.environ.get("SCHED_FAKE_MEMORY")
-    if fake:
-        try:
-            with open(fake) as f:
-                data = json.load(f)
-            return {
-                "level": float(data.get("level", 60)),
-                "ram_gb": float(data.get("ram_gb", 48)),
-                "swap_gb": float(data.get("swap_gb", 0)),
-                "pressure": data.get("pressure", "normal"),
-            }
-        except (OSError, ValueError):
-            pass
+    data = fake_memory()
+    if data is not None:
+        out = {
+            "level": float(data.get("level", 60)),
+            "ram_gb": float(data.get("ram_gb", 48)),
+            "swap_gb": float(data.get("swap_gb", 0)),
+            "pressure": data.get("pressure", "normal"),
+        }
+        if "native" in data:
+            out["native"] = data["native"] or {}
+        return out
     ram = (sysctl_int("hw.memsize") or 16 * GB) / GB
     level = sysctl_int("kern.memorystatus_level")
     kernel = sysctl_int("kern.memorystatus_vm_pressure_level") or 1
@@ -354,7 +489,10 @@ def guard_level(snap):
 
 
 def devserver_reserve_gb(snap=None):
-    """Miejsce na jeszcze jeden dev serwer: min(max_server_gb, budżet devguarda - zajęte)."""
+    """Miejsce na dev serwery: na jeszcze jeden (min(max_server_gb, budżet devguarda - zajęte)),
+    a co najmniej na powrót serwerów, których strażnik nie zatrzyma (chronione i przypięte), do
+    ich zmierzonego szczytu (lifetime_max_phys_footprint). Chroniony stos ponad budżetem dawał
+    rezerwę 0, choć rośnie dalej."""
     max_server = 4.0
     try:
         with open(DEVGUARD_CONFIG) as f:
@@ -365,10 +503,34 @@ def devserver_reserve_gb(snap=None):
     try:
         if time.time() - float(snap.get("at", 0)) < 120:
             room = (float(snap.get("budget", 0)) - float(snap.get("total", 0))) / GB
-            return round(max(0.0, min(max_server, room)), 2)
+            regrow = sum(
+                max(0.0, float(u.get("peak") or 0) - float(u.get("footprint") or 0))
+                for u in snap.get("units") or []
+                if u.get("protected")
+            ) / GB
+            return round(max(0.0, min(max_server, room), regrow), 2)
     except (ValueError, TypeError, AttributeError):
         pass
     return max_server
+
+
+def simulators_info(snap):
+    """Symulatory ze świeżego pomiaru strażnika: ile włączonych, ile w użyciu (dzierżawa żywej
+    sesji, ktoś patrzy, symulator człowieka) i limit; None bez pomiaru (wtedy bez limitu)."""
+    try:
+        if time.time() - float(snap.get("at", 0)) >= 120 or "simulators" not in snap:
+            return None
+        sims = [s for s in snap.get("simulators") or [] if isinstance(s, dict)]
+        used = [s for s in sims if s.get("in_use")]
+        return {
+            "booted": len(sims),
+            "in_use": len(used),
+            "cap": int(snap.get("simulator_cap") or 0),
+            "gb": round(sum(float(s.get("footprint") or 0) for s in sims) / GB, 2),
+            "holders": [s.get("name") or s.get("udid") for s in used][:4],
+        }
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 # ---------- klasyfikacja komendy ----------
@@ -680,6 +842,22 @@ def parse_node(words, here):
     return dict(base, kind=kind, tool=script, filtered=filtered)
 
 
+def project_name(repo):
+    """Nazwa projektu dla klasy joba: worktree (`.git` to plik `gitdir: <repo>/.git/worktrees/x`)
+    dostaje nazwę głównego repo, więc wszystkie drzewa uczą się z jednej historii. Z nazwą
+    katalogu worktree każdy nowy zaczynał od priora (lint 2 GB zamiast zmierzonych 4)."""
+    try:
+        with open(os.path.join(repo, ".git")) as f:
+            line = f.readline().strip()
+    except OSError:  # katalog .git: zwykłe repo
+        return os.path.basename(repo)
+    gitdir = line[len("gitdir:"):].strip() if line.startswith("gitdir:") else ""
+    parts = os.path.normpath(gitdir).split(os.sep)
+    if len(parts) >= 3 and parts[-3:-1] == [".git", "worktrees"]:
+        return os.path.basename(os.sep.join(parts[:-3])) or os.path.basename(repo)
+    return os.path.basename(repo)
+
+
 def finish_node(raw):
     pkg_dir = find_up(raw["dir"], "package.json", stop_at_git=True) if os.path.isdir(raw["dir"]) else None
     if not pkg_dir:
@@ -687,7 +865,7 @@ def finish_node(raw):
     repo = find_repo(pkg_dir) or pkg_dir
     rel = os.path.relpath(pkg_dir, repo)
     detail = f"filter={raw['filter']}" if raw["filter"] else rel
-    cls = f"{os.path.basename(repo)}:{raw['kind']}:{detail}:{raw['tool']}"
+    cls = f"{project_name(repo)}:{raw['kind']}:{detail}:{raw['tool']}"
     cls += ":all" if raw["all"] else ""
     cls += ":filtered" if raw["filtered"] else ""
     label = " ".join(
@@ -843,7 +1021,7 @@ def finish_native(raw):
     repo = find_repo(here) if os.path.isdir(here) else None
     repo = repo or here
     # symulator to ten sam koszt z każdego repo; build to aplikacja, więc klasa jest per repo
-    owner = "mac" if tool == "simulator" else os.path.basename(repo)
+    owner = "mac" if tool == "simulator" else project_name(repo)
     cls = f"{owner}:native:{tool}" + (f":{detail}" if detail else "")
     label = " ".join(
         shlex.quote(a) if re.search(r"[\s'\"$^*|&;]", a) else a for a in raw["argv"]
@@ -874,6 +1052,8 @@ def finish_native(raw):
         "label": label,
         "native_prior": (gb, wall),
         "outside": outside,
+        # jedno miejsce na natywny build na całym Macu (plan, track_native); pody i symulator obok
+        "exclusive": kind == "build",
     }
 
 
@@ -1766,6 +1946,19 @@ def refresh_memory(state, cfg, mem=None):
     snap = devguard_snapshot()
     dev = devserver_reserve_gb(snap)
     internal = state["_internal"]
+    # natywny build spoza schedulera (odczepiony builder portivo-mobile, Xcode): zajmuje miejsce
+    # na natywny build i urośnie do szczytu buildu, więc jego wzrost idzie do rezerwy jak wzrost jobów
+    nat = internal.get("native") or {}
+    if "native" in mem:
+        nat = {"at": now, "gb": float(mem["native"].get("gb", 0)), "active": bool(mem["native"].get("active"))}
+    elif now - float(nat.get("at", 0)) >= 5:
+        scan = native_scan()
+        nat = {"at": now, "gb": round(scan["gb"], 2), "active": scan["active"]}
+    internal["native"] = nat
+    owner = native_owner(state)
+    outside = bool(nat.get("active")) and owner is None
+    native_reserve = max(0.0, native_build_gb(internal) - nat["gb"]) if outside else 0.0
+    reserved += native_reserve
     swap = [s for s in internal.get("swap", []) if now - s[0] <= 120]
     swap.append([now, mem["swap_gb"]])
     internal["swap"] = swap[-240:]
@@ -1799,6 +1992,15 @@ def refresh_memory(state, cfg, mem=None):
         "swap_growth_2m_gb": round(mem["swap_gb"] - swap[0][1], 2),
         "pressure": mem["pressure"],
         "guard_level": guard_level(snap),
+        "native": {
+            "build_gb": round(nat["gb"], 2),
+            "active": bool(nat.get("active")),
+            "outside": outside,
+            "reserve_gb": round(native_reserve, 2),
+            "owner": owner["id"] if owner else None,
+            "owner_label": owner["label"] if owner else None,
+        },
+        "simulators": simulators_info(snap),
     }
     today = state["today"]
     today["max_reserved_gb"] = round(max(today.get("max_reserved_gb", 0), reserved), 1)
@@ -1806,6 +2008,66 @@ def refresh_memory(state, cfg, mem=None):
         today.get("peak_concurrency", 0), len(state["running"])
     )
     return state["memory"]
+
+
+def native_owner(state):
+    """Lokalny job, który trzyma miejsce na natywny build (jedno na Maca), albo None."""
+    return next(
+        (
+            j
+            for j in state["running"]
+            if j.get("where") == "local" and j.get("exclusive") and not j.get("native_done")
+        ),
+        None,
+    )
+
+
+def native_build_gb(internal):
+    """Przewidywany szczyt natywnego buildu: p90 × 1,15 ostatnich zmierzonych buildów (drzewa
+    xcodebuild i joba), do pierwszych trzech nie mniej niż 80% wartości z tabeli NATIVE."""
+    peaks = [p for p in internal.get("native_peaks", []) if p]
+    base = NATIVE["xcodebuild"][1]
+    if not peaks:
+        return base
+    gb = percentile(peaks, 0.9) * 1.15
+    if len(peaks) < 3:
+        gb = max(gb, base * 0.8)
+    return round(gb, 2)
+
+
+def track_native(me, native, now, internal, now_gb):
+    """Faza buildu natywnego joba. Gdy wstaje xcodebuild, prognoza rośnie do szczytu buildu
+    (`portivo-mobile up` z samych trafień w cache przewidziałby mało). Gdy kompilatory milkną na
+    NATIVE_QUIET_S (albo nic się nie kompiluje przez dwa przewidywane czasy), job oddaje miejsce
+    na natywny build i rezerwację: `expo run:ios` po buildzie zostaje z Metro na godziny."""
+    if me.get("native_done"):
+        return
+    if native.get("active"):
+        me["native_seen"] = True
+        me["native_active_at"] = now
+        me["mem_predicted_gb"] = max(me.get("mem_predicted_gb") or 0.0, native_build_gb(internal))
+        return
+    seen = me.get("native_seen")
+    quiet = seen and now - me.get("native_active_at", now) >= NATIVE_QUIET_S
+    stale = not seen and now - me.get("started_at", now) > 2 * max(me.get("predicted_wall_s") or 0, 300)
+    if quiet or stale:
+        me["native_done"] = True
+        me["native_done_at"] = now
+        me["mem_predicted_gb"] = round(now_gb, 2)
+
+
+def sim_wait(job, mem):
+    """Start symulatora czeka, gdy symulatorów w użyciu jest tyle, ile pozwala strażnik
+    (`max_booted_simulators`): każdy to 2-4 GB, a cudzego, używanego nikt nie wyłączy.
+    `portivo-mobile up` sesji, która ma już swój symulator, nic nowego nie włącza. Nieużywane
+    wyłącza strażnik; bez jego świeżego pomiaru limitu nie ma."""
+    sims = mem.get("simulators") or {}
+    return (
+        job.get("native_tool") in ("portivo-mobile", "simulator")
+        and not job.get("sim_lease")
+        and bool(sims.get("cap"))
+        and sims.get("in_use", 0) >= sims["cap"]
+    )
 
 
 def queue_order(state):
@@ -1843,10 +2105,15 @@ def plan(state, cfg, now):
     blocked = None
     reserve = 0.0
     strict = False
+    # jeden natywny build naraz: trzyma go job w fazie buildu albo build spoza schedulera
+    slot = native_owner(state) is not None or bool((mem.get("native") or {}).get("outside"))
     if pressure == "critical":
         return admitted
     for job in queue_order(state):
         if (job.get("route") or {}).get("choice") == "depot":
+            continue
+        # czeka na swoją kolej, nie na pamięć: nie blokuje jobów za sobą i nic nie rezerwuje
+        if (job.get("exclusive") and slot) or sim_wait(job, mem):
             continue
         need = job["mem_predicted_gb"]
         native = job.get("lang") == "native"
@@ -1865,6 +2132,7 @@ def plan(state, cfg, now):
                 free -= need
                 now_free -= need
                 any_local = True
+                slot = slot or bool(job.get("exclusive"))
                 continue
             blocked = job
             if now - job["enqueued_at"] > cfg["starve_s"]:
@@ -1875,6 +2143,7 @@ def plan(state, cfg, now):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
             now_free -= need
+            slot = slot or bool(job.get("exclusive"))
     return admitted
 
 
@@ -1994,16 +2263,41 @@ def update_queue_view(state, cfg):
     labels = {j["id"]: j["label"] for j in state["running"] + state["queue"]}
     now = time.time()
     head_blocked = None
+    owner = native_owner(state)
+    native = mem.get("native") or {}
     for pos, job in enumerate(queue_order(state), start=1):
         job["position"] = pos
         job["waited_s"] = round(now - job["enqueued_at"], 1)
         wait, after = blockers_eta(state, job)
         job["eta_start_s"] = round(wait) if wait < 3600 else None
         free = max(0.0, mem["free_for_admission_gb"])
+        waits_turn = False  # czeka na kolej, nie na pamięć: nie rezerwuje jej dla siebie
         if mem.get("pressure") == "critical":
             code, text = "pressure", "paused: memory pressure is critical"
         elif job.get("lang") == "native" and mem.get("guard_level") == 2:
             code, text = "pressure", "paused: the dev server guard sees critical memory pressure"
+        elif job.get("exclusive") and (owner or native.get("outside")):
+            waits_turn, code = True, "native"
+            if owner:
+                left = (owner.get("predicted_wall_s") or 600) - (now - owner.get("started_at", now))
+                job["eta_start_s"] = round(max(5.0, left))
+                after = [owner["id"]]
+                text = f"waiting: one native build at a time, {owner['label']} is building"
+            else:
+                job["eta_start_s"] = None
+                text = (
+                    "waiting: a native build outside the scheduler is running "
+                    f"({native.get('build_gb', 0):.1f} GB, xcodebuild)"
+                )
+        elif sim_wait(job, mem):
+            waits_turn, code = True, "simulators"
+            sims = mem.get("simulators") or {}
+            job["eta_start_s"] = None
+            text = (
+                f"waiting: {sims['in_use']} simulators in use, cap {sims['cap']} "
+                f"({', '.join(str(h) for h in sims.get('holders') or [])}); "
+                "unused ones are shut down by the guard"
+            )
         elif (
             head_blocked is not None
             and now - head_blocked["enqueued_at"] > cfg["starve_s"]
@@ -2027,7 +2321,7 @@ def update_queue_view(state, cfg):
             "after": after,
             "text": text,
         }
-        if head_blocked is None:
+        if head_blocked is None and not waits_turn:
             head_blocked = job
 
 
@@ -2045,7 +2339,12 @@ def safety(state, cfg):
         "pressure"
     ) == "critical"
     if swapping:
-        heavy = [j for j in local if not j.get("paused") and not j.get("small")]
+        # natywny nie: jego kompilatory leżą zwykle poza grupą procesów joba (portivo-mobile buduje
+        # w odczepionym procesie), a SIGSTOP samego czekającego wrappera nic nie zwalnia
+        heavy = [
+            j for j in local
+            if not j.get("paused") and not j.get("small") and j.get("lang") != "native"
+        ]
         if len(local) - len(paused) > 1 and heavy:
             victim = max(heavy, key=lambda j: j.get("started_at", 0))
             try:
@@ -2074,6 +2373,39 @@ def new_id():
     import random
 
     return f"j-{int(time.time())}-{random.randrange(16**4):04x}"
+
+
+PORTIVO_LEASES = os.path.join(HOME, ".cache/portivo-mobile/leases")
+
+
+def session_lease():
+    """Czy sesja Claude nad tym procesem ma już symulator z portivo-mobile (dzierżawa
+    leases/<udid>.json z jej pid): wtedy `up` nic nowego nie włączy. Sesję szuka jak
+    portivo-mobile: pierwszy proces `claude` w górę drzewa."""
+    pid, claude = os.getppid(), None
+    for _ in range(40):
+        if not pid or pid <= 1:
+            break
+        path = proc_path(pid)
+        if proc_name(pid) == "claude" or os.path.basename(path) == "claude" or "/claude/versions/" in path:
+            claude = pid
+            break
+        pid = proc_bsd(pid, BSD_PPID)
+    if not claude:
+        return False
+    try:
+        names = os.listdir(PORTIVO_LEASES)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(PORTIVO_LEASES, name)) as f:
+                owner = json.load(f).get("owner") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        if owner.get("pid") == claude:
+            return True
+    return False
 
 
 def agent_info(session, name):
@@ -2160,6 +2492,8 @@ def new_entry(job, command, argv, opts):
         "route": None,
         "small": False,
         "count1_dropped": False,
+        "exclusive": bool(job.get("exclusive")),
+        "native_tool": job.get("tool") if job.get("lang") == "native" else None,
         "pid": os.getpid(),
         "via": opts.get("via", "cli"),
         "enqueued_at": time.time(),
@@ -2198,6 +2532,8 @@ def cmd_run(args):
             )
     if job["kind"] == "test" and os.path.isfile(os.path.join(job["repo_dir"], "scripts/depot-exec.sh")):
         job["uses_pg"] = uses_pg(job, cache)
+    if job.get("lang") == "native" and job.get("tool") == "portivo-mobile":
+        entry["sim_lease"] = session_lease()
     if likely_heavy(job) and job.get("lang") not in ("node", "native"):
         refresh_depot_eta(cache, job["repo_dir"])
     save_cache(cache)
@@ -2422,15 +2758,27 @@ def run_local(entry, job, command, argv, cfg):
         signal.signal(sig, forward)
     started = time.time()
     peak, cpu_live, last_beat = 0.0, 0.0, 0.0
+    # natywny build: do pamięci joba dochodzą drzewa xcodebuild na Macu (jeden build naraz, więc
+    # to jego) i symulator, który `portivo-mobile up` włączył; oba poza drzewem procesów joba
+    native = job.get("lang") == "native" and job.get("exclusive")
+    sims_since = started if job.get("tool") == "portivo-mobile" else None
+    pool, pool_at = None, 0.0
     while True:
         pid, status, rusage = os.wait4(child.pid, os.WNOHANG)
         if pid == child.pid:
             break
-        now_gb, cpu_live = job_usage(child.pid)
+        own = job_pids(child.pid)
+        if native and time.time() - pool_at >= 2.0:
+            pool, pool_at = native_scan(sims_since), time.time()
+        if pool and pool["pids"]:
+            now_gb, cpu_live = pids_usage(own | pool["pids"])
+        else:
+            now_gb, cpu_live = pids_usage(own)
+            now_gb += pool["gb"] if pool else 0.0
         peak = max(peak, now_gb)
         if time.time() - last_beat >= 1.0:
             last_beat = time.time()
-            heartbeat(jid, cfg, now_gb, peak, cpu_live, started)
+            heartbeat(jid, cfg, now_gb, peak, cpu_live, started, native=pool)
         time.sleep(0.25)
     rc = os.waitstatus_to_exitcode(status)
     cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
@@ -2438,7 +2786,7 @@ def run_local(entry, job, command, argv, cfg):
     return rc if rc >= 0 else 128 - rc
 
 
-def heartbeat(jid, cfg, now_gb, peak, cpu, started):
+def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None):
     with Locked(block=False) as lk:
         if not lk.ok:
             return
@@ -2446,6 +2794,8 @@ def heartbeat(jid, cfg, now_gb, peak, cpu, started):
         me = next((j for j in state["running"] if j["id"] == jid), None)
         if me is None:
             return
+        if native is not None and me.get("exclusive"):
+            track_native(me, native, time.time(), state["_internal"], now_gb)
         elapsed = time.time() - started
         wall = me.get("predicted_wall_s") or 60
         me.update(
@@ -2482,6 +2832,12 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
         internal = state["_internal"]
         where = me["where"]
         waited = me.get("waited_s") or 0.0
+        if me.get("native_seen"):
+            # szczyt z drzewami xcodebuild: z tego scheduler przewiduje każdy natywny build
+            internal["native_peaks"] = (internal.get("native_peaks", []) + [round(peak, 2)])[-10:]
+        if me.get("native_done_at") and me.get("started_at"):
+            # `expo run:ios` zostaje z Metro: czas buildu, a nie czas życia Metro
+            wall = min(wall, me["native_done_at"] - me["started_at"])
         today["wait_s"] = round(today["wait_s"] + waited, 1)
         units = cost = None
         if where == "local":
@@ -2557,6 +2913,8 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
             "predicted_wall_s": me.get("local_wall_s") or me.get("predicted_wall_s"),
             "count1_dropped": me.get("count1_dropped", False),
         }
+        if me.get("lang") == "native":
+            row["native_built"] = bool(me.get("native_seen"))
         with open(HISTORY_PATH, "a") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         refresh_memory(state, cfg)
@@ -2751,9 +3109,10 @@ def hook_rewrite(event):
     if job.get("lang") == "native":
         # kolejka natywnych potrafi czekać minutami, dłużej niż domyślny timeout Basha
         how = (
-            f"It waits until about {job['native_prior'][0]:g} GB fit in memory and then starts by "
-            "itself, which can take minutes: run it with run_in_background and do not kill it "
-            "while it waits"
+            f"It waits until about {job['native_prior'][0]:g} GB fit in memory (native builds run "
+            "one at a time on this Mac, a simulator start also waits for a free simulator slot) and "
+            "then starts by itself, which can take minutes: run it with run_in_background and do "
+            "not kill it while it waits"
         )
     else:
         how = "It may wait for memory, pick -p or run on Depot"
@@ -3071,6 +3430,24 @@ def cmd_status(args):
         f"zapas {pl_gb(mem['headroom_gb'])}, dev serwer {pl_gb(mem['devserver_reserve_gb'])}, "
         f"joby urosną jeszcze o {pl_gb(mem['reserved_gb'])}); pusty Mac zmieści {pl_gb(mem['idle_max_gb'])}"
     )
+    native = mem.get("native") or {}
+    if native.get("owner"):
+        slot = f"zajęte: {native['owner_label']}"
+    elif native.get("outside"):
+        slot = (
+            f"zajęte przez build spoza schedulera ({pl_gb(native['build_gb'])}, "
+            f"urośnie jeszcze o {pl_gb(native['reserve_gb'])})"
+        )
+    else:
+        slot = "wolne"
+    sims = mem.get("simulators")
+    sims_text = (
+        f"; symulatory: {sims['booted']} włączone ({pl_gb(sims['gb'])}), w użyciu {sims['in_use']}"
+        f" z limitu {sims['cap']}"
+        if sims
+        else ""
+    )
+    print(f"Natywny build (jeden naraz): {slot}{sims_text}")
     if not state["running"] and not state["queue"]:
         print("Nic nie biegnie.")
     for j in state["running"]:
@@ -3143,9 +3520,69 @@ def cmd_wait(args):
         time.sleep(max(0.05, min(every, limit - waited)))
 
 
-def cmd_rtk_excludes(_args):
-    """Linia `exclude_commands` do [hooks] w configu rtk: komendy, które owija scheduler."""
-    print("exclude_commands = [" + ", ".join(f"'{p}'" for p in RTK_EXCLUDES) + "]")
+RTK_CONFIG = os.path.join(HOME, "Library/Application Support/rtk/config.toml")
+
+
+def rtk_excludes_line():
+    """Linia `exclude_commands` do [hooks] w configu rtk: komendy, które owija scheduler.
+    Wzorce idą jako literały TOML ('...'), więc odwrotne ukośniki zostają, jak są."""
+    quote = lambda p: f"'{p}'" if "'" not in p and "\n" not in p else json.dumps(p)  # noqa: E731
+    return "exclude_commands = [" + ", ".join(quote(p) for p in RTK_EXCLUDES) + "]"
+
+
+def write_rtk_excludes(path=RTK_CONFIG):
+    """Wpisuje `rtk_excludes_line()` w sekcję [hooks] configu rtk (dopisuje sekcję, gdy jej nie
+    ma); reszta pliku zostaje bez zmian, a przed pierwszą zmianą powstaje kopia
+    `config.toml.bak-claude-acc`. True, gdy plik się zmienił."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    lines, line = text.splitlines(), rtk_excludes_line()
+    start = next((i for i, l in enumerate(lines) if l.strip() == "[hooks]"), None)
+    if start is None:
+        lines += ([""] if lines and lines[-1].strip() else []) + ["[hooks]", line]
+    else:
+        end = next(
+            (i for i in range(start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
+            len(lines),
+        )
+        at = next(
+            (i for i in range(start + 1, end) if re.match(r"\s*exclude_commands\s*=", lines[i])),
+            None,
+        )
+        if at is None:
+            lines.insert(start + 1, line)
+        else:
+            stop = at
+            # tablica rozpisana na kilka linii: do linii, która ją zamyka
+            while stop < end - 1 and not lines[stop].rstrip().endswith("]"):
+                stop += 1
+            lines[at : stop + 1] = [line]
+    out = "\n".join(lines) + "\n"
+    if out == text:
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    backup = path + ".bak-claude-acc"
+    if text and not os.path.exists(backup):
+        with open(backup, "w") as f:
+            f.write(text)
+    with open(path + ".tmp", "w") as f:
+        f.write(out)
+    os.replace(path + ".tmp", path)
+    return True
+
+
+def cmd_rtk_excludes(args):
+    """Bez argumentów drukuje linię `exclude_commands`; `--write [PATH]` wpisuje ją w config rtk
+    (domyślnie RTK_CONFIG). Woła to setup.sh przy każdej instalacji."""
+    if args[:1] != ["--write"]:
+        print(rtk_excludes_line())
+        return 0
+    path = args[1] if len(args) > 1 else RTK_CONFIG
+    changed = write_rtk_excludes(path)
+    print(f"rtk: {'wpisane wyjątki schedulera' if changed else 'wyjątki schedulera bez zmian'} ({path})")
     return 0
 
 
