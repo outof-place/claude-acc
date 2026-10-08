@@ -295,6 +295,9 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `brew` | `brew cleanup --prune=14` | weekly |
 | `uv` | `uv cache prune` | weekly |
 | `logs` | files in `~/Library/Logs` older than 30 days | daily |
+| `compress` | transparent APFS compression (`afsctool`, LZFSE) of files under `compress.paths` that haven't changed for an hour; off until you list paths | every run |
+
+`compress` keeps files on disk compressed the way macOS stores its own system files: reads are transparent, the kernel decompresses on the fly. Measured on 2026-10-08: Claude Code transcripts in `~/.claude/projects` shrink by 75%, Microsoft Word.app by 39%. Appending to a compressed file makes APFS write it back uncompressed, so each run picks up the files changed since the last one once they have been quiet for `min_age_minutes`. It skips files a process has open, the whole bundle of an app that is running (compressing in place swaps out a mapped executable), files you can't write that you don't own (the janitor has no root), and protected paths. Install the tool with `brew install afsctool`; without it the task logs a warning and does nothing. APFS clones share blocks and each compressed copy gets its own, so leave clone-heavy folders such as a pnpm store on APFS out of `paths`.
 
 Each run also checks which projects' `node_modules` end up in the Spotlight index. Spotlight skips directories whose name starts with a dot or ends with `.noindex`, so pnpm's `.pnpm` store is never indexed, but hoisted `node_modules` (Expo, npm, yarn) are, and every install makes Spotlight chew through tens of thousands of files. Neither a `.metadata_never_index` file nor `chflags hidden` stops it on current macOS. The fix is System Settings > Spotlight > Search Privacy; `claude-acc mac spotlight` lists the projects and opens that pane.
 
@@ -318,6 +321,7 @@ Configuration lives in `~/.local/share/claude-acc/janitor.json`. Every key is op
 | `low_disk_gb` | `40` | Below this much free space, a warning (at most every 12 hours) |
 | `skip` | `[]` | Task names to leave out, like `["docker", "brew"]` |
 | `caps` | `[]` | Folders agents fill without end, like `[{"path": "~/.cache/portivo-perf/*/builds", "max_gb": 10, "keep": 1}]`. Entries over `max_gb` go oldest first (by creation date, since `rsync -a` copies mtimes); the `keep` newest always stay, and so does anything changed in the last `fresh_minutes` (10) |
+| `compress` | `{}` | Transparent APFS compression, like `{"paths": ["~/.claude/projects"]}`. Other keys: `min_age_minutes` (60), `compressor` (`LZFSE`), `threads` (4), `max_file_mb` (1024), `exclude_running_apps` (`true`) |
 
 ## Dev server guard
 
@@ -584,7 +588,7 @@ What was measured and left alone, in [`docs/perf-research.md`](docs/perf-researc
 
 The tests run the real script end to end against fake `security`, `curl` and `claude` binaries put first on `PATH`, so they never touch your Keychain or your accounts. They cover logging in, switching during a 429, keeping MCP tokens, cancelling a login halfway, leaving an account whose token died, and when the limit pause starts and ends. `tests/test_hook.py` runs each pause hook the way `settings.json` gets it, through the shell command and, with `app/.build/release/claude-acc-hook` and `claude-acc-pause` built, through each native program in exec form, with JSON on stdin as Claude Code sends it, on a temporary `$HOME`, and installs and removes the hooks in a temporary `settings.json`. The guard tests check the native front's gate against the real `devguard.py admit`: every dev server start and every command the scheduler takes passes it, words inside paths and other words stay quiet, and the Swift binary reads the pattern the way Python does.
 
-The janitor tests run the real script on a temporary `$HOME` with the real `lsof`: caches that go, caches kept because a file is open or a dev server works in the app, a shell prompt that doesn't block, protected paths, stale and active projects, an interrupted delete, and `caps` dropping the oldest snapshots.
+The janitor tests run the real script on a temporary `$HOME` with the real `lsof`: caches that go, caches kept because a file is open or a dev server works in the app, a shell prompt that doesn't block, protected paths, stale and active projects, an interrupted delete, and `caps` dropping the oldest snapshots. The `compress` tests run the real `afsctool`: old files get compressed, an appended file comes back on the next run, and open files, protected paths and the bundle of a running app stay as they are.
 
 The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies, records and undoes exactly, Ultra on and off restore `settings.json` and `devguard.json` byte for byte, a second `ultra on` changes nothing, a value someone changed after Ultra survives `ultra off`, a hook command someone changed after `claude-hooks-native` survives its undo, hooks it moved out of the shell in 1.7 move to exec form and still come back to their originals, a script without `#!`, a program from `PATH` or a variable in an argument stay in the shell, the pause hooks in exec form are never made async or wrapped, a tweak a newer version adds to Ultra is turned on by `keep` while one undone by hand is not, and Ultra and the pause hooks come off in either order without taking each other's entries along.
 
