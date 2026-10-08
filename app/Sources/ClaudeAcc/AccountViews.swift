@@ -225,7 +225,11 @@ struct AccountDetails: View {
                     row("Active since", Format.stamp(switched, now: now), detail: Format.ago(switched, now: now))
                 }
                 if let age = account.dataAge {
-                    row("Data", "read \(Format.age(age)) ago", tint: age > 900 ? .orange : nil)
+                    row("Data", "read \(Format.age(age)) ago",
+                        detail: account.fullUntil.map { "exact until \(Format.moment($0, now: now))" },
+                        tint: account.dataStale ? .orange : nil,
+                        help: account.fullUntil == nil ? nil
+                            : "A full window stays full until it resets, so the API isn't asked again before then")
                 }
                 if account.mislabeled, let real = account.realEmail {
                     row("Holds", real, tint: .orange)
@@ -546,7 +550,7 @@ private struct AccountRow: View {
         if let status = account.subscriptionStatus, status != "active" {
             lines.append("Subscription \(status), auto-switch skips it")
         }
-        if let age = account.dataAge, age > 900 {
+        if account.dataStale, let age = account.dataAge {
             lines.append("Data \(Format.age(age)) old")
         }
         return lines.joined(separator: "\n")

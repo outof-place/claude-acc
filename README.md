@@ -104,6 +104,7 @@ A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Cla
 
 - `accswitch.py` holds all the logic. launchd runs `accswitch.py tick` every 2 minutes, with or without the app.
 - Usage comes from `GET https://api.anthropic.com/api/oauth/usage`, and the account behind a token from `/api/oauth/profile`.
+- It asks for usage only when the answer could have changed. Usage in a window only grows until the window resets, so an account with a full window isn't read again before that reset, apart from a check every 3 to 4 hours in case Anthropic resets limits early. An account nobody works on keeps its numbers for 30 minutes and is read once more right before the watcher switches to it. The active account is read as often as the fastest burn seen so far (5% of the 5-hour window a minute) could bring it to the switch threshold: every 2 minutes close to it, every 15 minutes far from it.
 
 ## Numbers
 
@@ -146,7 +147,7 @@ Each of these rules comes from an account that actually lost its login while the
 - An inactive account whose token no session holds is refreshed by whichever process reads it first (the watcher, a click, or the panel), one process at a time behind a file lock. The panel never refreshes a token that a session in any config directory may hold.
 - It never writes a token it hasn't checked against the API first. A future expiry date doesn't prove the token still works.
 - It replaces only `claudeAiOauth`. The same Keychain entry holds `mcpOAuth`, the tokens of your MCP servers, which belong to the config directory and survive every switch.
-- A 429 from the usage endpoint means "unknown", never "dead". It backs off for 2 minutes, then 4, 8 and 15 while the endpoint keeps refusing, starts over after the first good answer, and doesn't refresh or flag anything in the meantime. Claude Code and Orca poll the same endpoint too, so it can throttle even while this tool is quiet. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled. Accounts with a canceled subscription get a 403 there, so they aren't asked at all.
+- A 429 from the usage endpoint means "unknown", never "dead". It backs off that one account for 2 minutes, then 4, 8 and 15 while the endpoint keeps refusing it, starts over after that account's first good answer, and doesn't refresh or flag anything in the meantime. The endpoint throttles one account at a time: other accounts kept answering while the active one got 429 for an hour and a half. Claude Code and Orca poll the same endpoint too, so it can throttle even while this tool is quiet. Whether a token works is checked against the profile endpoint, so switching still works while the usage endpoint is throttled. Accounts with a canceled subscription get a 403 there, so they aren't asked at all.
 - Before overwriting the live entry it copies the token there back to its Orca copy, because the running session may have rotated it since the last switch.
 
 ## Using up every account

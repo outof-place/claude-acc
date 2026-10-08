@@ -106,6 +106,10 @@ struct Account: Decodable, Identifiable {
     let session: UsageWindow?
     let weekly: UsageWindow?
     let dataAge: Int?
+    /// A full window keeps the numbers exact until this reset, so the script doesn't read them again.
+    let fullUntil: Double?
+    /// Old numbers that could have changed since: a full account's numbers can't.
+    var dataStale: Bool { (dataAge ?? 0) > 900 && fullUntil == nil }
     /// Monthly anniversary of the subscription start: the API has no billing date.
     let renewsAt: Double?
     let subscriptionStatus: String?
