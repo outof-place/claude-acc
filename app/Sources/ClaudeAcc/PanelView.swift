@@ -25,6 +25,9 @@ struct PanelView: View {
                     Column(width: 350) {
                         ActiveAccountCard(store: store).fixedSize(horizontal: false, vertical: true)
                         AccountsCard(store: store)
+                        if let credits = store.snapshot?.credits {
+                            CreditsCard(credits: credits).fixedSize(horizontal: false, vertical: true)
+                        }
                         DiskCard(store: store).fixedSize(horizontal: false, vertical: true)
                     }
                     Column(width: 360) {

@@ -32,6 +32,8 @@ Komendy:
                     odświeżania: token aktywnego rotują sesje); idzie za przełączeniem konta
   token --fallback  zapisz długi token z `claude setup-token` dla `token` bez konta z zapasem
   watch [sekundy]   pętla ticków na pierwszym planie
+
+Kredyty API z planów (pula kluczy organizacji Console) to osobny skrypt: claude-acc credits --help.
 """
 
 import fcntl
@@ -1203,6 +1205,17 @@ def forecast(data, rows, cfg):
     return out
 
 
+def credits_summary():
+    """Suma kredytów API dla panelu i `status` (credits.py); None bez kont z kredytami.
+    Zepsuty plik kredytów nie może zatrzymać odczytu limitów, który aplikacja robi co minutę:
+    `claude-acc credits status` pokaże wtedy, co jest nie tak."""
+    try:
+        import credits
+        return credits.panel()
+    except Exception:
+        return None
+
+
 def snapshot(cfg):
     """Stan wszystkich kont w jednym słowniku. To czyta aplikacja w pasku menu."""
     accounts = load_accounts()
@@ -1278,6 +1291,7 @@ def snapshot(cfg):
         "pause": load_json(PAUSE_PATH, None),
         "limit_pause": bool(cfg["limit_pause"]),
         "drain": bool(cfg["drain"]),
+        "credits": credits_summary(),
         "accounts": items,
     }
 
@@ -1321,6 +1335,10 @@ def cmd_status(cfg, args):
     nxt = queue(rows)
     if nxt:
         print(f"\nnastępne w kolejce: {', '.join(r['account'].email for r in nxt[:3])}")
+    summary = credits_summary()
+    if summary:
+        import credits
+        print(f"\n{credits.summary_line(summary)} (szczegóły: claude-acc credits status)")
     return 0
 
 

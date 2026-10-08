@@ -106,8 +106,8 @@ if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
   "$STATE/python" "$STATE/acc.py" hint sync >/dev/null 2>&1 || true
 fi
 
-# jedna komenda na wszystko: konta, porządki (mac, clean), strażnik (guard), wydajność (perf,
-# perf-root), wiatraki (fans), hotspot iPhone'a (hotspot), aktualizacje (update, updates),
+# jedna komenda na wszystko: konta, kredyty API (credits), porządki (mac, clean), strażnik (guard),
+# wydajność (perf, perf-root), wiatraki (fans), hotspot iPhone'a (hotspot), aktualizacje (update, updates),
 # a `claude-acc uninstall` zdejmuje to, co postawił ten skrypt
 cat > "$HOME/.local/bin/claude-acc" <<'EOF'
 #!/bin/sh
@@ -127,6 +127,7 @@ case "$1" in
   browser) shift; exec "$PY" "$RUN" browser "$@" ;;
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
+  credits) shift; exec "$PY" "$RUN" credits "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka

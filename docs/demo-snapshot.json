@@ -23,6 +23,20 @@
  "switched_at": 1790421297.435127,
  "limit_pause": false,
  "drain": true,
+ "credits": {
+  "total_remaining_usd": 2187.4,
+  "granted_usd": 2700.0,
+  "linked": 13,
+  "pending": 2,
+  "error": 0,
+  "by_scope": {
+   "own": 2087.4,
+   "client": 100.0
+  },
+  "next_expiry_at": 1790777697.435127,
+  "next_expiry_usd": 162.3,
+  "checked_at": 1790338497.435127
+ },
  "accounts": [
   {
    "id": "demo-1",

@@ -81,7 +81,9 @@ GATE_PROGRAMS = (
 # Tak samo z przeglądarkami: klucz "Chrome/Brave Safe Storage" odszyfrowuje ciasteczka i hasła,
 # a pliki Cookies, Login Data i Web Data w profilu to sesje, hasła i karty. Agent wchodzi na
 # strony z Twoimi loginami przez bramkę przeglądarki (browser.py), nigdy przez te pliki.
-SECRET_WORDS = ("claude-acc-mail", "claude-acc-browser", "google-service-account", "dump-keychain", "Safe Storage", "BraveSoftware", "Google/Chrome")
+# Klucze API organizacji z kredytami (claude-acc-credits) dostaje tylko dziecko `credits exec`
+# albo Claude Code przez apiKeyHelper (`credits helper`), który nie idzie przez narzędzie Bash.
+SECRET_WORDS = ("claude-acc-mail", "claude-acc-browser", "claude-acc-credits", "credits helper", "google-service-account", "dump-keychain", "Safe Storage", "BraveSoftware", "Google/Chrome")
 HOOK_GATE = (
     r"(?<![\w./-])(?:dev|serve)(?![\w.-])"
     r"|(?<![\w.-])(?:" + "|".join(GATE_PROGRAMS) + r")(?![\w.-])"
@@ -91,6 +93,11 @@ SECRET_DENY = (
     "Sekrety bramki pocztowej zostają w Pęku kluczy. Do poczty użyj narzędzi mail "
     "(skill `mail`, `claude-acc mail ...`); diagnoza: `claude-acc mail doctor`."
 )
+CREDITS_SECRET_DENY = (
+    "Klucze API kredytów zostają w Pęku kluczy, a `credits helper` woła tylko Claude Code jako "
+    "apiKeyHelper. Komendę, która ma płacić kredytem, uruchom przez `claude-acc credits exec "
+    "--purpose <nazwa> -- <komenda>`; saldo: `claude-acc credits status`."
+)
 BROWSER_SECRET_DENY = (
     "Ciasteczka, hasła i karty z Chrome i Brave zostają w przeglądarce. Na strony z Twoimi "
     "loginami agent wchodzi bramką przeglądarki (skill `browser`, `claude-acc browser ...`)."
@@ -98,16 +105,25 @@ BROWSER_SECRET_DENY = (
 
 
 def secret_read(command):
-    """Powód odmowy dla komendy, która wyciąga sekret bramki pocztowej z Pęku kluczy albo
-    ciasteczka, hasła i karty z profilu Chrome lub Brave; None dla każdej innej."""
+    """Powód odmowy dla komendy, która wyciąga z Pęku kluczy sekret bramki pocztowej albo klucz
+    API kredytów, albo ciasteczka, hasła i karty z profilu Chrome lub Brave; None dla każdej innej."""
     import re
 
     if re.search(r"(?<![\w-])dump-keychain(?![\w-])", command):
         return SECRET_DENY
+    reads = r"find-(?:generic|internet)-password|export(?![\w-])|\s-[a-zA-Z]*[wg]\b"
+    if re.search(r"(?<![\w.-])credits\s+helper(?![\w.-])", command):
+        return CREDITS_SECRET_DENY
+    if (
+        re.search(r"(?<![\w-])security(?![\w-])", command)
+        and re.search(r"(?<![\w-])claude-acc-credits(?![\w-])", command)
+        and re.search(reads, command)
+    ):
+        return CREDITS_SECRET_DENY
     if (
         re.search(r"(?<![\w-])security(?![\w-])", command)
         and re.search(r"(?<![\w-])(?:claude-acc-mail|claude-acc-browser|google-service-account)(?![\w-])", command)
-        and re.search(r"find-(?:generic|internet)-password|export(?![\w-])|\s-[a-zA-Z]*[wg]\b", command)
+        and re.search(reads, command)
     ):
         return SECRET_DENY
     if re.search(r"(?:Chrome|Brave|Chromium)\s+Safe\s+Storage", command, re.IGNORECASE):

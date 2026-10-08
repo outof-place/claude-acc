@@ -96,10 +96,10 @@ enum Format {
     }
 
     /// Days to a date that has no time of day: "today", "tomorrow", "in 19 days".
-    static func inDays(_ epoch: Double) -> String {
+    static func inDays(_ epoch: Double, now: Date = .now) -> String {
         let calendar = Calendar.current
         let days = calendar.dateComponents(
-            [.day], from: calendar.startOfDay(for: .now),
+            [.day], from: calendar.startOfDay(for: now),
             to: calendar.startOfDay(for: Date(timeIntervalSince1970: epoch))).day ?? 0
         return switch days {
         case ..<1: "today"
@@ -116,6 +116,11 @@ enum Format {
         case ..<86_400: "\(seconds / 3600)h \(seconds % 3600 / 60)m"
         default: "\(seconds / 86_400)d \(seconds % 86_400 / 3600)h"
         }
+    }
+
+    /// "$2,340" from a hundred up, "$12.50" below: cents matter only when little is left.
+    static func usd(_ value: Double) -> String {
+        value.formatted(.currency(code: "USD").precision(.fractionLength(value >= 100 ? 0 : 2)).locale(english))
     }
 
     static func percent(_ value: Double?) -> String {
