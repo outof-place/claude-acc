@@ -7,6 +7,7 @@ importuje, więc jego bajtkod idzie z __pycache__, a nie z kompilacji przy każd
 import ctypes
 import ctypes.util
 import fcntl
+import fnmatch
 import json
 import os
 import plistlib
@@ -111,8 +112,11 @@ DEFAULT_CONFIG = {
     # tyle rdzeni CPU całego symulatora to używanie. Pomiar 2026-10-08: bezczynny symulator
     # z aplikacją RN 0,01 rdzenia, ten sam pod flow maestro 0,4-0,7
     "simulator_busy_cores": 0.15,
-    # nazwy albo UDID symulatorów, których strażnik nigdy nie wyłącza
-    "simulator_protect": [],
+    # nazwy (także wzorce z * i ?) albo UDID symulatorów, których strażnik nigdy nie wyłącza.
+    # Portivo-Perf-*: sesje, które mierzą wydajność aplikacji iOS, trzymają symulator długo bez
+    # dzierżawy; wyłączenie w środku pomiaru zabiera im urządzenie i jego stan. Własna lista
+    # zastępuje tę, więc wzorzec trzeba w niej powtórzyć.
+    "simulator_protect": ["Portivo-Perf-*"],
 }
 
 SERVER_KINDS = [
@@ -1105,8 +1109,9 @@ class Simulator:
         self.lease = read_lease(cfg, udid)
         self.lease_alive = lease_alive(self.lease)
         self.watchers = sorted(watchers)
-        protect = cfg["simulator_protect"]
-        self.protected = udid in protect or self.name in protect
+        self.protected = any(
+            udid == p or fnmatch.fnmatchcase(self.name, p) for p in cfg["simulator_protect"]
+        )
         stats = [s for s in (usage(p) for p in tree) if s]
         self.footprint = sum(s["footprint"] for s in stats)
         self.cpu = sum(s["cpu"] for s in stats)

@@ -537,9 +537,9 @@ def simulators_info(snap):
             return None
         sims = [s for s in snap.get("simulators") or [] if isinstance(s, dict)]
         used = [s for s in sims if s.get("in_use")]
-        # limit agentów liczy tylko pulę: Twoich symulatorów strażnik nie wyłączy, więc dwa
-        # Twoje zatrzymałyby każdy `portivo-mobile up` na zawsze
-        agents = [s for s in used if s.get("pool")]
+        # limit agentów liczy tylko pulę bez chronionych: Twoich ani chronionych (Portivo-Perf-*)
+        # strażnik nie wyłączy, więc dwa takie zatrzymałyby każdy `portivo-mobile up` na zawsze
+        agents = [s for s in used if s.get("pool") and not s.get("protected")]
         return {
             "booted": len(sims),
             "in_use": len(used),

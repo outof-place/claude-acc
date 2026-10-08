@@ -1580,6 +1580,9 @@ class NativeSlotTest(Paths):
                      "footprint": 2 * S.GB} for i in range(2)]
             # Twój symulator: liczy się do pamięci, ale nie do limitu agentów (strażnik go nie wyłączy)
             sims.append({"udid": "H", "name": "iPhone 17", "pool": False, "in_use": True, "footprint": 3 * S.GB})
+            # chroniony symulator innej sesji (pomiary wydajności): z tego samego powodu poza limitem
+            sims.append({"udid": "P", "name": "Portivo-Perf-iPhone", "pool": True, "protected": True,
+                         "in_use": True, "footprint": 3 * S.GB})
             with open(S.DEVGUARD_STATE, "w") as f:
                 json.dump({"snapshot": {"at": time.time(), "budget": 12 * S.GB, "total": 0,
                                         "simulators": sims, "simulator_cap": 2}}, f)

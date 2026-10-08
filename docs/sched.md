@@ -331,8 +331,9 @@ na swoją kolej job (`reason.code = native`) nie blokuje jobów za sobą.
 Start symulatora (`xcrun simctl boot`, `open -a Simulator`) i `portivo-mobile up` sesji, która nie
 ma jeszcze dzierżawy, czekają (`reason.code = simulators`), gdy symulatory agentów (z puli
 `simulator_pool_prefix`, `Portivo-*`) w użyciu są na limicie devguarda (`max_booted_simulators`).
-Twoje symulatory spoza puli liczą się do pamięci, ale nie do tego limitu: strażnik ich nie wyłącza,
-więc Twój otwarty iPhone nie może na stałe zablokować agentom startu. Nieużywane symulatory wyłącza strażnik (README, sekcja o
+Twoje symulatory spoza puli i chronione (`simulator_protect`, domyślnie `Portivo-Perf-*`) liczą
+się do pamięci, ale nie do tego limitu: strażnik ich nie wyłącza, więc Twój otwarty iPhone albo
+symulator sesji pomiarów wydajności nie może na stałe zablokować agentom startu. Nieużywane symulatory wyłącza strażnik (README, sekcja o
 strażniku dev serwerów); bez jego świeżego pomiaru limitu nie ma.
 
 ## `sched.py wait`

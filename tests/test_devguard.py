@@ -486,6 +486,32 @@ class SimulatorTest(unittest.TestCase):
             self.assertEqual(found[UDID].watchers, [400], viewer)
             self.assertTrue(found[UDID].in_use, viewer)
 
+    def test_performance_simulators_are_never_shut_down(self):
+        """Portivo-Perf-* to symulatory sesji, które mierzą wydajność aplikacji iOS: bez dzierżawy
+        i długo bez ruchu między pomiarami. Domyślny config chroni każdy taki (wzorzec, nie jedna
+        nazwa), także po godzinach ciszy, ponad limitem i przy braku pamięci; zwykły symulator puli
+        obok dalej idzie."""
+        perf, ipad, auto = UDID, "0F6A3C2B-1111-4222-8333-944455556666", "6B1D2E3F-AAAA-4BBB-8CCC-DDDDEEEEFFFF"
+        names = {perf: "Portivo-Perf-iPhone", ipad: "Portivo-Perf-iPad-Pro", auto: "Portivo-Auto-1"}
+        rows = [
+            (100 + i, 1, f"launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/{u}/data/var/run/launchd_bootstrap.plist")
+            for i, u in enumerate(names)
+        ]
+        found = self.discover(rows, names)
+        self.assertEqual({u: s.protected for u, s in found.items()}, {perf: True, ipad: True, auto: False})
+        for s in found.values():
+            s.age = s.quiet = 10 * 3600
+        sims = list(found.values())
+        # ponad limitem i przy presji: idzie tylko symulator spoza wzorca
+        self.assertEqual(plans(world(simulators=sims, level=2, reasons=["swap"])), [(f"sim:{auto}", "shutdown")])
+        # same chronione ponad limitem: ostrzeżenie, żadnego wyłączenia
+        got = plans(world(simulators=sims[:2], level=2, reasons=["swap"]), max_booted_simulators=1,
+                    simulator_idle_minutes=1, simulator_quiet_minutes=0)
+        self.assertEqual([action for _key, action in got], ["warn"])
+        # własna lista z innym wzorcem zastępuje domyślną
+        mine = self.discover(rows, names, simulator_protect=["Portivo-Auto-*"])
+        self.assertEqual({u: s.protected for u, s in mine.items()}, {perf: False, ipad: False, auto: True})
+
     def test_quiet_counts_from_the_last_use(self):
         """Cisza rośnie tylko, gdy CPU całego symulatora jest pod `simulator_busy_cores`, a nikt
         go nie trzyma i nikt nie patrzy (pomiar 2026-10-08: bezczynny 0,01 rdzenia)."""
