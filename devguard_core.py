@@ -4,11 +4,17 @@ Wejściem jest devguard.py (komendy, opis i szybka ścieżka hooka `admit`); ten
 importuje, więc jego bajtkod idzie z __pycache__, a nie z kompilacji przy każdym starcie.
 """
 
+# Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę.
+# ctypes zostaje: libc i struktury niżej powstają przy imporcie; json i subprocess ładuje janitor.
+__lazy_modules__ = ["shlex", "socket", "urllib.parse", "uuid"]
+
 import ctypes
 import ctypes.util
 import fcntl
+import fnmatch
 import json
 import os
+import plistlib
 import re
 import shlex
 import signal
@@ -89,6 +95,32 @@ DEFAULT_CONFIG = {
     "runtimes": ["node", "bun", "deno"],
     # limity katalogów z wynikami agentów (janitor caps) sprawdzane co tyle minut; 0 wyłącza
     "caps_minutes": 10,
+    # przy krytycznej presji, gdy żaden dev serwer nie zostaje do zatrzymania: sieroty,
+    # headless przeglądarki, gopls i przebiegi testów agentów (lastresort.py)
+    "last_resort": True,
+    # serwer zatrzymany z braku pamięci zostaje zatrzymany najwyżej tyle minut: hook nie wpuszcza
+    # go z powrotem, dopóki presja nie zejdzie do zera, a swap pod próg ostrzeżenia
+    "restart_hold_minutes": 10,
+    # symulatory iOS (każdy to 2-4 GB): najwyżej tyle włączonych naraz; ponad limit strażnik
+    # wyłącza nieużywane, a `portivo-mobile up` sesji bez symulatora czeka w schedulerze
+    "max_booted_simulators": 2,
+    # symulator z puli bez żywej dzierżawy i bez widzów wyłączany po tylu minutach
+    "simulator_idle_minutes": 30,
+    # ponad limitem wystarczy tyle minut bez używania
+    "simulator_quiet_minutes": 5,
+    # symulatory agentów (pula portivo-mobile); pozostałe są Twoje: liczą się do limitu, ale
+    # strażnik ich nie wyłącza
+    "simulator_pool_prefix": "Portivo-",
+    # dzierżawy portivo-mobile: <udid>.json z procesem sesji, która trzyma symulator
+    "simulator_leases": "~/.cache/portivo-mobile/leases",
+    # tyle rdzeni CPU całego symulatora to używanie. Pomiar 2026-10-08: bezczynny symulator
+    # z aplikacją RN 0,01 rdzenia, ten sam pod flow maestro 0,4-0,7
+    "simulator_busy_cores": 0.15,
+    # nazwy (także wzorce z * i ?) albo UDID symulatorów, których strażnik nigdy nie wyłącza.
+    # Portivo-Perf-*: sesje, które mierzą wydajność aplikacji iOS, trzymają symulator długo bez
+    # dzierżawy; wyłączenie w środku pomiaru zabiera im urządzenie i jego stan. Własna lista
+    # zastępuje tę, więc wzorzec trzeba w niej powtórzyć.
+    "simulator_protect": ["Portivo-Perf-*"],
 }
 
 SERVER_KINDS = [
@@ -116,9 +148,21 @@ BROWSER = re.compile(
     r"Brave Browser|Google Chrome(?! for Testing)|Safari|com\.apple\.WebKit|firefox|Arc\.app|Microsoft Edge|Chromium|Vivaldi|Opera"
 )
 HEADLESS = re.compile(
-    r"Chrome for Testing|HeadlessChrome|headless_shell|ms-playwright|puppeteer"
+    r"Chrome for Testing|HeadlessChrome|headless_shell|chrome-headless-shell|ms-playwright|puppeteer"
 )
 LOOPBACK = {"127.0.0.1", "[::1]", "::1", "localhost", "0.0.0.0", "*"}
+# proces z danych symulatora (aplikacja w nim, launchd_sim): UDID urządzenia z jego ścieżki
+UDID = re.compile(r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}")
+SIM_DEVICE = re.compile(rf"/CoreSimulator/Devices/({UDID.pattern})/")
+LAUNCHD_SIM = re.compile(r"(^|/)launchd_sim(\s|$)")
+# podgląd symulatora w Orce; bez UDID w argumentach ogląda każdy włączony
+SERVE_SIM = re.compile(r"(^|/)serve-sim(\s|$)")
+# `simctl io booted recordVideo`, `simctl spawn booted log stream`: alias każdego włączonego
+SIMCTL_BOOTED = re.compile(r"(^|/|\s)simctl\s.*\bbooted\b")
+# zostaje na urządzeniu po maestro; tak jak portivo-mobile nie liczymy go jako aplikacji w użyciu
+MAESTRO_DRIVER = "dev.mobile.maestro-driver-iosUITests.xctrunner"
+SIM_DEVICES = os.path.join(janitor.HOME, "Library/Developer/CoreSimulator/Devices")
+SIMULATOR_APP = "com.apple.iphonesimulator"
 
 
 def log(line):
@@ -248,6 +292,35 @@ _args = ctypes.create_string_buffer(64 * 1024)
 
 def procargs(pid):
     """Argumenty procesu z KERN_PROCARGS2: [argc, ścieżka, argv...]; None dla cudzego albo zombie."""
+    raw = _procargs_raw(pid)
+    if raw is None:
+        return None
+    argc = int.from_bytes(raw[:4], "little")
+    _exe, _, rest = raw[4:].partition(b"\0")
+    return [argc] + rest.lstrip(b"\0").split(b"\0")[:argc]
+
+
+def proc_env(pid):
+    """Środowisko procesu ({nazwa: wartość}) z tego samego bloku KERN_PROCARGS2, który trzyma
+    argumenty; {} dla cudzego albo zombie. Po środowisku jądro dokłada własne zmienne Apple
+    (executable_path=...) za pustym wpisem, więc czytamy tylko do niego."""
+    raw = _procargs_raw(pid)
+    if raw is None:
+        return {}
+    argc = int.from_bytes(raw[:4], "little")
+    _exe, _, rest = raw[4:].partition(b"\0")
+    env = {}
+    for item in rest.lstrip(b"\0").split(b"\0")[argc:]:
+        if not item:
+            break
+        name, sep, value = item.partition(b"=")
+        if sep:
+            env[name.decode(errors="replace")] = value.decode(errors="replace")
+    return env
+
+
+def _procargs_raw(pid):
+    """Surowy blok KERN_PROCARGS2 (argc, ścieżka, argv, środowisko); None dla cudzego albo zombie."""
     mib = (ctypes.c_int * 3)(1, KERN_PROCARGS2, pid)
     size = ctypes.c_size_t(len(_args))
     if _libc.sysctl(mib, 3, _args, ctypes.byref(size), None, 0):
@@ -263,11 +336,7 @@ def procargs(pid):
         if _libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0):
             return None
         raw = buf[: size.value]
-    if len(raw) < 4:
-        return None
-    argc = int.from_bytes(raw[:4], "little")
-    _exe, _, rest = raw[4:].partition(b"\0")
-    return [argc] + rest.lstrip(b"\0").split(b"\0")[:argc]
+    return raw if len(raw) >= 4 else None
 
 
 def proc_argv(pid):
@@ -416,6 +485,10 @@ class Pressure:
         self.available = sysctl_int("kern.memorystatus_level")
         self.swap_total, self.swap_used = swap_usage()
         self.compressed = sysctl_int("vm.compressor_bytes_used") or 0
+        # segmenty kompresora i ich limit: przy 98% limitu jądro ogłasza "compressor space
+        # shortage" (zamrożenie 08.10); na starszym macOS tych nazw nie ma i hamulec ich nie liczy
+        self.segments = sysctl_int("vm.compressor.segment.total")
+        self.segments_limit = sysctl_int("vm.compressor.segment.limit")
         swapouts = sysctl_int("vm.compressor.compactor.swapouts_queued_pressure")
         history = [h for h in state.get("swap_history", []) if now - h[0] <= 120]
         history.append([now, self.swap_used, swapouts])
@@ -445,6 +518,7 @@ class Pressure:
             self.reasons.append(f"swap {janitor.human(self.swap_used)} i rośnie")
         if self.reasons:
             self.level = 2
+            self._stage(cfg, kernel)
             return
         if kernel >= 2:
             self.reasons.append("jądro: ostrzeżenie o presji")
@@ -457,9 +531,33 @@ class Pressure:
             # pełny swap, który stoi, to ślad po dawnej presji: strony wracają dopiero
             # przy dotknięciu, więc gaszenie serwerów niczego tu nie zwolni
             self.notes.append(f"swap {janitor.human(self.swap_used)} stoi")
+        self._stage(cfg, kernel)
+
+    def _stage(self, cfg, kernel):
+        """Stopień hamulca (lastresort.stage): 0 spokój, 1 ciasno, 2 hamulec, 3 awaria."""
+        import lastresort
+
+        self.stage, self.stage_reasons = lastresort.stage(
+            {
+                "ram": self.ram,
+                "compressed": self.compressed,
+                "segments": self.segments,
+                "segments_limit": self.segments_limit,
+                "swap_used": self.swap_used,
+                "swap_growth": self.swap_growth,
+                "kernel": kernel,
+                "available": self.available,
+                "guard_level": self.level,
+            },
+            cfg,
+        )
 
     def summary(self):
         return {
+            "stage": self.stage,
+            "stage_reasons": self.stage_reasons,
+            "segments": self.segments,
+            "segments_limit": self.segments_limit,
             "level": self.level,
             "reasons": self.reasons,
             "notes": self.notes,
@@ -751,6 +849,8 @@ def sockets():
 
 
 def client_kind(command):
+    if SIM_DEVICE.search(command):
+        return "simulator"  # aplikacja w symulatorze iOS, zwykle z Metro
     if "Orca.app" in command:
         return "orca"
     if HEADLESS.search(command):
@@ -772,6 +872,8 @@ class Server:
         stats = [s for s in (usage(p) for p in tree) if s]
         self.footprint = sum(s["footprint"] for s in stats)
         self.peak = max((s["peak"] for s in stats), default=0)
+        # o ile procesy serwera mogą jeszcze urosnąć: każdy do swojego zmierzonego szczytu
+        self.regrow = sum(max(0, s["peak"] - s["footprint"]) for s in stats)
         self.cpu = sum(s["cpu"] for s in stats)
         self.written = sum(s["written"] for s in stats)
         self.ports = []
@@ -807,10 +909,13 @@ class Unit:
         self.biggest = max(s.footprint for s in servers)
         # szczyt pojedynczego procesu; suma drzewa bywa od niego większa
         self.peak = max(max(s.peak for s in servers), self.footprint)
+        self.regrow = sum(getattr(s, "regrow", 0) for s in servers)
         self.background = False
         self.cpu = sum(s.cpu for s in servers)
         self.ports = sorted({p for s in servers for p in s.ports})
         self.clients = []  # (pid, rodzaj, nazwa)
+        # aplikacje z symulatorów, których nikt nie używa: połączone, ale to nie widzowie
+        self.idle_sim_clients = []
         self.tabs = []
         self.terminal = None
         self.worktree = None
@@ -879,11 +984,13 @@ class Unit:
             "footprint": self.footprint,
             "biggest": self.biggest,
             "peak": self.peak,
+            "regrow": self.regrow,
             "host": self.host,
             "command": shlex.join(self.argv) if self.argv else None,
             "terminal": (self.terminal or {}).get("title"),
             "worktree": (self.worktree or {}).get("path"),
             "clients": [{"pid": p, "kind": k, "name": n} for p, k, n in self.clients],
+            "idle_sim_clients": len(self.idle_sim_clients),
             "tabs": [
                 {"url": t.get("url"), "focused": t.get("focused")} for t in self.tabs
             ],
@@ -959,6 +1066,222 @@ def discover(cfg, rows):
     return [Unit(root, group, table, children) for root, group in groups.items()], table
 
 
+# ---------- symulatory iOS ----------
+
+# ścieżka device.plist -> nazwa urządzenia; nie zmienia się, dopóki urządzenie istnieje
+_sim_names = {}
+
+
+def sim_name(udid):
+    path = os.path.join(SIM_DEVICES, udid, "device.plist")
+    if path not in _sim_names:
+        try:
+            with open(path, "rb") as f:
+                _sim_names[path] = str(plistlib.load(f).get("name") or udid)
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return udid
+    return _sim_names[path]
+
+
+def proc_start_epoch(pid):
+    """Start procesu w sekundach epoki (pbi_start_tvsec z proc_bsdinfo); None, gdy go nie ma
+    albo to zombie."""
+    buf = ctypes.create_string_buffer(BSDINFO_SIZE)
+    got = _libc.proc_pidinfo(
+        pid, PROC_PIDTBSDINFO, ctypes.c_uint64(0), buf, BSDINFO_SIZE
+    )
+    if got != BSDINFO_SIZE or int.from_bytes(buf.raw[4:8], "little") == SZOMB:
+        return None
+    return int.from_bytes(buf.raw[120:128], "little")
+
+
+def read_lease(cfg, udid):
+    path = os.path.join(janitor.expand(cfg["simulator_leases"]), udid + ".json")
+    lease = janitor.load_json(path, None)
+    return lease if isinstance(lease, dict) else None
+
+
+def lease_alive(lease):
+    """Czy sesja z dzierżawy portivo-mobile żyje: ten sam pid i ten sam start, który
+    portivo-mobile zapisał z `ps -o lstart=`. Start w nieznanym formacie (inny język
+    systemu) niczego nie przesądza: wtedy wystarczy żywy pid."""
+    owner = lease.get("owner") if isinstance(lease, dict) else None
+    if not isinstance(owner, dict):
+        return False
+    try:
+        pid = int(owner.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    started = proc_start_epoch(pid) if pid > 0 else None
+    if started is None:
+        return False
+    text = " ".join(str(owner.get("start") or "").split())
+    if not text:
+        return True
+    try:
+        want = time.mktime(time.strptime(text, "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return True
+    return abs(want - started) <= 2
+
+
+class Simulator:
+    """Włączony symulator iOS: jego launchd_sim i wszystko pod nim (aplikacje, demony).
+    W użyciu jest, gdy trzyma go żywa sesja (dzierżawa portivo-mobile), gdy ogląda go
+    proces spoza niego (maestro, build z `-destination id=UDID`, serve-sim) albo gdy nie
+    jest z puli agentów, czyli jest Twój."""
+
+    def __init__(self, cfg, udid, root, tree, watchers):
+        self.udid = udid
+        self.root = root
+        self.pids = sorted(tree)
+        self.name = sim_name(udid)
+        self.key = self.app_key = f"sim:{udid}"
+        self.label = f"symulator {self.name}"
+        self.pool = self.name.startswith(cfg["simulator_pool_prefix"])
+        self.lease = read_lease(cfg, udid)
+        self.lease_alive = lease_alive(self.lease)
+        self.watchers = sorted(watchers)
+        self.protected = any(
+            udid == p or fnmatch.fnmatchcase(self.name, p) for p in cfg["simulator_protect"]
+        )
+        stats = [s for s in (usage(p) for p in tree) if s]
+        self.footprint = sum(s["footprint"] for s in stats)
+        self.cpu = sum(s["cpu"] for s in stats)
+        self.start = (usage(root) or {}).get("start", 0)
+        # pola, których oczekują wspólne ścieżki planów i zdarzeń
+        self.ports = []
+        self.argv = None
+        self.launch_cwd = ""
+        # z historii
+        self.age = 0
+        self.quiet = 0
+
+    @property
+    def watched(self):
+        return bool(self.watchers)
+
+    @property
+    def in_use(self):
+        return self.lease_alive or self.watched or not self.pool or self.protected
+
+    def summary(self):
+        owner = (self.lease or {}).get("owner") or {}
+        return {
+            "key": self.key,
+            "udid": self.udid,
+            "name": self.name,
+            "pool": self.pool,
+            "footprint": self.footprint,
+            "processes": len(self.pids),
+            "lease_app": (self.lease or {}).get("app"),
+            "lease_session": owner.get("session") or None,
+            "lease_alive": self.lease_alive,
+            "watchers": self.watchers,
+            "in_use": self.in_use,
+            "protected": self.protected,
+            "age": round(self.age),
+            "quiet": round(self.quiet),
+        }
+
+
+class SimulatorGroup:
+    """Wszystkie włączone symulatory naraz: adresat ostrzeżenia o limicie."""
+
+    key = app_key = "simulators"
+
+    def __init__(self, sims):
+        self.footprint = sum(s.footprint for s in sims)
+        self.label = f"{len(sims)} włączone symulatory"
+        self.ports = []
+
+
+def discover_simulators(cfg, rows):
+    """Włączone symulatory z tabeli procesów: każdy ma własny launchd_sim (dziecko launchd)
+    z UDID urządzenia w argumentach. Widzowie to procesy spoza symulatora z jego UDID."""
+    children = {}
+    for pid, ppid, _command in rows:
+        children.setdefault(ppid, []).append(pid)
+    roots = {}
+    for pid, ppid, command in rows:
+        if ppid == 1 and LAUNCHD_SIM.search(command):
+            found = SIM_DEVICE.search(command)
+            if found:
+                roots[pid] = found.group(1)
+    if not roots:
+        return []
+    trees = {pid: set(descendants(pid, children)) for pid in roots}
+    inside = set().union(*trees.values())
+    outside = [(pid, command) for pid, _ppid, command in rows if pid not in inside]
+    viewers = [
+        pid
+        for pid, command in outside
+        if not UDID.search(command)
+        and (SERVE_SIM.search(command) or SIMCTL_BOOTED.search(command))
+    ]
+    sims = []
+    for root, udid in roots.items():
+        watchers = {pid for pid, command in outside if udid in command} | set(viewers)
+        sims.append(Simulator(cfg, udid, root, trees[root], watchers))
+    return sims
+
+
+def track_simulators(cfg, state, sims, now):
+    """Wiek i cisza symulatorów z historii stanu. Cisza liczy się od ostatniego użycia: CPU
+    ponad `simulator_busy_cores`, żywa dzierżawa albo widz."""
+    history = state.setdefault("sims", {})
+    busy_cores = cfg["simulator_busy_cores"]
+    seen = set()
+    for sim in sims:
+        key = f"{sim.udid}:{sim.start}"
+        seen.add(key)
+        h = history.get(key)
+        if h is None:
+            h = history[key] = {"first": now, "cpu": sim.cpu, "at": now, "busy": now}
+        dt = max(now - h["at"], 0.001)
+        if (sim.cpu - h["cpu"]) / dt >= busy_cores or sim.lease_alive or sim.watched:
+            h["busy"] = now
+        h["cpu"], h["at"] = sim.cpu, now
+        sim.age = now - h["first"]
+        sim.quiet = now - h["busy"]
+    for key in list(history):
+        if key not in seen:
+            del history[key]
+
+
+def drop_unused_simulator_clients(unit, commands, sims):
+    """Aplikacja w symulatorze, którego nikt nie używa, trzyma połączenie z Metro i tylko udaje
+    widza: bez tego Metro sesji, która umarła, nigdy nie wypada jako sierota ani bezczynny.
+    Symulator spoza pomiaru zostaje widzem (lepiej nie ruszyć, niż ruszyć cudzy)."""
+    kept, idle = [], []
+    for client in unit.clients:
+        found = SIM_DEVICE.search(commands.get(client[0], "")) if client[1] == "simulator" else None
+        sim = sims.get(found.group(1)) if found else None
+        (idle if sim is not None and not sim.in_use else kept).append(client)
+    unit.clients = kept
+    unit.idle_sim_clients = idle
+
+
+def frontmost_bundle():
+    """Bundle aplikacji na pierwszym planie (lsappinfo); None, gdy nie wiadomo."""
+    try:
+        asn = subprocess.run(
+            ["lsappinfo", "front"], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        if not asn:
+            return None
+        out = subprocess.run(
+            ["lsappinfo", "info", "-only", "bundleid", asn],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r'"CFBundleIdentifier"="([^"]*)"', out)
+    return found.group(1) if found else None
+
+
 class World:
     """Wszystko, co strażnik wie w jednej chwili."""
 
@@ -966,6 +1289,9 @@ class World:
         self.now = now
         rows = processes()
         self.units, self.table = discover(cfg, rows)
+        self.simulators = discover_simulators(cfg, rows)
+        track_simulators(cfg, state, self.simulators, now)
+        by_udid = {s.udid: s for s in self.simulators}
         self.pressure = Pressure(cfg, state, now)
         commands = {pid: command for pid, (_ppid, command) in self.table.items()}
         if self.units:
@@ -993,6 +1319,8 @@ class World:
                     )
                     if entry not in unit.clients:
                         unit.clients.append(entry)
+            for unit in self.units:
+                drop_unused_simulator_clients(unit, commands, by_udid)
         if use_orca and self.units:
             orca.refresh(rows, now, cfg["orca_seconds"])
         self.orca = orca if orca.ok else None
@@ -1053,7 +1381,8 @@ class World:
             busy = max(h["busy"], output / 1000 if output else 0)
             unit.age = now - h["first"]
             unit.started = started_at(unit.start, h["first"], now)
-            unit.quiet = now - busy
+            # wyjście terminala z Orki bywa o kilka sekund nowsze niż `now` z początku pomiaru
+            unit.quiet = max(0.0, now - busy)
             unit.last_watched = h["watched"]
         for key in list(history):
             if key not in seen:
@@ -1069,7 +1398,7 @@ class Plan:
 
     def __init__(self, unit, action, priority, reason, code="manual", **data):
         self.unit = unit
-        self.action = action  # "stop", "recycle", "warn"
+        self.action = action  # "stop", "recycle", "warn"; dla symulatora "shutdown"
         self.priority = priority
         self.reason = reason
         self.code = code
@@ -1286,6 +1615,8 @@ def decide(cfg, world, state):
                 Plan(unit, "recycle", 95, "po restarcie fseventsd nie widzi zmian plików", "fsevents")
             )
 
+    plans += simulator_plans(cfg, getattr(world, "simulators", []), pressure, grace)
+
     for plan in plans:
         if plan.action != "recycle":
             continue
@@ -1306,35 +1637,113 @@ def decide(cfg, world, state):
     return sorted(best.values(), key=lambda p: -p.priority)
 
 
+def simulator_plans(cfg, sims, pressure, grace):
+    """Wyłączenia symulatorów. Kandydat jest z puli agentów, bez żywej dzierżawy, bez widza,
+    nie chroniony i starszy niż `grace_minutes`. Taki idzie po `simulator_idle_minutes`
+    ciszy; ponad limitem włączonych albo przy braku pamięci już po `simulator_quiet_minutes`
+    (najdłużej cichy). Ponad limitem bez kandydata zostaje ostrzeżenie."""
+    if not sims:
+        return []
+    cap = cfg["max_booted_simulators"]
+    idle = cfg["simulator_idle_minutes"] * MINUTE
+    safe = [s for s in sims if not s.in_use and not s.protected and s.age >= grace]
+    plans = [
+        Plan(
+            s,
+            "shutdown",
+            45,
+            f"nikt go nie używa od {minutes(s.quiet)}",
+            "simulator_idle",
+            minutes=int(s.quiet // MINUTE),
+        )
+        for s in safe
+        if s.quiet >= idle
+    ]
+    over = bool(cap) and len(sims) > cap
+    if not (over or pressure.level):
+        return plans
+    ready = [s for s in safe if s.quiet >= cfg["simulator_quiet_minutes"] * MINUTE]
+    if ready:
+        top = max(ready, key=lambda s: (s.quiet, s.footprint))
+        unused = f"nieużywany od {minutes(top.quiet)}"
+        if over:
+            why = f"{len(sims)} włączone symulatory, limit {cap}; ten {unused}"
+            code, data = "simulator_cap", dict(booted=len(sims), cap=cap)
+        else:
+            why = "brak pamięci: " + ", ".join(pressure.reasons) + f"; symulator {unused}"
+            code, data = "pressure", dict(level=pressure.level)
+        plans.append(Plan(top, "shutdown", 85, why, code, minutes=int(top.quiet // MINUTE), **data))
+    elif over:
+        group = SimulatorGroup(sims)
+        plans.append(
+            Plan(
+                group,
+                "warn",
+                10,
+                f"{len(sims)} włączone symulatory ({janitor.human(group.footprint)}), limit {cap}; "
+                "każdy jest w użyciu albo dopiero wstał",
+                "simulator_cap",
+                booted=len(sims),
+                cap=cap,
+            )
+        )
+    return plans
+
+
 # ---------- akcje ----------
 
 
-def terminate(unit, table, grace=10):
-    """SIGTERM do całego drzewa naraz, po `grace` sekundach SIGKILL dla tych, które zostały."""
+def terminate(unit, table, grace=10, reap=10):
+    """SIGTERM do całego drzewa naraz, po `grace` sekundach SIGKILL dla tych, które zostały, i do
+    `reap` sekund na ich koniec. Pod presją proces po SIGKILL kończy się sekundami (jądro zwalnia
+    jego strony, także te w swapie i w kompresorze), więc żywy tuż po sygnale nie znaczy, że
+    przeżył: 2026-10-08 log mówił „nie chcą zginąć” o Metro, które za chwilę zniknęło.
+    Przed SIGTERM idzie SIGCONT: proces wstrzymany (scheduler pauzuje joby przy rosnącym swapie,
+    ktoś zrobił Ctrl+Z) nie obsłuży SIGTERM, dopóki stoi, i ginąłby dopiero od SIGKILL."""
     targets = []
     for pid in unit.pids:
         command = table.get(pid, (0, ""))[1]
         info = usage(pid)
         if info and not SACRED.search(command) and pid != os.getpid():
             targets.append((pid, info["start"]))
-    for pid, _start in targets:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+    for sig in (signal.SIGCONT, signal.SIGTERM):
+        for pid, _start in targets:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
     deadline = time.time() + grace
     while time.time() < deadline:
         left = [(p, s) for p, s in targets if alive(p, s)]
         if not left:
             return []
         time.sleep(0.25)
-    for pid, start in targets:
-        if alive(pid, start):
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-    return [p for p, s in targets if alive(p, s)]
+    left = [(p, s) for p, s in targets if alive(p, s)]
+    for pid, _start in left:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    deadline = time.time() + reap
+    while left and time.time() < deadline:
+        time.sleep(0.25)
+        left = [(p, s) for p, s in left if alive(p, s)]
+    return [p for p, _s in left]
+
+
+def notify_quiet(title, text):
+    """Powiadomienie bez czekania na osascript (przy duszącym się Macu startuje sekundami) i bez
+    zabierania fokusu: `display notification` nie aktywuje żadnej aplikacji."""
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
 
 
 def shell_idle(shell):
@@ -1428,18 +1837,135 @@ def note(cfg, orca, unit, text):
     )
 
 
+def held_back(state, key, now, text):
+    """Akcja wstrzymana (Simulator z przodu, sesja wzięła symulator, działa w nim aplikacja):
+    wpis w logu najwyżej co 10 minut na jednostkę, bo pętla pyta co kilka sekund."""
+    seen = state.setdefault("held", {})
+    if now - seen.get(key, 0) >= 10 * MINUTE:
+        seen[key] = now
+        log(text)
+
+
+def portivo_lock(cfg):
+    """Zamek dzierżaw portivo-mobile (`up` trzyma go, wybierając i dzierżawiąc symulator).
+    Uchwyt, gdy wolny; False, gdy ktoś go trzyma; None, gdy portivo-mobile tu nie ma."""
+    base = os.path.dirname(janitor.expand(cfg["simulator_leases"]).rstrip("/"))
+    if not os.path.isdir(base):
+        return None
+    handle = open(os.path.join(base, "lease.lock"), "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return False
+    return handle
+
+
+def running_apps(udid):
+    """Bundle id aplikacji użytkownika działających w symulatorze (`launchctl list` w nim, jak
+    portivo-mobile); systemowe com.apple.* działają w każdym. None, gdy nie da się sprawdzić."""
+    try:
+        out = subprocess.run(
+            ["xcrun", "simctl", "spawn", udid, "launchctl", "list"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return {
+        m.group(1)
+        for m in re.finditer(r"UIKitApplication:([\w.\-]+)\[", out.stdout)
+        if not m.group(1).startswith("com.apple.")
+    }
+
+
+def shutdown_simulator(cfg, plan, world, state):
+    """`simctl shutdown`, ale nigdy, gdy okno Simulatora jest na pierwszym planie, ani gdy
+    sesja właśnie wzięła ten symulator (dzierżawa czytana od nowa pod zamkiem portivo-mobile)."""
+    sim, now = plan.unit, world.now
+    size = janitor.human(sim.footprint)
+    front = frontmost_bundle()
+    if front in (SIMULATOR_APP, None):
+        why = "patrzysz na Simulator" if front else "nie wiem, co jest na pierwszym planie"
+        held_back(state, sim.key, now, f"czekam z wyłączeniem {sim.label}: {why}")
+        return False
+    lock = portivo_lock(cfg)
+    if lock is False:
+        return False  # `portivo-mobile up` właśnie dzierżawi; następny pomiar
+    try:
+        lease = read_lease(cfg, sim.udid)
+        if lease_alive(lease):
+            held_back(state, sim.key, now, f"nie wyłączam {sim.label}: sesja właśnie go wzięła")
+            return False
+        # jak portivo-mobile: symulator po martwej sesji z jej aplikacją (i sterownikiem maestro)
+        # jest wolny, a bez dzierżawy żadna aplikacja użytkownika nie może w nim działać, bo ktoś
+        # go używa spoza dzierżaw (skrypty perf przez idb, Ty)
+        allowed = {lease.get("bundle"), MAESTRO_DRIVER} if lease else set()
+        apps = running_apps(sim.udid)
+        if apps is None or apps - allowed:
+            what = ", ".join(sorted(apps - allowed)) if apps else "nie wiem, co w nim działa"
+            held_back(state, sim.key, now, f"nie wyłączam {sim.label}: działa w nim {what}")
+            return False
+        try:
+            done = subprocess.run(
+                ["xcrun", "simctl", "shutdown", sim.udid],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            ok = done.returncode == 0
+            result = "wyłączony" if ok else f"simctl: {(done.stderr or done.stdout).strip()[:200]}"
+        except (OSError, subprocess.SubprocessError) as err:
+            ok, result = False, f"simctl: {err}"
+    finally:
+        if lock:
+            lock.close()
+    log(f"shutdown {sim.label} {size}: {plan.reason} -> {result}")
+    events = state.setdefault("events", [])
+    events.append(
+        {
+            "at": now,
+            "action": "shutdown",
+            "label": sim.name,
+            "size": sim.footprint,
+            "reason": plan.reason,
+            "code": plan.code,
+            "data": plan.data,
+            "ports": [],
+            "cwd": "",
+            "result": result,
+            "ok": ok,
+        }
+    )
+    del events[:-20]
+    if cfg["notify"]:
+        janitor.notify("Strażnik: wyłączony symulator", f"{sim.name} ({size}): {plan.reason}")
+    return True
+
+
 def execute(cfg, plan, world, state):
+    """Wykonuje plan; False, gdy akcja została wstrzymana i nic się nie stało."""
     unit, now = plan.unit, world.now
     size = janitor.human(unit.footprint)
     if plan.action == "warn":
         warned = state.setdefault("warned", {})
         if now - warned.get(unit.app_key, 0) < HOUR:
-            return
+            return False
         warned[unit.app_key] = now
         log(f"uwaga {unit.label} {size}: {plan.reason}")
         if cfg["notify"]:
-            janitor.notify("Dev serwer puchnie", f"{unit.label}: {plan.reason}")
-        return
+            title = "Za dużo symulatorów" if plan.code == "simulator_cap" else "Dev serwer puchnie"
+            janitor.notify(title, f"{unit.label}: {plan.reason}")
+        return True
+    if plan.action == "shutdown":
+        return shutdown_simulator(cfg, plan, world, state)
+    if getattr(unit, "idle_sim_clients", None) and frontmost_bundle() == SIMULATOR_APP:
+        # Metro z aplikacją w symulatorze: patrzysz na Simulator, więc może na nią
+        held_back(state, unit.key, now, f"czekam z {plan.action} {unit.label}: patrzysz na Simulator")
+        return False
     if plan.action == "recycle":
         ok, result = recycle(unit, world, state)
         if not ok and getattr(unit, "killed", False):
@@ -1470,6 +1996,7 @@ def execute(cfg, plan, world, state):
             "data": plan.data,
             "ports": unit.ports,
             "cwd": unit.launch_cwd,
+            "apps": sorted({s.cwd for s in unit.servers}),
             "result": result,
             "ok": ok,
         }
@@ -1482,6 +2009,7 @@ def execute(cfg, plan, world, state):
             else "Strażnik: zatrzymany dev serwer"
         )
         janitor.notify(title, f"{unit.label} ({size}): {plan.reason}")
+    return True
 
 
 def check_pending(world, state):
@@ -1538,9 +2066,121 @@ def shape(cfg, world):
             del _background[pid]
 
 
+# ---------- długo żyjące procesy ----------
+
+# rodziny procesów, które siedzą w pamięci długo i zmniejszają to, co scheduler może wpuścić;
+# kolejność rozstrzyga, gdzie trafia proces pasujący do kilku
+FAMILIES = (
+    ("headless", HEADLESS),
+    ("simulators", re.compile(r"launchd_sim|CoreSimulator|Simulator\.app|SimulatorTrampoline|/Developer/CoreSimulator/")),
+    ("metro", re.compile(r"/expo(/bin/cli)?\s+start\b|/metro\b|react-native\s+start\b")),
+    ("watchers", re.compile(r"--watch(All)?\b|(^|/)nodemon(\s|$)|(^|\s)-w(\s|$)|/vitest(\.mjs)?\s+(watch|dev)\b")),
+    ("lsp", re.compile(r"(^|/)gopls(\s|$)|tsserver\.js|typescript-language-server|rust-analyzer|sourcekit-lsp|clangd|pyright-langserver")),
+    ("docker", re.compile(r"com\.docker|Docker\.app|com\.apple\.Virtualization")),
+    ("git", re.compile(r"^(\S*/)?git(\s|$)")),
+    ("agents", AGENT),
+    ("browsers", BROWSER),
+)
+FAMILY_NAMES = {
+    "dev": "dev serwery", "jobs": "joby schedulera", "headless": "headless przeglądarki",
+    "simulators": "symulatory", "metro": "expo/metro", "watchers": "watchery", "lsp": "LSP",
+    "docker": "Docker", "git": "git", "agents": "agenci", "browsers": "przeglądarki", "rest": "reszta",
+}  # fmt: skip
+# to liczy się jako długo żyjące: nie skończy się samo, a scheduler widzi je tylko jako mniej pamięci
+LONG_LIVED = ("dev", "metro", "watchers", "simulators", "headless", "lsp", "docker")
+
+
+def inventory(table, units, now):
+    """Pamięć procesów tego użytkownika po rodzinach: {at, families: {rodzina: {count, footprint,
+    top: [pid, rozmiar, komenda]}}, long_lived, biggest: [pid, rozmiar, komenda]}."""
+    dev = {p for u in units for p in u.pids}
+    jobs = set()
+    for job in janitor.load_json(os.path.join(STATE_DIR, "sched", "state.json"), {}).get("running", []) or []:
+        if job.get("child_pgid"):
+            jobs.update(descendants(job["child_pgid"], _children_of(table)))
+    families, biggest = {}, [0, 0, ""]
+    for pid, (_ppid, command) in table.items():
+        info = usage(pid)
+        if not info or not info["footprint"]:
+            continue
+        size = info["footprint"]
+        if pid in dev:
+            name = "dev"
+        elif pid in jobs:
+            name = "jobs"
+        else:
+            name = next((n for n, rx in FAMILIES if rx.search(command)), "rest")
+        f = families.setdefault(name, {"count": 0, "footprint": 0, "top": [0, 0, ""]})
+        f["count"] += 1
+        f["footprint"] += size
+        if size > f["top"][1]:
+            f["top"] = [pid, size, command[:120]]
+        if size > biggest[1] and not SACRED.search(command):
+            biggest = [pid, size, command[:120]]
+    return {
+        "at": now,
+        "families": families,
+        "long_lived": sum(f["footprint"] for n, f in families.items() if n in LONG_LIVED),
+        "biggest": biggest,
+    }
+
+
+def _children_of(table):
+    out = {}
+    for pid, (ppid, _command) in table.items():
+        out.setdefault(ppid, []).append(pid)
+    return out
+
+
+def inventory_line(inv):
+    """Jedna linia do statusu: długo żyjące rodziny od największej."""
+    fams = inv.get("families") or {}
+    parts = [
+        f"{FAMILY_NAMES[n]} {janitor.human(f['footprint'])}" + (f" ({f['count']})" if f["count"] > 1 else "")
+        for n, f in sorted(fams.items(), key=lambda kv: -kv[1]["footprint"])
+        if n in LONG_LIVED and f["footprint"] >= 50 * MB
+    ]
+    return f"Długo żyjące: {janitor.human(inv.get('long_lived', 0))}" + (": " + " · ".join(parts) if parts else "")
+
+
+def brake(cfg, world, state, now, enforce, acted):
+    """Hamulec pamięci (lastresort): jedno drzewo mniej, gdy stopień tego wymaga; opis albo None.
+
+    Hamulec (2) działa, gdy strażnik w tym przebiegu nic nie zrobił i minęła jego przerwa
+    między akcjami; awaria (3) nie czeka na nic poza własną krótką przerwą. Proces ponad pół
+    RAM ginie na każdym stopniu."""
+    import lastresort
+
+    if not (enforce and cfg.get("last_resort", True)):
+        return None
+    p = world.pressure
+    level = getattr(p, "stage", None)
+    if level is None:  # starszy kształt Pressure (testy): krytyczna presja strażnika to hamulec
+        level = 2 if p.level >= 2 else 0
+    s = lastresort.settings(cfg)
+    inv = state.get("inventory") or {}
+    runaway = (inv.get("biggest") or [0, 0])[1] >= s["runaway_percent"] / 100 * getattr(p, "ram", 0) > 0
+    if level < 2 and not runaway:
+        return None
+    gap = s["emergency_cooldown_seconds"] if level >= 3 else s["brake_cooldown_seconds"]
+    if now - state.get("brake_at", 0) < gap:
+        return None
+    if level < 3 and not runaway and (acted is not None or now - state.get("last_action", 0) < cfg["cooldown_seconds"]):
+        return None
+    reaped = lastresort.reap(world, state, sys.modules[__name__], level=level, cfg=cfg)
+    if reaped:
+        state["brake_at"] = now
+        state["last_action"] = now
+        # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
+        state["swap_history"] = []
+    return reaped
+
+
 def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
     now = now or time.time()
-    world = World(cfg, state, orca, now)
+    # przy awarii bez Orki: jej CLI to node, który przy duszącym się Macu startuje sekundami
+    previous = ((state.get("snapshot") or {}).get("pressure") or {}).get("stage", 0)
+    world = World(cfg, state, orca, now, use_orca=previous < 3)
     check_pending(world, state)
     plans = decide(cfg, world, state)
     enforce = cfg["mode"] == "enforce" and not dry_run
@@ -1550,13 +2190,22 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
         and enforce
         and now - state.get("last_action", 0) >= cfg["cooldown_seconds"]
     ):
-        plan = plans[0]
-        execute(cfg, plan, world, state)
-        if plan.action != "warn":
-            state["last_action"] = now
-            # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
-            state["swap_history"] = []
-            acted = plan
+        # pierwszy plan, który coś zrobił: wstrzymany (patrzysz na Simulator, `up` dzierżawi)
+        # nie może blokować tych pod nim, np. zatrzymania serwera przy presji
+        for plan in plans:
+            if execute(cfg, plan, world, state) is False:
+                continue
+            if plan.action != "warn":
+                state["last_action"] = now
+                # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
+                state["swap_history"] = []
+                acted = plan
+            break
+    stage = getattr(world.pressure, "stage", 0)
+    inv = state.get("inventory") or {}
+    if hasattr(world, "table") and world.table and (stage >= 1 or now - inv.get("at", 0) >= 30):
+        state["inventory"] = inventory(world.table, world.units, now)
+    reaped = brake(cfg, world, state, now, enforce, acted)
     history = state.setdefault("history", [])
     if not history or now - history[-1][0] >= 30:
         p = world.pressure
@@ -1581,8 +2230,12 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
         "total": sum(u.footprint for u in world.units),
         "orca": world.orca is not None,
         "units": [u.summary() for u in sorted(world.units, key=lambda u: -u.footprint)],
+        "simulators": [s.summary() for s in getattr(world, "simulators", [])],
+        "simulator_cap": cfg["max_booted_simulators"],
         "plans": [p.summary() for p in plans],
         "acted": acted.summary() if acted else None,
+        "last_resort": reaped,
+        "inventory": state.get("inventory"),
     }
     return world, plans, acted
 
@@ -1645,7 +2298,9 @@ def cmd_run(_cfg, _args):
             except Exception as err:  # pętla nie może paść przez jeden zły pomiar
                 log(f"błąd {err!r}")
             save_state(state)
-            time.sleep(cfg["interval_seconds"])
+            # przy ciasnej pamięci co 2 s: między pomiarami co 5 s swap potrafi urosnąć o gigabajt
+            stage = ((state.get("snapshot") or {}).get("pressure") or {}).get("stage", 0)
+            time.sleep(min(cfg["interval_seconds"], 2) if stage >= 1 else cfg["interval_seconds"])
     finally:
         restore_background()
         log("koniec strażnika")
@@ -1686,6 +2341,42 @@ def cmd_status(cfg, args):
         print(
             f"  {when} {event['action']} {event['label']}: {event['reason']} -> {event['result']}"
         )
+    for event in state.get("lastresort", [])[-5:]:
+        when = time.strftime("%H:%M", time.localtime(event["at"]))
+        print(
+            f"  {when} hamulec {event['code']} pid {event['pid']} {janitor.human(event['size'])} -> {event['result']}"
+            + (f" | wznowienie: {event['resume']}" if event.get("resume") else "")
+        )
+    return 0
+
+
+def cmd_brake(cfg, args):
+    """`brake [--stage N] [--within PID] [--json]`: co hamulec zrobiłby teraz, bez sygnałów.
+
+    --stage udaje stopień (np. 3, żeby zobaczyć ofiarę awarii przy spokojnym Macu); --within
+    ogranicza tabelę procesów do drzewa pod PID i procesów, które się do niego przyznają
+    (CLAUDE_PID), np. na sztucznym drzewie w próbie."""
+    import lastresort
+
+    state = janitor.load_json(STATE_PATH, {})
+    world = World(cfg, dict(state), Orca(), time.time(), use_orca=False)
+    p = world.pressure
+    level = p.stage
+    if "--stage" in args:
+        level = int(args[args.index("--stage") + 1])
+    if "--within" in args:
+        root = int(args[args.index("--within") + 1])
+        keep = set(descendants(root, _children_of(world.table)))
+        keep |= {pid for pid in world.table if proc_env(pid).get("CLAUDE_ACC_BRAKE_PROBE") == str(root)}
+        world.table = {pid: row for pid, row in world.table.items() if pid in keep}
+        world.units = [u for u in world.units if set(u.pids) & keep]
+    pick = lastresort.reap(world, {}, sys.modules[__name__], level=level, cfg=cfg, dry_run=True)
+    out = {"stage": p.stage, "reasons": p.stage_reasons, "as_stage": level, "pick": pick}
+    if "--json" in args:
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    print(f"Stopień teraz: {lastresort.STAGE_NAMES[p.stage]}" + (": " + "; ".join(p.stage_reasons) if p.stage_reasons else ""))
+    print(f"Hamulec na stopniu „{lastresort.STAGE_NAMES[min(level, 3)]}” wybrałby: {pick or 'nic'}")
     return 0
 
 
@@ -1701,6 +2392,18 @@ def print_status(snap):
     )
     if p["reasons"] or p.get("notes"):
         print("  " + "; ".join(p["reasons"] + p.get("notes", [])))
+    import lastresort
+
+    stage = p.get("stage", 0)
+    seg = ""
+    if p.get("segments_limit"):
+        seg = f", segmenty kompresora {p['segments'] / p['segments_limit'] * 100:.0f}% limitu"
+    print(
+        f"Hamulec: {lastresort.STAGE_NAMES[stage]}{seg}"
+        + (": " + "; ".join(p.get("stage_reasons") or []) if p.get("stage_reasons") else "")
+    )
+    if snap.get("inventory"):
+        print(inventory_line(snap["inventory"]))
     print(
         f"Dev serwery: {h(snap['total'])} z budżetu {h(snap['budget'])}"
         f" | Orca: {'tak' if snap['orca'] else 'nie'} | tryb: {snap['mode']}"
@@ -1738,6 +2441,35 @@ def print_status(snap):
             print(f"    -> {verb}: {plan['reason']}")
     if not snap["units"]:
         print("  (żaden dev serwer nie działa)")
+    sims = snap.get("simulators")
+    if sims is None:
+        return
+    print(
+        f"\nSymulatory: {len(sims)} włączone ({h(sum(s['footprint'] for s in sims))})"
+        f", limit {snap.get('simulator_cap') or 'brak'}"
+    )
+    for s in sims:
+        who = []
+        if s["lease_alive"]:
+            who.append(f"dzierżawa {s.get('lease_app') or '?'}")
+        elif s.get("lease_app"):
+            who.append("dzierżawa po martwej sesji")
+        if s["watchers"]:
+            who.append(f"ogląda {len(s['watchers'])} proc.")
+        if not s["pool"]:
+            who.append("Twój")
+        if s["protected"]:
+            who.append("chroniony")
+        print(
+            f"\n  {s['name']}  {h(s['footprint'])}  cisza {s['quiet'] // 60}:{s['quiet'] % 60:02d}"
+            f"  {', '.join(who) or 'nieużywany'}"
+        )
+        plan = plans.get(s["key"])
+        if plan:
+            print(f"    -> wyłączę: {plan['reason']}")
+    group = plans.get("simulators")
+    if group:
+        print(f"    -> ostrzegę: {group['reason']}")
 
 
 # ---------- przypięcia ----------
@@ -1939,12 +2671,15 @@ def deny(reason):
     return 0
 
 
-def describe(unit):
-    url = f"http://localhost:{unit.ports[0]}" if unit.ports else f"pid {unit.root}"
+def describe(unit, app=None):
+    """Adres i katalog jednego serwera jednostki: z `app` tego, który serwuje tę aplikację, bo w
+    stosie `pnpm dev` pierwszy port i pierwszy katalog to zwykle dwie różne, inne aplikacje."""
+    server = next((s for s in unit.servers if app and s.cwd == app), unit.servers[0])
+    ports = server.ports or unit.ports
+    url = f"http://localhost:{ports[0]}" if ports else f"pid {unit.root}"
+    more = f", w stosie {len(unit.servers)} serwerów" if len(unit.servers) > 1 else ""
     where = f", terminal Orki „{unit.terminal.get('title')}”" if unit.terminal else ""
-    return (
-        f"{url} ({short(unit.servers[0].cwd)}, {janitor.human(unit.footprint)}{where})"
-    )
+    return f"{url} ({short(server.cwd)}, {janitor.human(unit.footprint)}{more}{where})"
 
 
 def cmd_admit(cfg, _args):
@@ -1963,6 +2698,51 @@ def cmd_admit(cfg, _args):
     return 0
 
 
+def memory_refusal(cfg, world, state, app=None):
+    """Dlaczego pamięć nie wpuści teraz nowego dev serwera (aplikacji w katalogu `app`), albo None.
+
+    Dwa powody, oba mijają z czasem, więc odmowa podaje agentowi warunek do czekania (`room`):
+    presja krytyczna, także gdy nie działa już żaden dev serwer (strażnik właśnie zatrzymał
+    ostatni), i serwer tej aplikacji, który strażnik zatrzymał z braku pamięci mniej niż
+    `restart_hold_minutes` temu, póki Mac nie odetchnął. Bez tego drugiego zatrzymany serwer
+    wracał od razu: po akcji strażnik mierzy przyrost swapu od nowa, więc przez chwilę presja
+    wygląda na mniejszą (2026-10-08: Metro zatrzymane o 18:45 przy 11,2 GB swapu, agent postawił
+    je znowu, o 18:52 swap 17,9 GB, o 18:57 Mac zamarzł)."""
+    pressure = world.pressure
+    if pressure.level == 2:
+        return "pamięć na krytycznym poziomie (" + ", ".join(pressure.reasons) + ")"
+    if app is None:
+        return None
+    if pressure.level == 0 and pressure.swap_used < cfg["swap_warn_percent"] / 100 * pressure.ram:
+        return None
+    hold = cfg["restart_hold_minutes"] * MINUTE
+    for event in reversed(state.get("events", [])):
+        if world.now - event.get("at", 0) >= hold:
+            break
+        if event.get("action") != "stop" or event.get("code") != "pressure":
+            continue
+        paths = [event.get("cwd")] + list(event.get("apps") or [])
+        if not any(p and os.path.realpath(p) == app for p in paths):
+            continue
+        now_why = ", ".join(pressure.reasons) or f"swap {janitor.human(pressure.swap_used)}"
+        return (
+            f"strażnik zatrzymał serwer {short(app)} o "
+            f"{time.strftime('%H:%M', time.localtime(event['at']))} z braku pamięci "
+            f"({event.get('reason', '').removeprefix('brak pamięci: ')}), a Mac jeszcze nie "
+            f"odetchnął ({now_why})"
+        )
+    return None
+
+
+def wait_hint(app):
+    """Dokładna komenda, którą agent czeka, aż pamięć wpuści serwer."""
+    condition = f"claude-acc guard room {shlex.quote(app)}"
+    return (
+        f"Poczekaj: `claude-acc sched wait -- {shlex.quote(condition)}` (kod 75: zawołaj jeszcze "
+        "raz), potem uruchom komendę ponownie."
+    )
+
+
 def devserver_refusal(cfg, event):
     """Powód odmowy startu dev serwera albo None."""
     command = (event.get("tool_input") or {}).get("command") or ""
@@ -1974,9 +2754,13 @@ def devserver_refusal(cfg, event):
         return None
     state = janitor.load_json(STATE_PATH, {})
     world = World(cfg, state, Orca(), time.time(), use_orca=False)
-    for target, package, stack in starts:
+    apps = []
+    for target, package, stack, reuses in starts:
         app = package_dir(target, package) if package else target
         app = os.path.realpath(app or target)
+        apps.append(app)
+        if reuses:
+            continue  # `expo run:ios` sam weźmie Metro, które już serwuje tę aplikację
         same = [
             u
             for u in world.units
@@ -1985,27 +2769,39 @@ def devserver_refusal(cfg, event):
         ]
         if same:
             return (
-                f"Strażnik dev serwerów: dla {short(app)} już działa {describe(same[0])}. "
+                f"Strażnik dev serwerów: dla {short(app)} już działa {describe(same[0], app)}. "
                 "Użyj tego adresu, nie stawiaj drugiego serwera tej samej aplikacji: "
                 "drugi zjada kolejne gigabajty i dubluje rekompilacje przy każdej edycji."
             )
+    allow = "Tylko na wyraźne polecenie użytkownika poprzedź komendę DEVGUARD_ALLOW=1."
+    listing = "; ".join(
+        describe(u) for u in sorted(world.units, key=lambda u: -u.footprint)[:5]
+    )
+    for app in apps:
+        why = memory_refusal(cfg, world, state, app)
+        if why:
+            running = f" Działają: {listing}; użyj któregoś z nich albo poczekaj." if listing else ""
+            return f"Strażnik dev serwerów: {why}.{running} {wait_hint(app)} {allow}"
     total = sum(u.footprint for u in world.units)
     budget = cfg["budget_percent"] / 100 * world.pressure.ram
-    if world.units and (world.pressure.level == 2 or total + 1.5 * GB > budget):
-        listing = "; ".join(
-            describe(u) for u in sorted(world.units, key=lambda u: -u.footprint)[:5]
-        )
-        why = (
-            "pamięć na krytycznym poziomie (" + ", ".join(world.pressure.reasons) + ")"
-            if world.pressure.level == 2
-            else f"dev serwery zajmują już {janitor.human(total)} z budżetu {janitor.human(budget)}"
-        )
+    if world.units and total + 1.5 * GB > budget:
         return (
-            f"Strażnik dev serwerów: {why}. Działają: {listing}. Użyj któregoś z nich albo poproś "
+            f"Strażnik dev serwerów: dev serwery zajmują już {janitor.human(total)} z budżetu "
+            f"{janitor.human(budget)}. Działają: {listing}. Użyj któregoś z nich albo poproś "
             "użytkownika o zgodę; do zrzutów ekranu i pomiarów wystarczy `next build && next start`. "
-            "Tylko na wyraźne polecenie użytkownika poprzedź komendę DEVGUARD_ALLOW=1."
+            + allow
         )
     return None
+
+
+def cmd_room(cfg, args):
+    """Kod 0, gdy pamięć wpuści nowy dev serwer (aplikacji w podanym katalogu), 1 z powodem."""
+    app = os.path.realpath(os.path.expanduser(args[0])) if args else None
+    state = janitor.load_json(STATE_PATH, {})
+    world = World(cfg, state, Orca(), time.time(), use_orca=False)
+    why = memory_refusal(cfg, world, state, app)
+    print(why or "jest miejsce")
+    return 1 if why else 0
 
 
 COMMANDS = {
@@ -2018,6 +2814,8 @@ COMMANDS = {
     "unpin": cmd_unpin,
     "pins": cmd_pins,
     "admit": cmd_admit,
+    "room": cmd_room,
+    "brake": cmd_brake,
 }
 
 
@@ -2031,6 +2829,10 @@ def main(argv):
     except Exception as err:
         if cmd == "admit":
             return 0  # hook nigdy nie blokuje agenta przez własny błąd
+        if cmd == "room":
+            # agent czeka na tym w pętli: własny błąd go nie zatrzymuje, hook i tak oceni komendę
+            print(f"błąd: {err}", file=sys.stderr)
+            return 0
         log(f"{cmd}: błąd {err!r}")
         print(f"błąd: {err}", file=sys.stderr)
         return 1

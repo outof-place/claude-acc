@@ -18,6 +18,12 @@ struct ClaudeAccApp: App {
             let live = args.contains("--live")
             exit(Self.render(to: args[i + 1], from: data, open: open, hover: hover, live: live) ? 0 : 1)
         }
+        // `ClaudeAcc --dictate-file test.wav`: one recording through dictation's whole path
+        // (Keychain, AI Gateway, correction) without the microphone, as JSON; works while the app runs
+        if let i = args.firstIndex(of: "--dictate-file"), i + 1 < args.count {
+            DictateFile.run(args[i + 1])
+        }
+        if args.contains("--widget-demo") { WidgetDemo.run() }
         // a second copy would put a second ring in the menu bar
         let mine = Bundle.main.bundleIdentifier ?? ""
         if NSRunningApplication.runningApplications(withBundleIdentifier: mine).count > 1 {
@@ -101,8 +107,35 @@ struct ClaudeAccApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBar: MenuBarController?
+    private var widget: DictationWidget?
+    private var store: Store?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // `claude-acc dictate` opens claude-acc://dictate/<toggle|start|stop|cancel> in the background
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(openURL(_:reply:)),
+            forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        menuBar = MenuBarController(store: Store())
+        let store = Store()
+        self.store = store
+        menuBar = MenuBarController(store: store)
+        widget = DictationWidget(dictation: store.dictation)
+        store.dictation.activate()
+    }
+
+    @objc private func openURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        guard let text = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: text), url.scheme == "claude-acc", url.host() == "dictate",
+              let dictation = store?.dictation
+        else { return }
+        dictationLog.notice("command: \(url.absoluteString, privacy: .public)")
+        switch url.lastPathComponent {
+        case "start": dictation.start(handsFree: true, fromCommand: true)
+        case "stop": dictation.stop()
+        case "cancel": dictation.cancel()
+        default: dictation.toggle()
+        }
     }
 }

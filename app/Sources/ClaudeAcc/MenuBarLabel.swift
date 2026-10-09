@@ -6,43 +6,38 @@ struct MenuBarLabel: View {
     let store: Store
 
     var body: some View {
-        let used = store.snapshot?.active?.worstUsed
+        let label = store.label
         HStack(spacing: 4) {
             Image(nsImage: RingImage.make(
-                fraction: used.map { $0 / 100 },
-                color: Format.nsTint(used),
-                badge: badge))
-            Text(text(used: used))
+                fraction: label.used.map { $0 / 100 },
+                color: Format.nsTint(label.used),
+                badge: label.badge.map { $0 == .memory ? .systemRed : .systemOrange }))
+            Text(label.text)
                 .monospacedDigit()
             if store.awake.isOn {
                 // Stay Awake is holding the Mac up, like Amphetamine's pill
                 Image(systemName: "cup.and.heat.waves.fill")
             }
-            if let hot {
+            if let hot = label.hot {
                 // only when it matters: the bar stays clean below 90 °C
-                Text("\(Int(hot.rounded()))°")
+                Text("\(hot)°")
                     .monospacedDigit()
                     .foregroundStyle(hot >= 95 ? .red : .orange)
             }
         }
     }
+}
 
-    /// Hottest CPU/GPU sensor from the fan daemon, when it's fresh and at 90 °C or more.
-    private var hot: Double? {
-        guard let state = store.fanState, Date.now.timeIntervalSince1970 - state.at < 15 else { return nil }
-        let value = [state.cpu, state.gpu].compactMap(\.self).max() ?? 0
-        return value >= 90 ? value : nil
-    }
+/// The label's numbers: the active account's usage of the window that runs out first, the
+/// badge (red: the Mac runs out of memory, orange: an account needs signing in) and the hottest
+/// CPU/GPU sensor when the fan daemon's reading is fresh and at 90 °C or more.
+struct MenuLabelState: Equatable {
+    enum Badge: Equatable { case login, memory }
 
-    private var badge: NSColor? {
-        if store.guardState?.snapshot?.pressure.level == 2 { return .systemRed }
-        return store.snapshot?.anyNeedsLogin == true ? .systemOrange : nil
-    }
-
-    private func text(used: Double?) -> String {
-        guard let snapshot = store.snapshot else { return store.problem == nil ? "…" : "!" }
-        return snapshot.foreignRuntime ? "?" : Format.percent(used)
-    }
+    var used: Double?
+    var text = "…"
+    var badge: Badge?
+    var hot: Int?
 }
 
 enum RingImage {

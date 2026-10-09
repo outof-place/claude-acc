@@ -36,6 +36,10 @@ Komendy:
 Kredyty API z planów (pula kluczy organizacji Console) to osobny skrypt: claude-acc credits --help.
 """
 
+# PEP 810: od Pythona 3.15 te moduły ładują się dopiero przy pierwszym użyciu, a starsze
+# wersje tę listę ignorują. Żaden nie jest potrzebny przy samym imporcie skryptu.
+__lazy_modules__ = ["glob", "hashlib", "json", "re", "shutil", "signal", "subprocess"]
+
 import fcntl
 import glob
 import hashlib
@@ -60,6 +64,9 @@ LOG_PATH = os.path.join(STATE_DIR, "switch.log")
 LOCK_PATH = os.path.join(STATE_DIR, "lock")
 LOGIN_LOCK_PATH = os.path.join(STATE_DIR, "login.lock")
 USAGE_CACHE_PATH = os.path.join(STATE_DIR, "usage-cache.json")
+# to samo co `status --json`, zapisywane po każdym ticku: aplikacja w pasku menu czyta je
+# przy zamkniętym panelu, zamiast co minutę uruchamiać skrypt
+STATUS_PATH = os.path.join(STATE_DIR, "status.json")
 # istnieje tylko w trakcie pauzy limitów; hook w sesjach Claude Code (hook.py) tylko go czyta
 PAUSE_PATH = os.path.join(STATE_DIR, "pause.json")
 # znaczniki hooka z bieżącego epizodu pauzy; kasowane razem z nią
@@ -1216,15 +1223,20 @@ def credits_summary():
         return None
 
 
-def snapshot(cfg):
-    """Stan wszystkich kont w jednym słowniku. To czyta aplikacja w pasku menu."""
-    accounts = load_accounts()
+def snapshot(cfg, accounts=None):
+    """Stan wszystkich kont w jednym słowniku. To czyta aplikacja w pasku menu.
+
+    Tick podaje konta wczytane w tym samym przebiegu, w którym zsynchronizował już
+    aktywne: druga runda odczytów Pęku kluczy sekundę później niczego by nie zmieniła.
+    """
+    synced = accounts is not None
+    accounts = load_accounts() if accounts is None else accounts
     active = find_active(accounts, cfg)
     # aplikacja pyta co minutę, więc nie odświeża żadnych tokenów (to robią sesje
     # i automat), a świeże limity bierze tylko dla aktywnego konta; reszta z
     # pamięci do 10 minut, bo endpoint limitów dławi 429 i blokuje wtedy automat
     orca = orca_selected(accounts)
-    if active and not orca:  # przy koncie wybranym w Orca niczego nie zapisujemy
+    if active and not orca and not synced:  # przy koncie wybranym w Orca niczego nie zapisujemy
         sync_back(active, cfg)
     if active:
         cached_usage(active, cfg, max_age=120, refresh=False)
@@ -1727,6 +1739,22 @@ def cmd_tick(cfg, _args):
         # pauza wyłączona w config.json w trakcie epizodu: sesje budzą się, gdy plik znika
         log("pauza limitów wyłączona w konfiguracji, sesje wznawiają pracę")
     accounts = load_accounts()
+    try:
+        return tick(cfg, accounts)
+    finally:
+        save_status(cfg, accounts)
+
+
+def save_status(cfg, accounts):
+    """Migawka dla aplikacji w pasku menu, jeszcze pod blokadą ticku. Jej błąd nie może
+    przesłonić wyniku ticku: aplikacja przy starym pliku sama uruchomi `status --json`."""
+    try:
+        write_json(STATUS_PATH, snapshot(cfg, accounts))
+    except Exception as err:
+        log(f"tick: zapis migawki nieudany: {err}")
+
+
+def tick(cfg, accounts):
     if not accounts:
         return 1
     orca = orca_selected(accounts)

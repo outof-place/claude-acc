@@ -36,6 +36,7 @@ struct AwakeCard: View {
                 }
                 VStack(spacing: 9) {
                     SettingRow("Keep the display on", symbol: "display", isOn: binding(\.keepDisplayOn))
+                    SettingRow("Awake with the lid closed", symbol: "laptopcomputer", isOn: binding(\.lidClosed))
                     SettingRow("Auto on any hotspot", symbol: "personalhotspot", isOn: binding(\.autoOnHotspot))
                     SettingRow("Keep the hotspot alive", symbol: "antenna.radiowaves.left.and.right", isOn: binding(\.keepHotspotAlive))
                     if let store {
@@ -197,7 +198,7 @@ struct FansCard: View {
             Temperature(label: "Battery", value: sensors["battery"])
         }
         if let history = state.history, history.count > 2 {
-            ThermalChart(history: history)
+            ThermalChart(history: history).equatable()
         }
     }
 
@@ -297,8 +298,14 @@ private struct Temperature: View {
 }
 
 /// CPU and GPU over the last 20 minutes, against the 95 °C line where fixed modes go full speed.
-private struct ThermalChart: View {
+private struct ThermalChart: View, Equatable {
     let history: [[Double]]
+
+    /// The daemon rewrites its file every 2 s but adds a row about every 5: the chart (480
+    /// monotone marks) draws again only when the newest row is another one.
+    static func == (a: Self, b: Self) -> Bool {
+        a.history.count == b.history.count && a.history.last == b.history.last
+    }
 
     private struct Point: Identifiable {
         let id: Int

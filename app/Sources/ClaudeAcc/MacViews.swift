@@ -58,7 +58,7 @@ private struct GuardContent: View {
                     .help(memoryHelp)
             }
             if let history = state.history, history.count > 2 {
-                MemoryChart(history: history, budget: snapshot.budget)
+                MemoryChart(history: history, budget: snapshot.budget).equatable()
             }
             if snapshot.units.isEmpty {
                 Label("No dev servers running", systemImage: "checkmark.circle")
@@ -246,9 +246,14 @@ private struct ServerRow: View {
 }
 
 /// Dev server memory over the last two hours against the budget line.
-private struct MemoryChart: View {
+private struct MemoryChart: View, Equatable {
     let history: [[Double]]
     let budget: Double
+
+    /// Redrawn only when a row comes or the budget moves, not on every rewrite of the file.
+    static func == (a: Self, b: Self) -> Bool {
+        a.budget == b.budget && a.history.count == b.history.count && a.history.last == b.history.last
+    }
 
     private struct Point: Identifiable {
         let date: Date

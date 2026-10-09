@@ -8,12 +8,24 @@ let settings: [SwiftSetting] = [
     .enableUpcomingFeature("InferIsolatedConformances"),
 ]
 
+// dictation's pure core runs off the main actor: no default isolation there
+let core: [SwiftSetting] = [
+    .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+    .enableUpcomingFeature("InferIsolatedConformances"),
+]
+
 let package = Package(
     name: "ClaudeAcc",
     platforms: [.macOS("26.0")],
     targets: [
         // the menu bar app
-        .executableTarget(name: "ClaudeAcc", path: "Sources/ClaudeAcc", swiftSettings: settings),
+        .executableTarget(
+            name: "ClaudeAcc", dependencies: ["DictationCore"], path: "Sources/ClaudeAcc", swiftSettings: settings),
+        // dictation without AppKit: text rules, the AI Gateway client, audio math, the right ⌥ trigger
+        .target(name: "DictationCore", path: "Sources/DictationCore", swiftSettings: core),
+        .testTarget(
+            name: "DictationCoreTests", dependencies: ["DictationCore"], path: "Tests/DictationCoreTests",
+            resources: [.copy("Fixtures")], swiftSettings: core),
         // fan control through the SMC; runs as a root LaunchDaemon, see install-fans.sh
         .executableTarget(name: "fanctl", path: "Sources/fanctl", swiftSettings: settings),
         // the PreToolUse hook's native front: answers most Bash commands without starting Python
