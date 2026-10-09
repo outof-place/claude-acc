@@ -59,7 +59,8 @@ Korek z 2026-10-09 wieczorem (~28 min, 14 jobów) zmienił cztery rzeczy:
   - Rodzina uczy najpierw z tego samego czasownika: `tc`, `tc:*`, `tsc` i `typecheck` to typecheck,
     więc `tc:cli` uczy się z `tc`, a nie z e2e w tej samej rodzinie pnpm. Bierze p75 × 1,25, a nie
     p90 × 1,5.
-  - `ensure:*`, esbuild i `--help`/`--version` to praca lekka (0,5 GB, 30 s).
+  - `--help`/`--version` narzędzia z czasownikiem pracy (`tsc --help`) to praca lekka (0,5 GB, 30 s).
+    `ensure:*` i esbuild od 1.30.1 w ogóle nie trafiają do kolejki (niżej: bez czasownika pracy).
   - `go test ./...` w module spoza tabeli rośnie z liczbą pakietów (1 GB + 0,15 GB na pakiet).
   - Biegi komend złożonych (`multi`) nie uczą klasy pojedynczej komendy.
 - **Rezerwa po rozgrzewce idzie za pomiarem.** Rozgrzewka trwa `max(60 s, połowa prognozy czasu)`,
@@ -410,8 +411,18 @@ pracą, kończą się same i potrafią zjeść gigabajty (`GENERIC_TOOLS` w `sch
   expo, react-native i start symulatora zna część natywna (sekcja wyżej). `swift build` jest tu, ale jego `swift-build`
   zajmuje miejsce na natywny build jak każdy build w drzewie joba schedulera (niżej);
 - skrypty: plik uruchamiany po ścieżce (`./scripts/e2e.sh`, `bin/verify`, `e2e.sh`), przez
-  interpreter (`python x.py`, `node x.js`, `tsx`, `ts-node`, `bun x.ts`, `bash x.sh`) i skrypty z
-  `package.json` o dowolnej nazwie (`pnpm sm capture`, `npm run e2e:ci`), także `sh -c '...'`.
+  interpreter (`python x.py`, `node x.js`, `tsx`, `ts-node`, `bun x.ts`, `bash x.sh`), skrypty z
+  `package.json` (`npm run e2e:ci`, `pnpm build:addon`), przepisy `make`/`just`/`task` i zadania
+  `deno run|task`, `nx run|run-many|affected`, `lerna run`, także w `sh -c '...'`. **Tylko gdy nazwa
+  mówi o pracy**: któryś człon nazwy pliku, skryptu, podkomendy albo celu to `build`, `test`, `tests`,
+  `e2e`, `spec`, `typecheck`, `tc`, `tsc`, `lint`, `check`, `verify`, `compile`, `bundle`, `bench`,
+  `coverage`, `integration` albo `unit` (`HEAVY_WORDS`, `heavy_sig` w `sched.py`). Reszta idzie od
+  razu, bez kolejki: `./perm-guard`, `bash scripts/commit-pliki.sh`, `make prepare-emails`,
+  `pnpm sm capture`, `pnpm run ensure:electron-runtime`, esbuild, `deno run main.ts`. 2026-10-09
+  binarka na 1 ms czekała tak 2m24s za `ensure:electron-runtime`. Skrypt, który jest pracą, ale
+  jego nazwa tego nie mówi, też biegnie od razu; jego pamięć widać potem w wolnej pamięci, jak każdy
+  proces spoza schedulera. `cargo run`, `swift run`, `dotnet run` i `bazel run` zostają w kolejce,
+  bo najpierw kompilują.
 
 Nigdy: serwery, watchery i REPL-e (nazwa skryptu, podkomenda albo treść skryptu z `dev`, `serve`,
 `server`, `start`, `watch`, `preview`, `runserver`..., `--watch`), `python -c`, `node -e`, heredoc

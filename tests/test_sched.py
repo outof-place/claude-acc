@@ -2599,8 +2599,9 @@ class JamTest(Paths):
         gb, _s, src = self.predict("pnpm run tc:cli")
         self.assertEqual(src, "family:typecheck:23")  # tc, tc:node: ten sam czasownik, bez e2e
         self.assertLessEqual(gb, self.small)  # było 30,32 GB
-        self.assertEqual(self.predict("pnpm run ensure:electron-runtime")[:3:2], (0.5, "light"))  # było 30,32
-        self.assertEqual(self.predict("node_modules/.bin/esbuild src/main.ts --bundle")[2], "light")  # było 11,92
+        # ensure i esbuild nie mają czasownika pracy: od 1.30.1 nie trafiają do kolejki wcale (30,32 i 11,92 GB)
+        for command in ("pnpm run ensure:electron-runtime", "node_modules/.bin/esbuild src/main.ts --bundle"):
+            self.assertIsNone(S.classify(command, self.ide), command)
         self.assertEqual(self.predict("node node_modules/typescript/bin/tsc --help --all")[2], "light")  # 9,85
         # nowy skrypt bez nikogo z tym samym czasownikiem: cała rodzina, odpornie i z sufitem
         self.assertLessEqual(self.predict("pnpm run e2e")[0], self.small)
@@ -2624,13 +2625,14 @@ class JamTest(Paths):
         job = S.classify("pnpm test; pnpm tc", self.ide)
         self.assertTrue(job["multi"])
         self.assertTrue(S.new_entry(job, "pnpm test; pnpm tc", None, {})["multi"])
-        # złożona bez własnych biegów: najcięższa część, czasy po kolei (ensure lekkie, e2e nie)
-        cmd = "pnpm run ensure:electron-runtime > /dev/null 2>&1; npx playwright test tests/e2e/a.spec.ts"
+        # złożona bez własnych biegów: najcięższa część, czasy po kolei
+        cmd = "pnpm run tc:web > /dev/null 2>&1; npx playwright test tests/e2e/a.spec.ts"
         job = S.classify(cmd, self.ide)
         self.assertEqual([p["kind"] for p in job["parts"]], ["e2e"])
         part_gb, part_s, _ = S.predict(dict(job["parts"][0], multi=False), 4, [], self.small)
+        main_gb, main_s = S.GENERIC_PRIORS["script"]
         gb, s, _src = S.predict(job, 4, [], self.small)
-        self.assertEqual((gb, s), (max(0.5, part_gb), S.LIGHT_PRIOR[1] + part_s))
+        self.assertEqual((gb, s), (max(min(main_gb, self.small), part_gb), main_s + part_s))
 
     def test_go_tree_in_a_small_module_scales_with_its_packages(self):
         mod = os.path.join(self.dir, "tinymod")
@@ -2793,12 +2795,14 @@ if __name__ == "__main__":
 def make_generic_repo(root):
     """Repo spoza Go i JS z ciężkimi komendami: skrypty, CLI projektu, Cargo, package.json."""
     os.makedirs(os.path.join(root, ".git"))
-    for name in ("scripts/e2e.sh", "scripts/capture.py", "scripts/dev-server.sh", "bin/verify",
-                 "plugins/cli/main.ts", "manage.py", "e2e.sh", "tools/emulator"):
+    for name in ("scripts/e2e.sh", "scripts/capture.py", "scripts/build_assets.py", "scripts/dev-server.sh", "bin/verify",
+                 "plugins/cli/main.ts", "manage.py", "e2e.sh", "tools/emulator", "perm-guard", "tools/perm-guard",
+                 "scripts/commit-pliki.sh"):
         write(os.path.join(root, name), "#!/bin/sh\necho ok\n", 0o755)
     write(os.path.join(root, "Cargo.toml"), "[package]\nname = 'x'\n")
     write(os.path.join(root, "package.json"), json.dumps({"scripts": {
-        "sm": "node plugins/cli/main.ts", "app": "next dev", "format": "oxfmt",
+        "sm": "node plugins/cli/main.ts", "app": "next dev", "format": "oxfmt", "build:addon": "node-gyp rebuild",
+        "ensure:electron-runtime": "node scripts/ensure.mjs",
         "test": "vitest run", "e2e:ci": "playwright test"}}))
 
 
@@ -2816,23 +2820,24 @@ class GenericTest(Paths):
         "pytest -x tests": "shop:test:pytest:tests",
         "python3 -m pytest": "shop:test:pytest",
         "uv run pytest": "shop:test:pytest",
-        "python3 scripts/capture.py --url http://localhost:3000": "shop:script:python:scripts/capture.py",
-        "uv run python scripts/capture.py": "shop:script:python:scripts/capture.py",
+        "python3 scripts/build_assets.py --url http://localhost:3000": "shop:script:python:scripts/build_assets.py",
+        "uv run python scripts/build_assets.py": "shop:script:python:scripts/build_assets.py",
         "python3 manage.py test": "shop:script:python:manage.py:test",
-        "node plugins/cli/main.ts capture": "shop:script:node:plugins/cli/main.ts:capture",
+        "node plugins/cli/main.ts build": "shop:script:node:plugins/cli/main.ts:build",
         "tsx plugins/cli/main.ts verify": "shop:script:tsx:plugins/cli/main.ts:verify",
         "./scripts/e2e.sh": "shop:script:script:scripts/e2e.sh",
         "bash scripts/e2e.sh": "shop:script:bash:scripts/e2e.sh",
         "e2e.sh": "shop:script:script:e2e.sh",
         "bin/verify all": "shop:script:script:bin/verify:all",
         "sh -c 'cargo test'": "shop:test:cargo:test",
-        "pnpm sm capture": "shop:script:pnpm-script:sm:capture",
-        "bun run sm": "shop:script:bun-script:sm",
         "npx lighthouse http://localhost:3000": "shop:e2e:lighthouse",
         "pnpm exec cypress run": "shop:e2e:cypress:run",
         "make e2e": "shop:script:make:e2e",
         "just test": "shop:script:just:test",
         "deno test": "shop:test:deno:test",
+        "deno task build": "shop:test:deno:task",
+        "npx nx run-many -t build": "shop:build:nx:run-many",
+        "nx run app:build": "shop:build:nx:run",
     }
     LEFT_ALONE = (
         # serwery, watchery, REPL-e: nigdy się nie kończą
@@ -2848,11 +2853,33 @@ class GenericTest(Paths):
         "git status", "ls -la", "gh pr list", "claude-acc sched run -- cargo test",
         "/Users/x/.local/bin/claude-acc status", "echo cargo test",
     )
+    # bez czasownika pracy w nazwie (build, test, e2e, typecheck, lint, check...): od razu, bez kolejki.
+    # 2026-10-09 `./perm-guard` (1 ms) czekał 2m24s za `ensure:electron-runtime`; `sm capture` i
+    # skrypty bez takiej nazwy też (decyzja z 2026-10-10: tylko znane ciężkie czasowniki)
+    PASSED_THROUGH = (
+        "./perm-guard perm-guard", "cd tools && echo '{}' | ./perm-guard perm-guard",
+        "bash scripts/commit-pliki.sh /tmp/x 'feat: y'", "make prepare-emails", "pnpm sm capture",
+        "bun run sm", "python3 scripts/capture.py --url http://localhost:3000",
+        "node plugins/cli/main.ts capture", "pnpm run ensure:electron-runtime",
+        "node_modules/.bin/esbuild src/main.ts --bundle", "deno run main.ts", "deno task deploy",
+        "nx run app:migrate", "lerna run publish-docs",
+    )
 
     def setUp(self):
         super().setUp()
         self.shop = os.path.join(self.dir, "shop")
         make_generic_repo(self.shop)
+
+    def test_commands_without_a_work_verb_pass_through(self):
+        for command in self.PASSED_THROUGH:
+            with self.subTest(command=command):
+                self.assertIsNone(S.classify(command, self.shop), command)
+        event = {"tool_name": "Bash", "cwd": self.shop, "tool_input": {"command": "./perm-guard perm-guard"}}
+        self.assertIsNone(S.hook_rewrite(event))
+        # ten sam program z czasownikiem pracy w podkomendzie idzie do kolejki
+        self.assertIsNotNone(S.classify("./perm-guard build", self.shop))
+        self.assertTrue(all(S.heavy_sig(s) for s in ("pnpm-script:build:ghostty-terminal-macos", "script:scripts/run-tests.sh",
+                                                     "pnpm-script:tc:cli", "make:e2e", "script:scripts/stack.sh:build")))
 
     def test_heavy_shapes_are_classified_by_signature(self):
         for command, cls in self.WRAPPED.items():
@@ -2872,7 +2899,7 @@ class GenericTest(Paths):
         self.assertIsNotNone(S.classify("cd apps/charter-service && go vet ./...", self.repo))
 
     def test_first_run_is_conservative_then_learns_from_the_signature(self):
-        job = S.classify("python3 scripts/capture.py", self.shop)
+        job = S.classify("python3 scripts/build_assets.py", self.shop)
         gb, s, src = S.predict(job, 4, [])
         self.assertEqual((gb, src), (S.GENERIC_PRIORS["script"][0], "prior"))
         rows = [{"where": "local", "lang": "generic", "class": job["class"], "peak_gb": 0.4, "wall_s": 9.0}] * 3
@@ -2884,12 +2911,12 @@ class GenericTest(Paths):
         # pięć innych skryptów Pythona w tym repo: nowy nie czeka na 4 GB
         rows = [{"where": "local", "lang": "generic", "class": f"shop:script:python:scripts/s{i}.py",
                  "peak_gb": 0.2, "wall_s": 3.0} for i in range(5)]
-        job = S.classify("python3 scripts/capture.py", self.shop)
+        job = S.classify("python3 scripts/build_assets.py", self.shop)
         gb, _s, src = S.predict(job, 4, rows)
         self.assertEqual(src, "family:5")
         self.assertAlmostEqual(gb, 0.5)  # p75 × 1,25, najmniej 0,5 GB
         # rodzina to repo, rodzaj i narzędzie: skrypty node się nie liczą
-        node = S.classify("node plugins/cli/main.ts capture", self.shop)
+        node = S.classify("node plugins/cli/main.ts build", self.shop)
         self.assertEqual(S.predict(node, 4, rows)[2], "prior")
 
     def test_docker_never_predicts_below_its_floor(self):
@@ -2904,12 +2931,12 @@ class GenericTest(Paths):
         self.assertFalse(S.uses_pg(job, {}))
 
     def test_hook_wraps_generic_commands(self):
-        event = {"tool_name": "Bash", "cwd": self.shop, "tool_input": {"command": "pnpm sm capture --site x"}}
+        event = {"tool_name": "Bash", "cwd": self.shop, "tool_input": {"command": "./scripts/e2e.sh --site x"}}
         with mock.patch.object(S, "with_rtk", side_effect=lambda c: c):
             out = S.hook_rewrite(event)
         argv = shlex.split(out["hookSpecificOutput"]["updatedInput"]["command"])
         self.assertEqual(argv[2:4], ["run", "--via"])
-        self.assertEqual(argv[-1], "pnpm sm capture --site x")
+        self.assertEqual(argv[-1], "./scripts/e2e.sh --site x")
 
     def test_reservation_ends_for_a_job_that_outlived_its_prediction(self):
         # job, który biegnie trzy razy dłużej, niż miał (serwer puszczony przez skrypt), nie
