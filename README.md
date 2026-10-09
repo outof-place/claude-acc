@@ -206,6 +206,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc mac report` | What slows the Mac down: top processes, Spotlight, orphaned dev servers, data of uninstalled apps, broken launchd entries |
 | `claude-acc mac spotlight` | Projects whose `node_modules` Spotlight indexes, and the settings pane to exclude them |
 | `claude-acc mac optimize [--dry-run\|--undo]` | Faster Dock, window and Finder animations, and disabling launch agents whose app is gone. Reversible |
+| `claude-acc mac compress-apps [--dry-run] [--apps A,B]` | Transparent APFS compression of root-owned apps (Office, Adobe, `.pkg` installs) through sudo, signature checked before and after, rolled back if it breaks |
 | `claude-acc guard status [--json]` | Dev servers, their memory, who watches them and what the guard is about to do |
 | `claude-acc guard once [--dry-run]` | One guard pass, at most one action |
 | `claude-acc guard stop <pid\|:port>` | Stop a dev server the way the guard does |
@@ -307,6 +308,16 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `compress` | transparent APFS compression (`afsctool`, LZFSE) of files under `compress.paths` that haven't changed for an hour; off until you list paths | every run |
 
 `compress` keeps files on disk compressed the way macOS stores its own system files: reads are transparent, the kernel decompresses on the fly. Measured on 2026-10-08: Claude Code transcripts in `~/.claude/projects` shrink by 75%, Microsoft Word.app by 39%. Appending to a compressed file makes APFS write it back uncompressed, so each run picks up the files changed since the last one once they have been quiet for `min_age_minutes`. It skips files a process has open, the whole bundle of an app that is running (compressing in place swaps out a mapped executable), files you can't write that you don't own (the janitor has no root), and protected paths. Nothing it skips is lost: `~/.local/share/claude-acc/janitor-compress.json` remembers an app that was running and goes through the whole bundle once it has quit, retries files that were open, and keeps a list of files afsctool could not shrink (media, binaries that are compressed already) so they are not read again until they change. Install the tool with `brew install afsctool`; without it the task logs a warning and does nothing. APFS clones share blocks and each compressed copy gets its own, so leave clone-heavy folders such as a pnpm store on APFS out of `paths`.
+
+Apps installed by a `.pkg` (Microsoft Office, Adobe, App Store apps, most installers) belong to root, so the `compress` task can't write them. `claude-acc mac compress-apps` does them through sudo (Touch ID), one app at a time:
+
+```bash
+claude-acc mac compress-apps --dry-run          # root-owned apps in /Applications (and one folder down), size, current savings
+claude-acc mac compress-apps                    # compress every root-owned app that isn't running or already done
+claude-acc mac compress-apps --apps Word,Premiere --threads 8
+```
+
+For each app it checks the signature with `codesign --verify --deep --strict`, and an app whose signature is already broken is left alone. Then it compresses with `afsctool -c -T LZFSE` and checks the signature again. If the check passed before and fails after, it decompresses the app (`afsctool -d`) and says so in the result table. It skips running apps and apps where nearly every file is compressed already. Measured on 2026-10-09, every signature stayed valid: Word 12.6% → 38.8% savings, Excel 45.6%, Outlook 42.6%, PowerPoint 43.6%, Premiere Pro 61.1%, Photoshop 48.7%, Lightroom 26.6%. Office (Microsoft AutoUpdate) and Creative Cloud updates install fresh uncompressed bundles, so run it again after big updates; a second run only does what changed. The code is in `compressapps.py`. It imports nothing from the repo and runs as `sudo /usr/bin/python3 -I`, with the full path to afsctool passed in because sudo's `secure_path` doesn't include `/opt/homebrew/bin`. A weekly root job for this isn't part of claude-acc.
 
 Each run also checks which projects' `node_modules` end up in the Spotlight index. Spotlight skips directories whose name starts with a dot or ends with `.noindex`, so pnpm's `.pnpm` store is never indexed, but hoisted `node_modules` (Expo, npm, yarn) are, and every install makes Spotlight chew through tens of thousands of files. Neither a `.metadata_never_index` file nor `chflags hidden` stops it on current macOS. The fix is System Settings > Spotlight > Search Privacy; `claude-acc mac spotlight` lists the projects and opens that pane.
 
