@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+"""Atrapa `claude-acc status --json` i `claude-acc token --json` dla wyboru konta subskrypcji.
+
+Konta i zachowanie tokenu: $HOME/fake/accounts.json
+    {"accounts": [{"email", "real_email"?, "usable", "active", "queue", "session_used", "weekly_used",
+                   "session_resets_at"?}, ...],
+     "token": {"source": "rotation"|"fallback"|"active", "fail": bool, "malformed": bool,
+               "expires_in_min": 300, "force_email": null}}
+`token` wybiera jak accswitch.pick_token: konta z kolejki (usable, nie aktywne) poza --avoid,
+najpierw --prefer, a przy force_email oddaje to konto mimo wszystko (zepsuty wybór). Token
+`sk-ant-oat01-fake-<email>-<n>` trafia do server.json["access"] jak w tests/fakes/_store, więc
+atrapa Claude Code wie, czyje to konto. Argumenty każdego wywołania: claude-acc-argv.log."""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fakes"))
+import _store  # noqa: E402
+
+os.makedirs(_store.ROOT, exist_ok=True)
+with open(os.path.join(_store.ROOT, "claude-acc-argv.log"), "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+data = _store.load("accounts.json", {"accounts": [], "token": {}})
+args = sys.argv[1:]
+
+
+def values(flag):
+    return [args[i + 1] for i, a in enumerate(args) if a == flag and i + 1 < len(args)]
+
+
+if args[:2] == ["status", "--json"]:
+    rows = []
+    for a in data["accounts"]:
+        rows.append({
+            "email": a["email"], "real_email": a.get("real_email", a["email"]), "usable": a.get("usable", True),
+            "active": a.get("active", False), "queue": a.get("queue"),
+            "session": {"used": a.get("session_used", 0.0), "resets_at": a.get("session_resets_at")},
+            "weekly": {"used": a.get("weekly_used", 0.0), "resets_at": None},
+            "last_resort": a.get("last_resort", a["email"] == "filip.maszota@blazity.com"),
+        })
+    print(json.dumps({"active_email": next((a["email"] for a in data["accounts"] if a.get("active")), None),
+                      "accounts": rows}))
+    sys.exit(0)
+
+if args[:1] == ["token"]:
+    conf = data.get("token") or {}
+    if conf.get("fail"):
+        print("brak konta z zapasem poza lokalnym i brak tokenu zapasowego (`claude-acc token --fallback`)", file=sys.stderr)
+        sys.exit(1)
+    avoid = set(values("--avoid"))
+    prefer = (values("--prefer") or [None])[-1]
+    queue = sorted((a for a in data["accounts"] if a.get("usable", True) and not a.get("active")),
+                   key=lambda a: a.get("queue") or 99)
+    rows = [a["email"] for a in queue if a["email"] not in avoid]
+    rows = [e for e in rows if e == prefer] + [e for e in rows if e != prefer]
+    email = conf.get("force_email") or (rows[0] if rows else None)
+    source = conf.get("source", "rotation") if email else "fallback"
+    server = _store.load("server.json", {})
+    n = server["counter"] = server.get("counter", 0) + 1
+    token = f"sk-ant-oat01-fake-{email or 'fallback'}-{n}"
+    server.setdefault("access", {})[token] = email or "fallback@example.com"
+    _store.save("server.json", server)
+    out = json.dumps({"email": email or "fallback", "token": token,
+                      "expiresAt": int(time.time() + 60 * conf.get("expires_in_min", 300)), "source": source})
+    print(out[: len(out) // 2] if conf.get("malformed") else out)
+    sys.exit(0)
+
+print("atrapa claude-acc: nieznana komenda", file=sys.stderr)
+sys.exit(2)
