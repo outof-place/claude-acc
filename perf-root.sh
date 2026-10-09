@@ -374,18 +374,53 @@ iogpu_status() {
 SPOTLIGHT_CONFIG=/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist
 
 spotlight_exclusions() {
-  # $1: "apps-only" albo plik z listą do przywrócenia; wypisuje poprzednią listę
-  /usr/bin/python3 - "$SPOTLIGHT_CONFIG" "$1" "$(eval echo "~$USER_NAME")" <<'PY'
+  # $1: "apps-only" albo plik z listą do przywrócenia; wypisuje poprzednią listę.
+  # $2 (opcjonalnie): katalog aplikacji, domyślnie /Applications; inny tylko w testach.
+  /usr/bin/python3 - "$SPOTLIGHT_CONFIG" "$1" "$(eval echo "~$USER_NAME")" "${2:-/Applications}" <<'PY'
 import json, os, plistlib, sys
-path, mode, home = sys.argv[1:4]
+path, mode, home, apps = sys.argv[1:5]
 raw = open(path, "rb").read()
 data = plistlib.loads(raw)
 before = data.get("Exclusions", [])
+
+
+def has_app(d, depth=0):
+    # czy pod d (do 4 poziomów, bez dowiązań) leży jakiś pakiet .app
+    try:
+        it = os.scandir(d)
+    except OSError:
+        return False
+    with it:
+        for e in it:
+            if e.is_symlink() or not e.is_dir(follow_symlinks=False):
+                continue
+            if e.name.endswith(".app") or (depth < 3 and has_app(e.path, depth + 1)):
+                return True
+    return False
+
+
+def without_apps(d):
+    # katalogi pod d bez żadnego .app; tam, gdzie .app jest, schodzimy niżej
+    out = []
+    try:
+        entries = sorted(os.scandir(d), key=lambda e: e.name)
+    except OSError:
+        return out
+    for e in entries:
+        if e.is_symlink() or not e.is_dir(follow_symlinks=False) or e.name.endswith(".app"):
+            continue
+        out += without_apps(e.path) if has_app(e.path) else [e.path]
+    return out
+
+
 if mode == "apps-only":
     wanted = [os.path.join(home, n) for n in sorted(os.listdir(home))
               if not n.startswith(".") and n != "Applications"
               and os.path.isdir(os.path.join(home, n)) and not os.path.islink(os.path.join(home, n))]
     wanted += [p for p in ("/Library", "/opt", "/usr/local", "/Users/Shared") if os.path.isdir(p)]
+    # Wewnątrz katalogu aplikacji też tylko aplikacje: XAMPP, presety i wtyczki Adobe
+    # były ~95% indeksu (22,7 tys. plików samego xamppfiles przy 380 pakietach .app).
+    wanted += without_apps(apps)
 else:
     wanted = json.load(open(mode))
 data["Exclusions"] = wanted
@@ -412,7 +447,7 @@ spotlight_apply() {
   local state_dir prev
   state_dir="$(eval echo "~$USER_NAME")/.local/share/claude-acc"
   if [ "$DRY" -eq 1 ]; then
-    echo "  (dry-run) lista Prywatności: katalogi domowe poza Applications, /Library, /opt, /usr/local"
+    echo "  (dry-run) lista Prywatności: katalogi domowe poza Applications, /Library, /opt, /usr/local, katalogi bez .app w /Applications"
     return
   fi
   prev="$(spotlight_exclusions apps-only)"
