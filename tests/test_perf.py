@@ -1682,6 +1682,21 @@ class UltraTest(Isolated):
         self.assertNotIn("docker-vm", data["applied"])
         self.assertNotIn("docker-vm", perf.load_state()["applied"])
 
+    def test_unknown_item_from_another_build_is_left_alone(self):
+        """Pozycja nałożona przez inną (np. deweloperską) wersję nie wywraca status, keep ani off."""
+        self.ultra("on")
+        state = perf.load_state()
+        state["applied"]["from-dev-build"] = {"ultra": True, "x": 1}
+        perf.ultra_state(state)["applied"].append("from-dev-build")
+        perf.save_state(state)
+        out = self.ultra("status")
+        self.assertIn("[?] from-dev-build", out)
+        self.assertIn("from-dev-build", perf.load_state()["applied"])
+        self.ultra("on")
+        self.assertIn("from-dev-build", self.status()["applied"])
+        self.ultra("off")
+        self.assertEqual(perf.load_state()["applied"]["from-dev-build"], {"ultra": True, "x": 1})
+
     def test_shaper_pending_only_when_network_bloats(self):
         state = perf.load_state()
         perf.record_bench(state, "network", {"idle_ms": 30, "up_net_p90_ms": 900}, 1)

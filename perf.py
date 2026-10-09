@@ -2709,7 +2709,8 @@ def ultra_on(cfg, system, state):
         ultra["results"] = {}
     ultra["on"] = True
     report = []
-    for name in [n for n in ultra["applied"] if n not in ULTRA]:
+    # pozycje, których ta wersja nie zna (nałożyła je inna, np. deweloperska), zostają nietknięte
+    for name in [n for n in ultra["applied"] if n not in ULTRA and tweak(n) is not None]:
         record = state["applied"].pop(name, None)
         ultra["applied"].remove(name)
         ultra["results"].pop(name, None)
@@ -2845,6 +2846,9 @@ def ultra_off(cfg, system, state):
         record = state["applied"].get(name)
         if record is None:
             continue
+        if tweak(name) is None:
+            report.append(f"{name}: nieznana tej wersji, zostawiam (cofnie ją wersja, która ją nałożyła)")
+            continue
         try:
             restored = tweak(name).undo(record, system)
         except Deferred:
@@ -2944,6 +2948,9 @@ def cmd_ultra(cfg, args, system=None):
         print(f"  od {ago(ultra['since'])}")
     for name in ultra["applied"]:
         item, record = tweak(name), state["applied"].get(name, {})
+        if item is None:
+            print(f"  [?] {name}: nieznana tej wersji claude-acc (nałożyła ją inna wersja), zostawiam")
+            continue
         print(f"  [x] {name}: {item.describe(record, system)}")
         result = ultra["results"].get(name)
         if result:
@@ -3347,6 +3354,8 @@ def cmd_keep(cfg, args, system=None):
     system = system or System()
     state = load_state()
     for name, record in list(state.get("deferred", {}).items()):
+        if tweak(name) is None:
+            continue
         try:
             tweak(name).undo(record, system)
         except Deferred:
