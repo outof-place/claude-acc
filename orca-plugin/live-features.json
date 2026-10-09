@@ -1,0 +1,12 @@
+{
+  "//": "Merged into orca-plugin.json by `claude-acc orca install` when Orca has plugin status bar items and live panel messaging; stock Orca rejects these keys, so the base manifest goes without them.",
+  "marker": "panelMessaging",
+  "contributes": {
+    "statusBarItems": [
+      { "id": "account", "alignment": "right", "priority": 50, "panel": "claude-acc" },
+      { "id": "memory", "alignment": "right", "priority": 49, "panel": "claude-acc" },
+      { "id": "awake", "alignment": "right", "priority": 48, "command": "claude-acc.awake-toggle" }
+    ]
+  },
+  "capabilities": [{ "kind": "statusBar" }, { "kind": "panelMessaging" }]
+}

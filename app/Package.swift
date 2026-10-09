@@ -26,6 +26,9 @@ let package = Package(
         .testTarget(
             name: "DictationCoreTests", dependencies: ["DictationCore"], path: "Tests/DictationCoreTests",
             resources: [.copy("Fixtures")], swiftSettings: core),
+        // the panel's own logic: what a state file or a script's answer means on screen
+        .testTarget(
+            name: "ClaudeAccTests", dependencies: ["ClaudeAcc"], path: "Tests/ClaudeAccTests", swiftSettings: settings),
         // fan control through the SMC; runs as a root LaunchDaemon, see install-fans.sh
         .executableTarget(name: "fanctl", path: "Sources/fanctl", swiftSettings: settings),
         // the PreToolUse hook's native front: answers most Bash commands without starting Python

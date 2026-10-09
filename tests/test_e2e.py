@@ -9,6 +9,7 @@ Uruchomienie: /usr/bin/python3 -m unittest discover -s ~/.local/share/claude-acc
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,12 +18,22 @@ import time
 import unittest
 from unittest import mock
 
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "accswitch.py")
 ACC = os.path.join(os.path.dirname(HERE), "acc.py")
 FAKES = os.path.join(HERE, "fakes")
+sys.path.insert(0, os.path.dirname(HERE))
+import orcahost  # noqa: E402
+
 USER = "tester"
-MANAGED = "Orca Claude Code Managed Credentials"
+MANAGED = orcahost.orca().keychain_service
+# Pod, który przemianował usługę kont i katalog danych (ClaudeAccHost w Info.plist)
+POD_MANAGED = "Pod Claude Code Managed Credentials"
 BASE = "Claude Code-credentials"
 # dłużej niż pół godziny, przez które automat i panel ufają odczytom kont bez pracy
 PAST_IDLE = 31 * 60
@@ -33,10 +44,18 @@ def scoped(config_dir):
 
 
 class Env:
-    """Świat jednego testu: konta, serwer i Pęk kluczy w plikach."""
+    """Świat jednego testu: konta, serwer i Pęk kluczy w plikach. Host kont to Orca, a z pod=True
+    Pod z własną usługą Pęku kluczy i katalogiem danych, wskazany przez CLAUDE_ACC_HOST_APP."""
 
-    def __init__(self):
+    def __init__(self, pod=False):
         self.home = tempfile.mkdtemp(prefix="claude-acc-test-")
+        self.user_data = orcahost.orca(self.home).user_data
+        self.service = MANAGED
+        self.host_env = {}
+        if pod:
+            self.host_env = {"CLAUDE_ACC_HOST_APP": self.pod_app()}
+            self.user_data = os.path.join(self.home, "Library", "Application Support", "Pod")
+            self.service = POD_MANAGED
         self.fake = os.path.join(self.home, "fake")
         self.state_dir = os.path.join(self.home, ".local/share/claude-acc")
         os.makedirs(self.fake)
@@ -53,13 +72,24 @@ class Env:
         self.keychain = {}
         self.ids = {}
 
+    def pod_app(self):
+        import plistlib
+
+        app = os.path.join(self.home, "Applications", "Pod.app")
+        os.makedirs(os.path.join(app, "Contents"))
+        info = {"CFBundleName": "Pod", "CFBundleExecutable": "Pod", "CFBundleIdentifier": "codes.pod.app",
+                "ClaudeAccHost": {"userData": "~/Library/Application Support/Pod", "keychainService": POD_MANAGED}}
+        with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump(info, f)
+        return app
+
     # --- budowanie świata ---
 
     def account(self, email, session_used=10, weekly_used=10, alive=True, expired=False, mcp=None,
                 expires_in=8 * 3600):
         acct_id = f"id-{email.split('@')[0]}"
         self.ids[email] = acct_id
-        info = os.path.join(self.home, "Library/Application Support/orca/claude-accounts", acct_id, "auth")
+        info = os.path.join(self.user_data, "claude-accounts", acct_id, "auth")
         os.makedirs(info)
         json.dump({"emailAddress": email}, open(os.path.join(info, "oauth-account.json"), "w"))
         self.server["counter"] += 1
@@ -76,7 +106,7 @@ class Env:
         blob = {"claudeAiOauth": {"accessToken": access, "refreshToken": refresh, "expiresAt": int(expires)}}
         if mcp is not None:
             blob["mcpOAuth"] = mcp
-        self.keychain[f"{MANAGED}|{acct_id}"] = json.dumps(blob)
+        self.keychain[f"{self.service}|{acct_id}"] = json.dumps(blob)
         return blob
 
     def runtime(self, blob, mcp=None, services=None):
@@ -89,7 +119,7 @@ class Env:
 
     def orca_selects(self, email):
         """Orca w trybie kont zarządzanych: wybrane konto w jej ustawieniach, jak zapisuje je Orca."""
-        profile = os.path.join(self.home, "Library/Application Support/orca/profiles/local-default")
+        profile = os.path.join(self.user_data, "profiles", "local-default")
         os.makedirs(profile, exist_ok=True)
         selected = self.ids[email] if email else None
         json.dump({"settings": {"activeClaudeManagedAccountId": selected,
@@ -110,6 +140,7 @@ class Env:
 
     def env(self, **extra):
         env = {"HOME": self.home, "USER": USER, "PATH": f"{FAKES}:/usr/bin:/bin"}
+        env.update(self.host_env)
         env.update(extra)
         return env
 
@@ -190,7 +221,7 @@ class Env:
         return json.loads(raw) if raw else None
 
     def managed(self, email):
-        return self.entry(MANAGED, self.ids[email])
+        return self.entry(self.service, self.ids[email])
 
     def calls(self, suffix):
         log = json.load(open(os.path.join(self.fake, "server.json")))["log"]
@@ -1254,7 +1285,7 @@ class OptionalPauseTest(unittest.TestCase):
         return w
 
     def warnings(self, w):
-        return [n for n in w.notifications() if '"Claude: brak konta z zapasem"' in n]
+        return [n for n in w.notifications() if n.endswith(" Claude: brak konta z zapasem")]
 
     def tick(self, w):
         w.forget_usage_cache()
@@ -1276,7 +1307,7 @@ class OptionalPauseTest(unittest.TestCase):
 
         self.assertIsNone(w.pause())
         self.assertEqual(len(self.warnings(w)), 1)  # raz na epizod, nie co 2 minuty
-        self.assertFalse([n for n in w.notifications() if '"Claude: pauza limit' in n])
+        self.assertFalse([n for n in w.notifications() if " Claude: pauza limit" in n])
         self.assertEqual(w.entry(BASE)["claudeAiOauth"]["accessToken"],
                          w.managed("a@x")["claudeAiOauth"]["accessToken"])
 
@@ -1350,7 +1381,7 @@ class DrainTest(unittest.TestCase):
         return next(e for e in w.ids if w.managed(e)["claudeAiOauth"]["accessToken"] == token)
 
     def said(self, w, title):
-        return [n for n in w.notifications() if f'"{title}"' in n]
+        return [n for n in w.notifications() if n.endswith(f" {title}")]
 
     def test_active_account_works_to_its_last_percent(self):
         # 3% sesji to poniżej progu porzucenia (5%), ale bez konta z zapasem szkoda go zostawiać
@@ -1477,8 +1508,8 @@ class PauseTest(unittest.TestCase):
             w.forget_usage_cache()
             w.run("tick")
 
-        # osascript dostaje tekst z json.dumps, więc polskie litery są tam jako \uXXXX
-        self.assertEqual(len([n for n in w.notifications() if '"Claude: pauza limit' in n]), 1)
+        # osascript dostaje tekst i tytuł jako argumenty, tytuł jest ostatni
+        self.assertEqual(len([n for n in w.notifications() if n.endswith(" Claude: pauza limitów")]), 1)
         self.assertIsNotNone(w.pause())
 
     def test_pause_ends_when_active_window_resets(self):
@@ -1567,6 +1598,75 @@ class PauseTest(unittest.TestCase):
 
         self.assertIsNone(w.pause())
         self.assertTrue(w.saved_state().get("hands_off_notified"))  # to była gałąź obcego konta
+
+
+class NotifyTest(unittest.TestCase):
+    def test_polish_letters_and_quotes_reach_osascript_as_arguments(self):
+        # json.dumps wstawiał do skryptu \u0105 zamiast "ą", AppleScript go nie parsował i nic się nie pokazywało
+        w = Env()
+        self.addCleanup(shutil.rmtree, w.home, True)
+        text = 'Żadne konto, ą, ł, ż i "cudzysłów"'
+        script = f"import sys; sys.path.insert(0, {os.path.dirname(HERE)!r}); import accswitch; accswitch.notify('Tytuł ą', sys.argv[1])"
+
+        subprocess.run(["/usr/bin/python3", "-c", script, text], env=w.env(), check=True)
+
+        self.assertEqual(w.notifications()[-1].split(" -- ", 1)[1], f"{text} Tytuł ą")
+
+
+class PodHostTest(unittest.TestCase):
+    """Konta w Pod: jego katalog danych i usługa Pęku kluczy zamiast Orki, reszta bez zmian."""
+
+    def test_status_reads_pods_accounts_and_names_it(self):
+        w = Env(pod=True)
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(sorted(x["email"] for x in snap["accounts"]), ["a@x", "b@x"])
+        self.assertEqual([x["email"] for x in snap["accounts"] if x["active"]], ["a@x"])
+        self.assertEqual(snap["host"], {"name": "Pod", "bundle_id": "codes.pod.app"})
+        self.assertFalse(any(k.startswith(MANAGED + "|") for k in json.load(open(os.path.join(w.fake, "keychain.json")))))
+
+    def test_switch_takes_the_token_from_pods_copy(self):
+        w = Env(pod=True)
+        a = w.account("a@x")
+        b = w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        r = w.run("switch", "b@x")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+        self.assertTrue(any(f"{POD_MANAGED}|" in call for _cmd, call in w.keychain_calls()))
+        self.assertFalse(any(f"{MANAGED}|" in call for _cmd, call in w.keychain_calls()))
+
+    def test_switch_refuses_while_pod_has_its_own_account_selected(self):
+        w = Env(pod=True)
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        w.orca_selects("a@x")
+
+        r = w.run("switch", "b@x")
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Pod ma wybrane konto a@x", r.stdout)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], a["claudeAiOauth"])
+
+    def test_orca_status_names_orca(self):
+        w = Env()
+        a = w.account("a@x")
+        w.runtime(a)
+        w.write()
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(snap["host"], {"name": "Orca", "bundle_id": orcahost.ORCA_BUNDLE_ID})
 
 
 if __name__ == "__main__":

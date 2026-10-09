@@ -37,7 +37,7 @@ struct AwakeCard: View {
                 VStack(spacing: 9) {
                     SettingRow("Keep the display on", symbol: "display", isOn: binding(\.keepDisplayOn))
                     SettingRow("Awake with the lid closed", symbol: "laptopcomputer", isOn: binding(\.lidClosed))
-                    SettingRow("Auto on any hotspot", symbol: "personalhotspot", isOn: binding(\.autoOnHotspot))
+                    SettingRow("Auto on the iPhone hotspot", symbol: "personalhotspot", isOn: binding(\.autoOnHotspot))
                     SettingRow("Keep the hotspot alive", symbol: "antenna.radiowaves.left.and.right", isOn: binding(\.keepHotspotAlive))
                     if let store {
                         SettingRow("Hotspot turbo", symbol: "gauge.with.dots.needle.67percent", isOn: Binding(

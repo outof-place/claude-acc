@@ -109,13 +109,14 @@ final class Store {
     init(
         preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
         ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil, depot: DepotRuns? = nil,
-        updates: UpdatesState? = nil, desktop: DesktopPanel? = nil
+        updates: UpdatesState? = nil, desktop: DesktopPanel? = nil, link: TetherLink? = nil
     ) {
-        awake = Awake(preview: true)
+        awake = Awake(preview: true, link: link)
         dictation = Dictation(preview: true)
         isPreview = true
         snapshot = preview
         latestSnapshot = preview
+        HostApp.current = preview.host ?? .orca
         readLocal()
         if let guardState { self.guardState = guardState }
         if let janitor { self.janitor = janitor }
@@ -182,6 +183,7 @@ final class Store {
 
     private func show(_ fresh: Snapshot) {
         latestSnapshot = fresh
+        HostApp.current = fresh.host ?? .orca
         // with the panel closed only the menu bar label reads it; the panel takes it when it opens
         if panelOpen || isPreview || snapshot == nil { snapshot = fresh }
         if problem != nil { problem = nil }

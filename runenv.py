@@ -117,6 +117,7 @@ from datetime import datetime
 
 import credits
 import meter
+import orcahost
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~")
@@ -170,7 +171,7 @@ AUTH_ENV = (
 )  # fmt: skip
 # zmienne sesji Claude Code, w której ktoś wywołał bieg: bieg startuje czysto, jak z launchd
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CONFIG_DIR", "CLAUDE_ACC_RUN")
-DROP_PREFIXES = ("OTEL_", "CLAUDE_CODE_", "CLAUDE_ACC_CREDITS_", "ORCA_")
+DROP_PREFIXES = ("OTEL_", "CLAUDE_CODE_", "CLAUDE_ACC_CREDITS_", orcahost.ENV_PREFIX)
 HEADLESS_MD = """# Headless run (claude-acc)
 
 Nobody is watching this run and nobody will answer a question.
@@ -207,7 +208,10 @@ PROJECT_AUTH_KEYS = ("apiKeyHelper", "awsAuthRefresh", "awsCredentialExport")
 # rekord transkryptu z punktem wejścia: "cli" to sesja interaktywna (Twoja), "sdk-cli" to `claude -p`,
 # "sdk-ts" i "sdk-py" to Agent SDK; zmierzone 09.10 na 340 transkryptach, każdy z jedną wartością
 ENTRYPOINT_RE = re.compile(rb'"entrypoint"\s*:\s*"([^"]*)"')
-LOGIN_ITEMS = re.compile(r"Claude Code-credentials|Orca Claude Code Managed Credentials|claude-acc-[a-z]+")
+# wpisy kont: Claude Code, kopie kont każdego hosta z tego Maca (Orca, Pod) i nasze
+LOGIN_ITEMS = re.compile(
+    "|".join(["Claude Code-credentials"] + [re.escape(s) for s in orcahost.keychain_services()] + ["claude-acc-[a-z]+"])
+)
 SECURITY_READ = re.compile(r"find-(?:generic|internet)-password|dump-keychain|(?<![\w-])export(?![\w-])|\s-[a-zA-Z]*[wg]\b")
 TOKEN_CALL = re.compile(r"(?<![\w.-])(?:claude-acc|accswitch(?:\.py)?)['\"]?\s+token(?![\w.-])")
 SECRETISH = re.compile(r"sk-ant-[A-Za-z0-9_-]+|[0-9a-fA-F]{40,}")

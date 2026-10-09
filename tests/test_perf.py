@@ -23,12 +23,18 @@ import unittest
 import uuid
 from unittest import mock
 
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "perf.py")
 ACC = os.path.join(ROOT, "acc.py")
 sys.path.insert(0, ROOT)
 
+import orcahost
 import perf
 
 
@@ -49,6 +55,9 @@ class FakeSystem:
 
     def rtk_hook(self):
         return self.rtk
+
+    def claude_plugin(self, *args):
+        return 1, "claude nie jest dostępny w testach"
 
     def rtk_path(self):
         return "/opt/homebrew/bin/rtk" if self.rtk else None
@@ -134,6 +143,12 @@ class Isolated(unittest.TestCase):
         patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # security-slim czyta wtyczki Claude Code i pisze marketplace w katalogu stanu: tu puste kopie
+        slim = perf.tweak("security-slim")
+        for attr, value in (("claude_dir", "dot-claude"), ("out_dir", "plugins")):
+            patcher = mock.patch.object(slim, attr, os.path.join(self.dir, value))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # siatka bezpieczeństwa: prawdziwe ustawienia Claude nie mogą się zmienić w teście
         self.real_settings = self.stamp(os.path.expanduser("~/.claude/settings.json"))
         patcher = mock.patch.object(
@@ -401,19 +416,28 @@ class RootRecordTest(Isolated):
         self.assertEqual(perf.pending_manual(state), [])
 
 
+def pod_host():
+    """Pod z własnym katalogiem hooków, jak gdyby fork go przemianował."""
+    return orcahost.orca()._replace(kind="pod", name="Pod", app="/Applications/Pod.app", executable="Pod",
+                                    bundle_id="codes.pod.app")
+
+
 class OrcaStartedTest(unittest.TestCase):
     def test_parses_etime(self):
-        main = "/Applications/Orca.app/Contents/MacOS/Orca"
-        procs = {7: "/usr/bin/other", 9: main + " --flag"}
-        for etime, seconds in (("05:10", 310), ("01:00:00", 3600), ("2-00:00:01", 172801)):
-            with mock.patch.object(perf, "own_processes", return_value=procs), mock.patch.object(
-                perf.janitor, "run", return_value=f"   {etime}\n"
-            ) as run:
-                started = perf.orca_started()
-            self.assertEqual(run.call_args[0][0][-1], "9")
-            self.assertAlmostEqual(time.time() - started, seconds, delta=2)
-        with mock.patch.object(perf, "own_processes", return_value={7: "/usr/bin/other"}):
-            self.assertIsNone(perf.orca_started())
+        for host in (orcahost.orca(), pod_host()):
+            main = orcahost.main_path(host)
+            other = orcahost.main_path(pod_host() if host.kind == "orca" else orcahost.orca())
+            procs = {7: "/usr/bin/other", 8: other, 9: main + " --flag"}
+            for etime, seconds in (("05:10", 310), ("01:00:00", 3600), ("2-00:00:01", 172801)):
+                with mock.patch.object(perf, "HOST", host), mock.patch.object(perf, "ORCA_APP", host.app), \
+                        mock.patch.object(perf, "own_processes", return_value=procs), \
+                        mock.patch.object(perf.janitor, "run", return_value=f"   {etime}\n") as run:
+                    started = perf.orca_started()
+                self.assertEqual(run.call_args[0][0][-1], "9", host.name)
+                self.assertAlmostEqual(time.time() - started, seconds, delta=2)
+            with mock.patch.object(perf, "HOST", host), mock.patch.object(perf, "ORCA_APP", host.app), \
+                    mock.patch.object(perf, "own_processes", return_value={7: "/usr/bin/other", 8: other}):
+                self.assertIsNone(perf.orca_started(), host.name)
 
 
 class GatekeeperTest(unittest.TestCase):
@@ -1985,6 +2009,29 @@ class TetherProfileTest(Isolated):
             link = perf.link_now()
         self.assertEqual((link["tethered"], link["port"]), (False, "Wi-Fi"))
 
+    def test_link_command_gives_the_panel_tether_profiles_answer(self):
+        """2026-10-09: panel pisał "Not on a hotspot" na hotspocie z iPhone'a, bo pytał macOS,
+        czy ścieżka jest droga, zamiast reguły tether-profile. Teraz pyta `perf link --json`;
+        po Wi-Fi do iPhone'a (brama 172.20.10.1) słyszy "tethered" z tej samej reguły, która
+        włącza tether-profile."""
+        self.write(self.claude, claude_settings())
+        ports = "Hardware Port: Wi-Fi\nDevice: en0\n\nHardware Port: iPhone USB\nDevice: en8\n"
+
+        def run(args, **kw):
+            if args[0] == "route":
+                return "   route to: default\n  gateway: 172.20.10.1\n  interface: en0\n"
+            return ports
+
+        with mock.patch.object(perf.janitor, "run", side_effect=run):
+            code, out = self.run_cmd(perf.cmd_link, "--json")
+            profile = perf.tweak("tether-profile")
+            record, _ = profile.apply(self.cfg, perf.System())
+        link = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual((link["tethered"], link["port"], link["iface"]), (True, "Wi-Fi", "en0"))
+        self.assertEqual(record["link"]["tethered"], link["tethered"])
+        self.assertIs(perf.COMMANDS["link"], perf.cmd_link)
+
 
 class SubagentCacheTest(Isolated):
     def test_setting_added_and_removed_exactly(self):
@@ -2208,6 +2255,51 @@ class DockerIdleTest(Isolated):
 
     def test_not_in_ultra(self):
         self.assertNotIn("docker-idle", perf.ULTRA)
+
+
+class HostFixtureTest(unittest.TestCase):
+    """Orca i Pod obok siebie: hooki obu idą w tle, etykiety i krok devtools mówią o hoście."""
+
+    def test_one_shared_hook_folder_named_after_the_owner(self):
+        """Pod zostaje przy ~/.orca: jeden katalog hooków statusu, w tle jak dotąd. Gdy claude-acc należy do
+        Pod (owner.json), ten katalog nosi jego hooki i panel podpisuje go Pod."""
+        with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
+            hosts = orcahost.hook_hosts([orcahost.orca(), pod_host()])
+        self.assertEqual(hosts, {".orca/agent-hooks": "Orca"})
+        entries = perf.host_async_hooks(hosts)
+        self.assertEqual({e["match"] for e in entries}, {".orca/agent-hooks/claude-hook"})
+        self.assertEqual(len(entries), len(perf.HOST_HOOK_EVENTS))
+        self.assertLessEqual({e["match"] for e in entries}, {e["match"] for e in perf.DEFAULT_CONFIG["async_hooks"]})
+        owned = {"owner": "pod", "version": "1.29.2", "app": None, "at": 0}
+        with mock.patch.object(orcahost, "owned_by_pod", return_value=owned):
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), pod_host()]), {".orca/agent-hooks": "Pod"})
+        # Pod, który zgłosi własny katalog (ClaudeAccHost hooksDir), dokłada go obok
+        canary = pod_host()._replace(name="Pod Canary", hooks=".pod-canary/agent-hooks")
+        with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
+            hosts = orcahost.hook_hosts([orcahost.orca(), canary])
+        self.assertEqual(hosts[".pod-canary/agent-hooks"], "Pod Canary")
+        self.assertEqual(len(perf.host_async_hooks(hosts)), 2 * len(perf.HOST_HOOK_EVENTS))
+
+    def test_hook_label_names_the_host(self):
+        hook = '/bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"'
+        for owner_name in ("Orca", "Pod"):
+            with mock.patch.object(perf, "HOST_HOOKS", {".orca/agent-hooks": owner_name}):
+                self.assertEqual(perf.hook_label(hook), owner_name)
+
+    def test_devtools_follows_the_host_app(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        state = {"applied": {}, "bench": {}, "ultra": {"results": {}}}
+        for host in (orcahost.orca(), pod_host()):
+            app = os.path.join(tmp, os.path.basename(host.app))
+            os.makedirs(app, exist_ok=True)
+            with self.subTest(host=host.name), mock.patch.object(perf, "HOST", host._replace(app=app)), \
+                    mock.patch.object(perf, "ORCA_APP", app), mock.patch.object(perf, "orca_started", return_value=None):
+                state["bench"] = {"gatekeeper": {"result": {"responsible": host.name, "penalty_ms": 0.5}}}
+                self.assertNotIn("devtools", perf.pending_manual(state))
+                other = "Pod" if host.kind == "orca" else "Orca"
+                state["bench"] = {"gatekeeper": {"result": {"responsible": other, "penalty_ms": 0.5}}}
+                self.assertIn("devtools", perf.pending_manual(state))
 
 
 if __name__ == "__main__":

@@ -38,13 +38,16 @@ import os
 import re
 import shlex
 
+import orcahost
+
 MB = 1024**2
 GB = 1024**3
 MINUTE = 60
 
-# komendy, które nigdy nie giną (to samo co SACRED strażnika plus aplikacje i nasze demony)
+# komendy, które nigdy nie giną (to samo co SACRED strażnika plus aplikacje i nasze demony);
+# aplikacje hosta (Orca, Pod) daje orcahost
 NEVER = re.compile(
-    r"(^|/)(claude|codex|login|launchd)(\s|$)|Orca\.app|^-?(\S*/)?(zsh|bash|fish|sh)(\s|$)"
+    r"(^|/)(claude|codex|login|launchd)(\s|$)|" + orcahost.APPS + r"|^-?(\S*/)?(zsh|bash|fish|sh)(\s|$)"
     r"|^/Applications/(?!.*(Chrome for Testing|--headless))|^/System/|^/usr/(libexec|sbin|bin)/"
     r"|^/Library/|\.local/share/claude-acc/|memory-guard\.py|com\.docker|Docker\.app"
     r"|WindowServer|^\("

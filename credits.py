@@ -476,12 +476,14 @@ def ask_key(email):
         f"Paste the API key of the Claude Console organization linked to {email}. "
         "It goes straight to your Keychain."
     )
+    # prompt idzie jako argument skryptu, nie w jego treści (json.dumps psuje AppleScriptowi nie-ASCII)
     script = (
-        f'display dialog {json.dumps(prompt)} default answer "" with hidden answer '
+        'display dialog (item 1 of argv) default answer "" with hidden answer '
         'with title "claude-acc credits" buttons {"Cancel", "Save"} default button "Save"'
     )
     out = subprocess.run(
-        [shutil.which("osascript") or "/usr/bin/osascript", "-e", script, "-e", "text returned of result"],
+        [shutil.which("osascript") or "/usr/bin/osascript", "-e", "on run argv", "-e", script,
+         "-e", "text returned of result", "-e", "end run", "--", prompt],
         capture_output=True, text=True,
     )  # fmt: skip
     if out.returncode != 0:

@@ -1,0 +1,38 @@
+{
+  "manifestVersion": 1,
+  "id": "claude-acc",
+  "publisher": "outof-place",
+  "name": "Claude Acc",
+  "version": "1.29.3",
+  "description": "claude-acc in Orca: Claude account limits and switching, dev servers per worktree, the build scheduler queue and Mac health, with commands for each.",
+  "author": { "name": "outof-place", "url": "https://github.com/outof-place/claude-acc" },
+  "repository": "https://github.com/outof-place/claude-acc",
+  "engines": { "orca": ">=1.4.0" },
+  "pluginApi": 1,
+  "main": "worker.mjs",
+  "contributes": {
+    "panels": [{ "id": "claude-acc", "title": "Claude Acc", "icon": "gauge", "entry": "panel/index.html" }],
+    "commands": [
+      { "id": "claude-acc.status", "title": "Claude Acc: Show status" },
+      { "id": "claude-acc.switch-next", "title": "Claude Acc: Switch to the next account" },
+      { "id": "claude-acc.resume", "title": "Claude Acc: Resume paused sessions" },
+      { "id": "claude-acc.pause-toggle", "title": "Claude Acc: Toggle pause at the limit" },
+      { "id": "claude-acc.drain-toggle", "title": "Claude Acc: Toggle draining accounts" },
+      { "id": "claude-acc.restart-dev-server", "title": "Claude Acc: Restart this worktree's dev server", "context": "worktree" },
+      { "id": "claude-acc.stop-dev-server", "title": "Claude Acc: Stop this worktree's dev server", "context": "worktree" },
+      { "id": "claude-acc.cancel-builds", "title": "Claude Acc: Cancel this worktree's builds", "context": "worktree" },
+      { "id": "claude-acc.clean", "title": "Claude Acc: Clean up now" },
+      { "id": "claude-acc.update", "title": "Claude Acc: Update tools now" },
+      { "id": "claude-acc.ultra-toggle", "title": "Claude Acc: Toggle Ultra" },
+      { "id": "claude-acc.dictate", "title": "Claude Acc: Toggle dictation" },
+      { "id": "claude-acc.awake-toggle", "title": "Claude Acc: Toggle Stay Awake" }
+    ],
+    "events": [{ "on": "agent.status.changed" }, { "on": "worktree.created" }, { "on": "worktree.removed" }]
+  },
+  "capabilities": [
+    { "kind": "workspace:read" },
+    { "kind": "notifications:show" },
+    { "kind": "storage" },
+    { "kind": "events:subscribe" }
+  ]
+}

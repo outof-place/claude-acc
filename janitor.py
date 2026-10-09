@@ -163,14 +163,26 @@ def log(line, path=LOG_PATH):
 
 
 def notify(title, text):
-    subprocess.run(
+    # tekst i tytuł idą jako argumenty skryptu, nie w jego treści: json.dumps zamieniłby "ą" na \u0105,
+    # którego AppleScript nie rozumie
+    out = subprocess.run(
         [
             "osascript",
             "-e",
-            f"display notification {json.dumps(text)} with title {json.dumps(title)}",
+            "on run argv",
+            "-e",
+            "display notification (item 1 of argv) with title (item 2 of argv)",
+            "-e",
+            "end run",
+            "--",
+            text,
+            title,
         ],
         capture_output=True,
+        text=True,
     )
+    if out.returncode != 0:
+        log(f"osascript nie pokazał powiadomienia ({out.returncode}): {out.stderr.strip()}")
 
 
 def write_json(path, data, **kwargs):
@@ -684,16 +696,26 @@ def task_node_modules(sw, scan):
                 sw.pnpm_prune = True
 
 
+def tmp_leftover(name):
+    """Co przerwany proces zostawia w $TMPDIR: katalogi robocze `go build`/`go test` i linkera Go
+    (po kilka GB) oraz ślady xctrace/Instruments (*.ktrace, po kilkaset MB)."""
+    return name.startswith(("go-build", "go-link-")) or (
+        name.startswith("instruments") and name.endswith(".ktrace")
+    )
+
+
 def task_tmp(sw, _scan):
-    """Katalogi go-build* po `go test`, które przerwany proces zostawia w $TMPDIR (po kilka GB)."""
+    """Śmieci w $TMPDIR (tmp_leftover) nieruszane od 6 godzin i bez procesu, który ich używa."""
     since = time.time() - 6 * HOUR
-    for path in glob.glob(os.path.join(user_tmpdir(), "go-build*")):
-        if not os.path.isdir(path) or mtime(path) > since:
+    root = user_tmpdir()
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not tmp_leftover(name) or mtime(path) > since:
             continue
         if sw.usage.busy(path) or recently_changed(path, since):
             sw.skip("tmp", path, "w użyciu")
         else:
-            sw.remove("tmp", path, lambda n: n.startswith("go-build"))
+            sw.remove("tmp", path, tmp_leftover)
 
 
 def trim_oldest(root, keep_bytes, dry_run=False):
@@ -1288,7 +1310,9 @@ def run_sweep(cfg, state, started, dry_run, force):
     alerts = [{"kind": "task_failed", "task": t, "error": e} for t, e in sw.failures]
     if free < cfg["low_disk_gb"] * GB:
         warnings.append(f"Na dysku zostało tylko {human(free)}")
-        alerts.append({"kind": "low_disk", "free": free})
+        # próg jedzie z alertem: panel czyta dysk co minutę i chowa alert, gdy znów jest ponad nim,
+        # zamiast pokazywać godzinami liczbę z tego przebiegu (2026-10-09: "9,3 GB" przy 44 GB)
+        alerts.append({"kind": "low_disk", "free": free, "limit": cfg["low_disk_gb"] * GB})
     if "scan" in cached:
         indexed = spotlight_indexed(cached["scan"])
         if indexed:

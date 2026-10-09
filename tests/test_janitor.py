@@ -16,6 +16,12 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "janitor.py")
@@ -128,6 +134,23 @@ class GoCacheTrimTest(unittest.TestCase):
         self.assertEqual(len([a for a, p in paths if os.path.exists(p)]), 4)
 
 
+class NoRealBannerTest(unittest.TestCase):
+    """Przebieg z mało miejsca woła atrapę osascript, nigdy prawdziwego: inaczej każdy przebieg
+    testów (nowy $HOME, więc nowa deduplikacja) pokazywałby Filipowi prawdziwy baner."""
+
+    def test_low_disk_sweep_reaches_the_fake_osascript(self):
+        env = Env()
+        self.addCleanup(env.cleanup)
+        env.config(low_disk_gb=10**6)  # każdy dysk ma mniej
+        log = os.path.join(env.home, "osascript.log")
+        with mock.patch.dict(os.environ, {"CLAUDE_ACC_TEST_OSASCRIPT_LOG": log}):
+            self.assertEqual(os.path.dirname(shutil.which("osascript")), os.path.join(HERE, "fakes-osascript"))
+            env.sweep()
+
+        with open(log) as f:
+            self.assertIn("Mało miejsca na dysku", f.read())
+
+
 class JanitorTest(unittest.TestCase):
     def setUp(self):
         self.env = Env()
@@ -151,6 +174,19 @@ class JanitorTest(unittest.TestCase):
         self.addCleanup(stop)
         time.sleep(0.3)
         return proc
+
+    def test_low_disk_alert_carries_its_limit_for_the_panel(self):
+        """Panel pokazuje alert z odczytem sprzed nawet 3 godzin; z progiem w alercie porównuje
+        go z bieżącym odczytem i chowa, gdy miejsca znów jest dość."""
+        self.env.config(protect=[], low_disk_gb=1_000_000)  # każdy dysk jest poniżej
+        # świeże powiadomienie: przebieg testowy nie wyśle prawdziwego do Centrum powiadomień
+        with open(os.path.join(self.env.state_dir, "janitor-state.json"), "w") as f:
+            json.dump({"low_disk_alert_at": time.time()}, f)
+        self.env.sweep()
+        low = [a for a in self.env.state()["alerts"] if a["kind"] == "low_disk"]
+        self.assertEqual(len(low), 1)
+        self.assertEqual(low[0]["limit"], 1_000_000 * 1024**3)
+        self.assertGreater(low[0]["free"], 0)
 
     def test_idle_next_goes_fresh_stays(self):
         self.app("idle")
@@ -449,6 +485,49 @@ class DerivedDataTest(unittest.TestCase):
         self.assertEqual([path for _, path, _ in self.sw.items], [os.path.join(self.derived, "Old-abc")])
 
 
+class TmpLeftoversTest(unittest.TestCase):
+    """Przerwane narzędzia zostawiają w $TMPDIR katalogi i ślady po kilkaset MB: idą po 6 h bez zmian.
+    2026-10-09 leżało tam 2,1 GB śladów xctrace sprzed doby i 0,6 GB katalogu linkera Go."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="tmp-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patched = {"user_tmpdir": lambda: self.tmp, "log": lambda line, path=None: None}
+        for name, value in patched.items():
+            self.addCleanup(setattr, janitor, name, getattr(janitor, name))
+            setattr(janitor, name, value)
+        self.sw = janitor.Sweep(dict(janitor.DEFAULT_CONFIG), dry_run=False)
+
+    def leftover(self, name, hours_old, is_dir=True):
+        path = os.path.join(self.tmp, name)
+        target = os.path.join(path, "a.out") if is_dir else path
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w") as f:
+            f.write("x" * 4096)
+        stamp = time.time() - hours_old * 3600
+        os.utime(target, (stamp, stamp))
+        if is_dir:
+            os.utime(path, (stamp, stamp))
+
+    def test_stale_leftovers_go_fresh_and_foreign_stay(self):
+        self.leftover("go-build123", 7)
+        self.leftover("go-link-456", 7)
+        self.leftover("instrumentsAbc.ktrace", 7, is_dir=False)
+        self.leftover("go-link-789", 1)
+        self.leftover("instrumentsXyz.ktrace", 1, is_dir=False)
+        self.leftover("instruments-notes.txt", 7, is_dir=False)
+        self.leftover("com.example.ShipIt.x", 7)
+        self.janitor.task_tmp(self.sw, None)
+        self.assertEqual(
+            sorted(os.listdir(self.tmp)),
+            ["com.example.ShipIt.x", "go-link-789", "instruments-notes.txt", "instrumentsXyz.ktrace"],
+        )
+
+
 def compressed(path):
     return bool(os.stat(path).st_flags & stat.UF_COMPRESSED)
 
@@ -682,7 +761,6 @@ class OptimizeTest(unittest.TestCase):
             ("NSGlobalDomain", "KeyRepeat"): "2",
         }
         self.calls = []
-        from unittest import mock
 
         def run(cmd, timeout=600):
             if cmd[:2] == ["defaults", "read"]:

@@ -9,9 +9,10 @@ import Observation
 final class Awake {
     /// Manual session: until a date, or `.distantFuture` for "until I turn it off".
     private(set) var manualUntil: Date?
-    /// macOS marks a path "expensive" for every hotspot: an iPhone over Wi-Fi or USB,
-    /// an Android with the metered hint, any network in Low Data Mode.
+    /// The default route goes through the phone, by the rule tether-profile acts on (`perf.py
+    /// link`). It used to be the path's "expensive" flag: a second rule, and the two disagreed.
     private(set) var onHotspot = false
+    /// The hardware port the hotspot comes through: "iPhone USB", "Wi-Fi", "Bluetooth PAN".
     private(set) var hotspotVia: String?
     @ObservationIgnored private(set) var lastKeepAlive: Date?
     private(set) var keepAliveFailing = false
@@ -36,6 +37,13 @@ final class Awake {
     @ObservationIgnored private let preview: Bool
     /// The `until` last sent to the daemon, 0 for no request; nil before the first write.
     @ObservationIgnored private var lidRequested: Double?
+    @ObservationIgnored private var linkChecking = false
+    /// The path changed again during a check: one more check follows it.
+    @ObservationIgnored private var linkChanged = false
+    /// The last check got no answer (perf.py missing or failing): the next tick asks again.
+    @ObservationIgnored private var linkUnknown = false
+    /// The state file's last contents without its timestamp: rewritten only when they change.
+    @ObservationIgnored private var publishedState: [String: AnyHashable]?
 
     private static let probe = URL(string: "http://captive.apple.com/hotspot-detect.html")!
     private static let session: URLSession = {
@@ -45,7 +53,8 @@ final class Awake {
         return URLSession(configuration: config)
     }()
 
-    init(preview: Bool = false) {
+    /// `link`: a panel render shows the route `perf keep` last saw, without acting on it.
+    init(preview: Bool = false, link: TetherLink? = nil) {
         autoOnHotspot = defaults.object(forKey: "awake.autoOnHotspot") as? Bool ?? true
         keepDisplayOn = defaults.bool(forKey: "awake.keepDisplayOn")
         keepHotspotAlive = defaults.object(forKey: "awake.keepHotspotAlive") as? Bool ?? true
@@ -53,19 +62,16 @@ final class Awake {
         self.preview = preview
         let until = defaults.double(forKey: "awake.until")
         manualUntil = until > 0 ? Date(timeIntervalSince1970: until) : nil
-        guard !preview else { return }
-        monitor.pathUpdateHandler = { [weak self] path in
-            let hotspot = path.status == .satisfied && path.isExpensive
-            let via: String? = if path.usesInterfaceType(.wifi) {
-                "Wi-Fi"
-            } else if path.usesInterfaceType(.wiredEthernet) {
-                "USB"
-            } else if path.usesInterfaceType(.cellular) {
-                "cellular"
-            } else {
-                nil
+        guard !preview else {
+            if let link, link.tethered {
+                onHotspot = true
+                hotspotVia = link.via
             }
-            Task { @MainActor in self?.pathChanged(hotspot: hotspot, via: via) }
+            return
+        }
+        // the monitor only says when the route may have changed; perf.py says where it goes
+        monitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor in self?.checkLink() }
         }
         monitor.start(queue: DispatchQueue(label: "claude-acc.awake.path"))
         ticker = Task { [weak self] in
@@ -93,7 +99,37 @@ final class Awake {
         apply()
     }
 
+    /// `claude-acc awake` opens claude-acc://awake/<on|off|toggle>[?for=<seconds>] in the background.
+    func command(_ url: URL) {
+        let seconds = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+            .first { $0.name == "for" }?.value.flatMap(TimeInterval.init).flatMap { $0 > 0 ? $0 : nil }
+        switch url.lastPathComponent {
+        case "on": stayAwake(for: seconds)
+        case "off": turnOff()
+        default: isOn ? turnOff() : stayAwake(for: seconds)
+        }
+    }
+
     // MARK: Internals
+
+    /// Asks perf.py where the default route goes (about 0.4 s, off the main actor); path changes
+    /// that come in the meantime fold into one more check.
+    private func checkLink() {
+        guard !linkChecking else {
+            linkChanged = true
+            return
+        }
+        linkChecking = true
+        linkChanged = false
+        Task {
+            let result = await CLI.run(["link", "--json"], script: CLI.perf)
+            let link = result.status == 0 ? Store.decode(TetherLink.self, from: Data(result.stdout.utf8)) : nil
+            linkChecking = false
+            linkUnknown = link == nil
+            if let link { pathChanged(hotspot: link.tethered, via: link.via) }
+            if linkChanged { checkLink() }
+        }
+    }
 
     private func pathChanged(hotspot: Bool, via: String?) {
         if !hotspot { hotspotDismissed = false }
@@ -109,6 +145,7 @@ final class Awake {
             manualUntil = nil
             save()
         }
+        if linkUnknown { checkLink() }
         apply()
         if onHotspot && keepHotspotAlive && isOn {
             await keepAlive()
@@ -138,6 +175,34 @@ final class Awake {
         set(&systemAssertion, type: "PreventUserIdleSystemSleep", on: isOn)
         set(&displayAssertion, type: "PreventUserIdleDisplaySleep", on: isOn && keepDisplayOn)
         requestLid()
+        publishState()
+    }
+
+    /// What the menu bar shows, for `claude-acc awake status` and the Orca plugin. Only this pid
+    /// holds the assertions, so a reader checks it is still alive before trusting `on`.
+    private func publishState() {
+        guard !preview else { return }
+        let forever = manualUntil == .distantFuture
+        var state: [String: AnyHashable] = [
+            "on": isOn,
+            "manual": manualActive,
+            "forever": manualActive && forever,
+            "hotspot": hotspotActive,
+            "on_hotspot": onHotspot,
+            "auto_on_hotspot": autoOnHotspot,
+            "keep_display": keepDisplayOn,
+            "lid_closed": lidClosed,
+            "pid": Int(getpid()),
+        ]
+        if manualActive, !forever, let until = manualUntil { state["until"] = until.timeIntervalSince1970 }
+        if let hotspotVia { state["via"] = hotspotVia }
+        guard state != publishedState else { return }
+        var file = state
+        file["updated_at"] = Date.now.timeIntervalSince1970
+        guard let data = try? JSONSerialization.data(withJSONObject: file, options: [.sortedKeys]),
+              (try? data.write(to: URL(fileURLWithPath: CLI.awakeState), options: .atomic)) != nil
+        else { return }
+        publishedState = state
     }
 
     /// An assertion stops idle sleep only: a closed lid sleeps a MacBook on battery anyway. The fan

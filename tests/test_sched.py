@@ -25,6 +25,11 @@ import time
 import unittest
 from unittest import mock
 
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "sched.py")
@@ -830,6 +835,34 @@ class BackfillTest(Paths):
             st["queue"] = [dict(j) for j in queue]
             self.assertEqual(S.plan(st, self.cfg, time.time()),
                              {"ruff": ("overtake", "build"), "pytest": ("overtake", "build")}, why)
+
+    def test_overdue_job_whose_memory_the_head_does_not_need_keeps_its_start_predictable(self):
+        """2026-10-09 18:26 (zrzut state.json): głowa e2e (5,76 GB przy 4,7 wolnych) czekała na koniec
+        next build (11,6 GB, za ~90 s), a obok biegł pytest (0,08 GB, prognoza 2,2 s) już 4 s. Przez
+        niego start głowy był „nie do przewidzenia”, choć zmieściłaby się i bez jego pamięci, więc
+        go test jednego pakietu (4,65 GB, 23 s), który skończyłby się przed nią, stał w kolejce: dla
+        ścieżki „short” jest za ciężki."""
+
+        def case(overdue_gb, head_gb):
+            return self.blocked(26.5, [self.running("build", 11.6, 154, elapsed=62),
+                                       self.running("pytest", overdue_gb, 2.2, elapsed=4)],
+                                [self.queued("e2e", head_gb, 47.1, ago=705),
+                                 self.queued("gotest", 4.65, 23.4, ago=691)])
+
+        st = case(0.08, 5.76)
+        free = st["memory"]["free_for_admission_gb"]
+        self.assertTrue(4.65 <= free < 5.76, free)
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"gotest": ("overtake", "e2e")})
+        # e2e nie czeka na koniec pytest, ale ten może jeszcze biec obok niej: miejsce obok głowy
+        # to tylko to, co zwolni next build
+        shade = S.shadow(st, 5.76, free, time.time())
+        self.assertEqual((shade["sure"], shade["after"]), (True, ["build"]))
+        self.assertAlmostEqual(shade["wait_s"], 92, delta=1)
+        self.assertAlmostEqual(shade["spare_gb"], free + 11.6 - 5.76)
+        # głowa potrzebuje też pamięci joba po prognozie: jej start dalej nie do przewidzenia
+        # (po końcu obu zostaje 1,3 GB ponad jej potrzebę, a job po prognozie trzyma 2 GB)
+        self.assertEqual(S.plan(case(2.0, 17.0), self.cfg, time.time()), {})
+        self.assertEqual(S.plan(case(2.0, 16.0), self.cfg, time.time()), {"gotest": ("overtake", "e2e")})
 
     def test_native_jobs_and_a_held_native_head_keep_their_rules(self):
         st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600)], [
@@ -2318,6 +2351,51 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.state()["queue"], [])
         self.done(first)
 
+    def cancel(self, *args):
+        done = subprocess.run(
+            ["/usr/bin/python3", SCRIPT, "cancel", *args, "--json"],
+            cwd=self.repo, env=self.env, capture_output=True, text=True, timeout=30,
+        )
+        return done.returncode, json.loads(done.stdout) if done.stdout.strip() else None
+
+    def test_cancel_takes_a_queued_job_off_the_queue(self):
+        first = self.start("cd apps/charter-service && go vet ./...", sleep="4")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        late = self.start("cd apps/charter-service && go vet ./...")
+        self.wait_for(lambda: len(self.state()["queue"]) == 1)
+        jid = self.state()["queue"][0]["id"]
+        rc, out = self.cancel(jid)
+        self.assertEqual(rc, 0)
+        self.assertEqual([(j["id"], j["state"], j["result"]) for j in out["jobs"]], [(jid, "queued", "dequeued")])
+        rc_late, _, err = self.done(late)
+        self.assertEqual(rc_late, 130)
+        self.assertIn("anulowane", err)
+        st = self.state()
+        self.assertEqual(st["queue"], [])
+        self.assertEqual(len(st["running"]), 1)  # biegnący job nie dostał nic
+        self.assertEqual(self.done(first)[0], 0)
+        self.assertEqual(len([r for r in self.go_log() if r[0] == "start"]), 1)
+
+    def test_cancel_by_pane_signals_the_running_job(self):
+        p = self.start("cd apps/charter-service && go test ./internal/moneyfmt/", sleep="30",
+                       ORCA_PANE_KEY="tab-1:pane-a")
+        other = self.start("cd apps/charter-service && go test ./internal/money/", sleep="2",
+                           ORCA_PANE_KEY="tab-2:pane-b")
+        self.wait_for(lambda: len([r for r in self.go_log() if r[0] == "start"]) == 2)
+        rc, out = self.cancel("tab-1:pane-a")
+        self.assertEqual(rc, 0)
+        self.assertEqual([(j["state"], j["result"]) for j in out["jobs"]], [("running", "ended")])
+        rc_p, _, _ = self.done(p, timeout=10)
+        self.assertNotEqual(rc_p, 0)
+        self.assertEqual(self.done(other)[0], 0)  # cudzy panel biegnie dalej
+        rows = {r["label"]: r for r in self.history()}
+        self.assertTrue(rows["go test ./internal/moneyfmt/"]["cancelled"])
+        self.assertFalse(rows["go test ./internal/money/"]["cancelled"])
+
+    def test_cancel_with_nothing_matching(self):
+        rc, out = self.cancel("j-1-abcd")
+        self.assertEqual((rc, out["jobs"]), (1, []))
+
     def test_sigterm_reaches_the_command(self):
         p = self.start(
             "cd apps/charter-service && go test ./internal/moneyfmt/", sleep="30"
@@ -2435,6 +2513,39 @@ class RunTest(unittest.TestCase):
         )
         self.assertNotIn("_internal", data)
         self.assertEqual(data["recent"][0]["label"], "go test ./internal/moneyfmt/")
+
+
+class HostTest(Paths):
+    """Orca i Pod: CLI hosta po pełnej ścieżce to dalej to samo CLI, a panel agenta idzie z env."""
+
+    def test_host_cli_by_full_path_is_not_a_project_script(self):
+        import orcahost
+
+        for app, cli in ((orcahost.orca().app, "orca"), ("/Applications/Pod.app", "podx")):
+            for command in (f"{app}/Contents/Resources/bin/{cli} terminal list --json", f"{cli} worktree ps"):
+                with self.subTest(command=command):
+                    self.assertIsNone(S.classify(command, self.repo))
+
+    def test_standalone_fallback_matches_orcahost(self):
+        """sched.py wczytany bez __file__ i bez sąsiadów ma te same nazwy, co orcahost."""
+        import orcahost
+
+        self.assertEqual((S.HOST_CLIS, S.PANE_ENV), (orcahost.CLI_NAMES, orcahost.PANE_ENV))
+        code = (
+            "import sys\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "m = type(sys)('acc_sched')\n"
+            f"SourceFileLoader('acc_sched', {SCRIPT!r}).exec_module(m)\n"
+            "print('orcahost' in sys.modules, m.HOST_CLIS, m.PANE_ENV)\n"
+        )
+        out = subprocess.run([sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.strip(), f"False {orcahost.CLI_NAMES} {orcahost.PANE_ENV}")
+
+    def test_agent_pane_comes_from_the_host_env(self):
+        with mock.patch.dict(os.environ, {"ORCA_PANE_KEY": "tab-1:pane-2"}):
+            self.assertEqual(S.agent_info("abcdef123456", "worker")["pane"], "tab-1:pane-2")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(S.agent_info(None, None)["pane"])
 
 
 if __name__ == "__main__":
@@ -2661,6 +2772,27 @@ class CodexHookTest(unittest.TestCase):
         before = open(self.path).read()
         self.run_cmd("uninstall")
         self.assertEqual(open(self.path).read(), before)
+
+
+class CancelSafetyTest(unittest.TestCase):
+    """`cancel` wysyła sygnał tylko wrapperowi `sched.py run`: pid z wpisu mógł przejść na inny proces."""
+
+    def test_a_pid_that_is_not_a_wrapper_gets_no_signal(self):
+        sleeper = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(lambda: (sleeper.kill(), sleeper.wait()))
+        with mock.patch.object(os, "kill", wraps=os.kill) as kill:
+            self.assertFalse(S.signal_job({"pid": sleeper.pid}, signal.SIGTERM))
+            self.assertFalse(S.signal_job({"pid": None}, signal.SIGTERM))
+        self.assertEqual([c.args[1] for c in kill.call_args_list], [0])  # tylko sprawdzenie, czy żyje
+        # grupa, której lider nie jest dzieckiem wrappera z wpisu, zostaje w spokoju
+        self.assertFalse(S.kill_child({"pid": 1, "child_pgid": sleeper.pid}))
+        self.assertIsNone(sleeper.poll())
+
+    def test_wrapper_recognised_through_acc_launcher(self):
+        with mock.patch.object(S, "proc_args", return_value=["python", "/x/acc.py", "sched", "run"]):
+            self.assertTrue(S.is_wrapper(1))
+        with mock.patch.object(S, "proc_args", return_value=["python", "/x/acc.py", "devguard", "run"]):
+            self.assertFalse(S.is_wrapper(1))
 
 
 class NestedRunTest(unittest.TestCase):

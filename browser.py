@@ -63,6 +63,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 
 import mcpbase
+import orcahost
 
 VERSION = "1.0.0"
 HOME = os.path.expanduser("~")
@@ -2309,9 +2310,12 @@ def log(text):
 
 def notify(title, text):
     """Powiadomienie macOS: nie zabiera fokusu, w przeciwieństwie do aktywowania okna."""
-    script = f"display notification {json.dumps(text)} with title {json.dumps(title)}"
+    # tekst i tytuł idą jako argumenty skryptu, nie w jego treści: json.dumps zamieniłby "ą" na \u0105,
+    # którego AppleScript nie rozumie
+    cmd = ["osascript", "-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+           "-e", "end run", "--", text, title]
     try:
-        subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
 
@@ -3017,7 +3021,7 @@ def cmd_config(cmd, args):
 
 
 # sesja agenta, z której przyszło wywołanie z wiersza: zmienna i przedrostek właściciela, od najdokładniejszej
-CLI_SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), ("ORCA_TERMINAL_HANDLE", "orca"), ("TERM_SESSION_ID", "term"))
+CLI_SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), (orcahost.TERMINAL_ENV, "orca"), ("TERM_SESSION_ID", "term"))
 
 
 def cli_owner(env=None):

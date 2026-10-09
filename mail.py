@@ -392,12 +392,13 @@ def keychain_secret(account):
 
 def ask_password(prompt):
     """Hasło przez okno systemowe z ukrytym polem: nie przechodzi przez terminal agenta."""
+    # prompt idzie jako argument skryptu, nie w jego treści (json.dumps psuje AppleScriptowi nie-ASCII)
     script = (
-        f'display dialog {json.dumps(prompt)} default answer "" with hidden answer '
+        'display dialog (item 1 of argv) default answer "" with hidden answer '
         'with title "claude-acc mail" buttons {"Cancel", "Save"} default button "Save"'
     )
     out = subprocess.run(
-        ["osascript", "-e", script, "-e", "text returned of result"],
+        ["osascript", "-e", "on run argv", "-e", script, "-e", "text returned of result", "-e", "end run", "--", prompt],
         capture_output=True,
         text=True,
     )

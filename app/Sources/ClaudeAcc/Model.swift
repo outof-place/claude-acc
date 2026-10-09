@@ -4,6 +4,17 @@ let gigabyte = 1_073_741_824.0
 
 // MARK: - Accounts (`claude-acc status --json`)
 
+/// The IDE that holds the Claude accounts and runs the agents (orcahost.py): Orca, or Pod, its
+/// downstream. The accounts snapshot names it; until one arrives it is Orca.
+struct HostApp: Decodable, Equatable {
+    let name: String
+    let bundleId: String
+
+    static let orca = HostApp(name: "Orca", bundleId: "com.stablyai.orca")
+    /// What the panel calls it and where dictation pastes like into a terminal; `Store.show` keeps it.
+    static var current = orca
+}
+
 /// The script owns all account logic; the app only shows it and calls its commands.
 struct Snapshot: Decodable {
     let generatedAt: Double
@@ -14,8 +25,11 @@ struct Snapshot: Decodable {
     let apiBackoffUntil: Double?
     let lastTick: Double?
     let switchedAt: Double?
-    /// Account selected in Orca's menu. Auto-switch then stands still and switching is blocked.
+    /// Account selected in the host's menu (Orca's, Pod's). Auto-switch then stands still and switching
+    /// is blocked.
     let orcaSelected: String?
+    /// The app that holds the accounts. Missing from scripts before 1.26, which means Orca.
+    let host: HostApp?
     /// The limit pause: no account has headroom, so sessions wind down to a checkpoint.
     /// Missing from older scripts, which decodes as no pause.
     let pause: Pause?
@@ -135,9 +149,24 @@ struct JanitorState: Decodable {
     struct Alert: Decodable, Hashable {
         let kind: String
         let free: Double?
+        /// low_disk: janitor.py's `low_disk_gb` in bytes, the line the sweep found `free` under.
+        let limit: Double?
         let projects: [String]?
         let task: String?
         let error: String?
+
+        /// The free space a low-disk alert reports, nil when it has nothing to say. The sweep
+        /// measured `free` up to 3 hours ago (2026-10-09: "Only 9.3 GB left on disk" under a
+        /// card that read 44 GB), so with today's reading at hand the alert says that number,
+        /// and only while it is still under the janitor's limit.
+        func lowDiskFree(now disk: DiskSpace?) -> Double? {
+            guard kind == "low_disk" else { return nil }
+            guard let disk else { return free }
+            return disk.free < (limit ?? Self.defaultLimit) ? disk.free : nil
+        }
+
+        /// janitor.py's default `low_disk_gb`, for an alert from before the limit came with it.
+        private static let defaultLimit = 40 * gigabyte
     }
 
     let lastSweep: Sweep?
@@ -273,12 +302,14 @@ struct Ultra: Decodable {
         "devguard-max-server", "git-speed", "fast-npx-hooks", "claude-limits", "workflow-size", "claude-ui",
     ]
 
-    static let catalog: [String: Tweak] = [
+    /// Computed: the texts name the host app, which the accounts snapshot may change.
+    static var catalog: [String: Tweak] { [
         "bg-helpers": Tweak(
             title: "Background helpers", detail: "Helpers no agent waits on move to the efficiency cores",
             unit: "% of a P-core"),
         "claude-hooks-async": Tweak(
-            title: "Async hooks", detail: "Memory and Orca hooks stop holding up every tool call", unit: "ms per tool call"),
+            title: "Async hooks", detail: "Memory and \(HostApp.current.name) hooks stop holding up every tool call",
+            unit: "ms per tool call"),
         "claude-hooks-native": Tweak(
             title: "Native Bash hooks", detail: "The guard and rtk check each Bash command in ms, without Python or a shell",
             unit: "ms per Bash command"),
@@ -308,7 +339,8 @@ struct Ultra: Decodable {
             title: "More memory for the GPU", detail: "Local models stay on Metal, set again at every boot (root)",
             unit: "MiB for the GPU", isSetting: true),
         "devtools": Tweak(
-            title: "Go tests skip Gatekeeper", detail: "Orca is a developer tool, so fresh test binaries start without a check",
+            title: "Go tests skip Gatekeeper",
+            detail: "\(HostApp.current.name) is a developer tool, so fresh test binaries start without a check",
             unit: "ms first run of a new binary"),
         "vnodes": Tweak(
             title: "Bigger file cache", detail: "Three times the vnodes, set again at every boot (root)",
@@ -321,7 +353,7 @@ struct Ultra: Decodable {
         "devguard-max-server": Tweak(
             title: "Dev server size limit", detail: "The guard restarts a bloated server sooner", unit: "GB per server",
             isSetting: true),
-    ]
+    ] }
 
     /// A tweak this app doesn't know yet: its name in words, numbers shown plainly.
     static func tweak(_ name: String) -> Tweak {
@@ -329,7 +361,7 @@ struct Ultra: Decodable {
             title: name.replacingOccurrences(of: "-", with: " ").capitalized, detail: "", unit: "", isSetting: true)
     }
 
-    static let steps: [String: Step] = [
+    static var steps: [String: Step] { [
         "vnodes": Step(
             title: "Bigger file cache", detail: "The vnode cache is full, so every scan of node_modules starts cold. Needs root.",
             command: "claude-acc perf-root vnodes trial"),
@@ -341,17 +373,17 @@ struct Ultra: Decodable {
             detail: "Spotlight indexes package caches (~/Library/pnpm, ~/go) for nothing. Add them under Search Privacy.",
             command: nil, opensSpotlight: true),
         "devtools": Step(
-            title: "Make Orca a developer tool",
-            detail: "Every new Go test binary waits ~0.2 s for Gatekeeper. Click +, pick Orca, confirm with Touch ID.",
+            title: "Make \(HostApp.current.name) a developer tool",
+            detail: "Every new Go test binary waits ~0.2 s for Gatekeeper. Click +, pick \(HostApp.current.name), confirm with Touch ID.",
             command: nil,
             pane: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_DevTools"),
         "devtools-restart": Step(
-            title: "Restart Orca once",
-            detail: "Developer Tools applies to Orca started after the change. A restart closes the sessions in its terminals.",
+            title: "Restart \(HostApp.current.name) once",
+            detail: "Developer Tools applies to \(HostApp.current.name) started after the change. A restart closes the sessions in its terminals.",
             command: nil),
         "docker-quit": Step(title: "Quit Docker once", detail: "The new memory cap is written while Docker is closed.", command: nil),
         "docker-restart": Step(title: "Restart Docker", detail: "The new memory cap applies on its next start.", command: nil),
-    ]
+    ] }
 
     static func number(_ value: Double) -> String {
         value.formatted(.number.precision(.fractionLength(value < 10 && value != value.rounded() ? 1 : 0))
@@ -359,9 +391,26 @@ struct Ultra: Decodable {
     }
 }
 
-/// perf-state.json holds more (applied tweaks, benchmarks); the panel needs only Ultra.
+/// perf-state.json holds more (applied tweaks, benchmarks); the panel needs Ultra and, for a
+/// render, the default route `perf keep` last saw.
 struct PerfFile: Decodable {
     let ultra: Ultra?
+    let link: TetherLink?
+}
+
+// MARK: - The default route (`perf.py link --json`, and `link` in perf-state.json)
+
+/// Where the default route goes and whether that is the phone: the answer tether-profile acts
+/// on (perf.py `link_now`: an iPhone USB or Bluetooth PAN port, or the iPhone hotspot's gateway
+/// 172.20.10.1, also over Wi-Fi). Stay Awake shows and follows this instead of a rule of its own.
+struct TetherLink: Decodable, Equatable {
+    let tethered: Bool
+    /// The hardware port from networksetup: "iPhone USB", "Wi-Fi", "Bluetooth PAN".
+    let port: String?
+    let iface: String?
+
+    /// What the hotspot line says after "via": the port, or the interface when it has none.
+    var via: String? { port ?? iface }
 }
 
 // MARK: - Hotspot turbo (`hotspot-state.json`, written by the root hotspot daemon)

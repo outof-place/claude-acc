@@ -194,7 +194,7 @@ private struct ServerRow: View {
         .contentShape(.rect(cornerRadius: 14, style: .continuous))
         .onHover { hovering = $0 }
         .animation(.snappy(duration: 0.18), value: hovering)
-        .help(unit.command.map { "\($0)\n\(unit.terminal.map { "Orca terminal “\($0)”" } ?? unit.host)" } ?? "")
+        .help(unit.command.map { "\($0)\n\(unit.terminal.map { "\(HostApp.current.name) terminal “\($0)”" } ?? unit.host)" } ?? "")
     }
 
     private var dotColor: Color {
@@ -323,7 +323,7 @@ struct DiskCard: View {
                 Text(summary)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                ForEach(store.janitor?.alerts ?? [], id: \.self) { alert in
+                ForEach(alerts, id: \.self) { alert in
                     AlertRow(store: store, alert: alert)
                 }
             }
@@ -340,6 +340,11 @@ struct DiskCard: View {
                     .help("Delete unused build caches, stale node_modules and tool leftovers")
             }
         }
+    }
+
+    /// The last sweep's alerts; the low-disk one stays only while today's reading is still low.
+    private var alerts: [JanitorState.Alert] {
+        (store.janitor?.alerts ?? []).filter { $0.kind != "low_disk" || $0.lowDiskFree(now: store.disk) != nil }
     }
 
     private var running: Bool {
@@ -380,7 +385,7 @@ private struct AlertRow: View {
     private var text: String {
         switch alert.kind {
         case "low_disk":
-            return "Only \(Format.bytes(alert.free ?? 0)) left on disk"
+            return "Only \(Format.bytes(alert.lowDiskFree(now: store.disk) ?? 0)) left on disk"
         case "spotlight":
             let projects = alert.projects ?? []
             let more = projects.count > 3 ? " and \(projects.count - 3) more" : ""

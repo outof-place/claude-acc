@@ -3,14 +3,32 @@
 # automaty w launchd i aplikacja w pasku menu.
 #
 #   setup.sh --app "<ścieżka do Claude Acc.app>" [--fanctl <ścieżka do fanctl>] [--hook <ścieżka do claude-acc-hook>]
+#            [--orca-plugin]   wtyczka claude-acc w Orce (bez flagi tylko odświeża już zainstalowaną)
 #   setup.sh --uninstall   zdejmuje automaty, aplikację, komendę i hooki pauzy limitów;
 #                          stan i konfiguracja zostają
+#   --owner pod [--owner-app <Pod.app>]   instaluje aplikacja, która wozi claude-acc w sobie (paczka
+#                          z scripts/payload.sh); zapisuje $STATE/owner.json, po czym setup.sh bez
+#                          --owner pod (Homebrew, install.sh) odmawia z kodem 3 (owner.py)
 #
 # Woła go install.sh po zbudowaniu ze źródeł i `claude-acc-setup` z Homebrew, które podaje
 # swoją zbudowaną aplikację. Wiatraki (root) to osobny krok: install-fans.sh.
 # CLAUDE_ACC_NO_HOOKS=1 pomija hooki pauzy limitów w settings.json Claude Code.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
+
+# kto jest właścicielem instalacji: z owner.json w $STATE; obcy setup nie nadpisuje skryptów i hooków Pod
+OWNER=""
+OWNER_APP=""
+ARGS=("$@")
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+  case "${ARGS[i]}" in
+    --owner) OWNER="${ARGS[i + 1]:-}" ;;
+    --owner-app) OWNER_APP="${ARGS[i + 1]:-}" ;;
+  esac
+done
+if [ -f "$SRC/owner.py" ]; then
+  /usr/bin/python3 "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
+fi
 
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
@@ -21,12 +39,15 @@ APP_SRC=""
 FANCTL=""
 HOOK=""
 DESKTOP=""
+ORCA_PLUGIN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --app) APP_SRC="$2"; shift 2 ;;
     --fanctl) FANCTL="$2"; shift 2 ;;
     --hook) HOOK="$2"; shift 2 ;;
     --desktop) DESKTOP="$2"; shift 2 ;;
+    --orca-plugin) ORCA_PLUGIN=1; shift ;;
+    --owner|--owner-app) shift 2 ;;
     --uninstall)
       for job in $JOBS; do
         launchctl bootout "gui/$(id -u)" "$AGENTS/$job.plist" 2>/dev/null || true
@@ -51,6 +72,10 @@ while [ $# -gt 0 ]; do
       [ -f "$STATE/desktop.py" ] && /usr/bin/python3 "$STATE/desktop.py" uninstall >/dev/null 2>&1 || true
       # wspólne serwery MCP wracają do stdio w ~/.claude.json, zanim zniknie ich automat
       [ -f "$STATE/mcpshare.py" ] && /usr/bin/python3 "$STATE/mcpshare.py" unshare --all >/dev/null 2>&1 || true
+      # wtyczka w katalogu wtyczek Orki (zgoda i ustawienia Orki zostają)
+      [ -f "$STATE/orcaplugin.py" ] && /usr/bin/python3 "$STATE/orcaplugin.py" uninstall || true
+      # właściciel zdejmuje też swoje oznaczenie
+      [ -n "$OWNER" ] && rm -f "$STATE/owner.json"
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -65,6 +90,11 @@ cp "$SRC"/*.py "$STATE/"
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 # drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
 [ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
+# wtyczka Orki (orcaplugin.py instaluje ją stąd w katalogu wtyczek Orki); bez testów
+if [ -d "$SRC/orca-plugin" ]; then
+  rm -rf "$STATE/orca-plugin.new" && cp -R "$SRC/orca-plugin" "$STATE/orca-plugin.new" && rm -rf "$STATE/orca-plugin.new/test"
+  rm -rf "$STATE/orca-plugin" && mv "$STATE/orca-plugin.new" "$STATE/orca-plugin"
+fi
 # dyktowanie w aplikacji: słownik, dźwięki i nagranie do testu; własny słownik (slownik-user.txt),
 # nagrania czekające na ponowienie i log czasów zostają
 if [ -d "$SRC/dictation" ]; then
@@ -120,6 +150,11 @@ else
 fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
+# właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji
+if [ -n "$OWNER" ]; then
+  version="$(cat "$SRC/VERSION" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_SRC/Contents/Info.plist")"
+  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"}
+fi
 # bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
 # przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
 if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
@@ -128,10 +163,19 @@ if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
   "$STATE/python" "$STATE/acc.py" desktop install --refresh >/dev/null 2>&1 || true
   "$STATE/python" "$STATE/acc.py" hint sync >/dev/null 2>&1 || true
 fi
+# wtyczka Orki: z --orca-plugin instalacja, bez niej tylko odświeżenie tej, którą już zainstalowano
+# (ustawień Orki nie rusza; system wtyczek i zgodę włączasz w Orce)
+if [ -d "$STATE/orca-plugin" ]; then
+  if [ -n "$ORCA_PLUGIN" ]; then
+    "$STATE/python" "$STATE/acc.py" orcaplugin install || echo "wtyczka Orki: instalacja nieudana, szczegóły wyżej" >&2
+  else
+    "$STATE/python" "$STATE/acc.py" orcaplugin install --refresh || true
+  fi
+fi
 
 # jedna komenda na wszystko: konta, kredyty API (credits), porządki (mac, clean), strażnik (guard),
 # wydajność (perf, perf-root), wiatraki (fans), hotspot iPhone'a (hotspot), aktualizacje (update, updates),
-# wspólne serwery MCP (mcp),
+# wspólne serwery MCP (mcp), Stay Awake aplikacji (awake), wtyczka Orki (orca),
 # a `claude-acc uninstall` zdejmuje to, co postawił ten skrypt
 cat > "$HOME/.local/bin/claude-acc" <<'EOF'
 #!/bin/sh
@@ -153,6 +197,10 @@ case "$1" in
   browser) shift; exec "$PY" "$RUN" browser "$@" ;;
   # dyktowanie w aplikacji: toggle (domyślnie), start, stop, cancel; w tle, bez fokusu
   dictate) exec open -g "claude-acc://dictate/${2:-toggle}" ;;
+  # Stay Awake aplikacji: on [--for 2h], off, toggle, status [--json]; przez claude-acc://awake
+  awake) shift; exec "$PY" "$RUN" awake "$@" ;;
+  # wtyczka claude-acc w Orce: install, uninstall, status
+  orca) shift; exec "$PY" "$RUN" orcaplugin "$@" ;;
   desktop) shift; exec "$PY" "$RUN" desktop "$@" ;;
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
@@ -167,6 +215,8 @@ case "$1" in
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     # stan limitu GPU to tylko odczyt sysctl i plisty demona
     case "${1:-} ${2:-}" in "iogpu status" | "iogpu ") exec "$(cat "$STATE/source")/perf-root.sh" "$@" ;; esac
+    # już pod sudo (`sudo claude-acc perf-root ...`): drugie sudo nadpisałoby SUDO_USER rootem
+    [ "$(id -u)" -eq 0 ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
   fans)
     shift
@@ -207,3 +257,8 @@ open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
 echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+# host agentów (Orca albo Pod) według orcahost.py
+HOST_APP="$("$STATE/python" "$STATE/orcahost.py" app 2>/dev/null || true)"
+if [ -n "$HOST_APP" ] && { [ -d "$HOST_APP" ] || [ -d "$HOME/Applications/$(basename "$HOST_APP")" ]; }; then
+  echo "$(basename "$HOST_APP" .app): wtyczka claude-acc (pasek statusu, panel, komendy Cmd-J): claude-acc orca install"
+fi

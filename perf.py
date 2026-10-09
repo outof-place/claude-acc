@@ -34,6 +34,7 @@ Komendy:
   undo <nazwa>|--all                  cofnij
   ultra on|off|status [--json]        wszystkie poprawki dla agentów naraz i ich wyniki
   keep                                pilnuj włączonych poprawek (dla launchd co 5 min)
+  link [--json]                       którędy idzie trasa domyślna i czy to tethering (dla panelu)
   list                                poprawki z opisem i zmierzonym efektem
 """
 
@@ -48,6 +49,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 # calendar, plistlib, statistics, tempfile i expat są importowane w funkcjach pomiarów:
@@ -56,6 +58,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import janitor
+import orcahost
 
 STATE_DIR = janitor.STATE_DIR
 STATE_PATH = os.path.join(STATE_DIR, "perf-state.json")
@@ -772,6 +775,34 @@ def bench_network(runs=1, flags=()):
 # ---------- poprawki ----------
 
 HOME = janitor.HOME
+# host agentów (orcahost.py): Orca albo Pod, a obok wszystkie hosty z tego Maca, bo hooki
+# w settings.json zostawia każdy, który kiedyś działał
+HOSTS = orcahost.known()
+HOST = HOSTS[0]
+# katalogi hooków statusu z nazwą hosta: ~/.orca/agent-hooks (Pod też go używa; z Pod jako właścicielem
+# claude-acc podpisany Pod) i katalog, który host zgłosi sam
+HOST_HOOKS = orcahost.hook_hosts(HOSTS)
+# zdarzenia, na których hook statusu hosta tylko zgłasza stan sesji (async_hooks niżej)
+HOST_HOOK_EVENTS = (
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+)
+
+
+def host_async_hooks(dirs):
+    """Wpisy async_hooks dla hooków statusu z każdego katalogu (Orca i Pod mają osobne)."""
+    return [
+        {"event": event, "match": f"{hooks}/claude-hook"}
+        for hooks in dict.fromkeys(dirs)
+        for event in HOST_HOOK_EVENTS
+    ]
+
+
 CLAUDE_SETTINGS = os.path.join(HOME, ".claude/settings.json")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude/projects")
 DEVGUARD_CONFIG = os.path.join(STATE_DIR, "devguard.json")
@@ -829,18 +860,7 @@ DEFAULT_CONFIG = {
         },
         {"event": "Stop", "match": "cavemem/dist/index.js hook run stop"},
     ]
-    + [
-        {"event": event, "match": ".orca/agent-hooks/claude-hook"}
-        for event in (
-            "PreToolUse",
-            "PostToolUse",
-            "PostToolUseFailure",
-            "UserPromptSubmit",
-            "Stop",
-            "SubagentStart",
-            "SubagentStop",
-        )
-    ],
+    + host_async_hooks(HOST_HOOKS),
     # limity dev serwerów strażnika w Ultra: procent RAM na wszystkie (strażnik domyślnie
     # ma 35) i GB, powyżej których jeden serwer jest spuchnięty (domyślnie 5)
     "devguard_budget_percent": 25,
@@ -938,6 +958,26 @@ class System:
 
     def link(self):
         return link_now()
+
+    def claude_plugin(self, *args):
+        """`claude plugin ...` tak, jak robi to człowiek: (kod wyjścia, wyjście)."""
+        claude = (
+            os.environ.get("CLAUDE_ACC_CLAUDE_BIN")
+            or janitor.which("claude")
+            or os.path.join(HOME, ".local/bin/claude")
+        )
+        try:
+            done = subprocess.run(
+                [claude, "plugin", *args],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=janitor.ENV,
+                stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired) as err:
+            return 127, str(err)
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
 
     def docker_running(self):
         """Docker Desktop trzyma ustawienia w pamięci i nadpisuje plik; piszemy tylko bez niego."""
@@ -1300,8 +1340,9 @@ class AsyncHooks:
 def hook_label(command):
     if "cavemem" in command and "hook run " in command:
         return "cavemem " + command.split("hook run ")[-1].split()[0]
-    if ".orca/agent-hooks/" in command:
-        return "Orca"
+    hooks = next((d for d in HOST_HOOKS if f"{d}/" in command), None)
+    if hooks:
+        return HOST_HOOKS[hooks]
     # transkrypt zapisuje hook bez powłoki jako program i argumenty po spacji
     if PAUSE_HOOKS in command or f"{NATIVE_HOOK} pause " in command or f"{PAUSE_NATIVE} " in command:
         return "pauza limitów"
@@ -1576,8 +1617,8 @@ class Deferred(Exception):
     """Cofnięcie musi poczekać (Docker działa); `keep` dokończy je później."""
 
 
-ORCA_DATA = os.path.join(HOME, "Library/Application Support/orca/orca-data.json")
-ORCA_APP = "/Applications/Orca.app"
+ORCA_DATA = os.path.join(HOST.user_data, HOST.data_file)
+ORCA_APP = HOST.app
 # `git maintenance start` stawia harmonogram jako LaunchAgenty org.git-scm.git.{hourly,daily,weekly}
 GIT_MAINTENANCE_PLIST = os.path.join(HOME, "Library/LaunchAgents/org.git-scm.git.hourly.plist")
 
@@ -1901,6 +1942,355 @@ class TetherProfile(ClaudeEnvSet):
         if not link.get("tethered"):
             return f"czeka na tethering (teraz: {where})"
         return f"{where}: {super().describe(record, system)}"
+
+
+CLAUDE_DIR = os.path.join(HOME, ".claude")
+OFFICIAL_SECURITY = "security-guidance@claude-plugins-official"
+# ręczna wersja tej poprawki sprzed claude-acc 1.26 (2026-10-09): ta sama rzecz, więc ją zastępujemy
+SECURITY_PREDECESSOR = re.compile(r"sec-patterns@[\w.-]+")
+
+
+class SecuritySlim:
+    """Z security-guidance zostają tylko regexy na Edit/Write, w jednym Pythonie bez powłoki.
+
+    Oficjalna wtyczka przy wyłączonym przeglądzie LLM i tak daje tylko te ostrzeżenia, ale płaci
+    za nie bashem i dwoma Pythonami na każdej edycji i wiadomości, a jej 7 hooków Bash z `if:
+    Bash(git commit:*)` odpala się przy każdym poleceniu, którego Claude Code nie umie rozebrać
+    (`$(...)`, `$VAR`, `for`), czyli przy ~15% wywołań Basha.
+
+    claude-acc nie rozprowadza kodu Anthropic: przy włączeniu kopiuje `patterns.py` z
+    zainstalowanej wtyczki do własnego lokalnego marketplace'u (`plugins/` w katalogu stanu),
+    obok kładzie swój hook (hooks/sec_slim.py) i `source.py` z wersją źródła, rejestruje
+    marketplace i wtyczkę przez `claude plugin`, a oficjalną wyłącza w zakresie użytkownika.
+    hooks.json wskazuje pliki w marketplace ścieżką bezwzględną, nie kopię w cache Claude Code,
+    więc keep po aktualizacji security-guidance tylko podmienia `patterns.py`. Ręczną
+    poprzedniczkę (`sec-patterns@...`) wyłącza tak samo i przywraca przy cofnięciu."""
+
+    name = "security-slim"
+    group = "claude"
+    root = False
+    title = (
+        "security-guidance bez kosztu: te same ostrzeżenia na Edit/Write z jednego Pythona "
+        "(wtyczka security-slim@claude-acc z patterns.py zainstalowanej wersji), oficjalna "
+        "wyłączona w zakresie użytkownika"
+    )
+    effect = (
+        "edycja 90 -> 27 ms, wiadomość 225 -> 0 ms, hooki Bash i Stop znikają, ~7,6% -> ~0,1% "
+        "rdzenia w pracy; 17/17 identycznych odpowiedzi na próbkach (2026-10-09)"
+    )
+    MARKET = "claude-acc"
+    PLUGIN = "security-slim"
+    ID = "security-slim@claude-acc"
+    path = None  # ~/.claude/settings.json; testy podstawiają kopię
+    claude_dir = None  # ~/.claude (installed_plugins.json, ustawienia projektów)
+    out_dir = None  # lokalny marketplace claude-acc
+    python = None  # interpreter hooka; domyślnie ten sam co skryptów claude-acc
+
+    def settings_path(self):
+        return self.path or CLAUDE_SETTINGS
+
+    def market_dir(self):
+        return self.out_dir or os.path.join(STATE_DIR, "plugins")
+
+    def hooks_dir(self):
+        return os.path.join(self.market_dir(), self.PLUGIN, "hooks")
+
+    def interpreter(self):
+        if self.python:
+            return self.python
+        linked = os.path.join(STATE_DIR, "python")
+        return linked if os.access(linked, os.X_OK) else sys.executable
+
+    def installed(self):
+        """{id wtyczki: [wpisy instalacji]} z installed_plugins.json Claude Code."""
+        data, _ = read_json_file(os.path.join(self.claude_dir or CLAUDE_DIR, "plugins/installed_plugins.json"))
+        plugins = data.get("plugins") if isinstance(data, dict) else None
+        return plugins if isinstance(plugins, dict) else {}
+
+    def source(self):
+        """Zainstalowany security-guidance (najpierw zakres użytkownika): {"version", "path",
+        "sha256" patterns.py} albo None."""
+        entries = [e for e in self.installed().get(OFFICIAL_SECURITY) or [] if isinstance(e, dict)]
+        for entry in sorted(entries, key=lambda e: e.get("scope") != "user"):
+            path = entry.get("installPath") or ""
+            try:
+                with open(os.path.join(path, "hooks/patterns.py"), "rb") as f:
+                    digest = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                continue
+            return {"version": str(entry.get("version") or ""), "path": path, "sha256": digest}
+        return None
+
+    def reenabled_by(self):
+        """Pliki ustawień projektu i lokalne, które włączają oficjalną wtyczkę z powrotem
+        (wygrywają z zakresem użytkownika): ścieżki projektów z installed_plugins.json."""
+        names = {"project": "settings.json", "local": "settings.local.json"}
+        found = []
+        for entry in self.installed().get(OFFICIAL_SECURITY) or []:
+            name = names.get((entry or {}).get("scope"))
+            if not name or not entry.get("projectPath"):
+                continue
+            path = os.path.join(entry["projectPath"], ".claude", name)
+            data, _ = read_json_file(path) if os.path.isfile(path) else ({}, None)
+            plugins = data.get("enabledPlugins") if isinstance(data, dict) else None
+            if isinstance(plugins, dict) and plugins.get(OFFICIAL_SECURITY) is True and path not in found:
+                found.append(path)
+        return found
+
+    def files(self, src, python):
+        """{ścieżka: bajty} wszystkiego, co leży w marketplace."""
+        market, hooks = self.market_dir(), self.hooks_dir()
+        runner = os.path.join(hooks, "sec_slim.py")
+        with open(os.path.join(src["path"], "hooks/patterns.py"), "rb") as f:
+            patterns = f.read()
+        with open(os.path.join(REPO_HOOKS, "sec_slim.py"), "rb") as f:
+            code = f.read()
+        tag = "[from security-guidance@claude-code-plugins plugin]"
+        try:
+            with open(os.path.join(src["path"], "hooks/_base.py")) as f:
+                found = re.search(r'^PROVENANCE_TAG = ("[^"\n]*")$', f.read(), re.M)
+            tag = json.loads(found.group(1)) if found else tag
+        except (OSError, ValueError):
+            pass
+        try:
+            major, minor, patch = (int(x) for x in src["version"].split(".")[:3])
+            pv = major * 10000 + minor * 100 + patch
+        except ValueError:
+            pv = 0
+        about = f"the pattern warnings of {OFFICIAL_SECURITY} {src['version']}, without the rest"
+
+        def dump(data):
+            return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode()
+
+        return {
+            os.path.join(market, ".claude-plugin/marketplace.json"): dump({
+                "name": self.MARKET,
+                "description": "Plugins generated by claude-acc on this Mac",
+                "owner": {"name": "claude-acc"},
+                "plugins": [{"name": self.PLUGIN, "source": "./" + self.PLUGIN, "description": about}],
+            }),
+            os.path.join(market, self.PLUGIN, ".claude-plugin/plugin.json"): dump(
+                {"name": self.PLUGIN, "version": "1.0.0", "description": about}
+            ),
+            os.path.join(hooks, "hooks.json"): dump({
+                "description": about,
+                "hooks": {"PostToolUse": [{
+                    "matcher": "Edit|Write|MultiEdit",
+                    "hooks": [{"type": "command", "command": python, "args": ["-I", "-S", runner]}],
+                }]},
+            }),
+            os.path.join(hooks, "source.py"): (
+                f"# generated by claude-acc (perf security-slim) from {src['path']}\n"
+                f"VERSION = {json.dumps(src['version'])}\nPV = {pv}\n"
+                f"PROVENANCE_TAG = {json.dumps(tag, ensure_ascii=False)}\n"
+            ).encode(),
+            runner: code,
+            os.path.join(hooks, "patterns.py"): patterns,
+        }
+
+    def generate(self, src, python):
+        """Zapisuje pliki, które się różnią; zwraca ich nazwy."""
+        changed = []
+        for path, data in self.files(src, python).items():
+            try:
+                with open(path, "rb") as f:
+                    if f.read() == data:
+                        continue
+            except OSError:
+                pass
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.perf-tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            changed.append(os.path.relpath(path, self.market_dir()))
+        return changed
+
+    def check(self, python):
+        """Hook ma wystartować tym Pythonem (importy patterns.py i source.py): z wyłączonymi
+        przypomnieniami odpowiada samą metryką, niczego nie czyta i nie zapisuje."""
+        runner = os.path.join(self.hooks_dir(), "sec_slim.py")
+        env = dict(janitor.ENV, ENABLE_SECURITY_REMINDER="0")
+        try:
+            done = subprocess.run(
+                [python, "-I", "-S", runner], input=b"{}", capture_output=True, timeout=30, env=env
+            )
+            ok = done.returncode == 0 and json.loads(done.stdout)["metrics"]["skipped"] is True
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            ok, done = False, None
+        if not ok:
+            err = (done.stderr or b"").decode(errors="replace").strip()[-300:] if done else ""
+            raise RuntimeError(f"hook security-slim nie startuje z {python}: {err or 'brak odpowiedzi'}")
+
+    def cli(self, system, *args):
+        code, out = system.claude_plugin(*args)
+        if code != 0:
+            raise RuntimeError(f"claude plugin {' '.join(args)}: {out.strip()[-300:]}")
+
+    def flags(self, record, on):
+        """enabledPlugins w ustawieniach użytkownika: oficjalna i poprzedniczka wyłączone, nasza
+        włączona (on) albo poprzednie wartości (not on, tylko te, które dalej są nasze)."""
+        wanted = {OFFICIAL_SECURITY: record.get("official")} if record.get("official") else {}
+        wanted.update(record.get("predecessors") or {})
+        changed = []
+
+        def change(data):
+            del changed[:]
+            plugins = data.get("enabledPlugins")
+            if not isinstance(plugins, dict):
+                return False
+            for key, entry in wanted.items():
+                if on and plugins.get(key, MISSING) != entry["value"]:
+                    plugins[key] = entry["value"]
+                    changed.append(f"{key} wyłączona")
+                elif not on and restore_key(plugins, key, entry["prev"], entry["value"]):
+                    changed.append(f"{key} przywrócona")
+            if on and plugins.get(self.ID) is not True and record.get("installed"):
+                plugins[self.ID] = True
+                changed.append(f"{self.ID} włączona")
+            return bool(changed)
+
+        edit_json_file(self.settings_path(), change)
+        return changed
+
+    def apply(self, cfg, system, record=None):
+        record = dict(record or {})
+        if not os.path.exists(self.settings_path()):
+            return record, []
+        src = self.source()
+        if not record.get("plugin"):
+            settings, _ = read_json_file(self.settings_path())
+            plugins = settings.get("enabledPlugins")
+            plugins = plugins if isinstance(plugins, dict) else {}
+            official = plugins.get(OFFICIAL_SECURITY, MISSING)
+            before = [k for k, v in plugins.items() if v is True and SECURITY_PREDECESSOR.fullmatch(k)]
+            # wyłączona przez użytkownika i bez poprzedniczki: nie chce tych ostrzeżeń
+            if src is None or (official is not True and not before):
+                return {}, []
+            record = {
+                "plugin": self.ID,
+                "had": {k: k in settings for k in ("enabledPlugins", "extraKnownMarketplaces")},
+                "official": {"value": False, "prev": official} if official is True else None,
+                "predecessors": {k: {"value": False, "prev": True} for k in before},
+            }
+            try:
+                return record, self.converge(record, src, system)
+            except (OSError, ValueError, RuntimeError):
+                self.undo(record, system)  # nic na pół: następny keep zaczyna od zera
+                raise
+        return record, self.converge(record, src, system)
+
+    def converge(self, record, src, system):
+        """Pliki z bieżącego źródła, marketplace i wtyczka zarejestrowane, flagi ustawione.
+        Bez zainstalowanego źródła zostaje ostatnia kopia."""
+        changed = []
+        python = record.get("python") or self.interpreter()
+        if not os.access(python, os.X_OK):
+            python = self.interpreter()
+        src = src or (record.get("source") if os.path.isdir(self.hooks_dir()) else None)
+        if src is None:
+            raise RuntimeError("brak security-guidance i brak kopii jego patterns.py")
+        if src.get("path") and os.path.isdir(src["path"]):
+            written = self.generate(src, python)
+            if written:
+                self.check(python)
+                version = src["version"] or "?"
+                changed.append(f"patterns.py z security-guidance {version} ({', '.join(written)})")
+            record["source"], record["python"] = src, python
+        settings, _ = read_json_file(self.settings_path())
+        markets = settings.get("extraKnownMarketplaces")
+        if not (isinstance(markets, dict) and self.MARKET in markets):
+            self.cli(system, "marketplace", "add", self.market_dir())
+            record["marketplace"] = True
+            changed.append(f"marketplace {self.MARKET} dodany")
+        if not any(
+            isinstance(e, dict) and e.get("scope") == "user" for e in self.installed().get(self.ID) or []
+        ):
+            self.cli(system, "install", self.ID, "--scope", "user")
+            record["installed"] = True
+            changed.append(f"{self.ID} zainstalowana")
+        changed += self.flags(record, True)
+        return changed
+
+    def undo(self, record, system):
+        restored = self.flags(record, False) if os.path.exists(self.settings_path()) else []
+        if record.get("installed"):
+            self.cli(system, "uninstall", self.ID, "--scope", "user")
+            restored.append(f"{self.ID} odinstalowana")
+            cache = os.path.join(self.claude_dir or CLAUDE_DIR, "plugins/cache", self.MARKET)
+            shutil.rmtree(cache, ignore_errors=True)
+        if record.get("marketplace"):
+            self.cli(system, "marketplace", "remove", self.MARKET)
+            restored.append(f"marketplace {self.MARKET} usunięty")
+        if record.get("plugin"):
+            shutil.rmtree(self.market_dir(), ignore_errors=True)
+        had = record.get("had") or {}
+
+        def change(data):
+            # `claude plugin` zostawia puste słowniki, których przed nami nie było
+            gone = [k for k, was in had.items() if not was and data.get(k) == {}]
+            for key in gone:
+                del data[key]
+            return bool(gone)
+
+        if had and os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        return restored
+
+    def describe(self, record, system):
+        if not (record or {}).get("plugin"):
+            return "security-guidance nie jest włączony, nie ma czego odchudzać"
+        version = (record.get("source") or {}).get("version") or "?"
+        text = f"{self.ID} z patterns.py security-guidance {version}, oficjalna wyłączona"
+        others = self.reenabled_by()
+        if others:
+            text += "; włączają ją z powrotem: " + ", ".join(short_path(p) for p in others)
+        return text
+
+    def measure(self, record, runs=5):
+        """Czas hooka na edycji pliku bez trafień (p50 ms): oficjalnego i naszego; None bez źródła."""
+        src = (record.get("source") or {}).get("path")
+        hooks, _ = read_json_file(os.path.join(src or "", "hooks/hooks.json"))
+        official = None
+        for group in ((hooks.get("hooks") or {}).get("PostToolUse") or []) if src else []:
+            if "Edit" in (group.get("matcher") or ""):
+                official = [h.get("command") for h in group.get("hooks") or [] if h.get("command")]
+                break
+        if not official:
+            return None
+        work = tempfile.mkdtemp(prefix="security-slim-")
+        try:
+            state = os.path.join(work, "state")
+            os.makedirs(state)
+            # bez tego oficjalny hook zaczyna budować środowisko SDK do przeglądu LLM
+            open(os.path.join(state, ".sdk_bootstrap_spawned"), "w").close()
+            env = dict(
+                janitor.ENV, CLAUDE_PLUGIN_ROOT=src, SECURITY_WARNINGS_STATE_DIR=state,
+                ENABLE_CODE_SECURITY_REVIEW="0", CLAUDE_PROJECT_DIR=work,
+            )
+            event = json.dumps({
+                "session_id": "perf-security-slim", "cwd": work, "hook_event_name": "PostToolUse",
+                "tool_name": "Edit", "tool_input": {
+                    "file_path": os.path.join(work, "a.ts"), "old_string": "a", "new_string": "const b = 1",
+                }, "tool_response": {},
+            }).encode()
+            runner = os.path.join(self.hooks_dir(), "sec_slim.py")
+            slim = [record.get("python") or self.interpreter(), "-I", "-S", runner]
+
+            def timed(argv):
+                times = []
+                for _ in range(runs + 1):
+                    t = time.perf_counter()
+                    subprocess.run(argv, input=event, capture_output=True, timeout=60, env=env, cwd=work)
+                    times.append((time.perf_counter() - t) * 1000)
+                return median(times[1:])  # pierwszy rozgrzewa cache dysku
+
+            before = max(timed(["/bin/sh", "-c", c]) for c in official)
+            return {"before": rnd(before, 0), "after": rnd(timed(slim), 0), "unit": "ms hooka na edycję (p50)"}
+        except (OSError, subprocess.SubprocessError):
+            return None
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 class HookWrap:
@@ -2290,6 +2680,7 @@ TWEAKS = [
     ),
     TetherProfile(),
     RipgrepThreads(),
+    SecuritySlim(),
     DockerIdle(),
     RootTweak(
         "vnodes",
@@ -2318,7 +2709,7 @@ TWEAKS = [
     ),
     RootTweak(
         "devtools",
-        "Orca na liście Narzędzi deweloperskich: binarki zbudowane przez agentów (testy Go, "
+        f"{HOST.name} na liście Narzędzi deweloperskich: binarki zbudowane przez agentów (testy Go, "
         "go run, natywne moduły node) startują bez oceny Gatekeepera",
         "pierwsze uruchomienie nowej binarki Go w terminalu Orki 196 ms p50, w Terminalu "
         "(narzędzie deweloperskie) 4 ms; ocena to skan XProtect i zapytanie do Apple o notaryzację",
@@ -2895,7 +3286,7 @@ def record_gatekeeper(cfg, state, result):
     if (
         not record
         or record.get("result")
-        or result.get("responsible") != "Orca"
+        or result.get("responsible") != orcahost.bundle_name(ORCA_APP)
         or result.get("first_ms") is None
     ):
         return False
@@ -2999,6 +3390,7 @@ ULTRA = [
     "subagent-cache-1h",
     "tether-profile",
     "rg-threads",
+    "security-slim",
 ]
 # wyniki z transkryptów liczone najwyżej raz na tyle sekund (doba transkryptów to ~10 s)
 AGENTS_CHECK_SECONDS = 1800
@@ -3087,7 +3479,7 @@ def spotlight_result(cfg, state, force=False):
 
 def orca_started():
     """Kiedy (epoch) wystartował główny proces Orki; None, gdy nie działa."""
-    main = os.path.join(ORCA_APP, "Contents/MacOS/Orca")
+    main = os.path.join(ORCA_APP, "Contents/MacOS", HOST.executable)
     for pid, command in own_processes().items():
         if command != main and not command.startswith(main + " "):
             continue
@@ -3112,7 +3504,7 @@ def pending_manual(state):
     # Orka dodana ręcznie, bez perf-root: pomiar z jej terminala bez kary jest dowodem
     gatekeeper = state["bench"].get("gatekeeper", {}).get("result", {})
     exempt = (
-        gatekeeper.get("responsible") == "Orca"
+        gatekeeper.get("responsible") == orcahost.bundle_name(ORCA_APP)
         and gatekeeper.get("penalty_ms") is not None
         and gatekeeper["penalty_ms"] < GATEKEEPER_EXEMPT_MS
     )
@@ -3166,6 +3558,8 @@ def measure_before_after(item, cfg, system, record):
             "after": record.get("value"),
             "unit": "GB na jeden dev serwer",
         }
+    if name == "security-slim":
+        return item.measure(record) if record.get("plugin") else None
     if name == "docker-vm":
         prev = record.get("prev")
         before = 8192 if prev == MISSING or prev is None else prev
@@ -3469,9 +3863,9 @@ def cmd_ultra(cfg, args, system=None):
 
 
 MANUAL = {
-    "devtools": "Ustawienia > Prywatność i ochrona > Narzędzia deweloperskie > + > Orca "
+    "devtools": f"Ustawienia > Prywatność i ochrona > Narzędzia deweloperskie > + > {HOST.name} "
     "(`claude-acc perf-root devtools add` w Terminalu otwiera panel i zapisuje zmianę)",
-    "devtools-restart": "zrestartuj Orkę: Narzędzia deweloperskie działają dopiero dla Orki "
+    "devtools-restart": f"zrestartuj {HOST.name}: Narzędzia deweloperskie działają dopiero dla aplikacji "
     "uruchomionej po zmianie (restart zamyka sesje w jej terminalach)",
     "spotlight-privacy": "Ustawienia > Spotlight > Prywatność wyszukiwania: dodaj katalogi "
     "z `spotlight_noise` (magazyn pnpm, moduły Go)",
@@ -3624,7 +4018,7 @@ def describe_agents(r):
         lines.append(f"czekanie na hooki (p50/p90): {parts}")
     slow = r.get("slow_hooks") or []
     if slow:
-        lines.append("hooki, które kosztują najwięcej (ms p50 / p90, liczba):")
+        lines.append("hooki, które kosztują najwięcej (tylko te, które coś wypisały; ms p50 / p90, liczba):")
         for h in slow:
             lines.append(f"  {h['hook']} ({h['event']}): {fmt(h['p50'])} / {fmt(h['p90'])} ({h['n']})")
     lines.append(
@@ -3963,6 +4357,19 @@ def cmd_keep(cfg, args, system=None):
     return 0
 
 
+def cmd_link(cfg, args, system=None):
+    """Którędy idzie trasa domyślna i czy to tethering: ta sama odpowiedź, na którą działa
+    tether-profile (link_now). Panel pyta przy każdej zmianie ścieżki sieciowej, zamiast
+    zgadywać po swojemu; niczego nie zapisuje, bo perf-state.json należy do keep."""
+    link = (system or System()).link()
+    if "--json" in args:
+        print(json.dumps(link, ensure_ascii=False))
+        return 0
+    kind = "tethering" if link.get("tethered") else "zwykłe łącze"
+    print(f"{link.get('port') or '?'} ({link.get('iface')}, brama {link.get('gateway')}), {kind}")
+    return 0
+
+
 def cmd_list(cfg, args, system=None):
     for item in TWEAKS:
         root = " (root: " + item.command + ")" if item.root else ""
@@ -4054,6 +4461,7 @@ COMMANDS = {
     "apply": cmd_apply,
     "undo": cmd_undo,
     "keep": cmd_keep,
+    "link": cmd_link,
     "list": cmd_list,
     "ultra": cmd_ultra,
     "shaper-rate": cmd_shaper_rate,
