@@ -1180,6 +1180,27 @@ def drain_queue(rows):
     return sorted(scraps, key=lambda r: (r["rank"][0], -min(headroom(r["data"]))))
 
 
+def jobs_free(rows):
+    """Kandydaci do przełączenia bez kont subskrypcji, którymi płaci teraz bieg `claude-acc jobs`
+    (jobs/held-accounts.json, wpis ze świeżym "until"): Twoje sesje nie palą okna biegu, a ich
+    odświeżenie tokenu nie wyrzuca biegu 401. Tylko w ticku; queue() i token zostają bez zmian.
+    Zepsuty plik to brak wskazówki i jedna linia w logu."""
+    path = os.path.join(STATE_DIR, "jobs", "held-accounts.json")
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        now = time.time()
+        held = {e["email"].lower() for e in data["accounts"] if float(e["until"]) > now}
+    except FileNotFoundError:
+        return rows
+    except Exception as err:  # noqa: BLE001 - wskazówka nigdy nie zatrzymuje przełączania
+        log(f"tick: wskazówka jobów nieczytelna, pomijam ją ({err.__class__.__name__}: {err})")
+        return rows
+    if held:
+        log(f"tick: pomijam konta trzymane przez joby: {', '.join(sorted(held))}")
+    return [r for r in rows if r["account"].email.lower() not in held]
+
+
 def confirmed(rows, cfg, fits):
     """Pierwszy z kolejki, którego świeży odczyt nadal spełnia fits(data), albo None.
 
@@ -1461,6 +1482,14 @@ def cmd_status(cfg, args):
     if summary:
         import credits
         print(f"\n{credits.summary_line(summary)} (szczegóły: claude-acc credits status)")
+    try:  # tik jobów: świeżość, konta trzymane przez biegi, to, co czeka (same pliki, bez sieci)
+        import jobs
+        line = jobs.status_line()
+    except Exception as err:  # noqa: BLE001 - status kont działa bez jobów
+        line = f"joby: nie umiem odczytać stanu ({err.__class__.__name__})" if os.path.exists(
+            os.path.join(STATE_DIR, "jobs", "jobs.json")) else None
+    if line:
+        print(f"\n{line}")
     return 0
 
 
@@ -1920,6 +1949,11 @@ def cmd_resume(cfg, _args):
 
 def cmd_tick(cfg, _args):
     """Jeden przebieg pilnowania. Uruchamiany przez launchd co 2 minuty."""
+    try:  # baner, gdy tik jobów stoi: sprawdza go proces inny niż ten tik (jobs.py, same pliki)
+        import jobs
+        jobs.heartbeat_alarm()
+    except Exception:  # noqa: BLE001 - joby nigdy nie zatrzymują automatu kont
+        pass
     lock = take_lock(wait=10)
     if not lock:
         return 0
@@ -2007,7 +2041,7 @@ def tick(cfg, accounts):
     # w pauzie i przy dobijaniu automat czytał wszystkie konta co dwie minuty, a zapas
     # nieużywanego konta wraca dopiero z resetem okna, który settled liczy lokalnie
     rows = survey(accounts, cfg, exclude_id=active.id, max_age=IDLE_MAX_AGE)
-    pick = confirmed(queue(rows), cfg, lambda d: has_room(d, cfg))
+    pick = confirmed(jobs_free(queue(rows)), cfg, lambda d: has_room(d, cfg))
     candidates = [pick] if pick else []
     if candidates and carries:
         # trwa pauza, a inne konto odżyło: aktywne jeszcze niesie, więc zostaje,
@@ -2018,7 +2052,7 @@ def tick(cfg, accounts):
         if not dead and min(headroom(data)) >= DRAIN_FLOOR:
             keep_draining(reason)  # aktywne konto pracuje do ostatniego procenta
             return 0
-        scrap = confirmed(drain_queue(rows), cfg, lambda d: min(headroom(d)) >= DRAIN_FLOOR)
+        scrap = confirmed(jobs_free(drain_queue(rows)), cfg, lambda d: min(headroom(d)) >= DRAIN_FLOOR)
         if scrap:
             target = scrap["account"]
             switch_to(target, cfg, f"{reason}; dobijanie, {scrap['why']}")

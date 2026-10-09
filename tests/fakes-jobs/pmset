@@ -1,0 +1,10 @@
+#!/bin/sh
+# Atrapa `pmset -g systemstate` dla tiku jobów: $HOME/fake/pmset mówi full, dark albo fail.
+# full to dzisiejsze wyjście tego Maca; dark to DarkWake bez Graphics i Audio (pmset -g log: [CDNP]).
+state=$(cat "$HOME/fake/pmset" 2>/dev/null || echo full)
+echo "$*" >> "$HOME/fake/pmset.log"
+case "$state" in
+  full) printf 'Current System Capabilities are: CPU Graphics Audio Network \nCurrent Power State: 4\n' ;;
+  dark) printf 'Current System Capabilities are: CPU Network \nCurrent Power State: 4\n' ;;
+  *) echo "pmset: błąd" >&2; exit 1 ;;
+esac

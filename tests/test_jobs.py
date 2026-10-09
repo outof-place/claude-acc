@@ -1052,10 +1052,13 @@ class Cli(Base):
 
     def test_set_changes_one_field_and_keeps_the_rest(self):
         self.w.add_job()
-        r = self.w.jobs("set", "blog", "budget_usd=3.5", "enabled=false", 'schedule={"every_days": 2}')
+        # harmonogram należy do etapu A2b i jest sprawdzany (tests/test_jobs_schedule.py)
+        sched = {"every_days": 2, "anchor": "2026-10-10", "at": ["05:30"]}
+        r = self.w.jobs("set", "blog", "budget_usd=3.5", "enabled=false", f"schedule={json.dumps(sched)}")
         self.assertEqual(r.returncode, 0, r.stderr)
         data = json.loads(self.w.jobs("list", "--json").stdout)["jobs"][0]
-        self.assertEqual((data["budget_usd"], data["enabled"], data["schedule"]), (3.5, False, {"every_days": 2}))
+        core = {k: v for k, v in data["schedule"].items() if k not in ("since", "edited")}
+        self.assertEqual((data["budget_usd"], data["enabled"], core), (3.5, False, sched))
         self.assertEqual(data["entry"], f"{PY} {PIPELINE} entry")
         self.assertEqual(self.w.jobs("set", "blog", "budget_usd=-1").returncode, 64)
         self.assertEqual(data["live_urls"], [])
