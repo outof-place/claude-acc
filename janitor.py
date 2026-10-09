@@ -21,6 +21,9 @@ Komendy:
   spotlight                     projekty, których node_modules indeksuje Spotlight,
                                 i otwarcie ustawień, w których się je wyklucza
   optimize [--dry-run|--undo]   jednorazowe strojenie systemu, odwracalne
+  compress-apps [--dry-run] [--apps A,B] [--threads N]
+                                kompresja APFS aplikacji roota (Office, Adobe, .pkg) przez sudo,
+                                ze sprawdzeniem podpisu przed i po (compressapps.py)
 """
 
 import fcntl
@@ -1784,12 +1787,50 @@ def optimize_undo():
     return 0
 
 
+def cmd_compress_apps(cfg, args):
+    """Aplikacje roota, których zadanie `compress` nie zapisze: lista bez sudo, kompresja przez sudo.
+
+    compressapps.py leży obok tego pliku i sam nic nie importuje, więc pod sudo idzie z -I
+    (bez PYTHONPATH i katalogu skryptu w sys.path). Pełna ścieżka do afsctool idzie w
+    argumencie, bo secure_path sudo nie zna /opt/homebrew/bin.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "compressapps.py")
+    sys.path.insert(0, here)
+    import compressapps
+
+    opts = compressapps.parse_args(["plan"] + list(args))
+    tool = compressapps.find_afsctool()
+    if not tool:
+        print("brak afsctool: brew install afsctool")
+        return 1
+    passthrough = ["--afsctool", tool, "--threads", str(opts.threads), "--done-ratio", str(opts.done_ratio)]
+    if opts.apps:
+        passthrough += ["--apps", opts.apps]
+    if opts.dry_run:
+        return compressapps.main(["plan"] + passthrough)
+    out = os.path.join(user_tmpdir(), f"compress-apps-{os.getpid()}.json")
+    rc = subprocess.run(["sudo", "/usr/bin/python3", "-I", script, "run", "--json-out", out] + passthrough).returncode
+    try:
+        with open(out) as f:
+            results = json.load(f)
+        os.unlink(out)
+    except (OSError, ValueError):
+        results = []
+    if results:
+        freed = sum(r.get("freed", 0) for r in results)
+        back = sum(1 for r in results if r.get("rolled_back"))
+        log(f"compress-apps: {len(results)} aplikacji, zwolniono {human(freed)}" + (f", cofnięte: {back}" if back else ""))
+    return rc
+
+
 COMMANDS = {
     "sweep": cmd_sweep,
     "status": cmd_status,
     "report": cmd_report,
     "spotlight": cmd_spotlight,
     "optimize": cmd_optimize,
+    "compress-apps": cmd_compress_apps,
 }
 
 

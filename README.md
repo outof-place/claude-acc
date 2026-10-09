@@ -206,6 +206,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc mac report` | What slows the Mac down: top processes, Spotlight, orphaned dev servers, data of uninstalled apps, broken launchd entries |
 | `claude-acc mac spotlight` | Projects whose `node_modules` Spotlight indexes, and the settings pane to exclude them |
 | `claude-acc mac optimize [--dry-run\|--undo]` | Faster Dock, Mission Control, window, Quick Look and Finder animations, faster key repeat (15 ms, from the next login), and disabling launch agents whose app is gone. Reversible |
+| `claude-acc mac compress-apps [--dry-run] [--apps A,B]` | Transparent APFS compression of root-owned apps (Office, Adobe, `.pkg` installs) through sudo, signature checked before and after, rolled back if it breaks |
 | `claude-acc guard status [--json]` | Dev servers, their memory, who watches them and what the guard is about to do |
 | `claude-acc guard once [--dry-run]` | One guard pass, at most one action |
 | `claude-acc guard stop <pid\|:port>` | Stop a dev server the way the guard does |
@@ -257,6 +258,8 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc desktop doctor [--open]` / `status [--json]` | Whether the helper has Accessibility and Screen Recording (and which binary to tick), the displays, the mode |
 | `claude-acc desktop mode full\|guarded` | Whether the agent acts freely (full) or is asked before `type`, `key` and `hold_key` (guarded) |
 | `claude-acc desktop <member> ['<json input>']` | Any toolset member from the shell, such as `screenshot --out shot.png` or `left_click '{"coordinate": [640, 300]}'` |
+| `claude-acc mcp share <name> [--force] [--port N]` | Run that user-scope stdio MCP server once for every Claude Code session instead of once per session |
+| `claude-acc mcp unshare <name>\|--all` / `status [--json]` | Put it back to one copy per session / the shared servers, their sessions, restarts and memory |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
 ## Configuration
@@ -308,6 +311,16 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `compress` | transparent APFS compression (`afsctool`, LZFSE) of files under `compress.paths` that haven't changed for an hour; off until you list paths | every run |
 
 `compress` keeps files on disk compressed the way macOS stores its own system files: reads are transparent, the kernel decompresses on the fly. Measured on 2026-10-08: Claude Code transcripts in `~/.claude/projects` shrink by 75%, Microsoft Word.app by 39%. Appending to a compressed file makes APFS write it back uncompressed, so each run picks up the files changed since the last one once they have been quiet for `min_age_minutes`. It skips files a process has open, the whole bundle of an app that is running (compressing in place swaps out a mapped executable), files you can't write that you don't own (the janitor has no root), and protected paths. Nothing it skips is lost: `~/.local/share/claude-acc/janitor-compress.json` remembers an app that was running and goes through the whole bundle once it has quit, retries files that were open, and keeps a list of files afsctool could not shrink (media, binaries that are compressed already) so they are not read again until they change. Install the tool with `brew install afsctool`; without it the task logs a warning and does nothing. APFS clones share blocks and each compressed copy gets its own, so leave clone-heavy folders such as a pnpm store on APFS out of `paths`.
+
+Apps installed by a `.pkg` (Microsoft Office, Adobe, App Store apps, most installers) belong to root, so the `compress` task can't write them. `claude-acc mac compress-apps` does them through sudo (Touch ID), one app at a time:
+
+```bash
+claude-acc mac compress-apps --dry-run          # root-owned apps in /Applications (and one folder down), size, current savings
+claude-acc mac compress-apps                    # compress every root-owned app that isn't running or already done
+claude-acc mac compress-apps --apps Word,Premiere --threads 8
+```
+
+For each app it checks the signature with `codesign --verify --deep --strict`, and an app whose signature is already broken is left alone. Then it compresses with `afsctool -c -T LZFSE` and checks the signature again. If the check passed before and fails after, it decompresses the app (`afsctool -d`) and says so in the result table. It skips running apps and apps where nearly every file is compressed already. Measured on 2026-10-09, every signature stayed valid: Word 12.6% → 38.8% savings, Excel 45.6%, Outlook 42.6%, PowerPoint 43.6%, Premiere Pro 61.1%, Photoshop 48.7%, Lightroom 26.6%. Office (Microsoft AutoUpdate) and Creative Cloud updates install fresh uncompressed bundles, so run it again after big updates; a second run only does what changed. The code is in `compressapps.py`. It imports nothing from the repo and runs as `sudo /usr/bin/python3 -I`, with the full path to afsctool passed in because sudo's `secure_path` doesn't include `/opt/homebrew/bin`. A weekly root job for this isn't part of claude-acc.
 
 Each run also checks which projects' `node_modules` end up in the Spotlight index. Spotlight skips directories whose name starts with a dot or ends with `.noindex`, so pnpm's `.pnpm` store is never indexed, but hoisted `node_modules` (Expo, npm, yarn) are, and every install makes Spotlight chew through tens of thousands of files. Neither a `.metadata_never_index` file nor `chflags hidden` stops it on current macOS. The fix is System Settings > Spotlight > Search Privacy; `claude-acc mac spotlight` lists the projects and opens that pane.
 
@@ -591,6 +604,46 @@ claude-acc credits exec --no-env --purpose nightly-digest -- \
 
 There is no desktop daemon and no "open app" member: an agent opens an app through Spotlight (`cmd+space`, type its name, Return) or the Dock. Prefer the `browser` gateway for anything inside a web page; it works in a background tab and never takes focus.
 
+## Shared MCP servers
+
+Every Claude Code session starts its own copy of every stdio MCP server in `~/.claude.json`, so with
+eight agents running you have eight copies of each, and a server that loads a model loads it eight
+times. `claude-acc mcp share <name>` runs one copy for all of them: a launchd agent
+(`com.filip.claude-acc.mcpshare.<name>`) keeps the stdio server alive and serves it as Streamable HTTP
+on `127.0.0.1`, and the user-scope entry becomes an `http` entry with a bearer token. Sessions started
+after that connect to the shared copy; running ones keep theirs until they restart.
+
+Measured on 2026-10-09 with cavemem (it loads a MiniLM embedder) and nine sessions: 490 MB of copies
+became 165 MB for the bridge and the one server, and a session connects in 8 ms instead of 83 ms. A
+new session adds nothing.
+
+How it works: the server initializes once and every client gets that answer from memory. Each client
+has its own `Mcp-Session-Id`, and its JSON-RPC ids and progress tokens are rewritten to unique ones on
+the way in and back on the way out, so two sessions both sending id 1 never get each other's result.
+Progress streams back over SSE to the session that asked, cancellations reach the server under its
+own id, and a crashed server restarts with backoff while the HTTP side stays up. Both protocol eras
+work: the classic `initialize` handshake and 2026-07-28 (`server/discover`, `subscriptions/listen`,
+and the `ttlMs`/`cacheScope` that list results need there, which an older server doesn't send). It
+listens on `127.0.0.1` only, answers 401 without the token (a 0600 file under
+`~/.local/share/claude-acc/mcpshare/`), and 403 for a foreign `Host` or `Origin`, so a web page can't
+reach it through DNS rebinding. `~/.claude.json` is backed up before the change and kept at 0600,
+because the token is in it.
+
+Only stateless servers can be shared. A server that asks the client something (elicitation, sampling,
+roots) can't be told which of the sessions asked, so the bridge answers it with an error, and the
+server still runs in your home directory, not each session's project. That is why `share` refuses,
+unless you pass `--force`:
+
+- `mail`: it collects send approval through MCP elicitation.
+- `browser`: it remembers which tabs each session opened or borrowed.
+- `desktop`: it asks for approval through elicitation and maps coordinates from the session's last screenshot.
+- `chrome-devtools`: one browser and page per client.
+- MCP Magic: every session joins its own Figma channel.
+
+`claude-acc mcp unshare <name>` puts the original stdio entry back exactly as it was and removes the
+agent; `claude-acc uninstall` unshares everything first. `CLAUDE_ACC_MCPSHARE_DEBUG=1` in the agent's
+environment logs each request's method names (never their content) to `<name>.log`.
+
 ## Stay Awake
 
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
@@ -661,6 +714,8 @@ The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies,
 The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go`, `pip`, `uv`, `claude`, `npx` and `pkgutil` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, an npm package rolled back when its command stops working after npm blocked its install scripts, the 3-day interval and the next-night retry, Python packages upgraded together from wheels (with the user site on its own, a package installed from a folder left alone, a source-only release and one held lower by another package reported as held back), an upgrade that breaks `pip check` rolled back while a conflict from before the run is not, an upgrade that stops a package importing rolled back, a pinned package and a pinned dependency held, a new Playwright given its browsers, a failed `pip install`, every Python upgraded once and named, a newer python.org patch offered (and not a new minor, nor Homebrew's Python) and an unsigned installer thrown away, a uv Python that holds pip packages left on its patch, Claude Code and its plugins updated, plugins updated from their own project and never auto-confirmed, a hand-edited skill left alone, the native `claude` first on the `PATH`, a step from an older version dropped from the state, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
 
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands, Metro in every form among them, and that a killed process slow to exit is not reported as surviving. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, that the hook sends a second start to the running one, refuses a Metro under critical pressure with no server left and one the guard just stopped for memory, and that `guard room` lets it through once memory is back.
+
+The shared MCP tests (`tests/test_mcpshare.py`) run the bridge on a random port with a fake stdio server: the token, `Host` and `Origin` guards, one `initialize` for two clients, two sessions sending the same id at once, progress over SSE under the client's own token, a server request refused instead of routed, a crash and restart, sessions and DELETE, the 2026-07-28 era with its list cache fields and `subscriptions/listen`, and `share`/`unshare` on a temporary `.claude.json` through fake `launchctl` (which starts the real `serve` from the plist) and `claude mcp`, including a server that never starts and an entry someone else changed in the meantime.
 
 The mail gateway tests (`tests/test_mail.py`) need no network: the MCP handshake, version negotiation, tool calls and errors over stdio; levels, the send switch and the audit log; the envelope, invisible characters and HTML; Gmail's MIME tree and threaded drafts; Gmail queries turned into IMAP `SEARCH`; the IMAP provider against a fake `imaplib` (search, read, attachment to quarantine, archive, draft, the connection pool and a sign-in that times out); a Gmail mailbox on a token command (scopes from tokeninfo, a failing command); and the approval flag on `mail_send` following the send modes. The SigV4 signer is checked against the example in AWS's documentation.
 
