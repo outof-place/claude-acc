@@ -19,17 +19,21 @@ let state = (ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory()) +
 
 // `pause <mode>`: the limit pause hooks of hook.py, which Claude Code runs without a shell
 // (exec form), after every tool call of every session. Outside a pause that is two file
-// checks and the event drained; during one, hook.py gets the event untouched on stdin. The
-// same checks as the shell guard hook.py installs when this binary is missing.
+// checks and the event drained; during one, hook.py gets the event untouched on stdin,
+// through acc.py on the managed interpreter like claude-acc-pause, or without them through
+// /usr/bin/python3. The same checks as the shell guard hook.py installs when this binary is
+// missing.
 if CommandLine.arguments.count > 2, CommandLine.arguments[1] == "pause" {
     let override = ProcessInfo.processInfo.environment["CLAUDE_ACC_PAUSE_FILE"] ?? ""
     let pause = override.isEmpty ? state + "/pause.json" : override
     let script = state + "/hook.py"
     if access(pause, F_OK) == 0, access(script, F_OK) == 0 {
-        let python = "/usr/bin/python3"
-        let args = [python, script, CommandLine.arguments[2]]
+        let python = state + "/python", launcher = state + "/acc.py"
+        let args = access(python, X_OK) == 0 && access(launcher, F_OK) == 0
+            ? [python, launcher, "hook", CommandLine.arguments[2]]
+            : ["/usr/bin/python3", script, CommandLine.arguments[2]]
         var argv = args.map { strdup($0) } + [nil]
-        execv(python, &argv)
+        execv(args[0], &argv)
     }
     // the shell's `cat >/dev/null`: Claude Code's write of the event never meets a closed pipe
     _ = FileHandle.standardInput.readDataToEndOfFile()
@@ -44,8 +48,9 @@ func interpreter() -> String {
     return access(linked, X_OK) == 0 ? linked : "/usr/bin/python3"
 }
 
-/// `devguard.py admit` with the event on stdin. An unlinked temp file holds it, so an event
-/// of any size is there in full before Python starts reading.
+/// `devguard.py admit` with the event on stdin, through acc.py (bytecode from the cache) when
+/// it is there. An unlinked temp file holds the event, so one of any size is there in full
+/// before Python starts reading.
 func handOver() -> Never {
     var template = Array((NSTemporaryDirectory() + "claude-acc-hook.XXXXXX").utf8CString)
     let fd = mkstemp(&template)
@@ -57,7 +62,11 @@ func handOver() -> Never {
     let python = interpreter()
     // `claude-acc-hook codex`: the same hook for Codex, whose rewrite needs an "allow" next to it
     let codex = CommandLine.arguments.count > 1 && CommandLine.arguments[1] == "codex"
-    let args = [python, state + "/devguard.py", "admit"] + (codex ? ["--codex"] : [])
+    let launcher = state + "/acc.py"
+    let admit = access(launcher, F_OK) == 0
+        ? [python, launcher, "devguard", "admit"]
+        : [python, state + "/devguard.py", "admit"]
+    let args = admit + (codex ? ["--codex"] : [])
     var argv = args.map { strdup($0) } + [nil]
     execv(python, &argv)
     exit(0)  // the hook never blocks an agent over its own failure

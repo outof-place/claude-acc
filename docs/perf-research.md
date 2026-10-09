@@ -654,6 +654,274 @@ Naprawa to Orca na liście Narzędzi deweloperskich:
   Gatekeepera. To ten sam poziom zaufania, jaki Terminal ma od początku, a Orca i tak
   uruchamia dowolne polecenia agentów.
 
+## Faza 4: pętla agenta od modelu do wyniku (2026-10-08)
+
+Pytanie: gdzie Claude naprawdę traci czas i co jeszcze da się przyspieszyć natywnie. Pod
+uwagę wchodzi model, sieć, Bash, hooki, Python, build, Orca i sprzęt. Wszystko jest
+zmierzone na tym Macu: MacBook Pro M4 Max (12 rdzeni P + 4 E, 48 GB), zasilanie z
+sieci, `pmset powermode 2`, brak ostrzeżeń termicznych.
+
+### Skąd liczby
+
+Źródło to 7 dni transkryptów Claude Code: 712 plików, 5 GB, także subagenci.
+
+- **Zapytanie do modelu** zaczyna się wpisem tuż przed jego pierwszym blokiem (prompt
+  albo wynik narzędzia). Kończy się ostatnim blokiem z tym samym `requestId`.
+- **Narzędzie** liczę od `tool_use` do `tool_result`, jak w fazie 3.
+- **Hooki** biorę z `durationMs` we wpisach `hook_success`.
+
+`perf.py bench agents [--hours N]` liczy dziś to wszystko sam: opóźnienie modelu według
+kontekstu, podłogę Bash, zimny cache i narzędzia według łącznego czasu.
+
+| gdzie | wynik | uwaga |
+|---|---|---|
+| zapytania do modelu | 145 tys. na tydzień, 79% od subagentów | suma 372 h po równoległych agentach |
+| narzędzia | 327 h | z tego `sleep`/`until` 53 h, to celowe czekanie |
+| Bash | 122 tys. wywołań | polecenia krótsze niż 5 s: p10 120 ms, p50 260 ms przy 5-20 ms samej pracy |
+| hooki blokujące Bash | ~5 ms | fasthooks rtk-enforce (Go) równolegle z claude-acc-hook (Swift); ~40 ms przy go/npm/dev |
+
+**Model zwalnia z kontekstem.** p50 / p90 całego zapytania, pierwszy blok p50:
+
+| kontekst | zapytań | p50 | p90 | pierwszy blok |
+|---|---|---|---|---|
+| < 30 tys. | 475 | 2,6 s | 6,1 s | 2,0 s |
+| 30-100 tys. | 11 706 | 3,9 s | 11,3 s | 3,4 s |
+| 100-200 tys. | 27 593 | 5,1 s | 16,5 s | 4,5 s |
+| 200-400 tys. | 45 617 | 5,9 s | 20,0 s | 4,9 s |
+| 400-700 tys. | 41 995 | 6,8 s | 19,5 s | 5,5 s |
+| 700 tys.+ | 13 467 | 6,8 s | 19,3 s | 5,4 s |
+
+70% zapytań idzie z kontekstem ponad 200 tys. Generowanie stoi na 250-280 tokenach/s
+niezależnie od kontekstu, więc różnicę robi czas do pierwszego bloku.
+
+Subagenci startują z małym kontekstem (16-56 tys. tokenów), ale rosną:
+- członkowie zespołu do p50 444 tys. i p90 965 tys.,
+- workflow-subagent do p50 363 tys.
+
+Nie ma ustawienia kompaktacji tylko dla subagentów. `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` i
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` działają też na główną sesję.
+
+### Cache subagentów: godzina zamiast 5 minut
+
+Subagenci domyślnie piszą cache na 5 minut. Przerwa dłuższa niż 5 minut, na przykład
+członek zespołu czekający na innego, oznacza zapis całego kontekstu od nowa.
+
+Od 1 do 3.10, z cache 5-minutowym:
+- 300-500 mln tokenów zapisu na dobę,
+- 47% zapisów to kontekst zapisywany od nowa po 5-60 min ciszy,
+- 678 takich zapytań w tygodniu, p50 8,1 s.
+
+Od 4.10 `~/.claude/settings.json` ma `subagentPromptCacheTtl: "1h"`. Od 5.10 subagenci
+piszą tylko do kubełka 1 h, 45-115 mln tokenów na dobę. W ostatniej dobie nie było ani
+jednego zapisu od nowa po przerwie 5-60 min. Ultra pilnuje teraz tego ustawienia jako
+`subagent-cache-1h`.
+
+### Sieć: telefon zamiast kabla
+
+Trasa domyślna szła przez iPhone USB (`en8`) z flagą `constrained`, czyli Low Data Mode.
+Adapter USB LAN był odłączony, a Wi-Fi wyłączone.
+
+| pomiar | wynik |
+|---|---|
+| ping do 1.1.1.1 | 10-248 ms (σ 75 ms) |
+| TCP do api.anthropic.com | p50 25 ms |
+| TLS | p50 51 ms |
+| upload | 16-21 Mb/s |
+| treść 2 MB (surowy kontekst ~400 tys. tokenów) | +0,45-0,8 s wobec 40 KB |
+
+Claude Code domyślnie kompresuje duże zapytania (`CLAUDE_CODE_GZIP_REQUEST_BODIES`, tu
+`1`), więc realny koszt uploadu jest mniejszy. Nie da się go zmniejszyć inaczej niż
+mniejszym kontekstem.
+
+Poprawka **`tether-profile`** sprawdza w `perf keep` co 5 min, którędy idzie trasa
+domyślna. Tethering to port `iPhone USB` albo `Bluetooth PAN`, albo brama `172.20.10.1`.
+Na takim łączu poprawka ustawia w env Claude Code:
+- `DISABLE_AUTOUPDATER=1`, bo natywny updater ściąga ~236 MB na każde wydanie,
+- `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`,
+- `CLAUDE_CODE_ENABLE_AWAY_SUMMARY=0`.
+
+Na kablu albo zwykłym Wi-Fi zdejmuje je co do bajtu. Ten sam przebieg zapisuje `link` w
+`perf-state.json`. Według niego `updates.py` wstrzymuje zaplanowane aktualizacje na
+tetheringu. `claude-acc update` działa zawsze.
+
+MPTCP (telefon plus Wi-Fi naraz) odpada: `URLSession` na macOS go nie ma, a serwer
+musiałby go obsługiwać.
+
+### Bash: 17 ms z ~/.zshenv w każdym wywołaniu
+
+Claude Code uruchamia każde polecenie przez `/bin/zsh -c "source <snapshot> … eval"`.
+Snapshot zastępuje `.zshrc`, ale `~/.zshenv` i tak wykonuje się przy każdym poleceniu. Tam
+dwa razy wołany był `security find-generic-password`. Dodatkowo jeden klucz leżał w
+pliku jawnym tekstem.
+
+| spawn powłoki jak w Claude Code | czas |
+|---|---|
+| przed | 21,1 ms |
+| po (guard `[ -n "$VAR" ] \|\|`, zmienne dziedziczone z procesu `claude`) | **4,2 ms** |
+| bez dziedziczonych zmiennych (pierwsza powłoka sesji) | 36,8 ms |
+
+Klucze przeszły do Pęku kluczy przez `security -i` na stdin, więc wartość nie trafiła do
+`ps`. Konfiguracja Claude Platform on AWS i Bedrock zniknęła z `~/.zshrc`, z env w
+settings.json i z 156 snapshotów powłoki.
+
+`PYTHON_JIT=1` nie kosztuje startu: 12,6 ms wobec 12,8 ms dla `-c pass`, więc zostaje.
+
+### rg: 16 wątków walczy o blokady jądra
+
+To samo wyszukiwanie w portivo (17,7 tys. plików), przy obciążeniu 5-6:
+
+| wątki | czas | czas jądra |
+|---|---|---|
+| domyślnie (16) | 428 ms | 3,9 s |
+| -j2 | 242 ms | |
+| -j4 | **179 ms** | 0,7 s |
+| -j6 | 272 ms | |
+| -j12 | 434 ms | |
+
+W claude-acc: 6,5 ms przy domyślnych wątkach, 5,8 ms z `-j4`. Agenci wołają rg/grep
+~4300 razy na dobę.
+
+Poprawka **`rg-threads`** zapisuje `ripgreprc` z `--threads=4` i ustawia
+`RIPGREP_CONFIG_PATH` w env Claude Code. Jawne `-j` w poleceniu dalej wygrywa.
+
+### cavemem worker: 228% CPU bez przerwy
+
+Worker cavemem (node, onnxruntime-node 1.21, MiniLM-L6 q8) palił 140-228% CPU przez cały
+dzień. Średnie obciążenie Maca stało przez to na 14-15.
+
+`sample` pokazał dwa źródła:
+- `observationsMissingEmbeddings` co 2 s robiło `SCAN` wszystkich 628 tys. wierszy bazy
+  2,2 GB. W stanie ustalonym brakowało mniej niż 16 wierszy, więc zapytanie z
+  `ORDER BY id DESC LIMIT 16` przechodziło całą tabelę.
+- 7 wątków puli ORT kręciło się na pusto (`RunQueue::PopFront`). Inferencja to ~1%
+  pracy, więc CoreML ani ANE nic by tu nie dały.
+
+bg-helpers trzymał worker w tle, ale ten tracił `PRIO_DARWIN_BG` co kilkadziesiąt minut.
+Nawet na rdzeniach E zajmował 2,3 z 4.
+
+Naprawa poszła w repo cavemem (sweep z kursorem `afterId`, build z 18:16). Nowy worker
+pali 0-2% CPU. Do zrobienia tam jeszcze: `session_options` z `intraOpNumThreads: 1` i
+`allow_spinning: "0"`.
+
+### Build Swift
+
+| pomiar | wynik |
+|---|---|
+| czysty release (swiftbuild) | 12-17 s |
+| czysty release `--build-system native` | 12,2 s, ale native jest oznaczony jako przestarzały |
+| czysty debug | 7 s |
+| no-op | ~1 s |
+| frontend ClaudeAcc | 14,1 s na jednym wątku, 8,7 s na 8 wątkach; optymalizacja SIL 4,1 s, sprawdzanie typów 1,8 s |
+| najwolniejsze ciało widoku | ≤106 ms, nie jest wąskim gardłem |
+
+`-Osize` daje ten sam czas buildu (11,5-12,1 s wobec 12,2-15,3 s) i 12% mniejszy
+`__TEXT` (1,10 -> 0,97 MB). Dla aplikacji w pasku menu to bez znaczenia, więc go nie
+włączam. Caching kompilacji przez CAS (SE-0547) przyjęto dziś, ale w CLI 6.4 go nie ma.
+
+### Sprawdzone i niewłączone
+
+| pomysł | dlaczego nie |
+|---|---|
+| CoreML/ANE dla embeddingów cavemem | inferencja to ~1% pracy workera |
+| MPTCP telefon + Wi-Fi | brak w `URLSession` na macOS, serwer musiałby go obsługiwać |
+| RAM disk na `.build`, `noatime` | APFS i SSD M4 Max: zysk w szumie |
+| `-mcpu=apple-m4` | 0-3% dla małych CLI, SIGILL na M1 z butelki Homebrew |
+| Python free-threaded, mypyc | wolniejszy pojedynczy wątek; XProtect skanuje każdy `.so` |
+| git z Homebrew zamiast shimu xcrun | +4,3 ms na proces × ~3 tys. wywołań na tydzień |
+| `USE_BUILTIN_RIPGREP=0` | narzędzie Grep 0 razy na tydzień; agenci wołają rg przez Bash |
+| typecheck TS w tle (`asyncRewake`) | 4 edycje formatowane na dobę, ~15 min na tydzień |
+| podział ClaudeAcc na moduły | release 12 s, budowany przy instalacji |
+| Orca | git co ~6 s (p50 18 ms, 916 s na 34 h), trace 10 MB na dobę: mało |
+
+### GPU, termika, debloat
+
+**GPU.** Zajęty w 13% (max 34%), z czego WindowServer to 14% czasu GPU, a Orca 1%. Małe
+zlecenie wraca w 463 µs p50. W pętli agenta nic na GPU nie czeka: model liczy się w
+chmurze, a rg, git, kompilacja i testy to CPU i IO.
+
+Lokalny model na GPU (MLX) mógłby robić drobne rzeczy, ale Claude Code nie wyprowadza
+swoich zapytań w tle do lokalnego modelu bez proxy na cały ruch. Pomijam.
+
+**Termika.** Wiatraki już stoją na maksimum: fanctl trzyma 5777 rpm w trybie manual. Test
+z 16 procesami SHA-256 przez 90 s, przy obciążeniu Maca 15:
+
+| sekunda | przepustowość | CPU |
+|---|---|---|
+| 10 | 27,9 GB/s | 84 °C |
+| 40 | 34,8 GB/s | 85 °C |
+| 80 | 30,5 GB/s | 87 °C |
+
+Przepustowość nie ma trendu spadkowego, a wahania to inni agenci. M4 Max zbija zegary
+dopiero przy ~100 °C, więc throttlingu nie ma i nic więcej z wentylacji się nie wyciśnie.
+
+**Prawdziwy hamulec to CPU zajęte przez tło.** `bench cpu` przy 16 procesach: 58%
+czasu w kolejce.
+
+| proces | RAM | CPU |
+|---|---|---|
+| VM Dockera | 8,6 GB | 55% |
+| WindowServer | | 45% |
+| Brave | ~4 GB | ~70% razem |
+| Canary Mail | | 25% |
+
+Reduce Transparency jest już włączone, a ekran tylko wewnętrzny, więc WindowServer nie
+ma łatwej dźwigni.
+
+**Docker.** 26 kontenerów w trzech projektach:
+
+| projekt | kontenery | stan |
+|---|---|---|
+| portivo (`untitled`) | 15 | stack dev od 8 h; z Maca tylko 2 połączenia do mailpit |
+| klastry testpg | 6 | wspólne, do ponownego użycia; harness ma limit 6 |
+| Supabase `outofplace-finance` | 11 | |
+
+Wszystkie 17 zdarzeń `docker exec` z ostatniej godziny to healthchecki.
+
+Harness testpg w portivo sam zatrzymuje swoje klastry po 2 h bez podłączenia i usuwa je
+po 24 h, ale tylko gdy akurat startuje test. Restart po zatrzymaniu to ~1 s plus 10-40 s
+budowy szablonu.
+
+Poprawka **`docker-idle`** (poza Ultra, `perf.py apply docker-idle`) zatrzymuje projekt
+compose albo kontener, gdy przez `docker_idle_hours` (2 h) nikt z Maca się z nim nie
+łączył i nikt nie zrobił `docker exec` poza healthcheckiem. Zegar rusza od pierwszego
+spojrzenia, a nie od startu kontenera. Resource Saver Dockera usypia potem VM, gdy nic
+już nie działa. `undo` uruchamia z powrotem dokładnie to, co poprawka zatrzymała. Projekt
+przywraca `docker compose up -d` w repo albo `docker start <id>`.
+
+**Updatery.** Pliki Google Keystone (`com.google.keystone.*`) to celowe zaślepki: pusty
+`<dict/>` należący do roota, blokujący ponowną instalację Keystone. Zostają. Reszta jest
+albo potrzebna, albo nic nie kosztuje:
+- Microsoft AutoUpdate to jedyne łatki Office,
+- GoogleUpdater łata Chrome, bo `updates.py` aktualizuje caski bez `--greedy`,
+- Adobe ARMDC i XQuartz startują tylko na żądanie.
+
+### claude-acc: mniej procesów, szybszy interpreter
+
+| zmiana | przed | po |
+|---|---|---|
+| `claude-acc-hook pause` w trakcie pauzy (fronty przez `acc.py` na `$STATE/python` zamiast `/usr/bin/python3` 3.9) | 34,6 ms | 22,9 ms |
+| `claude-acc-pause` w trakcie pauzy | 30,0 ms | 20,4 ms |
+| procesy na minutę przy zamkniętym panelu: tick zapisuje `status.json`, aplikacja go czyta zamiast co minutę uruchamiać `status --json` z ~20 odczytami Pęku kluczy | ~32 | ~12 |
+| `mail --help`, Python 3.15 z `__lazy_modules__` (PEP 810) | 39 ms | 24 ms |
+| `updates --help`, Python 3.15 z `__lazy_modules__` | 26 ms | 16 ms |
+| import `mcpbase`, Python 3.15 z `__lazy_modules__` | 15 ms (3.14) | 7 ms |
+
+Hand-over do `devguard admit` przez `acc.py` zmienia się w granicach szumu (16,7 -> 17,1 ms).
+
+`setup.sh` przejdzie na uv-owego 3.15, gdy będzie wydaniem końcowym (premiera 2026-10-09).
+Do tego czasu zostaje 3.14.8, a `__lazy_modules__` na 3.14 i 3.9 nic nie zmienia.
+
+Token z `/login` aplikacja przejmuje teraz najpóźniej po jednym ticku (do 120 s), a przy
+otwarciu panelu od razu.
+
+`PYTHON_JIT=1` zostaje: start trwa 12,6 ms z JIT i 12,8 ms bez.
+
+### rg pod skrajnym obciążeniem
+
+Przy obciążeniu 152 (inny agent puścił test wyścigów z 32 procesami `yes`) `-j4` było o
+10% wolniejsze od 16 wątków: 576 wobec 518 ms. Przy zwykłym obciążeniu tego Maca (5-15) jest
+2,3-2,4x szybsze. Zostaje 4.
+
 ## Wyniki ogólne: sieć, CPU, GPU
 
 ### Sieć (TKB, kabel)
@@ -943,6 +1211,20 @@ Stan dla panelu jest w `~/.local/share/claude-acc/perf-state.json`:
 - `deferred`: cofnięcia, które czekają, aż Docker będzie zamknięty.
 
 ## Źródła
+
+- Faza 4 (2026-10-08): ustawienia i zmienne Claude Code
+  https://code.claude.com/docs/en/env-vars , https://code.claude.com/docs/en/settings-reference ,
+  https://code.claude.com/docs/en/prompt-caching , https://code.claude.com/docs/en/sub-agents
+- PEP 810 i Python 3.15: https://peps.python.org/pep-0810/ ,
+  https://docs.python.org/3.15/whatsnew/3.15.html
+- ONNX Runtime, wątki i spinning: https://onnxruntime.ai/docs/performance/tune-performance/threading.html
+- SwiftPM, zmiana domyślnego build systemu:
+  https://forums.swift.org/t/swiftpm-development-update-default-build-system-change/85548 ;
+  SE-0547 (caching kompilacji): https://forums.swift.org/t/se-0547-swiftpm-support-for-compilation-caching/89191
+- QoS i rdzenie E (`taskpolicy -b`): https://eclecticlight.co/2022/10/20/making-the-most-of-apple-silicon-power-5-user-control/
+- MPTCP na macOS: https://www.mptcp.dev/macOS.html
+- Low Data Mode a ruch na pierwszym planie:
+  https://developer.apple.com/documentation/foundation/urlsessionconfiguration/allowsconstrainednetworkaccess
 
 - Apple, Testing and debugging L4S in your app:
   https://developer.apple.com/documentation/network/testing-and-debugging-l4s-in-your-app

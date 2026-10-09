@@ -571,6 +571,40 @@ def network_id():
     return {"interface": iface, "gateway": gateway}
 
 
+# porty sprzętowe, którymi Mac idzie przez dane komórkowe telefonu (networksetup)
+TETHER_PORTS = ("iPhone USB", "Bluetooth PAN")
+HOTSPOT_GATEWAY = "172.20.10.1"  # hotspot z iPhone'a, także po Wi-Fi
+
+
+def hardware_ports():
+    """{urządzenie: port sprzętowy} z networksetup, np. {"en8": "iPhone USB"}."""
+    out = janitor.run(["networksetup", "-listallhardwareports"]) or ""
+    ports, port = {}, None
+    for line in out.splitlines():
+        if line.startswith("Hardware Port: "):
+            port = line[len("Hardware Port: ") :].strip()
+        elif line.startswith("Device: ") and port:
+            ports[line[len("Device: ") :].strip()] = port
+    return ports
+
+
+def link_now():
+    """Którędy idzie trasa domyślna i czy to tethering z telefonu (2026-10-08: iPhone USB
+    z Low Data Mode, upload 16-21 Mb/s, ping 10-248 ms)."""
+    iface, gateway = default_route()
+    port = hardware_ports().get(iface) if iface else None
+    tethered = gateway == HOTSPOT_GATEWAY or bool(
+        port and any(port.startswith(p) for p in TETHER_PORTS)
+    )
+    return {
+        "tethered": tethered,
+        "port": port,
+        "iface": iface,
+        "gateway": gateway,
+        "at": time.time(),
+    }
+
+
 def interface_tbr(iface):
     """Ogranicznik wysyłania ustawiony na interfejsie (np. "27.00 Mbps") albo None."""
     out = janitor.run(["ifconfig", "-v", iface]) or "" if iface else ""
@@ -745,6 +779,7 @@ DOCKER_SETTINGS = os.path.join(
     HOME, "Library/Group Containers/group.com.docker/settings-store.json"
 )
 COMPILE_CACHE_DIR = os.path.join(HOME, "Library/Caches/node-compile-cache")
+RG_CONFIG = os.path.join(STATE_DIR, "ripgreprc")
 DOCKER_CLI = "/Applications/Docker.app/Contents/Resources/bin/docker"
 # skrypty hooków dostarczane z perf.py (hooks/ obok niego) i ich kopie w katalogu stanu,
 # na które wskazuje settings.json, żeby nie zależał od miejsca, z którego uruchomiono perf.py
@@ -813,6 +848,11 @@ DEFAULT_CONFIG = {
     # pamięć maszyny Dockera dla `perf.py apply docker-vm` (poza Ultra, tylko na życzenie);
     # zapis tylko przy zamkniętym Dockerze, działa od jego następnego startu
     "docker_memory_mib": 6144,
+    # `perf.py apply docker-idle` (poza Ultra, tylko na życzenie): projekty Dockera bez
+    # żadnego połączenia z Maca przez tyle godzin stają; 2 h jak stopIdle wspólnych klastrów
+    # testpg w portivo (restart ~1 s, szablon budowany od nowa w 10-40 s)
+    "docker_idle_hours": 2,
+    "docker_idle_keep": [],
     # repozytoria, w których Ultra włącza core.untrackedCache i core.fsmonitor: lista
     # ścieżek albo "orca" (wszystkie repozytoria z worktree w Orce). Domyślnie pusta, bo
     # jedyne takie repo (portivo) zmienia tylko jego właściciel
@@ -840,6 +880,21 @@ DEFAULT_CONFIG = {
     # rozmiar workflow, na jaki model planuje (small <5, medium <10, large <50 agentów);
     # domyślne medium; twarde limity runtime zostają (docs: code.claude.com/docs/en/workflows)
     "workflow_size_guideline": "large",
+    # cache promptu subagentów i członków zespołu (subagentPromptCacheTtl). Domyślne 5 min
+    # nie wytrzymuje przerw: 47% zapisów cache subagentów to ponowny zapis 300-900 tys.
+    # tokenów kontekstu po 5-60 min ciszy (1-8.10, zanim było 1 h)
+    "subagent_prompt_cache_ttl": "1h",
+    # env Claude Code tylko na tetheringu z telefonu: auto-updater ściąga ~236 MB na każde
+    # wydanie (updates.py zaktualizuje Claude Code na zwykłym łączu), podpowiedzi promptu i
+    # streszczenia po powrocie to osobne zapytania do modelu w tle
+    # wątki rg dla agentów: na Macu 16 wątków walczy o blokady jądra przy przechodzeniu
+    # drzewa (sys 3,9 s na jedno wyszukiwanie w portivo), 4 wychodzą najszybciej
+    "rg_threads": 4,
+    "tether_env": {
+        "DISABLE_AUTOUPDATER": "1",
+        "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": "false",
+        "CLAUDE_CODE_ENABLE_AWAY_SUMMARY": "0",
+    },
     # katalogi, które Spotlight indeksuje bez potrzeby; wykluczenie jest tylko w Ustawieniach
     "spotlight_noise": ["~/Library/pnpm", "~/go"],
     # drzewo do pomiaru `bench fs` (lstat wszystkiego, dwa przebiegi)
@@ -880,6 +935,9 @@ class System:
         except OSError:
             return False
         return True
+
+    def link(self):
+        return link_now()
 
     def docker_running(self):
         """Docker Desktop trzyma ustawienia w pamięci i nadpisuje plik; piszemy tylko bez niego."""
@@ -925,6 +983,85 @@ class System:
         except (OSError, subprocess.SubprocessError):
             return False
         return done.returncode == 0
+
+    def docker_containers(self):
+        """Działające kontenery: [{"id", "name", "project", "ports", "started"}]; [] bez Dockera."""
+        cli = janitor.which("docker") or DOCKER_CLI
+        ids = (janitor.run([cli, "ps", "-q"], timeout=20) or "").split()
+        if not ids:
+            return []
+        try:
+            data = json.loads(janitor.run([cli, "inspect", *ids], timeout=30) or "[]")
+        except ValueError:
+            return []
+        found = []
+        for c in data:
+            labels = (c.get("Config") or {}).get("Labels") or {}
+            test = ((c.get("Config") or {}).get("Healthcheck") or {}).get("Test") or []
+            # healthcheck idzie przez exec tak jak psql agenta; jego komenda w zdarzeniu
+            # to "/bin/sh -c <cmd>" (CMD-SHELL) albo argumenty po spacji (CMD)
+            if test[:1] == ["CMD-SHELL"]:
+                health = "/bin/sh -c " + " ".join(test[1:])
+            elif test[:1] == ["CMD"]:
+                health = " ".join(test[1:])
+            else:
+                health = None
+            ports = set()
+            for binds in ((c.get("NetworkSettings") or {}).get("Ports") or {}).values():
+                for bind in binds or []:
+                    if str(bind.get("HostPort", "")).isdigit():
+                        ports.add(int(bind["HostPort"]))
+            found.append(
+                {
+                    "id": c.get("Id", "")[:12],
+                    "name": (c.get("Name") or "").lstrip("/"),
+                    "project": labels.get("com.docker.compose.project")
+                    or (c.get("Name") or "").lstrip("/"),
+                    "ports": sorted(ports),
+                    "started": iso_epoch((c.get("State") or {}).get("StartedAt")) or 0,
+                    "health": health,
+                }
+            )
+        return found
+
+    def connected_ports(self):
+        """Porty, do których ktoś na Macu ma teraz otwarte połączenie TCP (strona klienta;
+        backend Dockera, który trzyma drugi koniec, się nie liczy)."""
+        out = janitor.run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-F", "cn"], timeout=30) or ""
+        ports, command = set(), ""
+        for line in out.splitlines():
+            if line.startswith("c"):
+                command = line[1:]
+            elif line.startswith("n") and "->" in line and not command.startswith(("com.docke", "vpnkit")):
+                remote = line.rsplit("->", 1)[1]
+                port = remote.rsplit(":", 1)[-1]
+                if port.isdigit():
+                    ports.add(int(port))
+        return ports
+
+    def docker_execs(self, since):
+        """{(kontener, komenda)} z `docker exec` od `since`: psql agentów, ale też healthchecki."""
+        cli = janitor.which("docker") or DOCKER_CLI
+        out = janitor.run(
+            [cli, "events", "--since", str(int(since)), "--until", str(int(time.time())),
+             "--filter", "type=container", "--filter", "event=exec_start",
+             "--format", "{{.Actor.Attributes.name}}\t{{.Action}}"],
+            timeout=30,
+        ) or ""
+        found = set()
+        for line in out.splitlines():
+            name, _, action = line.partition("\t")
+            if name.strip():
+                found.add((name.strip(), action.partition("exec_start: ")[2].strip()))
+        return found
+
+    def docker_stop(self, ids):
+        cli = janitor.which("docker") or DOCKER_CLI
+        return janitor.run([cli, "stop", "-t", "30", *ids], timeout=300) is not None
+
+    def docker_start(self, ids):
+        cli = janitor.which("docker") or DOCKER_CLI
+        return janitor.run([cli, "start", *ids], timeout=300) is not None
 
     def docker_memory(self):
         """Pamięć maszyny Dockera w bajtach z `docker info`, gdy Docker działa."""
@@ -1236,6 +1373,58 @@ class ClaudeEnv:
         return f"{self.var}={self.value}"
 
 
+class RipgrepThreads(ClaudeEnv):
+    """Plik konfiguracji rg z `--threads` i RIPGREP_CONFIG_PATH w env sesji Claude Code:
+    rg z Bash agentów i wbudowany Grep czytają go przy każdym starcie, jawne `-j` wygrywa."""
+
+    def __init__(self):
+        super().__init__(
+            "rg-threads",
+            "RIPGREP_CONFIG_PATH",
+            RG_CONFIG,
+            "rg agentów na 4 wątkach zamiast 16 (RIPGREP_CONFIG_PATH w env "
+            "~/.claude/settings.json, plik ripgreprc w katalogu claude-acc)",
+            "portivo (17,7 tys. plików): rg -n 428 ms, 3,9 s czasu jądra -> 179 ms, 0,7 s "
+            "z -j4 (-j2 242, -j6 272, -j12 434 ms); claude-acc 6,5 -> 5,8 ms; ~4300 wywołań "
+            "rg/grep na dobę (2026-10-08)",
+        )
+
+    def contents(self, cfg):
+        return f"# claude-acc perf rg-threads\n--threads={int(cfg['rg_threads'])}\n"
+
+    def apply(self, cfg, system, record=None):
+        wanted = self.contents(cfg)
+        try:
+            with open(self.value) as f:
+                current = f.read()
+        except FileNotFoundError:
+            current = None
+        if current is not None and not current.startswith("# claude-acc perf rg-threads"):
+            return dict(record or {}), []  # cudzy plik pod tą ścieżką: nie ruszamy
+        changed = []
+        if current != wanted:
+            os.makedirs(os.path.dirname(self.value), exist_ok=True)
+            tmp = f"{self.value}.{os.getpid()}.perf-tmp"
+            with open(tmp, "w") as f:
+                f.write(wanted)
+            os.replace(tmp, self.value)
+            changed.append(wanted.splitlines()[-1])
+        record, more = super().apply(cfg, system, record)
+        return record, changed + more
+
+    def undo(self, record, system):
+        restored = super().undo(record, system)
+        try:
+            with open(self.value) as f:
+                ours = f.read().startswith("# claude-acc perf rg-threads")
+            if ours:
+                os.remove(self.value)
+                restored.append(os.path.basename(self.value))
+        except FileNotFoundError:
+            pass
+        return restored
+
+
 class JsonSetting:
     """Jeden klucz w pliku JSON innego narzędzia, z dokładnym cofnięciem."""
 
@@ -1299,6 +1488,88 @@ class JsonSetting:
         if not record.get("written"):
             return f"{self.key}={record.get('value')} czeka na zamknięcie Dockera"
         return f"{self.key}={record.get('value')}"
+
+
+class DockerIdle:
+    """Projekty Dockera (compose albo pojedynczy kontener), do których nikt z Maca się nie
+    łączy, zatrzymane po `docker_idle_hours`: VM Dockera oddaje CPU i pamięć, a Resource
+    Saver usypia ją, gdy nic już nie działa. `docker start` przywraca je w kilka sekund."""
+
+    name = "docker-idle"
+    group = "docker"
+    root = False
+    title = (
+        "zatrzymanie projektów Dockera bez połączeń z Maca od `docker_idle_hours` "
+        "(compose albo kontener; poza `docker_idle_keep`)"
+    )
+    effect = (
+        "VM Dockera 8,6 GB RSS i 55% CPU przy 26 kontenerach, do których od godzin nikt się "
+        "nie łączył (portivo od 8 h: 0 połączeń poza mailpit); wspólne klastry testpg same "
+        "zatrzymują się po 2 h dopiero przy następnym teście (2026-10-08)"
+    )
+
+    def apply(self, cfg, system, record=None):
+        checked = (record or {}).get("checked")
+        record = {
+            "seen": dict((record or {}).get("seen", {})),
+            "stopped": dict((record or {}).get("stopped", {})),
+            "checked": time.time(),
+        }
+        containers = system.docker_containers()
+        if not containers:
+            return record, []
+        now, limit = record["checked"], float(cfg["docker_idle_hours"]) * 3600
+        keep = set(cfg.get("docker_idle_keep") or [])
+        # połączenie otwarte w chwili sprawdzenia albo `docker exec` od poprzedniego
+        # sprawdzenia; krótkie połączenia między próbkami co 5 min umykają, stąd zapas godzin
+        used = system.connected_ports()
+        execs = system.docker_execs(checked or now - 300)
+        projects = {}
+        for c in containers:
+            projects.setdefault(c["project"], []).append(c)
+        changed = []
+        for project, items in projects.items():
+            # ktoś go znowu uruchomił: to już nie nasze zatrzymanie
+            record["stopped"].pop(project, None)
+            # zegar bezczynności rusza od pierwszego spojrzenia, nie od startu kontenera:
+            # bez historii połączeń nie wiadomo, co działo się wcześniej
+            last = max([record["seen"].get(project, now)] + [c["started"] for c in items])
+            if any(port in used for c in items for port in c["ports"]) or any(
+                name == c["name"] and command != c.get("health")
+                for c in items
+                for name, command in execs
+            ):
+                last = now
+            record["seen"][project] = last
+            if project in keep or now - last < limit:
+                continue
+            ids = [c["id"] for c in items]
+            if system.docker_stop(ids):
+                record["stopped"][project] = {"ids": ids, "at": now}
+                hours = (now - last) / 3600
+                changed.append(f"{project}: zatrzymany ({len(ids)} kontenerów, {hours:.1f} h bez połączeń)")
+        # projekty, które zniknęły (usunięte), nie wiszą w stanie
+        record["seen"] = {k: v for k, v in record["seen"].items() if k in projects or k in record["stopped"]}
+        return record, changed
+
+    def undo(self, record, system):
+        running = {c["id"] for c in system.docker_containers()}
+        restored = []
+        for project, entry in (record or {}).get("stopped", {}).items():
+            ids = [i for i in entry.get("ids", []) if i not in running]
+            if ids and system.docker_start(ids):
+                restored.append(project)
+        return restored
+
+    def describe(self, record, system):
+        stopped = (record or {}).get("stopped", {})
+        if not stopped:
+            return f"pilnuje {len((record or {}).get('seen', {}))} projektów, nic nie zatrzymane"
+        return "zatrzymane: " + ", ".join(
+            f"{name} ({ago(entry['at'])}; docker start {' '.join(entry['ids'][:3])}"
+            f"{' …' if len(entry['ids']) > 3 else ''})"
+            for name, entry in stopped.items()
+        )
 
 
 class Deferred(Exception):
@@ -1599,6 +1870,39 @@ class ClaudeUi:
         return ", ".join(f"{k}={json.dumps(v['value'])}" for k, v in found.items()) or "nic"
 
 
+class TetherProfile(ClaudeEnvSet):
+    """Zmienne z `tether_env` tylko wtedy, gdy trasa domyślna idzie przez telefon; keep
+    zdejmuje je po przejściu na kabel albo zwykłe Wi-Fi i zakłada przy następnym
+    tetheringu."""
+
+    def __init__(self):
+        super().__init__(
+            "tether-profile",
+            "tether_env",
+            "na tetheringu z telefonu sesje Claude Code bez auto-updatera i zapytań w tle "
+            "(`tether_env` w env ~/.claude/settings.json, zdejmowane na zwykłym łączu)",
+            "iPhone USB z Low Data Mode: upload 16-21 Mb/s, ping 10-248 ms; auto-updater "
+            "ściągał ~236 MB na każde wydanie Claude Code (2026-10-08)",
+        )
+
+    def apply(self, cfg, system, record=None):
+        link = system.link()
+        if link.get("tethered"):
+            record, changed = super().apply(cfg, system, record)
+        else:
+            undone = super().undo(record, system) if record else []
+            record, changed = {"vars": {}}, [f"{v} zdjęte" for v in undone]
+        record["link"] = {k: link.get(k) for k in ("tethered", "port", "iface")}
+        return record, changed
+
+    def describe(self, record, system):
+        link = (record or {}).get("link") or {}
+        where = link.get("port") or link.get("iface") or "?"
+        if not link.get("tethered"):
+            return f"czeka na tethering (teraz: {where})"
+        return f"{where}: {super().describe(record, system)}"
+
+
 class HookWrap:
     """Hooki formatowania uruchamiane przez hooks/npx-fast-wrap.sh: ten sam skrypt hooka,
     tylko `npx --no-install <narzędzie>` bierze narzędzie wprost z node_modules/.bin.
@@ -1833,7 +2137,8 @@ class NativeHooks:
                             entry = waiting.pop(0)
                             # wpis zostaje ten sam: cofnięcie dalej przywraca prawdziwy oryginał
                             target = next(
-                                (t for t in targets if t[0].search(entry["original"])), None
+                                (t for t in targets if t[0].search(entry["original"])),
+                                None,
                             )
                             if not target:
                                 continue
@@ -1850,8 +2155,12 @@ class NativeHooks:
                         hook["command"], hook["args"] = found[0], list(found[1])
                         if (event, command) not in known:
                             entries.append(
-                                {"event": event, "original": command, "native": found[0],
-                                 "args": list(found[1])}
+                                {
+                                    "event": event,
+                                    "original": command,
+                                    "native": found[0],
+                                    "args": list(found[1]),
+                                }
                             )
                         native = " ".join([found[0], *found[1]])
                         changed.append(f"{event}: {hook_label(command)} -> {hook_label(native)}")
@@ -1967,6 +2276,21 @@ TWEAKS = [
         "medium (<10 agentów) -> large (<50); limit runtime na agentów i ostrzeżenia zostają",
     ),
     ClaudeUi(),
+    JsonSetting(
+        "subagent-cache-1h",
+        "claude",
+        CLAUDE_SETTINGS,
+        "subagentPromptCacheTtl",
+        "subagent_prompt_cache_ttl",
+        "godzinny cache promptu subagentów i członków zespołu (subagentPromptCacheTtl "
+        "w ~/.claude/settings.json); główna sesja bez zmian",
+        "zapisy cache subagentów 300-500 mln tokenów na dobę (5 min, 1-3.10) -> 45-115 mln "
+        "(1 h, 5-8.10); przy 5 min 47% zapisów to kontekst zapisywany od nowa po 5-60 min "
+        "przerwy (678 zapytań po 8,1 s p50 w tydzień)",
+    ),
+    TetherProfile(),
+    RipgrepThreads(),
+    DockerIdle(),
     RootTweak(
         "vnodes",
         "większy cache vnode (kern.maxvnodes 263168 -> 786432): metadane drzew node_modules "
@@ -2325,6 +2649,7 @@ def agent_turnaround(since, until=None):
     polecenia ścięte do 10 min wbrew prośbie agenta."""
     families = {}
     formatted = []
+    quick = []
     capped = 0
     for name, args, ms, text in tool_calls(since, until):
         family = tool_family(name, args)
@@ -2333,11 +2658,146 @@ def agent_turnaround(since, until=None):
             formatted.append(ms)
         if name == "Bash" and capped_bash(text, args):
             capped += 1
+        if name == "Bash" and ms < 5000:
+            quick.append(ms)
     return {
         "families": {k: ms_stats(v) for k, v in families.items()},
         "formatted_edits": ms_stats(formatted),
         "capped": capped,
+        # podłoga wywołania Bash: samo polecenie to 5-20 ms, reszta to Claude Code,
+        # powłoka ze snapshotem i hooki (2026-10-08: p10 120 ms, p50 260 ms)
+        "bash_floor": {
+            "n": len(quick),
+            "p10": rnd(percentile(quick, 0.1), 0),
+            "p50": rnd(percentile(quick, 0.5), 0),
+        },
+        "total_s": {k: rnd(sum(v) / 1000, 0) for k, v in families.items()},
     }
+
+
+STAMP = re.compile(r'"timestamp":"([^"]+)"')
+# progi kontekstu (tokeny) dla opóźnienia modelu: rośnie z kontekstem (2026-10-08, 7 dni:
+# p50 2,6 s poniżej 30 tys., 5,9 s przy 200-400 tys., 6,8 s powyżej 400 tys.)
+CTX_BUCKETS = [
+    (0, 30000, "<30k"),
+    (30000, 100000, "30-100k"),
+    (100000, 200000, "100-200k"),
+    (200000, 400000, "200-400k"),
+    (400000, 700000, "400-700k"),
+    (700000, float("inf"), "700k+"),
+]
+CACHE_TTL_S = 300  # cache promptu bez subagentPromptCacheTtl
+COLD_WRITE = 50000  # tyle tokenów zapisanych w jednym zapytaniu to kontekst od nowa
+
+
+def model_requests(since, until=None):
+    """Zapytania do modelu z transkryptów Claude Code (także subagentów) w oknie czasu,
+    każde jako {"sub", "gap", "ms", "first_ms", "ctx", "created", "read", "out"}.
+
+    Zapytanie zaczyna wpis tuż przed jego pierwszym blokiem (wynik narzędzia, prompt), a
+    kończy ostatni blok; Claude Code zapisuje blok gotowy, więc first_ms to pierwszy blok
+    razem z myśleniem. gap to cisza od końca poprzedniego zapytania w tym transkrypcie.
+    """
+    until = until or time.time()
+    for path in glob.glob(
+        os.path.join(CLAUDE_PROJECTS, "**", "*.jsonl"), recursive=True
+    ):
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+            yield from transcript_requests(path, since, until)
+        except OSError:
+            continue
+
+
+def transcript_requests(path, since, until):
+    """model_requests dla jednego transkryptu: json tylko dla wpisów modelu, reszcie
+    wystarcza znacznik czasu (wyniki narzędzi mają po kilka MB)."""
+    sub = f"{os.sep}subagents{os.sep}" in path
+    found, order = {}, []
+    prev = last_end = None
+    with open(path, errors="replace") as handle:
+        for line in handle:
+            match = STAMP.search(line)
+            stamp = iso_epoch(match.group(1)) if match else None
+            if stamp is None:
+                continue
+            stamp += iso_fraction(match.group(1))
+            entry = None
+            if '"type":"assistant"' in line:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    entry = None
+            if entry and entry.get("type") == "assistant":
+                message = entry.get("message") or {}
+                key = entry.get("requestId") or message.get("id")
+                item = found.get(key)
+                if item is None:
+                    gap = None if last_end is None else (prev or stamp) - last_end
+                    item = found[key] = [prev or stamp, stamp, stamp, {}, gap]
+                    order.append(key)
+                item[2] = stamp
+                item[3] = message.get("usage") or item[3]
+                last_end = stamp
+            prev = stamp
+    for key in order:
+        start, first, last, usage, gap = found[key]
+        if not since <= start <= until:
+            continue
+        created = usage.get("cache_creation_input_tokens") or 0
+        read = usage.get("cache_read_input_tokens") or 0
+        yield {
+            "sub": sub,
+            "gap": gap,
+            "ms": (last - start) * 1000,
+            "first_ms": (first - start) * 1000,
+            "ctx": (usage.get("input_tokens") or 0) + created + read,
+            "created": created,
+            "read": read,
+            "out": usage.get("output_tokens") or 0,
+        }
+
+
+def model_latency(requests):
+    """Opóźnienie modelu (ms) w progach kontekstu: {"200-400k": {"n", "p50", "p90", "first_p50"}}."""
+    out = {}
+    for low, high, label in CTX_BUCKETS:
+        chosen = [r for r in requests if low <= r["ctx"] < high]
+        if chosen:
+            out[label] = dict(
+                ms_stats([r["ms"] for r in chosen]),
+                first_p50=rnd(percentile([r["first_ms"] for r in chosen], 0.5), 0),
+            )
+    return out
+
+
+def cold_cache(requests):
+    """Kontekst zapisany do cache od nowa po ciszy dłuższej niż 5-minutowy cache, osobno
+    dla głównych sesji i subagentów: {"sub": {"requests", "mtok", "s"}, "main": ...}.
+    Liczy tylko przerwy krótsze niż godzina: tyle uratuje godzinny cache."""
+    out = {}
+    for who in ("sub", "main"):
+        cold = [
+            r
+            for r in requests
+            if r["sub"] == (who == "sub")
+            and r["gap"] is not None
+            and CACHE_TTL_S <= r["gap"] < 3600
+            and r["created"] > COLD_WRITE
+        ]
+        out[who] = {
+            "requests": len(cold),
+            "mtok": rnd(sum(r["created"] for r in cold) / 1e6, 1),
+            "s": rnd(sum(r["ms"] for r in cold) / 1000, 0),
+        }
+    return out
+
+
+def cold_per_day(since, until):
+    """Mln tokenów zimnego cache subagentów na dobę w oknie (wynik subagent-cache-1h)."""
+    days = max((until - since) / 86400, 1 / 24)
+    return rnd(cold_cache(list(model_requests(since, until)))["sub"]["mtok"] / days, 1)
 
 
 def bench_agents(hours=24):
@@ -2349,17 +2809,34 @@ def bench_agents(hours=24):
     waits, per_hook = hook_stats(since)
     # najwięcej łącznego czasu: hook do przepisania na program albo do puszczenia w tle
     slow = sorted(per_hook.items(), key=lambda kv: -kv[1]["n"] * (kv[1]["p50"] or 0))
+    requests = list(model_requests(since))
+    totals = sorted(data["total_s"].items(), key=lambda kv: -kv[1])
     return {
         "hours": hours,
         "tools": dict(top[:16]),
         "formatted_edits": data["formatted_edits"],
         "capped_per_day": rnd(data["capped"] * 24 / hours, 1),
         "hooks": waits,
-        "slow_hooks": [dict(st, event=event, hook=label) for (event, label), st in slow[:8]],
+        "slow_hooks": [
+            dict(st, event=event, hook=label) for (event, label), st in slow[:8]
+        ],
+        # gdzie idzie czas: model wobec narzędzi, oba zsumowane po równoległych agentach
+        "model": {
+            "requests": len(requests),
+            "sub_share": rnd(
+                100 * sum(r["sub"] for r in requests) / max(len(requests), 1), 0
+            ),
+            "s": rnd(sum(r["ms"] for r in requests) / 1000, 0),
+            "by_context": model_latency(requests),
+        },
+        "tools_s": rnd(sum(data["total_s"].values()), 0),
+        "tools_by_total_s": dict(totals[:10]),
+        "bash_floor": data["bash_floor"],
+        "cold_cache": cold_cache(requests),
     }
 
 
-GO_PROBE = 'package main\n\nconst v = %d\n\nfunc main() { _ = v }\n'
+GO_PROBE = "package main\n\nconst v = %d\n\nfunc main() { _ = v }\n"
 
 
 def responsible_app(pid=None):
@@ -2519,11 +2996,16 @@ ULTRA = [
     "claude-limits",
     "workflow-size",
     "claude-ui",
+    "subagent-cache-1h",
+    "tether-profile",
+    "rg-threads",
 ]
 # wyniki z transkryptów liczone najwyżej raz na tyle sekund (doba transkryptów to ~10 s)
 AGENTS_CHECK_SECONDS = 1800
 # "po" dla limitu Bash dopiero po tylu godzinach od włączenia: ścięć jest kilka na dobę
 CAPPED_AFTER_HOURS = 6
+# "po" dla cache subagentów dopiero po pełnej dobie: noc i dzień mają inne przerwy
+COLD_AFTER_HOURS = 24
 # co sprawdzić co najwyżej raz na tyle sekund (mdfind trwa około sekundy)
 SPOTLIGHT_CHECK_SECONDS = 600
 # poprawka hooków liczy się dopiero po tylu zdarzeniach od włączenia
@@ -2783,6 +3265,20 @@ def ultra_apply(name, cfg, system, state):
                 "unit": "ms hooków na narzędzie (p50)",
                 "note": f"po {HOOK_SAMPLES} wywołaniach od włączenia",
             }
+    elif (
+        name == "subagent-cache-1h"
+        and name not in ultra["results"]
+        and record.get("prev") != record.get("value")
+    ):
+        # "przed" z dwóch dób transkryptów przed włączeniem tej poprawki (nie całej Ultry);
+        # ustawione już wcześniej nie ma czego porównać
+        at = record["at"]
+        result = {
+            "before": cold_per_day(at - 2 * 86400, at),
+            "after": None,
+            "unit": "mln tokenów cache subagentów od nowa na dobę",
+            "note": f"po {COLD_AFTER_HOURS} h od włączenia",
+        }
     elif name not in ultra["results"]:
         result = measure_before_after(item, cfg, system, record)
     if result:
@@ -2815,7 +3311,7 @@ def transcript_after(ultra, state, force=False):
     """Wyniki "po" z transkryptów od włączenia Ultry, najwyżej raz na AGENTS_CHECK_SECONDS."""
     waiting = [
         n
-        for n in ("fast-npx-hooks", "claude-limits")
+        for n in ("fast-npx-hooks", "claude-limits", "subagent-cache-1h")
         if n in ultra["results"] and ultra["results"][n].get("after") is None
     ]
     if not waiting or not ultra["since"]:
@@ -2826,6 +3322,14 @@ def transcript_after(ultra, state, force=False):
     ):
         return
     state["agents_checked"] = time.time()
+    cache = ultra["results"].get("subagent-cache-1h")
+    at = state["applied"].get("subagent-cache-1h", {}).get("at")
+    if cache and cache.get("after") is None and at:
+        if time.time() - at >= COLD_AFTER_HOURS * 3600:
+            cache["after"] = cold_per_day(at, time.time())
+            cache.pop("note", None)
+    if not [n for n in waiting if n != "subagent-cache-1h"]:
+        return
     data = agent_turnaround(ultra["since"])
     elapsed = time.time() - ultra["since"]
     fast = ultra["results"].get("fast-npx-hooks")
@@ -3126,6 +3630,40 @@ def describe_agents(r):
     lines.append(
         f"polecenia ścięte do 10 min wbrew timeoutowi agenta: {fmt(r.get('capped_per_day'))} na dobę"
     )
+    model = r.get("model") or {}
+    if model.get("requests"):
+        lines.append(
+            f"model: {model['requests']} zapytań ({fmt(model.get('sub_share'))}% subagenci), "
+            f"{fmt(model['s'] / 3600, ' h')}; narzędzia {fmt(r.get('tools_s', 0) / 3600, ' h')} "
+            "(suma po równoległych agentach)"
+        )
+        lines.append(
+            "opóźnienie modelu wg kontekstu (s p50 / p90, pierwszy blok p50, liczba):"
+        )
+        for label, st in (model.get("by_context") or {}).items():
+            lines.append(
+                f"  {label}: {fmt(st['p50'] / 1000)} / {fmt(st['p90'] / 1000)}, "
+                f"{fmt(st['first_p50'] / 1000)} ({st['n']})"
+            )
+    floor = r.get("bash_floor") or {}
+    if floor.get("n"):
+        lines.append(
+            f"podłoga Bash (polecenia < 5 s): p10 {fmt(floor['p10'], ' ms')}, "
+            f"p50 {fmt(floor['p50'], ' ms')} ({floor['n']})"
+        )
+    totals = r.get("tools_by_total_s") or {}
+    if totals:
+        parts = ", ".join(
+            f"{k} {fmt(v / 60, ' min')}" for k, v in list(totals.items())[:6]
+        )
+        lines.append(f"najwięcej czasu łącznie: {parts}")
+    for who, label in (("sub", "subagenci"), ("main", "główne sesje")):
+        cold = (r.get("cold_cache") or {}).get(who) or {}
+        if cold.get("requests"):
+            lines.append(
+                f"cache od nowa po 5-60 min ciszy ({label}): {cold['requests']} zapytań, "
+                f"{fmt(cold['mtok'])} mln tokenów, {fmt(cold['s'] / 60, ' min')}"
+            )
     return lines
 
 
@@ -3180,11 +3718,23 @@ def cmd_status(cfg, args, system=None):
                 entry["detail"] = record.get("detail", "")
         tweaks.append(entry)
     if "--json" in args:
-        out = {"tweaks": tweaks, "bench": state["bench"], "ultra": ultra_state(state)}
+        out = {
+            "tweaks": tweaks,
+            "bench": state["bench"],
+            "ultra": ultra_state(state),
+            "link": state.get("link"),
+        }
         print(json.dumps(out, ensure_ascii=False))
         return 0
     ultra = ultra_state(state)
     print(f"Ultra: {'włączona' if ultra['on'] else 'wyłączona'} (perf.py ultra status)")
+    link = state.get("link")
+    if link:
+        kind = "tethering" if link.get("tethered") else "zwykłe łącze"
+        print(
+            f"Łącze ({ago(link['at'])}): {link.get('port') or '?'} ({link.get('iface')}, "
+            f"brama {link.get('gateway')}), {kind}"
+        )
     print("Poprawki:")
     for entry in tweaks:
         mark = "x" if entry["applied"] else " "
@@ -3241,7 +3791,10 @@ def cmd_bench(cfg, args, system=None):
         elif kind == "fs":
             result = bench_fs(cfg)
         elif kind == "agents":
-            result = bench_agents()
+            hours = 24
+            if "--hours" in args:
+                hours = max(1, int(args[args.index("--hours") + 1]))
+            result = bench_agents(hours)
         elif kind == "gatekeeper":
             result = bench_gatekeeper()
         else:
@@ -3353,6 +3906,12 @@ def cmd_keep(cfg, args, system=None):
     kończy też cofnięcia, które musiały poczekać."""
     system = system or System()
     state = load_state()
+    # łącze dla updates.py: na tetheringu zaplanowane aktualizacje czekają
+    try:
+        state["link"] = system.link()
+    except (OSError, ValueError) as err:
+        log(f"keep: łącze nieznane {err!r}")
+    errors = state.setdefault("keep_errors", {})
     for name, record in list(state.get("deferred", {}).items()):
         if tweak(name) is None:
             continue
@@ -3369,8 +3928,14 @@ def cmd_keep(cfg, args, system=None):
         try:
             record, changed = item.apply(cfg, system, old)
         except (OSError, ValueError, RuntimeError) as err:
-            log(f"keep {item.name}: błąd {err!r}")
+            # ten sam błąd co 5 min (docker-vm: macOS nie wpuszcza do kontenera Dockera)
+            # trafia do logu raz, nowy znowu
+            if errors.get(item.name) != repr(err):
+                log(f"keep {item.name}: błąd {err!r}")
+            errors[item.name] = repr(err)
             continue
+        if errors.pop(item.name, None):
+            log(f"keep {item.name}: znowu działa")
         record["at"] = old["at"]
         if old.get("ultra"):
             record["ultra"] = True

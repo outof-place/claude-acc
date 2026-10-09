@@ -35,11 +35,17 @@ import perf
 class FakeSystem:
     """Procesy jako {pid: [start, linia poleceń, w tle?]}; zapisuje każdą zmianę priorytetu."""
 
-    def __init__(self, procs, docker=False, rtk=False):
+    def __init__(self, procs, docker=False, rtk=False, tethered=False):
         self.procs = {pid: list(v) for pid, v in procs.items()}
         self.calls = []
         self.docker = docker
         self.rtk = rtk
+        self.tethered = tethered
+
+    def link(self):
+        if self.tethered:
+            return {"tethered": True, "port": "iPhone USB", "iface": "en8", "gateway": "172.20.10.1", "at": time.time()}
+        return {"tethered": False, "port": "Wi-Fi", "iface": "en0", "gateway": "10.0.0.1", "at": time.time()}
 
     def rtk_hook(self):
         return self.rtk
@@ -119,6 +125,11 @@ class Isolated(unittest.TestCase):
                 continue
             patcher.start()
             self.addCleanup(patcher.stop)
+        # plik konfiguracji rg leży w katalogu claude-acc: w teście tylko kopia
+        self.rg_config = os.path.join(self.dir, "ripgreprc")
+        patcher = mock.patch.object(perf.tweak("rg-threads"), "value", self.rg_config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.hooks_dir = os.path.join(self.dir, "hooks")
         patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
         patcher.start()
@@ -1914,6 +1925,289 @@ class OwnProcessesTest(unittest.TestCase):
             self.assertEqual(perf.own_processes(), {})
             self.assertEqual(perf.own_processes(), {5: "/bin/x"})
             self.assertEqual(run.call_count, 2)
+
+
+class TetherProfileTest(Isolated):
+    def test_env_only_while_tethered_and_exact_undo(self):
+        self.write(self.claude, claude_settings())
+        before = self.text(self.claude)
+        item = perf.tweak("tether-profile")
+        record, changed = item.apply(self.cfg, FakeSystem({}, tethered=True))
+        self.assertEqual(len(changed), 3)
+        env = self.read(self.claude)["env"]
+        self.assertEqual(env["DISABLE_AUTOUPDATER"], "1")
+        self.assertEqual(env["CLAUDE_CODE_ENABLE_AWAY_SUMMARY"], "0")
+        self.assertIn("iPhone USB", item.describe(record, FakeSystem({})))
+        # kabel albo zwykłe Wi-Fi: zmienne schodzą, plik wraca bajt w bajt
+        record, changed = item.apply(self.cfg, FakeSystem({}), record)
+        self.assertEqual(len(changed), 3)
+        self.assertEqual(self.text(self.claude), before)
+        self.assertIn("czeka na tethering", item.describe(record, FakeSystem({})))
+        # znowu telefon: wracają
+        record, changed = item.apply(self.cfg, FakeSystem({}, tethered=True), record)
+        self.assertEqual(self.read(self.claude)["env"]["DISABLE_AUTOUPDATER"], "1")
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), before)
+
+    def test_users_own_value_stays(self):
+        data = claude_settings()
+        data["env"]["DISABLE_AUTOUPDATER"] = "1"
+        self.write(self.claude, data)
+        item = perf.tweak("tether-profile")
+        record, _ = item.apply(self.cfg, FakeSystem({}, tethered=True))
+        item.apply(self.cfg, FakeSystem({}), record)
+        self.assertEqual(self.read(self.claude)["env"]["DISABLE_AUTOUPDATER"], "1")
+
+    def test_keep_writes_link_for_updates(self):
+        self.run_cmd(perf.cmd_keep, system=FakeSystem({}, tethered=True))
+        link = perf.load_state()["link"]
+        self.assertTrue(link["tethered"])
+        self.assertEqual(link["iface"], "en8")
+
+    def test_link_now_reads_route_and_hardware_ports(self):
+        ports = (
+            "Hardware Port: Wi-Fi\nDevice: en0\nEthernet Address: x\n\n"
+            "Hardware Port: iPhone USB\nDevice: en8\nEthernet Address: y\n"
+        )
+
+        def fake(route_iface, gateway):
+            def run(args, **kw):
+                if args[0] == "route":
+                    return f"   route to: default\n  gateway: {gateway}\n  interface: {route_iface}\n"
+                return ports
+            return run
+
+        with mock.patch.object(perf.janitor, "run", side_effect=fake("en8", "192.168.1.1")):
+            self.assertTrue(perf.link_now()["tethered"])
+        with mock.patch.object(perf.janitor, "run", side_effect=fake("en0", "172.20.10.1")):
+            self.assertTrue(perf.link_now()["tethered"])  # hotspot po Wi-Fi
+        with mock.patch.object(perf.janitor, "run", side_effect=fake("en0", "10.0.0.1")):
+            link = perf.link_now()
+        self.assertEqual((link["tethered"], link["port"]), (False, "Wi-Fi"))
+
+
+class SubagentCacheTest(Isolated):
+    def test_setting_added_and_removed_exactly(self):
+        self.write(self.claude, claude_settings())
+        before = self.text(self.claude)
+        item = perf.tweak("subagent-cache-1h")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(changed, ["subagentPromptCacheTtl=1h"])
+        self.assertEqual(self.read(self.claude)["subagentPromptCacheTtl"], "1h")
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), before)
+
+    def test_in_ultra(self):
+        self.assertIn("subagent-cache-1h", perf.ULTRA)
+        self.assertIn("tether-profile", perf.ULTRA)
+
+
+def compact(entry):
+    return json.dumps(entry, separators=(",", ":")) + "\n"
+
+
+def model_transcript(t0):
+    """Główna tura: prompt, zapytanie A (dwa bloki), wynik narzędzia, zapytanie B; potem
+    10 min ciszy i zapytanie C, które zapisuje cały kontekst do cache od nowa."""
+
+    def at(seconds):
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t0 + seconds)) + ".000Z"
+
+    def assistant(rid, seconds, created, read, out=200):
+        usage = {"input_tokens": 2, "cache_creation_input_tokens": created, "cache_read_input_tokens": read, "output_tokens": out}
+        return {"type": "assistant", "requestId": rid, "timestamp": at(seconds), "message": {"id": rid, "role": "assistant", "content": [{"type": "text", "text": "x"}], "usage": usage}}
+
+    def user(seconds, text="tool output with \"timestamp\":\"1999-01-01T00:00:00Z\""):
+        return {"type": "user", "timestamp": at(seconds), "message": {"role": "user", "content": text}}
+
+    return [
+        user(0, "prompt"),
+        assistant("A", 3, 1000, 40000),
+        assistant("A", 5, 1000, 40000),
+        user(6),
+        assistant("B", 10, 500, 250000),
+        user(610),
+        assistant("C", 618, 300000, 0),
+    ]
+
+
+class ModelRequestsTest(Isolated):
+    def test_requests_latency_buckets_and_cold_cache(self):
+        t0 = int(time.time()) - 3600
+        folder = os.path.join(perf.CLAUDE_PROJECTS, "proj", "sess", "subagents")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "agent-a.jsonl"), "w") as f:
+            f.writelines(compact(e) for e in model_transcript(t0))
+            f.write("{zepsuta linia \"type\":\"assistant\"\n")
+        reqs = list(perf.model_requests(t0 - 60))
+        self.assertEqual(len(reqs), 3)
+        a, b, c = reqs
+        self.assertTrue(a["sub"])
+        self.assertEqual((a["ms"], a["first_ms"], a["ctx"]), (5000, 3000, 41002))
+        self.assertEqual(b["ms"], 4000)
+        self.assertEqual(c["gap"], 600)
+        buckets = perf.model_latency(reqs)
+        self.assertEqual(buckets["30-100k"]["n"], 1)
+        self.assertEqual(buckets["200-400k"]["n"], 2)
+        cold = perf.cold_cache(reqs)
+        self.assertEqual(cold["sub"], {"requests": 1, "mtok": 0.3, "s": 8})
+        self.assertEqual(cold["main"]["requests"], 0)
+
+    def test_bench_agents_reports_model_and_bash_floor(self):
+        t0 = int(time.time()) - 3600
+        folder = os.path.join(perf.CLAUDE_PROJECTS, "proj")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "s.jsonl"), "w") as f:
+            f.writelines(compact(e) for e in model_transcript(t0))
+        result = perf.bench_agents(hours=2)
+        self.assertEqual(result["model"]["requests"], 3)
+        self.assertEqual(result["model"]["sub_share"], 0)
+        self.assertEqual(result["cold_cache"]["main"]["requests"], 1)
+        self.assertIn("bash_floor", result)
+        lines = perf.describe_agents(result)
+        self.assertTrue(any("opóźnienie modelu" in line for line in lines))
+
+
+class KeepErrorsTest(Isolated):
+    def test_same_error_logged_once(self):
+        state = perf.load_state()
+        state["applied"]["devguard-budget"] = {"value": 25, "prev": 35, "written": True, "at": 1}
+        perf.save_state(state)
+        item = perf.tweak("devguard-budget")
+        with mock.patch.object(item, "apply", side_effect=PermissionError(1, "Operation not permitted")):
+            for _ in range(3):
+                self.run_cmd(perf.cmd_keep, system=FakeSystem({}))
+        self.assertEqual(self.text(perf.LOG_PATH).count("keep devguard-budget: błąd"), 1)
+        self.run_cmd(perf.cmd_keep, system=FakeSystem({}))
+        self.assertIn("keep devguard-budget: znowu działa", self.text(perf.LOG_PATH))
+
+
+class RipgrepThreadsTest(Isolated):
+    def test_config_file_and_env_come_and_go(self):
+        self.write(self.claude, claude_settings())
+        before = self.text(self.claude)
+        item = perf.tweak("rg-threads")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertIn("--threads=4", changed)
+        self.assertEqual(self.text(self.rg_config).splitlines()[-1], "--threads=4")
+        self.assertEqual(self.read(self.claude)["env"]["RIPGREP_CONFIG_PATH"], self.rg_config)
+        again, changed = item.apply(self.cfg, FakeSystem({}), record)
+        self.assertEqual(changed, [])
+        item.undo(record, FakeSystem({}))
+        self.assertFalse(os.path.exists(self.rg_config))
+        self.assertEqual(self.text(self.claude), before)
+
+    def test_foreign_file_is_left_alone(self):
+        self.write(self.claude, claude_settings())
+        with open(self.rg_config, "w") as f:
+            f.write("--smart-case\n")
+        item = perf.tweak("rg-threads")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(changed, [])
+        self.assertNotIn("RIPGREP_CONFIG_PATH", self.read(self.claude)["env"])
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.rg_config), "--smart-case\n")
+
+
+class FakeDocker(FakeSystem):
+    """Kontenery {id: (nazwa, projekt, porty, start)}; zapisuje stop i start."""
+
+    def __init__(self, containers, used=(), execs=()):
+        super().__init__({})
+        self.containers = dict(containers)
+        self.running = set(containers)
+        self.used, self.execs = set(used), set(execs)
+        self.log = []
+
+    def docker_containers(self):
+        return [
+            {"id": i, "name": n, "project": pr, "ports": list(po), "started": st,
+             "health": "redis-cli ping" if n == "portivo-redis" else None}
+            for i, (n, pr, po, st) in sorted(self.containers.items())
+            if i in self.running
+        ]
+
+    def connected_ports(self):
+        return set(self.used)
+
+    def docker_execs(self, since):
+        return set(self.execs)
+
+    def docker_stop(self, ids):
+        self.running -= set(ids)
+        self.log.append(("stop", tuple(ids)))
+        return True
+
+    def docker_start(self, ids):
+        self.running |= set(ids)
+        self.log.append(("start", tuple(ids)))
+        return True
+
+
+class DockerIdleTest(Isolated):
+    def stack(self, started):
+        return {
+            "a1": ("portivo-postgres", "untitled", [5433], started),
+            "a2": ("portivo-redis", "untitled", [6380], started),
+            "b1": ("supabase_db_fin", "fin", [54322], started),
+        }
+
+    def test_clock_starts_at_first_sight_then_idle_projects_stop(self):
+        item = perf.tweak("docker-idle")
+        old = time.time() - 10 * 3600
+        system = FakeDocker(self.stack(old), used={54322})
+        record, changed = item.apply(self.cfg, system)
+        self.assertEqual(changed, [])  # bez historii nic nie staje od razu
+        # dwie godziny później: portivo bez połączeń, fin dalej używany
+        record["seen"]["untitled"] -= 2 * 3600 + 1
+        record["seen"]["fin"] -= 2 * 3600 + 1
+        record, changed = item.apply(self.cfg, system, record)
+        self.assertEqual(len(changed), 1)
+        self.assertIn("untitled", changed[0])
+        self.assertEqual(system.running, {"b1"})
+        self.assertIn("untitled", item.describe(record, system))
+        # undo przywraca dokładnie to, co zatrzymaliśmy
+        item.undo(record, system)
+        self.assertEqual(system.running, {"a1", "a2", "b1"})
+
+    def test_exec_and_keep_list_count_as_use(self):
+        item = perf.tweak("docker-idle")
+        old = time.time() - 10 * 3600
+        system = FakeDocker(self.stack(old), execs={("portivo-postgres", "psql -c select 1")})
+        record, _ = item.apply(dict(self.cfg, docker_idle_keep=["fin"]), system)
+        for name in record["seen"]:
+            record["seen"][name] -= 3 * 3600
+        record, changed = item.apply(dict(self.cfg, docker_idle_keep=["fin"]), system, record)
+        self.assertEqual(changed, [])
+        self.assertEqual(system.running, {"a1", "a2", "b1"})
+
+    def test_healthcheck_exec_is_not_use(self):
+        item = perf.tweak("docker-idle")
+        system = FakeDocker(self.stack(time.time() - 10 * 3600), execs={("portivo-redis", "redis-cli ping")})
+        record, _ = item.apply(self.cfg, system)
+        for name in record["seen"]:
+            record["seen"][name] -= 3 * 3600
+        record, changed = item.apply(self.cfg, system, record)
+        self.assertEqual(set(record["stopped"]), {"untitled", "fin"})
+
+    def test_restarted_project_is_no_longer_ours(self):
+        item = perf.tweak("docker-idle")
+        system = FakeDocker(self.stack(time.time() - 10 * 3600))
+        record, _ = item.apply(self.cfg, system)
+        for name in record["seen"]:
+            record["seen"][name] -= 3 * 3600
+        record, _ = item.apply(self.cfg, system, record)
+        self.assertEqual(set(record["stopped"]), {"untitled", "fin"})
+        system.running |= {"a1", "a2"}  # agent zrobił docker compose up
+        for cid in ("a1", "a2"):
+            name, project, ports, _ = system.containers[cid]
+            system.containers[cid] = (name, project, ports, time.time())
+        record, changed = item.apply(self.cfg, system, record)
+        self.assertEqual(set(record["stopped"]), {"fin"})
+        self.assertEqual(changed, [])
+
+    def test_not_in_ultra(self):
+        self.assertNotIn("docker-idle", perf.ULTRA)
 
 
 if __name__ == "__main__":

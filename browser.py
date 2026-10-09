@@ -41,6 +41,10 @@ Tryb full: agent może wszystko, zostają tylko Twoje własne wpisy deny i read.
 w kopercie <untrusted-page>; każde wywołanie trafia do dziennika audytu (bez wpisywanego tekstu).
 """
 
+# Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę.
+# Bez json, threading i concurrent.futures: mcpbase i tak ładuje je od razu.
+__lazy_modules__ = ["base64", "hashlib", "secrets", "socket", "struct", "subprocess", "urllib.parse"]
+
 import base64
 import fcntl
 import hashlib
