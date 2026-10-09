@@ -50,6 +50,9 @@ class FakeSystem:
     def rtk_hook(self):
         return self.rtk
 
+    def claude_plugin(self, *args):
+        return 1, "claude nie jest dostępny w testach"
+
     def rtk_path(self):
         return "/opt/homebrew/bin/rtk" if self.rtk else None
 
@@ -134,6 +137,12 @@ class Isolated(unittest.TestCase):
         patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # security-slim czyta wtyczki Claude Code i pisze marketplace w katalogu stanu: tu puste kopie
+        slim = perf.tweak("security-slim")
+        for attr, value in (("claude_dir", "dot-claude"), ("out_dir", "plugins")):
+            patcher = mock.patch.object(slim, attr, os.path.join(self.dir, value))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # siatka bezpieczeństwa: prawdziwe ustawienia Claude nie mogą się zmienić w teście
         self.real_settings = self.stamp(os.path.expanduser("~/.claude/settings.json"))
         patcher = mock.patch.object(
@@ -1984,6 +1993,29 @@ class TetherProfileTest(Isolated):
         with mock.patch.object(perf.janitor, "run", side_effect=fake("en0", "10.0.0.1")):
             link = perf.link_now()
         self.assertEqual((link["tethered"], link["port"]), (False, "Wi-Fi"))
+
+    def test_link_command_gives_the_panel_tether_profiles_answer(self):
+        """2026-10-09: panel pisał "Not on a hotspot" na hotspocie z iPhone'a, bo pytał macOS,
+        czy ścieżka jest droga, zamiast reguły tether-profile. Teraz pyta `perf link --json`;
+        po Wi-Fi do iPhone'a (brama 172.20.10.1) słyszy "tethered" z tej samej reguły, która
+        włącza tether-profile."""
+        self.write(self.claude, claude_settings())
+        ports = "Hardware Port: Wi-Fi\nDevice: en0\n\nHardware Port: iPhone USB\nDevice: en8\n"
+
+        def run(args, **kw):
+            if args[0] == "route":
+                return "   route to: default\n  gateway: 172.20.10.1\n  interface: en0\n"
+            return ports
+
+        with mock.patch.object(perf.janitor, "run", side_effect=run):
+            code, out = self.run_cmd(perf.cmd_link, "--json")
+            profile = perf.tweak("tether-profile")
+            record, _ = profile.apply(self.cfg, perf.System())
+        link = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual((link["tethered"], link["port"], link["iface"]), (True, "Wi-Fi", "en0"))
+        self.assertEqual(record["link"]["tethered"], link["tethered"])
+        self.assertIs(perf.COMMANDS["link"], perf.cmd_link)
 
 
 class SubagentCacheTest(Isolated):

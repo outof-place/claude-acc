@@ -44,7 +44,7 @@ After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new ver
 | **Claude accounts** | Session and weekly usage of every subscription in the menu bar. Moves your running Claude Code sessions to the account with the most headroom once the active one is down to 5% of the session or 3% of the week, with no restart and no `/login`, skipping accounts whose subscription was canceled. When no account is left, it can [use up the last few percent of every account](#using-up-every-account) (`claude-acc drain on`), then tells you once; with the optional [limit pause](#how-the-pause-works) (`claude-acc pause on`) it also stops your sessions at a checkpoint instead of letting agents run into the wall, and wakes them when limits come back. Keeps [`depot claude`](#depot-sandboxes) sandboxes on another account than the laptop. Click any account for its plan, subscription start, renewal and both resets to the minute. |
 | **Dev server guard** | Agents in [Orca](https://github.com/stablyai/orca) each run their own `next dev` with a preview tab, and Turbopack grows to 6-9 GB per server under their edits. The guard watches every dev server's real memory (the number macOS kills by), knows who is looking at it, restarts a bloated one in its own Orca terminal in seconds, stops duplicates, orphans and loops, and turns away an agent about to start a second server of the same app. |
 | **Janitor** | Removes what a build or an install brings back (`.next`, `.turbo`, stale `node_modules`, Go and npm caches, Docker leftovers) when nobody is using it, at login and every 3 hours, and keeps folders that agents fill without end under a size cap. |
-| **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on, even with the lid closed. Turns on by itself on any hotspot (iPhone over Wi-Fi or USB, Android, cellular) and keeps the hotspot from dozing off. With [Hotspot turbo](#hotspot-turbo) on, an iPhone hotspot stops queueing every session's requests behind one session's upload. |
+| **Stay Awake** | Like Amphetamine: awake until you say so or for 1-8 hours, optionally with the display on, even with the lid closed. Turns on by itself on the iPhone hotspot (over Wi-Fi or USB, or a phone over Bluetooth) and keeps the hotspot from dozing off. With [Hotspot turbo](#hotspot-turbo) on, an iPhone hotspot stops queueing every session's requests behind one session's upload. |
 | **Load & heat** | CPU load split into performance and efficiency cores, GPU load, and P-core, E-core, GPU, SSD and battery temperatures with a 20-minute chart. Fans on Auto, 50%, 75% or Max, going full speed whenever a chip passes 95 °C, and never fighting another fan app. |
 | **Updates** | Everything on the Mac brought to its newest version every 3 days: Homebrew formulae and casks, global npm packages, Go programs, Python packages (rolled back if anything conflicts or stops importing), Python itself, Claude Code with its plugins and skills. Pins are respected and hand-edited skills are left alone. The panel shows when it last worked, what each part did and why something failed, and an Update button runs it now. |
 | **Mail gateway** | Your agents read and answer the company mail without a password or key on disk: several mailboxes, Google Workspace through domain-wide delegation and any IMAP/SMTP server, behind one [MCP server](#mail-gateway) every Claude Code session gets. Each mailbox has its own level (read, modify, draft) and sending is off unless you allow it, so an agent leaves a draft for you. What an email says is treated as untrusted data, and every call lands in an audit log. |
@@ -219,6 +219,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc guard room [dir]` | Exit 0 when memory admits a new dev server (of the app in `dir`), 1 with the reason: what a refused agent waits on |
 | `claude-acc guard brake [--stage N] [--within PID]` | The memory brake's stage now and whom it would stop, without a signal |
 | `claude-acc run -- <command>` | Run a heavy command through the memory scheduler from a terminal, a script or an Orca automation |
+| `claude-acc sched cancel <job-id\|pane> [--queued] [--kill] [--json]` | Take a waiting job off the queue (its command exits with 130) or stop a running one: SIGTERM through its wrapper, which passes it to the command's process group. A pane key (`ORCA_PANE_KEY`) means every job of that Orca pane; `--queued` only the waiting ones, `--kill` SIGKILLs a command that outlives the 5 s grace |
 | `claude-acc sched codex install` / `uninstall` / `status` | The scheduler's hook for Codex in `~/.codex/hooks.json` (trust it once in Codex's `/hooks`) |
 | `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
 | `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
@@ -233,7 +234,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc perf-root spotlight apps-only\|undo` | Root: Spotlight indexes apps only; undo restores the previous privacy list |
 | `claude-acc perf-root iogpu set [MB]\|undo\|status` | Root: more memory for the GPU (`iogpu.wired_limit_mb`), so local models stay on Metal; kept across reboots, `status` without sudo |
 | `claude-acc perf-root devtools add\|undo\|status` | Opens Developer Tools in System Settings and waits until Orca is on the list, so fresh Go test binaries skip Gatekeeper |
-| `claude-acc perf bench agents [--hours N]` | Where agents spend their time, from Claude Code transcripts (last day by default): model latency by context size, the floor of a Bash call, cache re-writes after idle gaps, tool turnaround and the hooks that cost the most |
+| `claude-acc perf bench agents [--hours N]` | Where agents spend their time, from Claude Code transcripts (last day by default): model latency by context size, the floor of a Bash call, cache re-writes after idle gaps, tool turnaround and the hooks that cost the most, among those that print something ([why](#silent-hooks)) |
 | `claude-acc perf bench gatekeeper` | How long the first run of a freshly built binary waits for Gatekeeper from this terminal |
 | `claude-acc mail add <address> gmail\|imap [read\|modify\|draft] [--send] [...]` | Add a mailbox; for IMAP the password goes into the Keychain, `--token-command` gives a Gmail mailbox without delegation |
 | `claude-acc mail google --service-account SA [--aws-audience A --aws-profile P]` | The Google service account and the identity that signs for it |
@@ -259,11 +260,14 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc credits canary [--version X.Y.Z]` | Check a Claude Code version with one metered Haiku call and pin it for `run` |
 | `claude-acc credits record --org ID --usd N --purpose NAME` | Report what a call cost, so the balance stays current between Console readings |
 | `claude-acc credits key --purpose NAME --json` | Which Keychain entry to use, without the key |
+| `claude-acc jobs run NAME [--slot S] [--json]` | One unattended attempt of a blog job and its record ([Jobs](#jobs)); `jobs list`, `jobs log NAME`, `jobs add/set/remove`, `jobs hold/release` |
 | `claude-acc desktop install` / `uninstall` | Register the `desktop` MCP server, the `desktop` skill and the prompt hint for every Claude Code session |
 | `claude-acc desktop doctor [--open]` / `status [--json]` | Whether the helper has Accessibility and Screen Recording (and which binary to tick), the displays, the mode |
 | `claude-acc desktop mode full\|guarded` | Whether the agent acts freely (full) or is asked before `type`, `key` and `hold_key` (guarded) |
 | `claude-acc desktop <member> ['<json input>']` | Any toolset member from the shell, such as `screenshot --out shot.png` or `left_click '{"coordinate": [640, 300]}'` |
 | `claude-acc mcp share <name> [--force] [--port N]` | Run that user-scope stdio MCP server once for every Claude Code session instead of once per session |
+| `claude-acc awake on [--for 2h]\|off\|toggle` / `status [--json]` | Stay Awake from outside the app: through `claude-acc://awake/...`, confirmed in `awake-state.json` |
+| `claude-acc orca install` / `uninstall` / `status` | The claude-acc plugin in Orca's plugin folder (see [Orca plugin](#orca-plugin)) |
 | `claude-acc mcp unshare <name>\|--all` / `status [--json]` | Put it back to one copy per session / the shared servers, their sessions, restarts and memory |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
@@ -300,7 +304,7 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 
 | Task | What goes | When |
 | --- | --- | --- |
-| `next` | `.next` and `.next-*` next to a `package.json`, unchanged for 24 hours | every run |
+| `next` | `.next` and `.next-*` next to a `package.json`, unchanged for 24 hours; Turbopack's persistent cache in `.next/cache` and `.next/dev/cache` (what new worktrees seed from) stays until it is unchanged for 7 days | every run |
 | `caches` | `.turbo`, `node_modules/.cache`, `node_modules/.vite`, unchanged for 7 days | daily |
 | `node_modules` | every `node_modules` of a project where no file changed and git didn't move for 30 days | daily |
 | `tmp` | `go-build*` in `$TMPDIR` older than 6 hours | every run |
@@ -309,7 +313,7 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `npm` | `npm cache verify`, npx packages unused for 30 days (not the ones a running process uses, like MCP servers), npm logs older than a week | daily |
 | `pnpm` | `pnpm store prune`, and after every run that removed a `node_modules` | weekly |
 | `docker` | dangling images and build cache older than a week, only when the engine is already running | daily |
-| `xcode` | DerivedData unchanged for 14 days, unavailable simulators | daily |
+| `xcode` | DerivedData unchanged for 14 days except the shared `ModuleCache.noindex` and `CompilationCache.noindex`, unavailable simulators | daily |
 | `brew` | `brew cleanup --prune=14` | weekly |
 | `uv` | `uv cache prune` | weekly |
 | `logs` | files in `~/Library/Logs` older than 30 days | daily |
@@ -337,8 +341,8 @@ Configuration lives in `~/.local/share/claude-acc/janitor.json`. Every key is op
 | --- | --- | --- |
 | `roots` | `~/Documents`, `~/Developer`, `~/Projects`, `~/code`, `~/src` | Where projects live |
 | `protect` | `[]` | Paths the janitor never touches (footage, experiment results) |
-| `next_idle_hours` | `24` | Age of a `.next` cache before it goes |
-| `cache_idle_days` | `7` | Age of `.turbo` and `node_modules/.cache` |
+| `next_idle_hours` | `24` | Age of a `.next` build before it goes |
+| `cache_idle_days` | `7` | Age of `.turbo`, `node_modules/.cache` and Turbopack's cache in `.next` |
 | `node_modules_idle_days` | `30` | Project inactivity before its `node_modules` goes, `0` turns it off |
 | `npx_idle_days` | `30` | Age of an npx package |
 | `go_cache_max_gb` / `go_cache_keep_percent` | `20` / `60` | Go build cache size that triggers a trim, and how much of it the trim keeps (the most recently used entries) |
@@ -623,6 +627,25 @@ A run is also refused before the start when the project in its working directory
 
 Programs use the same thing from Python: `runenv.prepare(purpose, budget_usd, ...)` returns the run (its `env`, payer, live `spent()`, `alarm()` and `alarms()`), `runenv.finish(run, exit_code)` returns the summary and `runenv.exit_code_for(summary, code)` the exit code; the docstring at the top of `runenv.py` has the details.
 
+## Jobs
+
+`claude-acc jobs` runs a blog pipeline (one repo command that follows the blog pipeline contract) unattended and leaves one record per attempt that says what happened, what it cost, who paid, the links and the log.
+
+```sh
+claude-acc jobs add outofplace --cwd ~/orca/workspaces/outofplace/blog-autopilot \
+  --precheck 'sh scripts/autopilot/precheck.sh' --entry 'pnpm autopilot' --budget-usd 25
+claude-acc jobs run outofplace     # one attempt; exits with the contract's code, 75 when it could not start
+claude-acc jobs list               # every job, its last outcome, a run in progress, a hold
+claude-acc jobs log outofplace     # the last attempts and the tail of the latest log
+claude-acc jobs set outofplace budget_usd=30 run_min=240
+claude-acc jobs set outofplace live_urls=https://example.com/blog   # checked after an unclean publish
+claude-acc jobs hold --hours 4 --reason 'iOS build'   # until `jobs release`
+```
+
+An attempt picks a payer through `credits run`'s run environment (credit from the pool, otherwise a subscription account, never the work account), runs the precheck and then the entry command in their own process groups with the pinned `claude` first on `PATH` (built like the updater's, so `pnpm`, `node`, `vercel` and `gh` resolve under launchd), and holds `caffeinate -i -s` for as long as the runner lives. Limits are in awake minutes and count from the moment a command starts: time the Mac sleeps, time spent waiting for memory and time a heavy step waits in the build scheduler's queue are not counted. Before the start the run waits for memory (no brake, no critical pressure, `footprint_gb` free); heavy steps inside the pipeline go through `$CLAUDE_ACC_JOB_HEAVY`, one at a time through the scheduler. One attempt per job at a time (a second one exits 73 without a record) and one heavy job at a time across jobs.
+
+The outcome follows the contract's exit code unless the runner saw something itself before the pipeline wrote its side-effect marker: a credit that ran out, a 401 or 429, a sleep, the memory brake, a signal, the time limit. Those make it BŁĄD, retryable, with a hint to pay differently next time where it fits. The brake kills first and logs its victim at the end of its pass, after the pipeline has already exited, so on a failing end the runner waits up to 12 seconds for the guard's state file to change before it decides. The side-effect phase starts with the marker, with a final result that says OPUBLIKOWANO, ZAPARKOWANO or PILNE, or with exit code 0, 2 or 5, and the runner writes the exit code to `current.json` the moment the pipeline ends. After that nothing is retried: any unclean end, a runner error included, is PILNE, and the runner opens the result's URLs itself, or the job's `live_urls` when the result has none (the marker carries no URLs). A stop at 1.5 × the budget, a payer mismatch or a leaked login is final and carries a banner. An attempt that could not start is POMINIĘTO with a `skip` cause (`heavy`, `hold`, `memory`, `payer`, `version`, `interrupt`) for the scheduler to time its retry. A runner killed outright leaves its attempt in `current.json`, and the next `jobs` command turns it into a record once the run environment has settled the run's bill. Records live in `~/.local/share/claude-acc/jobs/<job>/history.jsonl`, logs next to them in `logs/` (60 per job, skipped attempts' logs pruned first); the field list is in the docstring at the top of `jobs.py`.
+
 ## Desktop gateway
 
 `claude-acc desktop mcp` is a stdio MCP server with Anthropic's computer use toolset (`computer_toolset_20260801`), the tools Claude models are trained on, under their own names and inputs: `screenshot`, `zoom`, `cursor_position`, `mouse_move`, `left_mouse_down`, `left_mouse_up`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `left_click_drag`, `scroll`, `type`, `key`, `hold_key` and `wait`. It drives the whole macOS desktop the way the browser gateway drives your Chrome: the agent takes a `screenshot` of the active display, then clicks and types at coordinates in that screenshot's pixel space. `claude-acc desktop install` registers it as `desktop` in your user scope with the `desktop` skill and the shared prompt hint; scripts call any member with `claude-acc desktop <member> '<json>'`.
@@ -679,13 +702,37 @@ unless you pass `--force`:
 agent; `claude-acc uninstall` unshares everything first. `CLAUDE_ACC_MCPSHARE_DEBUG=1` in the agent's
 environment logs each request's method names (never their content) to `<name>.log`.
 
+## Orca plugin
+
+![The claude-acc panel in Orca](docs/orca-plugin-panel.png)
+
+`orca-plugin/` is a native plugin for [Orca](https://github.com/stablyai/orca), plain JavaScript with no dependencies. It shows what the menu bar panel shows, next to the worktrees it is about:
+
+- **Status bar:** the active account's ring (the worse of session and weekly) with the time to the next switch, reset or resume, a memory brake badge from stage 1 (warning) and stage 2 (error) up, and Stay Awake while it is on. A click opens the panel; the Awake item turns Stay Awake off. ![Status bar](docs/orca-plugin-statusbar.png)
+- **Panel:** accounts with Switch, Resume, pause at the limit and draining; dev servers grouped by Orca worktree with their size, who watches them and what the guard plans, with Restart, Stop and Pin; the scheduler's running and queued jobs per worktree with the reason and the ETA, and Cancel; Stay Awake, Ultra, Hotspot turbo, fans, cleanup, updates and dictation. Orca's design tokens color it.
+- **Commands** (Cmd-J): switch to the next account, resume, pause at the limit, drain, restart or stop the focused worktree's dev servers, cancel its builds, clean up, update, Ultra, Stay Awake and dictation. A command reports back as a notification.
+- **Worktree cards:** one `claude-acc: :3000 4.5 GB watched · 1 build running` line in the card's comment, written only when it changes (in half-gigabyte steps, at most once a minute) and only on a card that is empty or holds nothing but claude-acc's and devguard's own lines. A comment you or an agent wrote is never touched. The worktree's board status stays yours. Turn it off in the panel.
+- **Notifications:** an account at 90% of a window, the switch less than 10 minutes away, an account switch, sessions paused at the limit, and the memory brake reaching stage 2. Each comes once.
+
+The worker reads the state files the daemons write, the way the menu bar app does (it never runs `claude-acc status --json`, which takes a lock and reads the Keychain), runs `~/.local/bin/claude-acc` for actions from a closed list of commands with checked arguments, and reaches Orca's own runtime socket for worktree paths, terminals and card comments. It finds that socket through its parent process, so a second or dev instance of Orca talks to itself. The data side has no Orca code in it: `orca-plugin/lib/core.mjs` (`createAccCore`) reads the state files, builds the model and runs the allowlisted actions, so another host can import it as-is; `worker.mjs` only adds the plugin API, the runtime RPC and the panel transport.
+
+Install it with `claude-acc orca install`, then in Orca open **Settings › Plugins**, turn on the plugin system (experimental) and approve **Claude Acc**. claude-acc never turns the plugin system on for you and never writes Orca's settings: the installer only lays the plugin out the way Orca's own installer does, as an immutable folder named by its content hash plus a `current` pointer in `~/Library/Application Support/orca/plugins/outof-place.claude-acc`. `claude-acc-setup` refreshes a plugin installed that way (`setup.sh --orca-plugin` installs it); `claude-acc orca uninstall` removes it.
+
+The status bar items and the live panel need an Orca with plugin status bar items and live panel messaging. An older Orca rejects a manifest that declares them, so the installer looks for them in Orca's app bundle and leaves them out when they are missing (`--live on|off` overrides). There everything else works, and the panel lists the commands instead of live data:
+
+![The panel on an Orca without live panels](docs/orca-plugin-panel-stock.png)
+
+Tests: `node --test orca-plugin/test/*.test.mjs` (also part of the Python suite). `orca-plugin/test/e2e/` holds two Playwright specs for an Orca checkout (copy them into its `tests/e2e`, set `CLAUDE_ACC_REPO`): one installs the plugin with `orcaplugin.py` into an isolated Orca, approves it and checks the status bar, the panel, a panel action, a command and the card line; the other does the same on an Orca without the live APIs.
+
 ## Stay Awake
 
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours.
 
 An assertion only stops idle sleep: closing the lid of a MacBook on battery sleeps it anyway. With **Awake with the lid closed** (on by default) a session you started yourself also asks the fan daemon (root, `claude-acc fans install`) to turn on `SleepDisabled`, the switch behind `pmset disablesleep`, through `~/.local/share/claude-acc/awake.json`. The daemon holds it only while the session lasts and the app that asked still runs, lets go on battery at 10% or less, at a serious thermal state (then waits 15 minutes before holding it again), 24 hours after the request even for a session without an end, and when it stops, and never turns off a `SleepDisabled` it didn't turn on (Amphetamine, `sudo pmset disablesleep 1`). A session that switched itself on for a hotspot doesn't ask: a Mac awake in a bag has to be your choice.
 
-With **Auto on any hotspot** it switches itself on whenever the Mac joins a network that macOS marks as expensive: an iPhone or Android hotspot over Wi-Fi or USB, or a cellular modem. It turns off again when you leave that network, unless you turned it on yourself. **Keep the hotspot alive** sends one small request every 25 seconds, so a phone doesn't drop a hotspot it thinks nobody uses. The settings live in the app's preferences.
+Outside the app, `claude-acc awake on [--for 90m]`, `off`, `toggle` and `status [--json]` open `claude-acc://awake/<on|off|toggle>[?for=<seconds>]` in the background, and the app writes what it holds to `~/.local/share/claude-acc/awake-state.json` on every change (`on`, `manual`, `until`, `hotspot`, `pid`). Only the app's process holds the assertions, so a reader checks that pid is alive; the Orca plugin shows and toggles it from there.
+
+With **Auto on the iPhone hotspot** it switches itself on whenever the default route goes through the phone, by the same rule as Ultra's tether-profile (`claude-acc perf link`): the iPhone hotspot over Wi-Fi or USB (gateway 172.20.10.1, port iPhone USB), or a phone over Bluetooth. Other networks, an Android hotspot over Wi-Fi included, don't count. It turns off again when you leave that network, unless you turned it on yourself. **Keep the hotspot alive** sends one small request every 25 seconds, so a phone doesn't drop a hotspot it thinks nobody uses. The settings live in the app's preferences.
 
 ## Dictation
 
@@ -747,8 +794,11 @@ A Mac running a dozen agents spends a surprising amount of its time on work nobo
 | `subagent-cache-1h` | `subagentPromptCacheTtl: "1h"` in `~/.claude/settings.json`. With the 5-minute default, 47% of subagent cache writes re-wrote a 300-900k context after a 5-60 minute pause |
 | `tether-profile` | While the default route goes through a phone (iPhone USB, Bluetooth PAN, Personal Hotspot), `tether_env` in the `env` of `~/.claude/settings.json`: no auto-updater download (~236 MB a release) and no background prompt suggestions or away summaries. Removed again on a cable or regular Wi-Fi; scheduled `updates` runs wait for a regular link too |
 | `rg-threads` | A `ripgreprc` with `--threads=4` and `RIPGREP_CONFIG_PATH` for Claude Code sessions: on macOS 16 threads fight over kernel locks walking a tree (428 → 179 ms in a 17.7k-file repo). An explicit `-j` still wins |
+| `security-slim` | When `security-guidance@claude-plugins-official` is on at user scope, the same pattern warnings on Edit and Write from one Python process, and the official plugin off at user scope. Its hooks run bash plus two Pythons on every edit and every prompt, and its seven Bash hooks with `if: Bash(git commit:*)` fire on every command Claude Code can't fully parse (`$(...)`, `$VAR`, `for`), about 15% of Bash calls, although with the LLM review off they only ever add the edit warnings. On apply, claude-acc copies `patterns.py` from the plugin you have installed into its own local marketplace (`~/.local/share/claude-acc/plugins`, plugin `security-slim@claude-acc`), so it ships none of that code, and registers it with `claude plugin`. `perf keep` copies the rules again after the official plugin updates. `perf ultra status` names project and local settings files that turn the official plugin back on (they win over user scope). A hand-made predecessor (`sec-patterns@...`) is turned off and comes back on undo. Measured: an edit 90 → 27 ms, a prompt 225 → 0 ms, about 7.6% → 0.1% of a core while agents work; the same JSON as the official hook on 17 sample events. One difference: a Write is compared with HEAD, not with the snapshot the official plugin takes on each prompt |
 
-Claude Code runs every hook of an event in parallel and waits for the slowest, and a shell script with `jq` pays 50-80 ms in process starts on every tool call of every session. `claude-acc perf bench agents` lists the hooks that cost the most (it sees the hooks that print something). For a hook of your own that shows up there, a small compiled program (Go, Swift) answers in about 5 ms, and `"async": true` removes the wait for a hook whose output nobody reads. `sh -c` itself costs 3-4 ms per hook on a loaded Mac; exec form (Claude Code 2.1.139 and later) skips it, and `claude-hooks-native` moves simple hooks there. Running sessions keep the hook commands they started with: the change shows in new and resumed sessions.
+Claude Code runs every hook of an event in parallel and waits for the slowest, and a shell script with `jq` pays 50-80 ms in process starts on every tool call of every session. `claude-acc perf bench agents` lists the hooks that cost the most. For a hook of your own that shows up there, a small compiled program (Go, Swift) answers in about 5 ms, and `"async": true` removes the wait for a hook whose output nobody reads. `sh -c` itself costs 3-4 ms per hook on a loaded Mac; exec form (Claude Code 2.1.139 and later) skips it, and `claude-hooks-native` moves simple hooks there. Running sessions keep the hook commands they started with: the change shows in new and resumed sessions.
+
+<a id="silent-hooks"></a>**The ranking misses silent hooks.** Claude Code writes a hook's run time to the transcript (`durationMs` in a `hook_success` entry) only when the hook printed something, so a hook that stays quiet never shows up, however slow. On 2026-10-09 that hid a plugin's Python hooks that cost about 51 ms before and 53 ms after every tool call, and security-guidance. Claude Code 2.1.294 keeps no other local record of each hook's time: `stop_hook_summary` lists every `Stop` hook but times only those with output, `lastSessionMetrics` in `~/.claude.json` holds one figure for all hooks of a project's last session, debug logs are off unless a session starts with `--debug` and give no time per command hook, and OpenTelemetry's `hook_execution_complete` times all matching hooks of one event together (`PostToolUse:Read`), needs telemetry on in every session plus an OTLP receiver (there is no file exporter), and names the hooks only under detailed beta tracing. To check a quiet hook, time it by hand: start its command with a sample event on stdin, the way Claude Code does.
 
 Docker's VM is left out of Ultra because the cap applies only after a Docker restart: `claude-acc perf apply docker-vm` writes `MemoryMiB` 6144 while Docker is closed (the VM held 8 GB for 3.7 GB of containers), and every container with a restart policy comes back on its own.
 

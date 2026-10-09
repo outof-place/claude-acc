@@ -442,6 +442,10 @@ dostępną pamięć), a przy `emergency` nie startuje nic; joby w kolejce czekaj
 `pressure`), nikt nie dostaje odmowy. Hamulec może zgasić biegnący job schedulera: agent dostaje
 kod wyjścia sygnału, a log strażnika komendę do wznowienia.
 
+## `sched.py cancel`
+
+`claude-acc sched cancel <job-id|pane>` zaznacza job w `state.json` (`cancelled`, czas). Czekający wrapper widzi to w następnym obrocie pętli (co 0,5 s), zdejmuje się z kolejki i kończy kodem 130 z linią `[sched] anulowane …`; biegnący dostaje SIGTERM do wrappera, który jak przy Ctrl-C przekazuje SIGCONT i SIGTERM grupie procesów komendy i zapisuje bieg do historii z `"cancelled": true`. Sygnał idzie tylko do pidu, który wciąż jest wrapperem `sched.py run` (argv z KERN_PROCARGS2), a `--kill` (SIGKILL po 5 s) tylko do grupy, której lider jest dzieckiem tego wrappera. Klucz panelu Orki (`ORCA_PANE_KEY`, w `agent.pane`) wybiera wszystkie joby panelu, `--queued` tylko czekające; `--json` wypisuje `{"target", "jobs": [{"id", "label", "state", "result"}]}` z `result` `dequeued`, `ended`, `terminated`, `killed`, `still running` albo `gone`.
+
 ## `sched.py wait`
 
 `sched.py wait [--max S] [--every S] -- 'WARUNEK'` sprawdza WARUNEK (komendę powłoki) co `--every`

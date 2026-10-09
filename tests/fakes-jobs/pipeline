@@ -1,0 +1,172 @@
+#!/usr/bin/python3
+"""Atrapa potoku bloga dla `claude-acc jobs run` (tests/test_jobs.py): precheck i komenda wejścia
+według kontraktu v2 (~/.claude/plans/credit-blogs-2026-10-09/CONTRACT-blog-pipeline.md).
+
+  pipeline precheck    FAKE_PRECHECK_EXIT (0), FAKE_PRECHECK_REASON, FAKE_PRECHECK_SLEEP (s),
+                       FAKE_PRECHECK_HEAVY=1 (krok przez $CLAUDE_ACC_JOB_HEAVY, zanim skończy)
+  pipeline entry       FAKE_JOB_EXIT (0), FAKE_JOB_OUTCOME (domyślnie z tabeli kontraktu),
+                       FAKE_JOB_MARKER=1 ({"phase":"side-effect"} przed "publikacją"),
+                       FAKE_JOB_EARLY_MARKER=1 (znacznik na samym początku, przed `claude`),
+                       FAKE_JOB_NO_RESULT=1 (bez końcowego JSON-a), FAKE_JOB_RETRYABLE=1,
+                       FAKE_JOB_WYNIK (inne słowo w bloku WYNIK albo "none"), FAKE_JOB_URLS (po
+                       przecinku), FAKE_JOB_TITLE, FAKE_JOB_CLAUDE=1 (`claude -p` z PATH),
+                       FAKE_JOB_SLEEP (s, po "publikacji"), FAKE_JOB_SLEEP_GAP (s snu dopisane do
+                       zegara runnera, $CLAUDE_ACC_JOBS_CLOCK), FAKE_JOB_KILL_SELF=1 (SIGKILL w miejscu
+                       "publikacji", po znaczniku, gdy jest), FAKE_JOB_BRAKE=1 (dziecko zgaszone jak
+                       przez hamulec pamięci; pid i chwilę zostawia w brake.log, a zdarzenie w
+                       devguard-state.json pisze test, później i spoza drzewa biegu, jak strażnik),
+                       FAKE_JOB_LEAK=1 (`claude` spoza katalogu biegu, jak wyciek S2 z test_runenv),
+                       FAKE_JOB_HEAVY=1 (krok przez $CLAUDE_ACC_JOB_HEAVY), FAKE_JOB_IGNORE_TERM=1,
+                       FAKE_JOB_TOOLS=plik (`command -v` narzędzi i zmienne biegu),
+                       FAKE_JOB_RESULT_EXTRA (JSON dopisany do końcowego JSON-a wyniku),
+                       FAKE_JOB_LINGER (s: potok żyje dalej po końcowym JSON-ie),
+                       FAKE_JOB_STRAGGLER=1 (dziecko we własnej sesji, głuche na SIGTERM: przeżywa
+                       komendę, więc runenv.finish() czeka na nie swoją łaskę),
+                       FAKE_JOB_LOCK_STATE=1 (katalog joba tylko do odczytu tuż przed znacznikiem:
+                       następny zapis current.json przez runnera rzuca wyjątek)
+
+Znacznik to dokładnie {"phase":"side-effect"}, a końcowy JSON nie ma "phase" (kontrakt, punkt 5;
+Renggli nadpisuje nim znacznik), żeby testy nie przechodziły dzięki temu, czego potok nie pisze.
+
+Obie komendy zapisują swój pid i pid-y dzieci w $HOME/fake/pids.log, a start w
+$HOME/fake/started.log, żeby testy sprawdziły, że nic nie przeżyło biegu.
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+HOME = os.environ["HOME"]
+FAKE = os.path.join(HOME, "fake")
+CONTRACT = {"0": "OPUBLIKOWANO", "2": "ZAPARKOWANO", "4": "BEZ WPISU", "1": "BŁĄD", "5": "PILNE"}
+
+
+def note(name, line):
+    os.makedirs(FAKE, exist_ok=True)
+    with open(os.path.join(FAKE, name), "a") as f:
+        f.write(line + "\n")
+
+
+def write_result(data):
+    path = os.environ["CLAUDE_ACC_JOB_RESULT"]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def heavy(cmd):
+    prefix = os.environ.get("CLAUDE_ACC_JOB_HEAVY", "").split()
+    return subprocess.run(prefix + cmd).returncode
+
+
+def precheck():
+    note("started.log", f"precheck {os.getpid()}")
+    note("pids.log", str(os.getpid()))
+    if os.environ.get("FAKE_PRECHECK_HEAVY"):
+        heavy(["/bin/sh", "-c", "echo precheck-step"])
+    if os.environ.get("FAKE_PRECHECK_SLEEP"):
+        child = subprocess.Popen(["/bin/sleep", os.environ["FAKE_PRECHECK_SLEEP"]])
+        note("pids.log", str(child.pid))
+        child.wait()
+    print("precheck: sprawdzam backlog", flush=True)
+    print("ostrzeżenie na stderr", file=sys.stderr, flush=True)
+    print(os.environ.get("FAKE_PRECHECK_REASON", "precheck: przebieg może ruszyć"), flush=True)
+    return int(os.environ.get("FAKE_PRECHECK_EXIT", "0"))
+
+
+def brake():
+    """Hamulec pamięci gasi ciężkie dziecko biegu tak jak naprawdę (lastresort.reap): najpierw
+    zabija, potok szybko kończy się błędem, a strażnik zapisuje zdarzenie dopiero na końcu tiku.
+    Zdarzenie pisze test (World.devguard) z pid-u i chwili z brake.log."""
+    child = subprocess.Popen(["/bin/sleep", "60"])
+    note("pids.log", str(child.pid))
+    time.sleep(1.5)  # runner próbkuje drzewo co pół sekundy
+    os.kill(child.pid, signal.SIGKILL)
+    child.wait()
+    note("brake.log", f"{child.pid} {time.time()}")
+    print("build zginął (hamulec pamięci)", flush=True)
+
+
+def straggler():
+    code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    child = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)  # fmt: skip
+    note("pids.log", str(child.pid))
+
+
+def leak():
+    """Claude Code spoza katalogu biegu (przebudowane środowisko, ścieżka bezwzględna): płaciłoby
+    bazowe logowanie, czyli Blazity. Jak w tests/test_runenv.py, wyciek S2."""
+    claude = os.path.join(HOME, ".local/bin/claude")
+    env = {"HOME": HOME, "USER": "tester", "PATH": "/usr/bin:/bin", "FAKE_CLAUDE_SLEEP": "5"}
+    child = subprocess.Popen([claude, "-p", "leak", "--no-session-persistence"], env=env, stdin=subprocess.DEVNULL)
+    note("pids.log", str(child.pid))
+    child.wait()
+
+
+def entry():
+    note("started.log", f"entry {os.getpid()}")
+    note("pids.log", str(os.getpid()))
+    if os.environ.get("FAKE_JOB_IGNORE_TERM"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if os.environ.get("FAKE_JOB_TOOLS"):
+        tools = {}
+        for tool in ("pnpm", "node", "vercel", "gh", "claude"):
+            out = subprocess.run(["/bin/sh", "-c", f"command -v {tool}"], capture_output=True, text=True)
+            tools[tool] = out.stdout.strip() or None
+        env = {k: v for k, v in os.environ.items() if k.startswith("CLAUDE_ACC_JOB") or k in ("PATH", "CLAUDE_CONFIG_DIR")}
+        with open(os.environ["FAKE_JOB_TOOLS"], "w") as f:
+            json.dump({"tools": tools, "env": env}, f)
+    code = os.environ.get("FAKE_JOB_EXIT", "0")
+    outcome = os.environ.get("FAKE_JOB_OUTCOME") or CONTRACT.get(code, "BŁĄD")
+    urls = [u for u in os.environ.get("FAKE_JOB_URLS", "").split(",") if u]
+    print("autopilot: start", flush=True)
+    if os.environ.get("FAKE_JOB_EARLY_MARKER"):
+        write_result({"phase": "side-effect"})
+        time.sleep(1.0)  # runner widzi znacznik, zanim przyjdzie drogie zapytanie
+    if os.environ.get("FAKE_JOB_CLAUDE"):
+        subprocess.run(["claude", "-p", "napisz wpis"], stdin=subprocess.DEVNULL)
+    if os.environ.get("FAKE_JOB_HEAVY"):
+        if heavy(["/bin/sh", "-c", f"echo built > {os.path.join(FAKE, 'built')}"]) != 0:
+            print("WYNIK: BŁĄD\nPowód: build nie przeszedł", flush=True)
+            return 1
+    if os.environ.get("FAKE_JOB_LEAK"):
+        leak()
+    if os.environ.get("FAKE_JOB_BRAKE"):
+        brake()
+    if os.environ.get("FAKE_JOB_SLEEP_GAP"):
+        with open(os.environ["CLAUDE_ACC_JOBS_CLOCK"], "w") as f:
+            json.dump({"slept": float(os.environ["FAKE_JOB_SLEEP_GAP"])}, f)
+        time.sleep(1.5)  # runner widzi skok zegara ściennego w kolejnym obrocie pętli
+    if os.environ.get("FAKE_JOB_LOCK_STATE"):
+        os.chmod(os.path.dirname(os.path.dirname(os.environ["CLAUDE_ACC_JOB_RESULT"])), 0o500)
+    if os.environ.get("FAKE_JOB_MARKER"):
+        write_result({"phase": "side-effect"})
+        time.sleep(1.0)  # znacznik leży na dysku, zanim cokolwiek wyjdzie na zewnątrz
+    if os.environ.get("FAKE_JOB_KILL_SELF"):
+        os.kill(os.getpid(), signal.SIGKILL)
+    if os.environ.get("FAKE_JOB_SLEEP"):
+        child = subprocess.Popen(["/bin/sleep", os.environ["FAKE_JOB_SLEEP"]])
+        note("pids.log", str(child.pid))
+        child.wait()
+    if not os.environ.get("FAKE_JOB_NO_RESULT"):
+        result = {"outcome": outcome, "reason": os.environ.get("FAKE_JOB_REASON", f"atrapa: {outcome}"),
+                  "title": os.environ.get("FAKE_JOB_TITLE"), "urls": urls, "pr": os.environ.get("FAKE_JOB_PR"),
+                  "retryable": bool(os.environ.get("FAKE_JOB_RETRYABLE")), "notes": "uwaga atrapy"}  # fmt: skip
+        result.update(json.loads(os.environ.get("FAKE_JOB_RESULT_EXTRA") or "{}"))
+        write_result(result)
+    if os.environ.get("FAKE_JOB_STRAGGLER"):
+        straggler()
+    if os.environ.get("FAKE_JOB_LINGER"):
+        time.sleep(float(os.environ["FAKE_JOB_LINGER"]))
+    wynik = os.environ.get("FAKE_JOB_WYNIK", outcome)
+    if wynik != "none":
+        print(f"\nWYNIK: {wynik}\nWpis: {os.environ.get('FAKE_JOB_TITLE') or '-'}\nPowód: atrapa", flush=True)
+    return int(code)
+
+
+if __name__ == "__main__":
+    sys.exit(precheck() if sys.argv[1:2] == ["precheck"] else entry())

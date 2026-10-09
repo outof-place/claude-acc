@@ -47,6 +47,7 @@ struct ClaudeAccApp: App {
         var depot: DepotRuns?
         var updates: UpdatesState?
         var desktop: DesktopPanel?
+        var link: TetherLink?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
             output = CLIResult(status: text.isEmpty ? 1 : 0, stdout: text, stderr: "no file \(snapshotFile)")
@@ -74,19 +75,24 @@ struct ClaudeAccApp: App {
                 updates = Store.decode(UpdatesState.self, from: data)
             }
             if let data = try? Data(contentsOf: folder.appending(path: "demo-perf.json")) {
-                ultra = Store.decode(PerfFile.self, from: data)?.ultra
+                let perf = Store.decode(PerfFile.self, from: data)
+                ultra = perf?.ultra
+                link = perf?.link
             }
             if let data = try? Data(contentsOf: folder.appending(path: "demo-desktop.json")) {
                 desktop = Store.decode(DesktopPanel.self, from: data)
             }
         } else {
             output = CLI.runBlocking(CLI.process(["status", "--json"]))
+            // Stay Awake's hotspot line: the route `perf keep` saw last (it runs every 5 minutes)
+            link = FileManager.default.contents(atPath: CLI.perfState)
+                .flatMap { Store.decode(PerfFile.self, from: $0) }?.link
         }
         guard output.status == 0, let snapshot = Store.decode(Snapshot.self, from: Data(output.stdout.utf8)) else {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, depot: depot, updates: updates, desktop: desktop)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, depot: depot, updates: updates, desktop: desktop, link: link)
         store.previewOpenAccount = open
         store.previewHoverAccount = hover
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
@@ -109,6 +115,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBar: MenuBarController?
     private var widget: DictationWidget?
     private var store: Store?
+    /// URLs that arrive before the store exists: `open -g` that starts the app delivers its URL early.
+    private var early: [URL] = []
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // `claude-acc dictate` opens claude-acc://dictate/<toggle|start|stop|cancel> in the background
@@ -123,19 +131,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBar = MenuBarController(store: store)
         widget = DictationWidget(dictation: store.dictation)
         store.dictation.activate()
+        early.forEach(handle)
+        early = []
     }
 
     @objc private func openURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
         guard let text = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
-              let url = URL(string: text), url.scheme == "claude-acc", url.host() == "dictate",
-              let dictation = store?.dictation
+              let url = URL(string: text), url.scheme == "claude-acc"
         else { return }
-        dictationLog.notice("command: \(url.absoluteString, privacy: .public)")
-        switch url.lastPathComponent {
-        case "start": dictation.start(handsFree: true, fromCommand: true)
-        case "stop": dictation.stop()
-        case "cancel": dictation.cancel()
-        default: dictation.toggle()
+        if store == nil { early.append(url) } else { handle(url) }
+    }
+
+    private func handle(_ url: URL) {
+        guard let store else { return }
+        switch url.host() {
+        // `claude-acc awake on|off|toggle`: Stay Awake from the terminal or Orca
+        case "awake": store.awake.command(url)
+        case "dictate":
+            dictationLog.notice("command: \(url.absoluteString, privacy: .public)")
+            switch url.lastPathComponent {
+            case "start": store.dictation.start(handsFree: true, fromCommand: true)
+            case "stop": store.dictation.stop()
+            case "cancel": store.dictation.cancel()
+            default: store.dictation.toggle()
+            }
+        default: break
         }
     }
 }
