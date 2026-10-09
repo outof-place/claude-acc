@@ -63,9 +63,10 @@ DEFAULT_CONFIG = {
     "protect": [],
     # przebieg z launchd nie powtarza porządków sprzed chwili (np. po ponownym logowaniu)
     "min_hours_between_sweeps": 2,
-    # cache buildów Next.js (.next, .next-*) bez zmian od tylu godzin
+    # cache buildów Next.js (.next, .next-*) bez zmian od tylu godzin; ich .next/cache
+    # i .next/dev/cache (trwały cache Turbopacka) mają próg z cache_idle_days
     "next_idle_hours": 24,
-    # .turbo, node_modules/.cache i node_modules/.vite bez zmian od tylu dni
+    # .turbo, node_modules/.cache, node_modules/.vite i cache Turbopacka w .next bez zmian od tylu dni
     "cache_idle_days": 7,
     # node_modules projektów, w których nic się nie zmieniło od tylu dni; 0 wyłącza
     "node_modules_idle_days": 30,
@@ -74,7 +75,7 @@ DEFAULT_CONFIG = {
     # cache kompilacji Go czyszczony dopiero powyżej tylu GB
     "go_cache_max_gb": 20,
     "go_cache_keep_percent": 60,
-    # Xcode DerivedData bez zmian od tylu dni
+    # Xcode DerivedData bez zmian od tylu dni; wspólne cache (XCODE_SHARED_CACHES) zostają
     "derived_data_idle_days": 14,
     # symulatory agentów (pula portivo-mobile) i ich dzierżawy; te same wartości co w devguard.json.
     # Nigdy nie kasujemy ich jako "niedostępnych": runtime potrafi zniknąć na chwilę przy zmianie Xcode
@@ -597,8 +598,15 @@ def task_trash(sw, scan):
         sw.remove("trash", path, lambda n: n.startswith(TRASH_PREFIX))
 
 
+# trwały cache Turbopacka (turbopackFileSystemCacheForBuild, dev server), z którego nowe
+# worktree portivo dostają twardymi linkami rozgrzany build: zostaje po skasowaniu reszty .next
+# i idzie dopiero po cache_idle_days bez zmian, jak .turbo
+NEXT_CACHES = ("cache", "dev/cache")
+
+
 def task_next(sw, scan):
     since = time.time() - sw.cfg["next_idle_hours"] * HOUR
+    cache_since = time.time() - sw.cfg["cache_idle_days"] * DAY
     for path in scan().next_dirs:
         app = os.path.dirname(path)
         if sw.usage.holds(path) or sw.usage.works_in(app) or not sw.usage.ok:
@@ -606,7 +614,27 @@ def task_next(sw, scan):
         elif recently_changed(path, since):
             sw.skip("next", path, "świeży")
         else:
-            sw.remove("next", path, lambda n: n == ".next" or n.startswith(".next-"))
+            keep = {c for c in NEXT_CACHES if recently_changed(os.path.join(path, c), cache_since)}
+            if keep:
+                remove_next_output(sw, path, keep)
+            else:
+                sw.remove("next", path, lambda n: n == ".next" or n.startswith(".next-"))
+
+
+def remove_next_output(sw, path, keep, prefix=""):
+    """Kasuje z .next wszystko poza `keep` (ścieżki względem .next) i katalogami nad nimi."""
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return
+    for entry in entries:
+        rel = prefix + entry.name
+        if rel in keep:
+            continue
+        if any(k.startswith(rel + "/") for k in keep) and entry.is_dir(follow_symlinks=False):
+            remove_next_output(sw, entry.path, keep, rel + "/")
+        else:
+            sw.remove("next", entry.path, lambda n, want=entry.name: n == want)
 
 
 def task_project_caches(sw, scan):
@@ -808,11 +836,16 @@ def task_docker(sw, _scan):
     )
 
 
+# wspólne dla wszystkich projektów w DerivedData: moduły Clang i CAS kompilacji Xcode 27
+# (compilation caching); bez CAS pierwszy build każdego projektu kompiluje ~2,7 GB od zera
+XCODE_SHARED_CACHES = ("ModuleCache.noindex", "CompilationCache.noindex")
+
+
 def task_xcode(sw, _scan):
     derived = os.path.join(HOME, "Library/Developer/Xcode/DerivedData")
     since = time.time() - sw.cfg["derived_data_idle_days"] * DAY
     for path in glob.glob(os.path.join(derived, "*")):
-        if not os.path.isdir(path) or path.endswith("ModuleCache.noindex"):
+        if not os.path.isdir(path) or os.path.basename(path) in XCODE_SHARED_CACHES:
             continue
         if sw.usage.busy(path) or recently_changed(path, since):
             continue
