@@ -49,6 +49,8 @@ while [ $# -gt 0 ]; do
       # hook schedulera w Codeksie (claude-acc sched codex install), jeśli był
       [ -f "$STATE/sched.py" ] && /usr/bin/python3 "$STATE/sched.py" codex uninstall >/dev/null 2>&1 || true
       [ -f "$STATE/desktop.py" ] && /usr/bin/python3 "$STATE/desktop.py" uninstall >/dev/null 2>&1 || true
+      # wspólne serwery MCP wracają do stdio w ~/.claude.json, zanim zniknie ich automat
+      [ -f "$STATE/mcpshare.py" ] && /usr/bin/python3 "$STATE/mcpshare.py" unshare --all >/dev/null 2>&1 || true
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -122,6 +124,7 @@ fi
 
 # jedna komenda na wszystko: konta, kredyty API (credits), porządki (mac, clean), strażnik (guard),
 # wydajność (perf, perf-root), wiatraki (fans), hotspot iPhone'a (hotspot), aktualizacje (update, updates),
+# wspólne serwery MCP (mcp),
 # a `claude-acc uninstall` zdejmuje to, co postawił ten skrypt
 cat > "$HOME/.local/bin/claude-acc" <<'EOF'
 #!/bin/sh
@@ -145,6 +148,8 @@ case "$1" in
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
+  # wspólne serwery MCP: jeden proces stdio dla wszystkich sesji Claude Code
+  mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka

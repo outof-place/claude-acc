@@ -256,6 +256,8 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc desktop doctor [--open]` / `status [--json]` | Whether the helper has Accessibility and Screen Recording (and which binary to tick), the displays, the mode |
 | `claude-acc desktop mode full\|guarded` | Whether the agent acts freely (full) or is asked before `type`, `key` and `hold_key` (guarded) |
 | `claude-acc desktop <member> ['<json input>']` | Any toolset member from the shell, such as `screenshot --out shot.png` or `left_click '{"coordinate": [640, 300]}'` |
+| `claude-acc mcp share <name> [--force] [--port N]` | Run that user-scope stdio MCP server once for every Claude Code session instead of once per session |
+| `claude-acc mcp unshare <name>\|--all` / `status [--json]` | Put it back to one copy per session / the shared servers, their sessions, restarts and memory |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
 ## Configuration
@@ -590,6 +592,46 @@ claude-acc credits exec --no-env --purpose nightly-digest -- \
 
 There is no desktop daemon and no "open app" member: an agent opens an app through Spotlight (`cmd+space`, type its name, Return) or the Dock. Prefer the `browser` gateway for anything inside a web page; it works in a background tab and never takes focus.
 
+## Shared MCP servers
+
+Every Claude Code session starts its own copy of every stdio MCP server in `~/.claude.json`, so with
+eight agents running you have eight copies of each, and a server that loads a model loads it eight
+times. `claude-acc mcp share <name>` runs one copy for all of them: a launchd agent
+(`com.filip.claude-acc.mcpshare.<name>`) keeps the stdio server alive and serves it as Streamable HTTP
+on `127.0.0.1`, and the user-scope entry becomes an `http` entry with a bearer token. Sessions started
+after that connect to the shared copy; running ones keep theirs until they restart.
+
+Measured on 2026-10-09 with cavemem (it loads a MiniLM embedder) and nine sessions: 490 MB of copies
+became 165 MB for the bridge and the one server, and a session connects in 8 ms instead of 83 ms. A
+new session adds nothing.
+
+How it works: the server initializes once and every client gets that answer from memory. Each client
+has its own `Mcp-Session-Id`, and its JSON-RPC ids and progress tokens are rewritten to unique ones on
+the way in and back on the way out, so two sessions both sending id 1 never get each other's result.
+Progress streams back over SSE to the session that asked, cancellations reach the server under its
+own id, and a crashed server restarts with backoff while the HTTP side stays up. Both protocol eras
+work: the classic `initialize` handshake and 2026-07-28 (`server/discover`, `subscriptions/listen`,
+and the `ttlMs`/`cacheScope` that list results need there, which an older server doesn't send). It
+listens on `127.0.0.1` only, answers 401 without the token (a 0600 file under
+`~/.local/share/claude-acc/mcpshare/`), and 403 for a foreign `Host` or `Origin`, so a web page can't
+reach it through DNS rebinding. `~/.claude.json` is backed up before the change and kept at 0600,
+because the token is in it.
+
+Only stateless servers can be shared. A server that asks the client something (elicitation, sampling,
+roots) can't be told which of the sessions asked, so the bridge answers it with an error, and the
+server still runs in your home directory, not each session's project. That is why `share` refuses,
+unless you pass `--force`:
+
+- `mail`: it collects send approval through MCP elicitation.
+- `browser`: it remembers which tabs each session opened or borrowed.
+- `desktop`: it asks for approval through elicitation and maps coordinates from the session's last screenshot.
+- `chrome-devtools`: one browser and page per client.
+- MCP Magic: every session joins its own Figma channel.
+
+`claude-acc mcp unshare <name>` puts the original stdio entry back exactly as it was and removes the
+agent; `claude-acc uninstall` unshares everything first. `CLAUDE_ACC_MCPSHARE_DEBUG=1` in the agent's
+environment logs each request's method names (never their content) to `<name>.log`.
+
 ## Stay Awake
 
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours. Closing the lid still sleeps a MacBook unless an external display is connected.
@@ -658,6 +700,8 @@ The performance tests run `perf.py` on a temporary `$HOME`: every tweak applies,
 The update tests run `updates.py` on a temporary `$HOME` against fake `brew`, `npm`, `go`, `pip`, `uv`, `claude`, `npx` and `pkgutil` that keep the installed and newest versions in a JSON file: every package manager brought to the newest version, a pinned formula and an npm major pin held (with versions in registry order, which sorts wrong as text), a failing cask and npm package that don't stop the rest and get one notification, an npm package rolled back when its command stops working after npm blocked its install scripts, the 3-day interval and the next-night retry, Python packages upgraded together from wheels (with the user site on its own, a package installed from a folder left alone, a source-only release and one held lower by another package reported as held back), an upgrade that breaks `pip check` rolled back while a conflict from before the run is not, an upgrade that stops a package importing rolled back, a pinned package and a pinned dependency held, a new Playwright given its browsers, a failed `pip install`, every Python upgraded once and named, a newer python.org patch offered (and not a new minor, nor Homebrew's Python) and an unsigned installer thrown away, a uv Python that holds pip packages left on its patch, Claude Code and its plugins updated, plugins updated from their own project and never auto-confirmed, a hand-edited skill left alone, the native `claude` first on the `PATH`, a step from an older version dropped from the state, a dry run that changes nothing, a failed `brew update`, a second run waiting for the first, and `--only` leaving the schedule alone.
 
 The guard tests check its decisions on a made-up picture of the Mac (bloated, busy, duplicate, orphaned, watched and loop-restarted servers, warning and critical pressure, sticky and growing swap) and the hook's reading of agent commands, Metro in every form among them, and that a killed process slow to exit is not reported as surviving. Then they start a fake `next dev` (Python with 48 MB of ballast, listening on a port) on a temporary `$HOME`, with `scope` limited to it so the real dev servers on the Mac stay invisible, and check that the guard sees its port and size, stops it, leaves it alone in `--dry-run` and `observe`, that the hook sends a second start to the running one, refuses a Metro under critical pressure with no server left and one the guard just stopped for memory, and that `guard room` lets it through once memory is back.
+
+The shared MCP tests (`tests/test_mcpshare.py`) run the bridge on a random port with a fake stdio server: the token, `Host` and `Origin` guards, one `initialize` for two clients, two sessions sending the same id at once, progress over SSE under the client's own token, a server request refused instead of routed, a crash and restart, sessions and DELETE, the 2026-07-28 era with its list cache fields and `subscriptions/listen`, and `share`/`unshare` on a temporary `.claude.json` through fake `launchctl` (which starts the real `serve` from the plist) and `claude mcp`, including a server that never starts and an entry someone else changed in the meantime.
 
 The mail gateway tests (`tests/test_mail.py`) need no network: the MCP handshake, version negotiation, tool calls and errors over stdio; levels, the send switch and the audit log; the envelope, invisible characters and HTML; Gmail's MIME tree and threaded drafts; Gmail queries turned into IMAP `SEARCH`; the IMAP provider against a fake `imaplib` (search, read, attachment to quarantine, archive, draft, the connection pool and a sign-in that times out); a Gmail mailbox on a token command (scopes from tokeninfo, a failing command); and the approval flag on `mail_send` following the send modes. The SigV4 signer is checked against the example in AWS's documentation.
 
