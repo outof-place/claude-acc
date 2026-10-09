@@ -1,0 +1,417 @@
+<title>Claude Acc</title>
+<style>
+  :root {
+    --acc-ok: #15803d;
+    --acc-warn: #ca8a04;
+    --acc-bad: var(--destructive, #e40014);
+    --acc-violet: #7c3aed;
+    --acc-radius: calc(var(--radius, 0.625rem) - 2px);
+    color-scheme: light dark;
+  }
+  html.dark {
+    --acc-ok: #86efac;
+    --acc-warn: #eab308;
+    --acc-violet: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 10px 10px 16px;
+    background: var(--background, Canvas);
+    color: var(--foreground, CanvasText);
+    font: 12px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted-foreground, GrayText); }
+  .card {
+    background: var(--card, transparent);
+    border: 1px solid var(--border, rgba(127,127,127,.2));
+    border-radius: var(--radius, 0.625rem);
+    padding: 10px;
+    margin-bottom: 8px;
+  }
+  .card h2 {
+    margin: 0 0 8px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+    color: var(--muted-foreground, GrayText);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .card h2 .spacer { flex: 1; }
+  .row { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+  .row + .row { margin-top: 4px; }
+  .grow { flex: 1; min-width: 0; }
+  .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sub { font-size: 11px; }
+  .hero { display: flex; gap: 12px; align-items: center; }
+  .ring { flex: none; }
+  .ring text { font-size: 11px; font-weight: 600; fill: var(--foreground, CanvasText); }
+  .bar { height: 4px; border-radius: 2px; background: var(--muted, rgba(127,127,127,.2)); overflow: hidden; }
+  .bar > span { display: block; height: 100%; border-radius: 2px; transition: width .3s ease; }
+  .meter { display: grid; grid-template-columns: 52px 1fr 36px; align-items: center; gap: 6px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 0 6px; height: 18px; border-radius: 9px;
+    font-size: 10.5px; font-weight: 500; white-space: nowrap;
+    background: var(--muted, rgba(127,127,127,.15));
+    color: var(--muted-foreground, GrayText);
+  }
+  .pill.ok { color: var(--acc-ok); background: color-mix(in srgb, var(--acc-ok) 12%, transparent); }
+  .pill.warn { color: var(--acc-warn); background: color-mix(in srgb, var(--acc-warn) 14%, transparent); }
+  .pill.bad { color: var(--acc-bad); background: color-mix(in srgb, var(--acc-bad) 12%, transparent); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--muted-foreground, gray); }
+  .dot.ok { background: var(--acc-ok); } .dot.warn { background: var(--acc-warn); } .dot.bad { background: var(--acc-bad); }
+  .dot.violet { background: var(--acc-violet); }
+  button {
+    font: inherit; font-size: 11px; font-weight: 500;
+    height: 22px; padding: 0 8px;
+    border-radius: var(--acc-radius);
+    border: 1px solid var(--border, rgba(127,127,127,.25));
+    background: var(--secondary, transparent);
+    color: var(--secondary-foreground, inherit);
+    cursor: pointer; white-space: nowrap;
+    transition: background-color .12s ease, opacity .12s ease, transform .08s ease;
+  }
+  button:hover { background: var(--accent, rgba(127,127,127,.15)); color: var(--accent-foreground, inherit); }
+  button:active { transform: scale(.97); }
+  button:focus-visible { outline: 2px solid var(--ring, Highlight); outline-offset: 1px; }
+  button.primary { background: var(--primary, Highlight); color: var(--primary-foreground, HighlightText); border-color: transparent; }
+  button.primary:hover { opacity: .9; }
+  button.danger:hover { color: var(--acc-bad); }
+  button[disabled] { opacity: .5; cursor: default; transform: none; }
+  .switch { position: relative; width: 26px; height: 15px; flex: none; padding: 0; border-radius: 8px; background: color-mix(in srgb, var(--muted-foreground, gray) 35%, transparent); border: none; }
+  .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: var(--background, white); box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: transform .15s ease; }
+  .switch[aria-checked="true"] { background: var(--primary, Highlight); }
+  .switch[aria-checked="true"]::after { transform: translateX(11px); }
+  .switch:hover { background: color-mix(in srgb, var(--muted-foreground, gray) 50%, transparent); }
+  .switch[aria-checked="true"]:hover { background: var(--primary, Highlight); opacity: .9; }
+  .actions { display: flex; gap: 4px; flex-wrap: wrap; }
+  .group + .group { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border, rgba(127,127,127,.2)); }
+  .group-title { font-weight: 600; margin-bottom: 4px; display: flex; gap: 6px; align-items: center; }
+  .item { padding: 4px 0; }
+  .item + .item { border-top: 1px dashed color-mix(in srgb, var(--border, gray) 70%, transparent); }
+  .plan { font-size: 11px; color: var(--acc-warn); }
+  .notice {
+    position: sticky; top: 0; z-index: 1;
+    margin: -2px 0 8px; padding: 6px 8px; border-radius: var(--acc-radius);
+    background: var(--muted, rgba(127,127,127,.15)); font-size: 11px;
+  }
+  .notice.bad { color: var(--acc-bad); }
+  .empty { color: var(--muted-foreground, GrayText); font-size: 11px; padding: 2px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr auto; gap: 4px 8px; align-items: center; }
+  kbd { font: inherit; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--border, gray); border-radius: 4px; }
+  ul.cmds { margin: 6px 0 0; padding-left: 16px; }
+  ul.cmds li { margin: 2px 0; }
+</style>
+<div id="app"><div class="card"><div class="empty">Loading…</div></div></div>
+<script>
+'use strict'
+;(function () {
+  var app = document.getElementById('app')
+  var bridge = window.orcaPanel
+  var live = Boolean(bridge && typeof bridge.postMessage === 'function' && typeof bridge.onMessage === 'function')
+  var state = { model: null, prefs: { cards: true, notifications: true }, features: {}, notice: null, pending: {} }
+  var nextId = 1
+
+  function h(tag, attrs) {
+    var el = document.createElement(tag)
+    for (var key in attrs || {}) {
+      var v = attrs[key]
+      if (v == null || v === false) continue
+      if (key === 'class') el.className = v
+      else if (key === 'text') el.textContent = v
+      else if (key.slice(0, 2) === 'on') el.addEventListener(key.slice(2), v)
+      else el.setAttribute(key, v === true ? '' : v)
+    }
+    for (var i = 2; i < arguments.length; i++) append(el, arguments[i])
+    return el
+  }
+  function append(el, child) {
+    if (child == null || child === false) return
+    if (Array.isArray(child)) { child.forEach(function (c) { append(el, c) }); return }
+    el.appendChild(typeof child === 'string' ? document.createTextNode(child) : child)
+  }
+  function sev(s) { return s === 'error' ? 'bad' : s === 'warning' ? 'warn' : 'ok' }
+  function tint(used) { return used == null ? 'var(--muted-foreground)' : used >= 90 ? 'var(--acc-bad)' : used >= 75 ? 'var(--acc-warn)' : 'var(--acc-violet)' }
+  function pct(used) { return used == null ? '–' : Math.round(used) + '%' }
+  function ago(at, now) {
+    if (!at) return 'never'
+    var s = Math.max(0, now - at)
+    if (s < 90) return 'just now'
+    if (s < 5400) return Math.round(s / 60) + ' min ago'
+    if (s < 129600) return Math.round(s / 3600) + ' h ago'
+    return Math.round(s / 86400) + ' d ago'
+  }
+  function gb(bytes) { return bytes == null ? '–' : (bytes / 1073741824).toFixed(bytes >= 10737418240 ? 0 : 1) + ' GB' }
+
+  function send(action, args, label) {
+    if (!live) return
+    var id = 'a' + nextId++
+    state.pending[id] = label || action
+    bridge.postMessage({ type: 'action', id: id, action: action, args: args || {} })
+    render()
+  }
+  function busy(label) {
+    for (var k in state.pending) if (state.pending[k] === label) return true
+    return false
+  }
+  function btn(text, action, args, opts) {
+    opts = opts || {}
+    var label = opts.key || action + ':' + JSON.stringify(args || {})
+    return h('button', {
+      class: opts.class, title: opts.title, disabled: !live || busy(label) || opts.disabled,
+      onclick: function () { send(action, args, label) }
+    }, busy(label) ? '…' : text)
+  }
+  function toggle(on, action, args, title) {
+    var label = action + ':toggle'
+    return h('button', {
+      class: 'switch', role: 'switch', 'aria-checked': on ? 'true' : 'false', title: title, 'aria-label': title,
+      disabled: !live || busy(label),
+      onclick: function () { send(action, Object.assign({ on: !on }, args || {}), label) }
+    })
+  }
+  function prefToggle(key, title) {
+    var on = state.prefs[key] !== false
+    return h('button', {
+      class: 'switch', role: 'switch', 'aria-checked': on ? 'true' : 'false', 'aria-label': title, disabled: !live,
+      onclick: function () {
+        var prefs = Object.assign({}, state.prefs)
+        prefs[key] = !on
+        state.prefs = prefs
+        bridge.postMessage({ type: 'prefs', prefs: prefs })
+        render()
+      }
+    })
+  }
+
+  function ring(used, size) {
+    var r = (size - 6) / 2, c = 2 * Math.PI * r
+    var frac = used == null ? 0 : Math.min(1, Math.max(0, used / 100))
+    var ns = 'http://www.w3.org/2000/svg'
+    var svg = document.createElementNS(ns, 'svg')
+    svg.setAttribute('width', size); svg.setAttribute('height', size); svg.setAttribute('class', 'ring')
+    svg.setAttribute('viewBox', '0 0 ' + size + ' ' + size)
+    function circle(stroke, dash) {
+      var el = document.createElementNS(ns, 'circle')
+      el.setAttribute('cx', size / 2); el.setAttribute('cy', size / 2); el.setAttribute('r', r)
+      el.setAttribute('fill', 'none'); el.setAttribute('stroke-width', '4'); el.setAttribute('stroke', stroke)
+      if (dash != null) {
+        el.setAttribute('stroke-dasharray', c); el.setAttribute('stroke-dashoffset', c * (1 - dash))
+        el.setAttribute('stroke-linecap', 'round'); el.setAttribute('transform', 'rotate(-90 ' + size / 2 + ' ' + size / 2 + ')')
+      }
+      return el
+    }
+    svg.appendChild(circle('color-mix(in srgb, var(--muted-foreground, gray) 25%, transparent)'))
+    if (frac > 0) svg.appendChild(circle(tint(used), frac))
+    var t = document.createElementNS(ns, 'text')
+    t.setAttribute('x', '50%'); t.setAttribute('y', '50%'); t.setAttribute('text-anchor', 'middle'); t.setAttribute('dominant-baseline', 'central')
+    t.setAttribute('class', 'num'); t.textContent = pct(used)
+    svg.appendChild(t)
+    return svg
+  }
+  function meter(name, w, now) {
+    if (!w) return null
+    var resets = w.resetsAt && w.resetsAt > now ? 'resets ' + fmtIn(w.resetsAt - now) : ''
+    return h('div', { class: 'meter', title: resets },
+      h('span', { class: 'muted sub', text: name }),
+      h('div', { class: 'bar' }, h('span', { style: 'width:' + Math.min(100, w.used) + '%;background:' + tint(w.used) })),
+      h('span', { class: 'num sub', style: 'text-align:right', text: pct(w.used) }))
+  }
+  function fmtIn(s) {
+    var m = Math.round(s / 60)
+    return m < 60 ? 'in ' + m + 'm' : m < 1440 ? 'in ' + Math.floor(m / 60) + 'h ' + ('0' + (m % 60)).slice(-2) + 'm' : 'in ' + Math.floor(m / 1440) + 'd ' + Math.floor((m % 1440) / 60) + 'h'
+  }
+
+  function accountCard(m) {
+    var a = m.account, sw = m.switching
+    var head = h('h2', null, 'Account', h('span', { class: 'spacer' }),
+      a && a.stale ? h('span', { class: 'pill warn', text: 'tick stalled' }) : null,
+      sw.pause ? h('span', { class: 'pill bad', text: 'paused' }) : null)
+    if (!a) return h('div', { class: 'card' }, head, h('div', { class: 'empty', text: 'No status.json yet: is claude-acc installed?' }))
+    return h('div', { class: 'card' }, head,
+      h('div', { class: 'hero' }, ring(a.used, 52),
+        h('div', { class: 'grow' },
+          h('div', { class: 'ellipsis', style: 'font-weight:600', text: a.foreign ? 'Unmanaged runtime account' : a.email }),
+          h('div', { class: 'muted sub' }, (a.tier ? a.tier + ' · ' : '') + (a.countdown ? a.countdown.text : 'no forecast')),
+          h('div', { style: 'margin-top:6px' }, meter('Session', a.session, m.at), meter('Weekly', a.weekly, m.at)))),
+      sw.orcaSelected ? h('div', { class: 'notice bad', style: 'margin-top:8px', text: 'Orca has ' + sw.orcaSelected + ' selected and reverts every switch: pick “System default” in Orca' }) : null,
+      h('div', { class: 'actions', style: 'margin-top:8px' },
+        btn('Switch to next', 'switch', { email: 'auto' }, { class: 'primary' }),
+        sw.pause ? btn('Resume sessions', 'resume') : null),
+      h('div', { class: 'grid2', style: 'margin-top:8px' },
+        h('span', { title: 'Pause sessions at the limit until an account frees up', text: 'Pause at limit' }), toggle(sw.limitPause, 'pause', null, 'Pause at limit'),
+        h('span', { title: 'With no headroom left, use up the last few percent of every account', text: 'Drain accounts' }), toggle(sw.drain, 'drain', null, 'Drain accounts')))
+  }
+
+  function accountsCard(m) {
+    var rows = m.accounts.filter(function (a) { return !a.active })
+    if (!rows.length) return null
+    return h('div', { class: 'card' }, h('h2', null, 'Other accounts'),
+      rows.map(function (a) {
+        var worst = Math.max(a.session ? a.session.used : 0, a.weekly ? a.weekly.used : 0)
+        return h('div', { class: 'row', title: a.note },
+          h('span', { class: 'dot ' + (!a.usable ? 'bad' : a.status !== 'ok' ? 'warn' : 'violet') }),
+          h('div', { class: 'grow' },
+            h('div', { class: 'ellipsis', text: a.email }),
+            h('div', { class: 'muted sub num' }, 'S ' + pct(a.session && a.session.used) + ' · W ' + pct(a.weekly && a.weekly.used) + (a.tier ? ' · ' + a.tier : '') + (a.queue ? ' · #' + a.queue : ''))),
+          btn('Switch', 'switch', { email: a.email }, { disabled: !a.usable || worst >= 100 }))
+      }))
+  }
+
+  function memoryCard(m) {
+    var mem = m.memory
+    return h('div', { class: 'card' },
+      h('h2', null, 'Memory', h('span', { class: 'spacer' }), h('span', { class: 'pill ' + sev(mem.severity), text: mem.stageName })),
+      mem.reasons.length ? h('div', { class: 'sub', text: mem.reasons.join('; ') }) : null,
+      h('div', { class: 'grid2 sub num' },
+        h('span', { class: 'muted', text: 'Dev servers' }), h('span', { text: gb(mem.devTotal) + (mem.budget ? ' of ' + gb(mem.budget) : '') }),
+        h('span', { class: 'muted', text: 'Swap' }), h('span', { text: gb(mem.swapUsed) }),
+        mem.freeForAdmissionGb != null ? h('span', { class: 'muted', text: 'Free for builds' }) : null,
+        mem.freeForAdmissionGb != null ? h('span', { text: mem.freeForAdmissionGb.toFixed(1) + ' GB' }) : null),
+      mem.stale ? h('div', { class: 'empty', text: 'The dev server guard has not written for a minute' }) : null)
+  }
+
+  var VIEWERS = { you: 'You', agents: 'Agent preview', headless: 'Headless', nobody: 'No viewers' }
+  function unitRow(u) {
+    return h('div', { class: 'item' },
+      h('div', { class: 'row' },
+        h('span', { class: 'dot ' + (u.plan ? 'warn' : u.attended ? 'ok' : 'violet') }),
+        h('div', { class: 'grow ellipsis' }, h('b', { text: u.title }), ' ', h('span', { class: 'muted num', text: u.portLabel })),
+        h('span', { class: 'num sub', text: u.gb })),
+      h('div', { class: 'row', style: 'min-height:20px;padding-left:15px' },
+        h('span', { class: 'pill' + (u.attended ? ' ok' : ''), text: VIEWERS[u.viewers] || u.viewers }),
+        u.pin ? h('span', { class: 'pill', text: 'pinned' }) : null,
+        u.protected ? h('span', { class: 'pill', title: 'Protected in devguard.json', text: 'protected' }) : null,
+        h('span', { class: 'grow' }),
+        h('div', { class: 'actions' },
+          btn('Restart', 'guard', { verb: 'recycle', target: u.target }, { disabled: !u.recyclable, title: u.recyclable ? 'Restart in its Orca terminal' : 'No Orca terminal to restart it in' }),
+          btn('Stop', 'guard', { verb: 'stop', target: u.target }, { class: 'danger' }),
+          u.pin ? btn('Unpin', 'guard', { verb: 'unpin', target: u.pinTarget }) : btn('Pin', 'guard', { verb: 'pin', target: u.pinTarget }, { disabled: !u.pinTarget, title: 'The guard leaves it running for 12 h' }))),
+      u.plan && u.plan.text ? h('div', { class: 'plan', style: 'padding-left:15px', text: u.plan.text }) : null)
+  }
+  function jobRow(j) {
+    var detail = j.running
+      ? (j.where === 'depot' ? 'on Depot' : (j.memGb != null ? j.memGb.toFixed(1) + ' of ' + (j.predictedGb || 0).toFixed(1) + ' GB' : 'running')) + (j.eta ? ' · ~' + j.eta + ' left' : '') + (j.paused ? ' · paused' : '')
+      : '#' + (j.position || '?') + ' · ' + (j.reason || 'waiting') + (j.eta ? ' · starts in ~' + j.eta : '')
+    return h('div', { class: 'item' },
+      h('div', { class: 'row' },
+        h('span', { class: 'dot ' + (j.running ? (j.paused ? 'warn' : 'ok') : '') }),
+        h('div', { class: 'grow ellipsis', title: j.label, text: j.label }),
+        btn(j.running ? 'Stop' : 'Cancel', 'cancel', { target: j.id }, { class: 'danger', disabled: j.cancelled })),
+      h('div', { class: 'muted sub', style: 'padding-left:15px', text: (j.agentName ? j.agentName + ' · ' : '') + detail }))
+  }
+  function worktreesCard(m) {
+    var groups = m.worktrees.slice().sort(function (a, b) { return (b.id === m.activeWorktreeId) - (a.id === m.activeWorktreeId) })
+    var other = m.elsewhere
+    var empty = !groups.length && !other.units.length && !other.jobs.length
+    return h('div', { class: 'card' },
+      h('h2', null, 'Dev servers & builds'),
+      empty ? h('div', { class: 'empty', text: 'No dev servers or scheduled builds' }) : null,
+      groups.map(function (g) {
+        return h('div', { class: 'group' },
+          h('div', { class: 'group-title' }, h('span', { class: 'ellipsis', title: g.path, text: g.name })),
+          g.units.map(unitRow), g.jobs.map(jobRow))
+      }),
+      other.units.length || other.jobs.length ? h('div', { class: 'group' },
+        h('div', { class: 'group-title muted', text: 'Outside Orca worktrees' }), other.units.map(unitRow), other.jobs.map(jobRow)) : null)
+  }
+
+  function healthCard(m) {
+    var hl = m.health, now = m.at, rows = []
+    function line(dot, name, detail, control) {
+      rows.push(h('div', { class: 'row' }, h('span', { class: 'dot ' + dot }),
+        h('div', { class: 'grow' }, h('div', { text: name }), detail ? h('div', { class: 'muted sub ellipsis', title: detail, text: detail }) : null), control))
+    }
+    if (hl.awake) {
+      line(hl.awake.on ? 'violet' : '', 'Stay Awake', hl.awake.text,
+        h('div', { class: 'actions' }, hl.awake.on ? null : btn('1 h', 'awake', { on: true, for: 3600 }), toggle(hl.awake.on, 'awake', null, 'Stay Awake')))
+    }
+    if (hl.ultra) {
+      var pending = hl.ultra.pendingManual + hl.ultra.pendingRoot
+      line(hl.ultra.on ? (pending ? 'warn' : 'ok') : '', 'Ultra', hl.ultra.on ? hl.ultra.applied + ' tweaks on' + (pending ? ', ' + pending + ' waiting for you' : '') : 'Off', toggle(hl.ultra.on, 'ultra', null, 'Ultra'))
+    }
+    if (hl.hotspot) {
+      line(hl.hotspot.active ? 'ok' : hl.hotspot.enabled && !hl.hotspot.running ? 'warn' : '', 'Hotspot turbo',
+        hl.hotspot.active ? (hl.hotspot.via ? hl.hotspot.via + ' · ' : '') + Math.round((hl.hotspot.rateKbps || 0) / 1000) + ' Mbit/s · ' + Math.round(hl.hotspot.delayP50 || 0) + ' ms' : hl.hotspot.enabled ? (hl.hotspot.running ? 'Waiting for a hotspot' : 'Daemon not running') : 'Off',
+        toggle(hl.hotspot.enabled, 'hotspot', null, 'Hotspot turbo'))
+    }
+    if (hl.fans) {
+      line(hl.fans.running ? 'ok' : 'warn', 'Fans', hl.fans.running ? (hl.fans.mode === 'auto' ? 'Auto' : (hl.fans.percent || 0) + '%') + ' · CPU ' + Math.round(hl.fans.cpu || 0) + '° · GPU ' + Math.round(hl.fans.gpu || 0) + '°' : 'Daemon not running')
+    }
+    if (hl.janitor) {
+      var j = hl.janitor
+      line(j.alerts ? 'bad' : j.warnings ? 'warn' : 'ok', 'Cleanup',
+        'Last ' + ago(j.lastSweepAt, now) + (j.freed ? ', freed ' + gb(j.freed) : '') + (j.diskFree != null ? ' · ' + gb(j.diskFree) + ' free' : ''),
+        btn('Clean now', 'clean'))
+    }
+    if (hl.updates) {
+      var u = hl.updates
+      line(u.ok === false ? 'warn' : 'ok', 'Updates',
+        'Last ' + ago(u.lastRunAt, now) + (u.ok === false ? ', ' + u.failed + ' failed' : u.updated ? ', ' + u.updated + ' updated' : ''),
+        btn('Update now', 'update'))
+    }
+    line('', 'Dictation', 'Toggle recording in the menu bar app', btn('Dictate', 'dictate'))
+    return h('div', { class: 'card' }, h('h2', null, 'Mac'), rows)
+  }
+
+  function prefsCard() {
+    return h('div', { class: 'card' }, h('h2', null, 'Plugin'),
+      h('div', { class: 'grid2' },
+        h('span', { title: 'One “claude-acc:” line on a worktree card, never over your own comment', text: 'Dev servers on worktree cards' }), prefToggle('cards', 'Dev servers on worktree cards'),
+        h('span', { text: 'Notifications' }), prefToggle('notifications', 'Notifications')))
+  }
+
+  function degraded() {
+    var cmds = ['Switch to the next account', 'Resume paused sessions', 'Toggle pause at the limit · Toggle draining accounts', "Restart this worktree's dev server · Stop this worktree's dev server", "Cancel this worktree's builds", 'Clean up now · Update tools now', 'Toggle Ultra · Toggle Stay Awake · Toggle dictation']
+    return h('div', { class: 'card' }, h('h2', null, 'Claude Acc'),
+      h('div', { class: 'sub', text: 'This Orca build has no live plugin panels yet, so this panel cannot show data. Everything works from Cmd-J:' }),
+      h('ul', { class: 'cmds sub' }, cmds.map(function (c) { return h('li', null, 'Claude Acc: ' + c) })),
+      h('div', { class: 'muted sub', style: 'margin-top:6px', text: 'Limit, switch and memory brake notices arrive as notifications, and worktree cards get a “claude-acc:” line with their dev servers.' }))
+  }
+
+  function render() {
+    var m = state.model
+    var nodes = []
+    if (state.notice) nodes.push(h('div', { class: 'notice' + (state.notice.ok ? '' : ' bad'), text: state.notice.text }))
+    if (!live) nodes.push(degraded())
+    else if (!m) nodes.push(h('div', { class: 'card' }, h('div', { class: 'empty', text: 'Waiting for the claude-acc worker…' })))
+    else nodes.push(accountCard(m), accountsCard(m), memoryCard(m), worktreesCard(m), healthCard(m), prefsCard())
+    var scroll = window.scrollY
+    app.replaceChildren.apply(app, nodes.filter(Boolean))
+    window.scrollTo(0, scroll)
+  }
+
+  var noticeTimer = null
+  if (live) {
+    bridge.onMessage(function (msg) {
+      if (!msg || typeof msg !== 'object') return
+      if (msg.type === 'model') {
+        state.model = msg.model
+        if (msg.prefs) state.prefs = msg.prefs
+        state.features = msg.features || {}
+        render()
+      } else if (msg.type === 'result') {
+        delete state.pending[msg.id]
+        state.notice = { ok: msg.ok, text: msg.message || (msg.ok ? 'Done' : 'Failed') }
+        clearTimeout(noticeTimer)
+        noticeTimer = setTimeout(function () { state.notice = null; render() }, 6000)
+        render()
+      }
+    })
+    // a hello sent before the host's live channel is up is dropped: repeat until the first model
+    var hello = function () {
+      if (state.model) return
+      bridge.postMessage({ type: 'hello' })
+      setTimeout(hello, 1500)
+    }
+    hello()
+  }
+  render()
+})()
+</script>
