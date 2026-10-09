@@ -2660,12 +2660,13 @@ def backfill(job, free, now_free, shade, stuck, cfg):
 
     Gdy start głowy da się przewidzieć (shade["sure"]): "ends", jeśli job skończy się przed nim
     (z zapasem BACKFILL_SLACK), albo "beside", jeśli w tej chwili zmieści się obok niej. Gdy nie
-    (czeka na job bez zmierzonej prognozy albo taki, który biegnie dłużej, niż miał): "short", jeśli
-    job jest lekki (small_gb), jego prognoza z zapasem mieści się w head_delay_s, a głowa nie
-    wystartowałaby nawet bez jobów, które ją już wyprzedziły (`stuck`). Opóźni ją wtedy najwyżej o
-    swój czas, a gdy to wyprzedzający trzymają jej pamięć, nikt więcej nie wchodzi, więc strumień
-    krótkich jobów jej nie zagłodzi. Ciężki krótki job (e2e na 5 GB) tu nie wchodzi: w replayu
-    2026-10-09 to on, gdy przeciągnął się 27 razy, trzymał głowie najwięcej pamięci najdłużej.
+    (potrzebuje pamięci joba bez zmierzonej prognozy albo takiego, który biegnie dłużej, niż miał,
+    `shadow`): "short", jeśli job jest lekki (small_gb), jego prognoza z zapasem mieści się w
+    head_delay_s, a głowa nie wystartowałaby nawet bez jobów, które ją już wyprzedziły (`stuck`).
+    Opóźni ją wtedy najwyżej o swój czas, a gdy to wyprzedzający trzymają jej pamięć, nikt więcej
+    nie wchodzi, więc strumień krótkich jobów jej nie zagłodzi. Ciężki krótki job (e2e na 5 GB) tu
+    nie wchodzi: w replayu 2026-10-09 to on, gdy przeciągnął się 27 razy, trzymał głowie najwięcej
+    pamięci najdłużej.
     Zawsze z prognozą z własnej historii i w pamięci wolnej po rezerwach. Lekki job, który przed
     startem głowy się skończy ("ends", "short"), może wejść też w pamięci dostępnej teraz, jak mały
     job szybką ścieżką, także po 2 × starve_s: rezerwy na wzrost długich jobów i natywnego buildu
@@ -2699,7 +2700,13 @@ def shadow(state, need, free, now, ahead=(), lone=None):
 
     {"wait_s": sekundy albo None, gdy końce jobów jej nie wpuszczą, "spare_gb": miejsce obok
     (None: żadne), "after": id jobów, na których koniec czeka, "sure": start da się przewidzieć,
-    bo każdy z tych jobów ma prognozę z własnej historii i jeszcze jej nie przekroczył}."""
+    bo każdy z tych jobów ma prognozę z własnej historii i jeszcze jej nie przekroczył}.
+
+    Job bez takiej prognozy (albo już po niej) nie psuje przewidywania, gdy głowa jego pamięci nie
+    potrzebuje: bez pamięci wszystkich takich jobów i tak zmieści się w tej samej chwili. Nie czeka
+    wtedy na ich koniec (nie ma ich w "after"), ale mogą jeszcze biec obok niej, więc ich pamięć
+    nie liczy się do "spare_gb". 2026-10-09 18:26 pytest (0,08 GB) biegnący 2 s dłużej, niż miał,
+    robił z przewidywalnego startu e2e po końcu next build start „nie do przewidzenia”."""
     ends = []
     for i, r in enumerate(state["running"]):
         if r["where"] != "local":
@@ -2715,16 +2722,24 @@ def shadow(state, need, free, now, ahead=(), lone=None):
     if need <= free:
         return out
     released = 0.0
+    unsure = {}  # id -> GB jobów, których koniec trudno przewidzieć
     for left, _i, jid, gb, held, sure in ends:
         free += gb
         released += held
         out["after"].append(jid)
-        out["sure"] = out["sure"] and sure
+        if not sure:
+            unsure[jid] = gb
         if need <= free:
-            out.update(wait_s=left, spare_gb=free - need)
+            idle = sum(unsure.values())
+            if idle <= free - need:  # bez ich pamięci głowa zmieści się w tej samej chwili
+                out["after"] = [a for a in out["after"] if a not in unsure]
+                out.update(wait_s=left, spare_gb=free - need - idle)
+            else:
+                out.update(wait_s=left, spare_gb=free - need, sure=False)
             return out
     if lone is not None and ends and (lone[1] or need <= lone[0] + released):
-        out.update(wait_s=ends[-1][0], spare_gb=None)
+        # sama na Macu czeka na koniec wszystkich
+        out.update(wait_s=ends[-1][0], spare_gb=None, sure=not unsure)
         return out
     out.update(wait_s=None, spare_gb=None, sure=False)
     return out

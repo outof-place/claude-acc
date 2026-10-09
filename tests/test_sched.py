@@ -831,6 +831,34 @@ class BackfillTest(Paths):
             self.assertEqual(S.plan(st, self.cfg, time.time()),
                              {"ruff": ("overtake", "build"), "pytest": ("overtake", "build")}, why)
 
+    def test_overdue_job_whose_memory_the_head_does_not_need_keeps_its_start_predictable(self):
+        """2026-10-09 18:26 (zrzut state.json): głowa e2e (5,76 GB przy 4,7 wolnych) czekała na koniec
+        next build (11,6 GB, za ~90 s), a obok biegł pytest (0,08 GB, prognoza 2,2 s) już 4 s. Przez
+        niego start głowy był „nie do przewidzenia”, choć zmieściłaby się i bez jego pamięci, więc
+        go test jednego pakietu (4,65 GB, 23 s), który skończyłby się przed nią, stał w kolejce: dla
+        ścieżki „short” jest za ciężki."""
+
+        def case(overdue_gb, head_gb):
+            return self.blocked(26.5, [self.running("build", 11.6, 154, elapsed=62),
+                                       self.running("pytest", overdue_gb, 2.2, elapsed=4)],
+                                [self.queued("e2e", head_gb, 47.1, ago=705),
+                                 self.queued("gotest", 4.65, 23.4, ago=691)])
+
+        st = case(0.08, 5.76)
+        free = st["memory"]["free_for_admission_gb"]
+        self.assertTrue(4.65 <= free < 5.76, free)
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"gotest": ("overtake", "e2e")})
+        # e2e nie czeka na koniec pytest, ale ten może jeszcze biec obok niej: miejsce obok głowy
+        # to tylko to, co zwolni next build
+        shade = S.shadow(st, 5.76, free, time.time())
+        self.assertEqual((shade["sure"], shade["after"]), (True, ["build"]))
+        self.assertAlmostEqual(shade["wait_s"], 92, delta=1)
+        self.assertAlmostEqual(shade["spare_gb"], free + 11.6 - 5.76)
+        # głowa potrzebuje też pamięci joba po prognozie: jej start dalej nie do przewidzenia
+        # (po końcu obu zostaje 1,3 GB ponad jej potrzebę, a job po prognozie trzyma 2 GB)
+        self.assertEqual(S.plan(case(2.0, 17.0), self.cfg, time.time()), {})
+        self.assertEqual(S.plan(case(2.0, 16.0), self.cfg, time.time()), {"gotest": ("overtake", "e2e")})
+
     def test_native_jobs_and_a_held_native_head_keep_their_rules(self):
         st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600)], [
             self.queued("build", 11.7, 154, ago=1500),
