@@ -21,6 +21,13 @@
 # zajęte vnode zostają do restartu, więc trial bez --keep nie jest pełnym cofnięciem.
 # Bez --persist wartość wraca do domyślnej po restarcie.
 #
+# iogpu: limit pamięci, którą Metal może przypiąć dla GPU (iogpu.wired_limit_mb). Bez
+# ustawienia macOS daje GPU około dwóch trzecich RAM (48 GB: 37,4 GiB), więc lokalny model,
+# który by się zmieścił, ląduje częściowo poza GPU. `set` podnosi limit do RAM bez 8 GB dla
+# systemu (najwyżej 85%; MLX widział potem 42,9 zamiast 40,2 GB, llama.cpp 40960 MiB) i
+# zostawia LaunchDaemon, bo jądro zapomina wartość przy restarcie. Sysctl opisuje README
+# mlx-lm (macOS 15+). undo zdejmuje demona i wraca do domyślnego 0.
+#
 # devtools: aplikacja (domyślnie Orca) na liście Narzędzi deweloperskich. Za każdą nową
 # binarką testu Go, `go run` czy natywnym modułem node uruchomionym w terminalu agenta stoi
 # Orca; dopóki jej tam nie ma, macOS ocenia każdą taką binarkę przy pierwszym exec (skan
@@ -41,6 +48,10 @@
 #        Spotlight indeksuje tylko aplikacje: katalogi domowe (poza Applications) i dane
 #        systemu idą na listę Prywatności; undo przywraca poprzednią listę
 #        --persist: LaunchDaemon ustawia wartość przy każdym starcie; undo go zdejmuje
+#   sudo ./perf-root.sh iogpu set [MB]
+#        limit pamięci GPU (domyślnie RAM bez 8 GB, najwyżej 85%), także po restarcie
+#   sudo ./perf-root.sh iogpu undo
+#   ./perf-root.sh iogpu status
 #   ./perf-root.sh devtools add|undo|status [--app /Applications/Orca.app]
 #        bez sudo, w Terminalu (czyta TCC.db): otwiera Ustawienia > Prywatność i ochrona >
 #        Narzędzia deweloperskie, czeka na "+" (undo: "-") i zapisuje zmianę w stanie
@@ -268,6 +279,94 @@ for t in json.load(sys.stdin)["tweaks"]:
   [ "$DRY" -eq 1 ] || as_user record vnodes --forget
 }
 
+# jądro zapomina iogpu.wired_limit_mb przy restarcie: ten demon ustawia go przy starcie
+# (ta sama etykieta, co demon postawiony ręcznie 2026-10-08, więc `set` go przejmuje)
+IOGPU_DAEMON=/Library/LaunchDaemons/com.filip.claude-acc.iogpu.plist
+
+iogpu_daemon_value() {
+  [ -f "$IOGPU_DAEMON" ] || return 0
+  sed -n 's/.*iogpu\.wired_limit_mb=\([0-9][0-9]*\).*/\1/p' "$IOGPU_DAEMON" | head -1
+}
+
+iogpu_set() {
+  need_root iogpu set
+  local mb before total
+  mb="${ARGS[2]:-$(as_user iogpu-default)}"
+  case "$mb" in ''|*[!0-9]*) echo "limit to liczba MB, nie: $mb" >&2; exit 2 ;; esac
+  if [ "$mb" -eq 0 ]; then
+    echo "przy tej ilości RAM domyślny limit macOS jest najlepszy; nic nie zmieniam"
+    return 0
+  fi
+  total=$(( $(sysctl -n hw.memsize) / 1048576 ))
+  if [ "$mb" -ge "$total" ]; then
+    echo "limit $mb MB nie zostawia nic systemowi (RAM: $total MB)" >&2
+    exit 2
+  fi
+  before="$(sysctl -n iogpu.wired_limit_mb)"
+  echo "iogpu.wired_limit_mb: $before -> $mb"
+  do_it sysctl -w iogpu.wired_limit_mb="$mb"
+  echo "przy starcie systemu: iogpu.wired_limit_mb=$mb ($IOGPU_DAEMON)"
+  [ "$DRY" -eq 1 ] && return 0
+  if [ "$(sysctl -n iogpu.wired_limit_mb)" != "$mb" ]; then
+    echo "jądro nie przyjęło nowej wartości; nic nie zapisuję" >&2
+    exit 1
+  fi
+  cat > "$IOGPU_DAEMON" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.filip.claude-acc.iogpu</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/sbin/sysctl</string>
+    <string>-w</string>
+    <string>iogpu.wired_limit_mb=$mb</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLIST
+  chown root:wheel "$IOGPU_DAEMON"
+  chmod 644 "$IOGPU_DAEMON"
+  launchctl bootout system "$IOGPU_DAEMON" 2>/dev/null || true
+  launchctl bootstrap system "$IOGPU_DAEMON"
+  as_user record iogpu "$mb" "prev=$before"
+}
+
+iogpu_undo() {
+  need_root iogpu undo
+  echo "iogpu.wired_limit_mb: $(sysctl -n iogpu.wired_limit_mb) -> 0 (domyślne macOS)"
+  do_it sysctl -w iogpu.wired_limit_mb=0
+  if [ -f "$IOGPU_DAEMON" ]; then
+    do_it launchctl bootout system "$IOGPU_DAEMON" 2>/dev/null || true
+    do_it rm -f "$IOGPU_DAEMON"
+  fi
+  [ "$DRY" -eq 1 ] || as_user record iogpu --forget
+}
+
+iogpu_status() {
+  local now daemon want
+  now="$(sysctl -n iogpu.wired_limit_mb)"
+  daemon="$(iogpu_daemon_value)"
+  want="$(as_user iogpu-default)"
+  if [ "$now" = 0 ]; then
+    echo "iogpu.wired_limit_mb: 0 (domyślne macOS, około 2/3 RAM)"
+  else
+    echo "iogpu.wired_limit_mb: $now MB"
+  fi
+  if [ -n "$daemon" ]; then
+    echo "przy starcie systemu: $daemon MB ($IOGPU_DAEMON)"
+  else
+    echo "przy starcie systemu: domyślne (bez demona)"
+  fi
+  if [ "${want:-0}" -gt 0 ]; then
+    echo "propozycja dla tego Maca: $want MB (sudo $0 iogpu set)"
+  else
+    echo "propozycja: zostaw domyślne (przy tej ilości RAM nie ma czego podnosić)"
+  fi
+}
+
 # Lista Prywatności Spotlight siedzi w VolumeConfiguration.plist, ale mds trzyma ją w pamięci
 # i przy `mdutil -i` zapisuje swoją wersję z powrotem. Działa: zapis pliku, SIGKILL dla mds
 # (bez szansy na zapis), launchd stawia go od nowa z listą z dysku, potem przebudowa indeksu,
@@ -492,6 +591,9 @@ case "$CMD $SUB" in
   "vnodes undo") vnodes_undo ;;
   "spotlight apps-only") spotlight_apply ;;
   "spotlight undo") spotlight_undo ;;
+  "iogpu set") iogpu_set ;;
+  "iogpu undo") iogpu_undo ;;
+  "iogpu status" | "iogpu ") iogpu_status ;;
   "devtools add") devtools_apply ;;
   "devtools undo") devtools_undo ;;
   "devtools status" | "devtools ") devtools_status ;;

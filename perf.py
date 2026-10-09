@@ -817,6 +817,16 @@ DEFAULT_CONFIG = {
     # ścieżek albo "orca" (wszystkie repozytoria z worktree w Orce). Domyślnie pusta, bo
     # jedyne takie repo (portivo) zmienia tylko jego właściciel
     "git_repos": [],
+    # git-speed globalnie (~/.gitconfig): równoległy checkout (worktree add w repo z 18 tys.
+    # plików 2,0 -> 1,55 s) i commit-graph przy każdym fetch (log, merge-base, rebase)
+    "git_global": {"checkout.workers": "0", "fetch.writeCommitGraph": "true"},
+    # git-speed w repozytoriach z `git_repos`: `git maintenance` (launchd co godzinę prefetch,
+    # commit-graph i pliki luzem, codziennie przyrostowy repack), zamiast gc w trakcie pracy
+    "git_maintenance": True,
+    # interfejs Claude Code w Ultra (~/.claude/settings.json, code.claude.com/docs/en/
+    # settings-reference): mniej animacji i bez podpowiedzi pod spinnerem; przy kilku sesjach
+    # w jednym oknie Orki (xterm.js) każda klatka animacji to przerysowanie
+    "claude_ui": {"prefersReducedMotion": True, "spinnerTipsEnabled": False},
     # hooki Claude Code (fragment komendy), które Ultra uruchamia z szybkim npx: w monorepo
     # pnpm `npx --no-install` szukał formattera 3,5-8,8 s przy każdej edycji
     "npx_fast_hooks": [
@@ -879,6 +889,20 @@ class System:
     def git(self, repo, *args):
         """Wyjście gita albo None (brak klucza w configu to też None)."""
         return janitor.run(["git", "-C", repo, *args], timeout=120)
+
+    def git_global(self, *args):
+        """Wyjście gita bez repozytorium (config --global) albo None."""
+        return janitor.run(["git", *args], timeout=120)
+
+    def maintenance_scheduled(self):
+        """Czy launchd ma już harmonogram `git maintenance` (plisty org.git-scm.git.*)."""
+        return os.path.exists(GIT_MAINTENANCE_PLIST)
+
+    def maintenance_schedule(self, repo, on):
+        """`git maintenance start` (rejestracja repo i harmonogram launchd) albo `stop`."""
+        if on:
+            return janitor.run(["git", "-C", repo, "maintenance", "start"], timeout=120)
+        return janitor.run(["git", "maintenance", "stop"], timeout=120)
 
     def rtk_path(self):
         """Ścieżka rtk z wbudowanym hookiem Claude Code albo None."""
@@ -1283,6 +1307,8 @@ class Deferred(Exception):
 
 ORCA_DATA = os.path.join(HOME, "Library/Application Support/orca/orca-data.json")
 ORCA_APP = "/Applications/Orca.app"
+# `git maintenance start` stawia harmonogram jako LaunchAgenty org.git-scm.git.{hourly,daily,weekly}
+GIT_MAINTENANCE_PLIST = os.path.join(HOME, "Library/LaunchAgents/org.git-scm.git.hourly.plist")
 
 
 def git_repos(cfg):
@@ -1297,33 +1323,94 @@ def git_repos(cfg):
 
 
 class GitSpeed:
-    """core.untrackedCache i core.fsmonitor w repozytoriach z listy `git_repos`."""
+    """core.untrackedCache, core.fsmonitor i `git maintenance` w repozytoriach z listy
+    `git_repos`, a globalnie klucze z `git_global` (równoległy checkout, commit-graph)."""
 
     name = "git-speed"
     group = "dev"
     root = False
-    title = "git status bez skanowania drzewa: untrackedCache + fsmonitor (repozytoria z `git_repos`)"
+    title = (
+        "git bez skanowania drzewa: untrackedCache + fsmonitor i `git maintenance` (repozytoria "
+        "z `git_repos`), globalnie równoległy checkout i commit-graph przy fetch"
+    )
     effect = (
         "klon portivo (14 tys. plików): git status 71 -> 31 ms z untrackedCache, 26 ms z "
-        "fsmonitor; feature.manyFiles (index v4, skipHash) i commit-graph nic nie dodały"
+        "fsmonitor; worktree add (18 tys. plików) 2,0 -> 1,55 s z checkout.workers=0; "
+        "feature.manyFiles (index v4, skipHash) nic nie dodał, commit-graph pomaga logowi, nie statusowi"
     )
     KEYS = (("core.untrackedCache", "true"), ("core.fsmonitor", "true"))
+    # `git maintenance register` ustawia je w repo (auto=false wyłącza gc --auto po poleceniach)
+    MAINTENANCE_KEYS = ("maintenance.auto", "maintenance.strategy")
+
+    @staticmethod
+    def stripped(out):
+        return out.strip() if out is not None else None
+
+    @staticmethod
+    def drop_empty(system, section, repo=None):
+        """Usuwa sekcję, z której cofnięcie zabrało ostatni klucz (git zostawia pusty nagłówek)."""
+        if repo is None:
+            run, scope = system.git_global, "--global"
+        else:
+            run, scope = (lambda *a: system.git(repo, *a)), "--local"
+        if not run("config", scope, "--get-regexp", f"^{section}\\."):
+            run("config", scope, "--remove-section", section)
+
+    def registered(self, system):
+        """Repozytoria z `maintenance.repo` w globalnym configu (ścieżki rzeczywiste)."""
+        out = system.git_global("config", "--global", "--get-all", "maintenance.repo") or ""
+        return {os.path.realpath(line) for line in out.splitlines() if line.strip()}
 
     def apply(self, cfg, system, record=None):
-        repos = dict((record or {}).get("repos", {}))
+        record = record or {}
+        repos = dict(record.get("repos", {}))
         changed = []
         for repo in git_repos(cfg):
             if repo in repos or system.git(repo, "rev-parse", "--git-dir") is None:
                 continue
             prev = {}
             for key, value in self.KEYS:
-                current = system.git(repo, "config", "--local", "--get", key)
-                prev[key] = current.strip() if current is not None else None
+                prev[key] = self.stripped(system.git(repo, "config", "--local", "--get", key))
                 system.git(repo, "config", "--local", key, value)
             system.git(repo, "update-index", "--untracked-cache")
             repos[repo] = prev
             changed.append(repo)
-        return {"repos": repos}, changed
+        # globalne klucze: poprzednia wartość z pierwszego razu, ponowne ustawienie, gdy ktoś
+        # nadpisał ~/.gitconfig (keep), jak przy settings.json
+        found = dict(record.get("global", {}))
+        for key, value in (cfg.get("git_global") or {}).items():
+            value = str(value)
+            current = self.stripped(system.git_global("config", "--global", "--get", key))
+            if key not in found or found[key]["value"] != value:
+                found[key] = {"value": value, "prev": found[key]["prev"] if key in found else current}
+            if current != value:
+                system.git_global("config", "--global", key, value)
+                changed.append(f"{key}={value}")
+        maintenance = dict(record.get("maintenance", {}))
+        scheduled = record.get("scheduled", False)
+        if cfg.get("git_maintenance", True):
+            registered = self.registered(system)
+            for repo in repos:
+                if repo in maintenance:
+                    continue
+                prev = {
+                    key: self.stripped(system.git(repo, "config", "--local", "--get", key))
+                    for key in self.MAINTENANCE_KEYS
+                }
+                before = os.path.realpath(repo) in registered
+                if not system.maintenance_scheduled():
+                    # start rejestruje repo i stawia harmonogram; zdejmujemy go tylko, gdy był nasz
+                    system.maintenance_schedule(repo, True)
+                    scheduled = scheduled or system.maintenance_scheduled()
+                elif not before:
+                    system.git(repo, "maintenance", "register")
+                maintenance[repo] = {"registered": before, "prev": prev}
+                if not before:
+                    changed.append(f"git maintenance: {short_path(repo)}")
+        result = {"repos": repos, "global": found, "maintenance": maintenance}
+        if scheduled:
+            result["scheduled"] = True
+        return result, changed
 
     def undo(self, record, system):
         restored = []
@@ -1337,13 +1424,42 @@ class GitSpeed:
             if prev.get("core.untrackedCache") is None:
                 system.git(repo, "update-index", "--no-untracked-cache")
             restored.append(repo)
+        for repo, entry in record.get("maintenance", {}).items():
+            if entry.get("registered"):
+                continue  # było w maintenance przed nami
+            system.git(repo, "maintenance", "unregister")
+            for key, value in entry.get("prev", {}).items():
+                if value is None:
+                    system.git(repo, "config", "--local", "--unset", key)
+                else:
+                    system.git(repo, "config", "--local", key, value)
+            self.drop_empty(system, "maintenance", repo)
+            self.drop_empty(system, "maintenance")
+            restored.append(f"git maintenance: {short_path(repo)}")
+        if record.get("scheduled") and not self.registered(system):
+            system.maintenance_schedule(None, False)  # nasz harmonogram, nikt już z niego nie korzysta
+        for key, entry in record.get("global", {}).items():
+            if entry["prev"] == entry["value"]:
+                continue
+            current = self.stripped(system.git_global("config", "--global", "--get", key))
+            if current != entry["value"]:
+                continue  # ktoś zmienił po nas: jego wartość zostaje
+            if entry["prev"] is None:
+                system.git_global("config", "--global", "--unset", key)
+                self.drop_empty(system, key.rsplit(".", 1)[0])
+            else:
+                system.git_global("config", "--global", key, entry["prev"])
+            restored.append(key)
         return restored
 
     def describe(self, record, system):
-        repos = (record or {}).get("repos", {})
-        return (
-            ", ".join(short_path(r) for r in repos) or "brak repozytoriów w `git_repos`"
-        )
+        record = record or {}
+        parts = [", ".join(short_path(r) for r in record.get("repos", {})) or "brak repozytoriów w `git_repos`"]
+        parts += [f"{k}={v['value']}" for k, v in record.get("global", {}).items()]
+        ours = [r for r, e in record.get("maintenance", {}).items() if not e.get("registered")]
+        if ours:
+            parts.append(f"git maintenance: {len(ours)} repo")
+        return "; ".join(parts)
 
 
 class ClaudeEnvSet:
@@ -1418,6 +1534,69 @@ class ClaudeEnvSet:
     def describe(self, record, system):
         found = (record or {}).get("vars", {})
         return ", ".join(f"{k}={v['value']}" for k, v in found.items()) or "nic"
+
+
+class ClaudeUi:
+    """Klucze interfejsu Claude Code z `claude_ui` na najwyższym poziomie ~/.claude/settings.json,
+    każdy z własnym cofnięciem. Działa w sesjach otwartych po zmianie."""
+
+    name = "claude-ui"
+    group = "claude"
+    root = False
+    path = None
+    title = (
+        "spokojniejszy interfejs Claude Code z `claude_ui`: prefersReducedMotion (spinner, shimmer "
+        "i błyski ograniczone) i spinnerTipsEnabled false (bez podpowiedzi pod spinnerem)"
+    )
+    effect = (
+        "polityka, nie pomiar: przy kilku sesjach w jednym oknie Orki (xterm.js) każda klatka "
+        "animacji to przerysowanie panelu; klucze z code.claude.com/docs/en/settings-reference"
+    )
+
+    def settings_path(self):
+        return self.path or CLAUDE_SETTINGS
+
+    def apply(self, cfg, system, record=None):
+        wanted = dict(cfg.get("claude_ui") or {})
+        known = dict((record or {}).get("keys", {}))
+        changed = []
+        if not os.path.exists(self.settings_path()):
+            return {"keys": known}, []
+
+        def change(data):
+            del changed[:]
+            for key, value in wanted.items():
+                current = data.get(key, MISSING)
+                if current == value and type(current) is type(value):
+                    known.setdefault(key, {"value": value, "prev": value})
+                    continue
+                if key not in known or known[key]["value"] != value:
+                    known[key] = {"value": value, "prev": known[key]["prev"] if key in known else current}
+                data[key] = value
+                changed.append(f"{key}={json.dumps(value)}")
+            return bool(changed)
+
+        edit_json_file(self.settings_path(), change)
+        return {"keys": known}, changed
+
+    def undo(self, record, system):
+        restored = []
+        todo = {k: e for k, e in record.get("keys", {}).items() if e["prev"] != e["value"]}
+
+        def change(data):
+            del restored[:]
+            for key, entry in todo.items():
+                if restore_key(data, key, entry["prev"], entry["value"]):
+                    restored.append(key)
+            return bool(restored)
+
+        if todo and os.path.exists(self.settings_path()):
+            edit_json_file(self.settings_path(), change)
+        return restored
+
+    def describe(self, record, system):
+        found = (record or {}).get("keys", {})
+        return ", ".join(f"{k}={json.dumps(v['value'])}" for k, v in found.items()) or "nic"
 
 
 class HookWrap:
@@ -1787,6 +1966,7 @@ TWEAKS = [
         "workflowSizeGuideline w ~/.claude/settings.json: workflowy planowane na duży rozmiar",
         "medium (<10 agentów) -> large (<50); limit runtime na agentów i ostrzeżenia zostają",
     ),
+    ClaudeUi(),
     RootTweak(
         "vnodes",
         "większy cache vnode (kern.maxvnodes 263168 -> 786432): metadane drzew node_modules "
@@ -1795,6 +1975,14 @@ TWEAKS = [
         "vnode (czysty pomiar). Koszt ~1,2 KB pamięci jądra na vnode, +0,63 GB. Jądro nie zwalnia "
         "vnode: po cofnięciu pamięć i cache zostają do restartu",
         "claude-acc perf-root vnodes trial",
+    ),
+    RootTweak(
+        "iogpu",
+        "więcej pamięci dla GPU (iogpu.wired_limit_mb): lokalne modele (MLX, llama.cpp, Ollama) "
+        "mieszczą się w GPU; domyślnie macOS daje Metalowi około 2/3 RAM",
+        "48 GB: domyślnie 37,4 GiB dla GPU, z limitem 40960 MLX widzi 42,9 zamiast 40,2 GB, "
+        "llama.cpp 40960 MiB; system zachowuje 8 GB. Sysctl opisany w README mlx-lm (macOS 15+)",
+        "claude-acc perf-root iogpu set",
     ),
     RootTweak(
         "spotlight",
@@ -2330,6 +2518,7 @@ ULTRA = [
     "fast-npx-hooks",
     "claude-limits",
     "workflow-size",
+    "claude-ui",
 ]
 # wyniki z transkryptów liczone najwyżej raz na tyle sekund (doba transkryptów to ~10 s)
 AGENTS_CHECK_SECONDS = 1800
@@ -2674,6 +2863,7 @@ ROOT_UNITS = {
     "devtools": "ms pierwszego uruchomienia nowej binarki",
     "shaper": "ms kolejki wysyłania",
     "spotlight": "plików w indeksie poza aplikacjami",
+    "iogpu": "MiB pamięci dla GPU",
 }
 
 
@@ -3235,6 +3425,21 @@ def cmd_shaper_rate(cfg, args, system=None):
     return 0
 
 
+def iogpu_default_mb(total_bytes):
+    """Proponowany iogpu.wired_limit_mb dla Maca z `total_bytes` RAM: cały RAM bez 8 GB dla
+    systemu, najwyżej 85%. 0, gdy to nie więcej niż domyślne macOS (około 2/3 RAM): wtedy
+    limit trzeba zostawić, bo mniejszy zabrałby GPU pamięć."""
+    total = total_bytes // 1048576
+    value = min(total - 8192, total * 85 // 100)
+    return value if value > total * 2 // 3 else 0
+
+
+def cmd_iogpu_default(cfg, args, system=None):
+    """Dla perf-root.sh: proponowany iogpu.wired_limit_mb tego Maca (0: zostaw domyślne)."""
+    print(iogpu_default_mb(sysctl_int("hw.memsize") or 0))
+    return 0
+
+
 def cmd_record(cfg, args, system=None):
     """Dla perf-root.sh: zapis albo usunięcie poprawki roota w stanie (`record shaper
     <opis>` / `record shaper --forget`), żeby panel i status ją widziały. `--result
@@ -3279,6 +3484,7 @@ COMMANDS = {
     "ultra": cmd_ultra,
     "shaper-rate": cmd_shaper_rate,
     "record": cmd_record,
+    "iogpu-default": cmd_iogpu_default,
 }
 
 

@@ -1590,14 +1590,14 @@ TWEAKS = [
         "com.apple.dock",
         "autohide-time-modifier",
         "float",
-        "0.15",
+        "0.1",
         "szybka animacja Docka",
     ),
     (
         "com.apple.dock",
         "expose-animation-duration",
         "float",
-        "0.15",
+        "0.1",
         "szybkie Mission Control",
     ),
     (
@@ -1620,6 +1620,20 @@ TWEAKS = [
         "float",
         "0.001",
         "arkusze i zmiana rozmiaru bez animacji",
+    ),
+    (
+        "NSGlobalDomain",
+        "QLPanelAnimationDuration",
+        "float",
+        "0",
+        "Quick Look otwiera się bez animacji",
+    ),
+    (
+        "NSGlobalDomain",
+        "KeyRepeat",
+        "int",
+        "1",
+        "szybsze powtarzanie klawiszy (15 ms, szybciej niż suwak w Ustawieniach; od następnego logowania)",
     ),
     (
         "com.apple.finder",
@@ -1652,6 +1666,12 @@ TWEAKS = [
 ]
 
 
+# strojenie, które ma sens tylko przy innym ustawieniu: (domena, klucz) -> (domena, klucz, wartość)
+TWEAK_ONLY_IF = {
+    ("com.apple.dock", "autohide-time-modifier"): ("com.apple.dock", "autohide", "true"),
+}
+
+
 def defaults_read(domain, key):
     out = run(["defaults", "read", domain, key])
     return None if out is None else out.strip()
@@ -1680,11 +1700,16 @@ def cmd_optimize(cfg, args):
     dry_run = "--dry-run" in args
     backup = load_json(BACKUP_PATH, {"defaults": {}, "agents": []})
     changed = []
+    dock = False
     for domain, key, kind, value, why in TWEAKS:
+        need = TWEAK_ONLY_IF.get((domain, key))
+        if need and not same_value(defaults_read(need[0], need[1]), "bool", need[2]):
+            continue
         current = defaults_read(domain, key)
         if same_value(current, kind, value):
             continue
         changed.append(why)
+        dock = dock or domain == "com.apple.dock"
         if dry_run:
             continue
         backup["defaults"].setdefault(
@@ -1717,7 +1742,8 @@ def cmd_optimize(cfg, args):
         print(f"  {why}")
     if not dry_run:
         write_json(BACKUP_PATH, backup, indent=1)
-        subprocess.run(["killall", "Dock"], capture_output=True)
+        if dock:
+            subprocess.run(["killall", "Dock"], capture_output=True)
         log(f"optimize: {len(changed)} zmian")
         print("Cofnięcie: claude-acc mac optimize --undo")
     return 0
@@ -1728,6 +1754,7 @@ def optimize_undo():
     if not backup:
         print("Nie ma czego cofać")
         return 0
+    dock = any(e["domain"] == "com.apple.dock" for e in backup.get("defaults", {}).values())
     for entry in backup.get("defaults", {}).values():
         if entry["value"] is None:
             run(["defaults", "delete", entry["domain"], entry["key"]])
@@ -1750,7 +1777,8 @@ def optimize_undo():
                 capture_output=True,
             )
     os.remove(BACKUP_PATH)
-    subprocess.run(["killall", "Dock"], capture_output=True)
+    if dock:
+        subprocess.run(["killall", "Dock"], capture_output=True)
     log("optimize: cofnięte")
     print("Cofnięte")
     return 0
