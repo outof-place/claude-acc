@@ -1,0 +1,76 @@
+#!/bin/bash
+# Paczka claude-acc dla aplikacji, która go w sobie wozi (Pod): ten sam układ co libexec formuły
+# Homebrew plus zbudowana aplikacja i binarki Swift, plik VERSION i tarball z sumą sha256.
+#
+#   scripts/payload.sh [--out DIR] [--version X] [--products DIR]
+#
+# --products: gotowe binarki (ClaudeAcc, fanctl, claude-acc-hook, claude-acc-pause, claude-acc-desktop)
+# zamiast budowania ze źródeł; testy i CI z osobnym krokiem buildu. Domyślnie --out dist.
+# Wynik: DIR/claude-acc/ (rozpakowana paczka), DIR/claude-acc-payload-<wersja>.tar.gz i .sha256.
+# Paczkę instaluje jej własny setup.sh:
+#   setup.sh --app "claude-acc/Claude Acc.app" --fanctl claude-acc/fanctl --hook claude-acc/claude-acc-hook \
+#            --desktop claude-acc/claude-acc-desktop --owner pod --owner-app <Pod.app>
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="$ROOT/dist"
+VERSION=""
+PRODUCTS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out) OUT="$2"; shift 2 ;;
+    --version) VERSION="$2"; shift 2 ;;
+    --products) PRODUCTS="$2"; shift 2 ;;
+    *) echo "nieznana opcja: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$VERSION" ] || VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/app/Info.plist")"
+PRODUCT_NAMES="ClaudeAcc fanctl claude-acc-hook claude-acc-pause claude-acc-desktop"
+
+if [ -z "$PRODUCTS" ]; then
+  (cd "$ROOT/app" && swift build -c release)
+  PRODUCTS="$(cd "$ROOT/app" && swift build -c release --show-bin-path)"
+fi
+for name in $PRODUCT_NAMES; do
+  [ -f "$PRODUCTS/$name" ] || { echo "brak produktu Swift: $PRODUCTS/$name" >&2; exit 1; }
+done
+
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+DEST="$OUT/claude-acc"
+rm -rf "$DEST" "$DEST.new"
+mkdir -p "$DEST.new"
+cd "$ROOT"
+# to samo, co formuła kładzie w libexec (setup.sh kopiuje każdy *.py, więc nowy skrypt nie wymaga zmian)
+cp ./*.py janitor-root.sh perf-root.sh setup.sh install-fans.sh install-fsguard.sh sign-app.sh "$DEST.new/"
+for dir in launchd hooks skills sdk dictation orca-plugin; do
+  if [ -d "$dir" ]; then cp -R "$dir" "$DEST.new/$dir"; fi
+done
+rm -rf "$DEST.new/orca-plugin/test"
+find "$DEST.new" \( -name __pycache__ -o -name .DS_Store \) -prune -exec rm -rf {} +
+
+APP="$DEST.new/Claude Acc.app"
+mkdir -p "$APP/Contents/MacOS"
+cp "$PRODUCTS/ClaudeAcc" "$APP/Contents/MacOS/ClaudeAcc"
+cp app/Info.plist "$APP/Contents/Info.plist"
+for name in fanctl claude-acc-hook claude-acc-pause claude-acc-desktop; do
+  cp "$PRODUCTS/$name" "$DEST.new/$name"
+done
+# podpisy jak w formule; setup.sh podpisuje aplikację jeszcze raz po skopiowaniu (sign-app.sh)
+if [ -z "${PAYLOAD_NO_SIGN:-}" ]; then
+  DESKTOP_ID="com.filip.claude-acc.desktop"
+  codesign --force --sign - --identifier "$DESKTOP_ID" -r="designated => identifier \"$DESKTOP_ID\"" \
+    "$DEST.new/claude-acc-desktop"
+  codesign --force --sign - "$APP"
+fi
+
+COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+printf '%s\n' "$VERSION" > "$DEST.new/VERSION"
+printf '{"version": "%s", "commit": "%s"}\n' "$VERSION" "$COMMIT" > "$DEST.new/payload.json"
+mv "$DEST.new" "$DEST"
+
+TARBALL="$OUT/claude-acc-payload-$VERSION.tar.gz"
+# bez metadanych właściciela i atrybutów macOS (._ pliki): paczka rozpakowuje się czysto u każdego
+COPYFILE_DISABLE=1 tar -C "$OUT" --uid 0 --gid 0 --uname root --gname wheel -czf "$TARBALL" claude-acc
+(cd "$OUT" && shasum -a 256 "$(basename "$TARBALL")" > "$(basename "$TARBALL").sha256")
+echo "paczka: $DEST"
+echo "tarball: $TARBALL ($(cut -d' ' -f1 < "$TARBALL.sha256"))"
