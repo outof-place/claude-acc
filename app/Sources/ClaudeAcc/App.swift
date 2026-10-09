@@ -115,6 +115,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBar: MenuBarController?
     private var widget: DictationWidget?
     private var store: Store?
+    /// URLs that arrive before the store exists: `open -g` that starts the app delivers its URL early.
+    private var early: [URL] = []
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         // `claude-acc dictate` opens claude-acc://dictate/<toggle|start|stop|cancel> in the background
@@ -129,19 +131,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBar = MenuBarController(store: store)
         widget = DictationWidget(dictation: store.dictation)
         store.dictation.activate()
+        early.forEach(handle)
+        early = []
     }
 
     @objc private func openURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
         guard let text = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
-              let url = URL(string: text), url.scheme == "claude-acc", url.host() == "dictate",
-              let dictation = store?.dictation
+              let url = URL(string: text), url.scheme == "claude-acc"
         else { return }
-        dictationLog.notice("command: \(url.absoluteString, privacy: .public)")
-        switch url.lastPathComponent {
-        case "start": dictation.start(handsFree: true, fromCommand: true)
-        case "stop": dictation.stop()
-        case "cancel": dictation.cancel()
-        default: dictation.toggle()
+        if store == nil { early.append(url) } else { handle(url) }
+    }
+
+    private func handle(_ url: URL) {
+        guard let store else { return }
+        switch url.host() {
+        // `claude-acc awake on|off|toggle`: Stay Awake from the terminal or Orca
+        case "awake": store.awake.command(url)
+        case "dictate":
+            dictationLog.notice("command: \(url.absoluteString, privacy: .public)")
+            switch url.lastPathComponent {
+            case "start": store.dictation.start(handsFree: true, fromCommand: true)
+            case "stop": store.dictation.stop()
+            case "cancel": store.dictation.cancel()
+            default: store.dictation.toggle()
+            }
+        default: break
         }
     }
 }

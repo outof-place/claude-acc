@@ -42,6 +42,8 @@ final class Awake {
     @ObservationIgnored private var linkChanged = false
     /// The last check got no answer (perf.py missing or failing): the next tick asks again.
     @ObservationIgnored private var linkUnknown = false
+    /// The state file's last contents without its timestamp: rewritten only when they change.
+    @ObservationIgnored private var publishedState: [String: AnyHashable]?
 
     private static let probe = URL(string: "http://captive.apple.com/hotspot-detect.html")!
     private static let session: URLSession = {
@@ -95,6 +97,17 @@ final class Awake {
         if hotspotActive { hotspotDismissed = true }
         save()
         apply()
+    }
+
+    /// `claude-acc awake` opens claude-acc://awake/<on|off|toggle>[?for=<seconds>] in the background.
+    func command(_ url: URL) {
+        let seconds = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+            .first { $0.name == "for" }?.value.flatMap(TimeInterval.init).flatMap { $0 > 0 ? $0 : nil }
+        switch url.lastPathComponent {
+        case "on": stayAwake(for: seconds)
+        case "off": turnOff()
+        default: isOn ? turnOff() : stayAwake(for: seconds)
+        }
     }
 
     // MARK: Internals
@@ -162,6 +175,34 @@ final class Awake {
         set(&systemAssertion, type: "PreventUserIdleSystemSleep", on: isOn)
         set(&displayAssertion, type: "PreventUserIdleDisplaySleep", on: isOn && keepDisplayOn)
         requestLid()
+        publishState()
+    }
+
+    /// What the menu bar shows, for `claude-acc awake status` and the Orca plugin. Only this pid
+    /// holds the assertions, so a reader checks it is still alive before trusting `on`.
+    private func publishState() {
+        guard !preview else { return }
+        let forever = manualUntil == .distantFuture
+        var state: [String: AnyHashable] = [
+            "on": isOn,
+            "manual": manualActive,
+            "forever": manualActive && forever,
+            "hotspot": hotspotActive,
+            "on_hotspot": onHotspot,
+            "auto_on_hotspot": autoOnHotspot,
+            "keep_display": keepDisplayOn,
+            "lid_closed": lidClosed,
+            "pid": Int(getpid()),
+        ]
+        if manualActive, !forever, let until = manualUntil { state["until"] = until.timeIntervalSince1970 }
+        if let hotspotVia { state["via"] = hotspotVia }
+        guard state != publishedState else { return }
+        var file = state
+        file["updated_at"] = Date.now.timeIntervalSince1970
+        guard let data = try? JSONSerialization.data(withJSONObject: file, options: [.sortedKeys]),
+              (try? data.write(to: URL(fileURLWithPath: CLI.awakeState), options: .atomic)) != nil
+        else { return }
+        publishedState = state
     }
 
     /// An assertion stops idle sleep only: a closed lid sleeps a MacBook on battery anyway. The fan

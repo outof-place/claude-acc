@@ -219,6 +219,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc guard room [dir]` | Exit 0 when memory admits a new dev server (of the app in `dir`), 1 with the reason: what a refused agent waits on |
 | `claude-acc guard brake [--stage N] [--within PID]` | The memory brake's stage now and whom it would stop, without a signal |
 | `claude-acc run -- <command>` | Run a heavy command through the memory scheduler from a terminal, a script or an Orca automation |
+| `claude-acc sched cancel <job-id\|pane> [--queued] [--kill] [--json]` | Take a waiting job off the queue (its command exits with 130) or stop a running one: SIGTERM through its wrapper, which passes it to the command's process group. A pane key (`ORCA_PANE_KEY`) means every job of that Orca pane; `--queued` only the waiting ones, `--kill` SIGKILLs a command that outlives the 5 s grace |
 | `claude-acc sched codex install` / `uninstall` / `status` | The scheduler's hook for Codex in `~/.codex/hooks.json` (trust it once in Codex's `/hooks`) |
 | `claude-acc fans [read\|keys]` | Fan speeds, CPU and GPU temperature, or every SMC key |
 | `claude-acc fans set auto\|<30-100>` | Set the fans by hand (root) |
@@ -265,6 +266,8 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc desktop mode full\|guarded` | Whether the agent acts freely (full) or is asked before `type`, `key` and `hold_key` (guarded) |
 | `claude-acc desktop <member> ['<json input>']` | Any toolset member from the shell, such as `screenshot --out shot.png` or `left_click '{"coordinate": [640, 300]}'` |
 | `claude-acc mcp share <name> [--force] [--port N]` | Run that user-scope stdio MCP server once for every Claude Code session instead of once per session |
+| `claude-acc awake on [--for 2h]\|off\|toggle` / `status [--json]` | Stay Awake from outside the app: through `claude-acc://awake/...`, confirmed in `awake-state.json` |
+| `claude-acc orca install` / `uninstall` / `status` | The claude-acc plugin in Orca's plugin folder (see [Orca plugin](#orca-plugin)) |
 | `claude-acc mcp unshare <name>\|--all` / `status [--json]` | Put it back to one copy per session / the shared servers, their sessions, restarts and memory |
 | `claude-acc uninstall` | Remove the launchd jobs, the app, this command and the limit pause hooks; settings stay |
 
@@ -699,11 +702,35 @@ unless you pass `--force`:
 agent; `claude-acc uninstall` unshares everything first. `CLAUDE_ACC_MCPSHARE_DEBUG=1` in the agent's
 environment logs each request's method names (never their content) to `<name>.log`.
 
+## Orca plugin
+
+![The claude-acc panel in Orca](docs/orca-plugin-panel.png)
+
+`orca-plugin/` is a native plugin for [Orca](https://github.com/stablyai/orca), plain JavaScript with no dependencies. It shows what the menu bar panel shows, next to the worktrees it is about:
+
+- **Status bar:** the active account's ring (the worse of session and weekly) with the time to the next switch, reset or resume, a memory brake badge from stage 1 (warning) and stage 2 (error) up, and Stay Awake while it is on. A click opens the panel; the Awake item turns Stay Awake off. ![Status bar](docs/orca-plugin-statusbar.png)
+- **Panel:** accounts with Switch, Resume, pause at the limit and draining; dev servers grouped by Orca worktree with their size, who watches them and what the guard plans, with Restart, Stop and Pin; the scheduler's running and queued jobs per worktree with the reason and the ETA, and Cancel; Stay Awake, Ultra, Hotspot turbo, fans, cleanup, updates and dictation. Orca's design tokens color it.
+- **Commands** (Cmd-J): switch to the next account, resume, pause at the limit, drain, restart or stop the focused worktree's dev servers, cancel its builds, clean up, update, Ultra, Stay Awake and dictation. A command reports back as a notification.
+- **Worktree cards:** one `claude-acc: :3000 4.5 GB watched · 1 build running` line in the card's comment, written only when it changes (in half-gigabyte steps, at most once a minute) and only on a card that is empty or holds nothing but claude-acc's and devguard's own lines. A comment you or an agent wrote is never touched. The worktree's board status stays yours. Turn it off in the panel.
+- **Notifications:** an account at 90% of a window, the switch less than 10 minutes away, an account switch, sessions paused at the limit, and the memory brake reaching stage 2. Each comes once.
+
+The worker reads the state files the daemons write, the way the menu bar app does (it never runs `claude-acc status --json`, which takes a lock and reads the Keychain), runs `~/.local/bin/claude-acc` for actions from a closed list of commands with checked arguments, and reaches Orca's own runtime socket for worktree paths, terminals and card comments. It finds that socket through its parent process, so a second or dev instance of Orca talks to itself. The data side has no Orca code in it: `orca-plugin/lib/core.mjs` (`createAccCore`) reads the state files, builds the model and runs the allowlisted actions, so another host can import it as-is; `worker.mjs` only adds the plugin API, the runtime RPC and the panel transport.
+
+Install it with `claude-acc orca install`, then in Orca open **Settings › Plugins**, turn on the plugin system (experimental) and approve **Claude Acc**. claude-acc never turns the plugin system on for you and never writes Orca's settings: the installer only lays the plugin out the way Orca's own installer does, as an immutable folder named by its content hash plus a `current` pointer in `~/Library/Application Support/orca/plugins/outof-place.claude-acc`. `claude-acc-setup` refreshes a plugin installed that way (`setup.sh --orca-plugin` installs it); `claude-acc orca uninstall` removes it.
+
+The status bar items and the live panel need an Orca with plugin status bar items and live panel messaging. An older Orca rejects a manifest that declares them, so the installer looks for them in Orca's app bundle and leaves them out when they are missing (`--live on|off` overrides). There everything else works, and the panel lists the commands instead of live data:
+
+![The panel on an Orca without live panels](docs/orca-plugin-panel-stock.png)
+
+Tests: `node --test orca-plugin/test/*.test.mjs` (also part of the Python suite). `orca-plugin/test/e2e/` holds two Playwright specs for an Orca checkout (copy them into its `tests/e2e`, set `CLAUDE_ACC_REPO`): one installs the plugin with `orcaplugin.py` into an isolated Orca, approves it and checks the status bar, the panel, a panel action, a command and the card line; the other does the same on an Orca without the live APIs.
+
 ## Stay Awake
 
 The **Stay Awake** card holds an `IOPMAssertion`, the same thing `caffeinate` does: the Mac doesn't sleep while it's on, and with **Keep the display on** neither does the screen. It runs until you turn it off or for 1, 2, 4 or 8 hours.
 
 An assertion only stops idle sleep: closing the lid of a MacBook on battery sleeps it anyway. With **Awake with the lid closed** (on by default) a session you started yourself also asks the fan daemon (root, `claude-acc fans install`) to turn on `SleepDisabled`, the switch behind `pmset disablesleep`, through `~/.local/share/claude-acc/awake.json`. The daemon holds it only while the session lasts and the app that asked still runs, lets go on battery at 10% or less, at a serious thermal state (then waits 15 minutes before holding it again), 24 hours after the request even for a session without an end, and when it stops, and never turns off a `SleepDisabled` it didn't turn on (Amphetamine, `sudo pmset disablesleep 1`). A session that switched itself on for a hotspot doesn't ask: a Mac awake in a bag has to be your choice.
+
+Outside the app, `claude-acc awake on [--for 90m]`, `off`, `toggle` and `status [--json]` open `claude-acc://awake/<on|off|toggle>[?for=<seconds>]` in the background, and the app writes what it holds to `~/.local/share/claude-acc/awake-state.json` on every change (`on`, `manual`, `until`, `hotspot`, `pid`). Only the app's process holds the assertions, so a reader checks that pid is alive; the Orca plugin shows and toggles it from there.
 
 With **Auto on any hotspot** it switches itself on whenever the Mac joins a network that macOS marks as expensive: an iPhone or Android hotspot over Wi-Fi or USB, or a cellular modem. It turns off again when you leave that network, unless you turned it on yourself. **Keep the hotspot alive** sends one small request every 25 seconds, so a phone doesn't drop a hotspot it thinks nobody uses. The settings live in the app's preferences.
 
