@@ -2310,9 +2310,12 @@ def log(text):
 
 def notify(title, text):
     """Powiadomienie macOS: nie zabiera fokusu, w przeciwieństwie do aktywowania okna."""
-    script = f"display notification {json.dumps(text)} with title {json.dumps(title)}"
+    # tekst i tytuł idą jako argumenty skryptu, nie w jego treści: json.dumps zamieniłby "ą" na \u0105,
+    # którego AppleScript nie rozumie
+    cmd = ["osascript", "-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+           "-e", "end run", "--", text, title]
     try:
-        subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
 

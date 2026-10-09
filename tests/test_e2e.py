@@ -9,6 +9,7 @@ Uruchomienie: /usr/bin/python3 -m unittest discover -s ~/.local/share/claude-acc
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -1279,7 +1280,7 @@ class OptionalPauseTest(unittest.TestCase):
         return w
 
     def warnings(self, w):
-        return [n for n in w.notifications() if '"Claude: brak konta z zapasem"' in n]
+        return [n for n in w.notifications() if n.endswith(" Claude: brak konta z zapasem")]
 
     def tick(self, w):
         w.forget_usage_cache()
@@ -1301,7 +1302,7 @@ class OptionalPauseTest(unittest.TestCase):
 
         self.assertIsNone(w.pause())
         self.assertEqual(len(self.warnings(w)), 1)  # raz na epizod, nie co 2 minuty
-        self.assertFalse([n for n in w.notifications() if '"Claude: pauza limit' in n])
+        self.assertFalse([n for n in w.notifications() if " Claude: pauza limit" in n])
         self.assertEqual(w.entry(BASE)["claudeAiOauth"]["accessToken"],
                          w.managed("a@x")["claudeAiOauth"]["accessToken"])
 
@@ -1375,7 +1376,7 @@ class DrainTest(unittest.TestCase):
         return next(e for e in w.ids if w.managed(e)["claudeAiOauth"]["accessToken"] == token)
 
     def said(self, w, title):
-        return [n for n in w.notifications() if f'"{title}"' in n]
+        return [n for n in w.notifications() if n.endswith(f" {title}")]
 
     def test_active_account_works_to_its_last_percent(self):
         # 3% sesji to poniżej progu porzucenia (5%), ale bez konta z zapasem szkoda go zostawiać
@@ -1502,8 +1503,8 @@ class PauseTest(unittest.TestCase):
             w.forget_usage_cache()
             w.run("tick")
 
-        # osascript dostaje tekst z json.dumps, więc polskie litery są tam jako \uXXXX
-        self.assertEqual(len([n for n in w.notifications() if '"Claude: pauza limit' in n]), 1)
+        # osascript dostaje tekst i tytuł jako argumenty, tytuł jest ostatni
+        self.assertEqual(len([n for n in w.notifications() if n.endswith(" Claude: pauza limitów")]), 1)
         self.assertIsNotNone(w.pause())
 
     def test_pause_ends_when_active_window_resets(self):
@@ -1592,6 +1593,19 @@ class PauseTest(unittest.TestCase):
 
         self.assertIsNone(w.pause())
         self.assertTrue(w.saved_state().get("hands_off_notified"))  # to była gałąź obcego konta
+
+
+class NotifyTest(unittest.TestCase):
+    def test_polish_letters_and_quotes_reach_osascript_as_arguments(self):
+        # json.dumps wstawiał do skryptu \u0105 zamiast "ą", AppleScript go nie parsował i nic się nie pokazywało
+        w = Env()
+        self.addCleanup(shutil.rmtree, w.home, True)
+        text = 'Żadne konto, ą, ł, ż i "cudzysłów"'
+        script = f"import sys; sys.path.insert(0, {os.path.dirname(HERE)!r}); import accswitch; accswitch.notify('Tytuł ą', sys.argv[1])"
+
+        subprocess.run(["/usr/bin/python3", "-c", script, text], env=w.env(), check=True)
+
+        self.assertEqual(w.notifications()[-1].split(" -- ", 1)[1], f"{text} Tytuł ą")
 
 
 class PodHostTest(unittest.TestCase):
