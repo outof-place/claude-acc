@@ -86,8 +86,22 @@ done
 CMD="${ARGS[0]:-}"
 SUB="${ARGS[1]:-}"
 
-# perf.py i jego stan należą do użytkownika, nie do roota
-USER_NAME="${SUDO_USER:-$(id -un)}"
+# perf.py i jego stan należą do użytkownika, nie do roota. Pod sudo to SUDO_USER; sudo wołane już przez
+# roota (dawny wrapper ~/.local/bin/claude-acc pod `sudo claude-acc perf-root`) daje SUDO_USER=root, a
+# root bez sudo nie daje nic: wtedy właściciel konsoli. Stanu roota nie ma (/var/root bez claude-acc),
+# więc root jako użytkownik to odmowa, zanim cokolwiek się zmieni
+USER_NAME="${SUDO_USER:-}"
+if [ -z "$USER_NAME" ] || [ "$USER_NAME" = root ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    USER_NAME="$(stat -f %Su /dev/console 2>/dev/null || true)"
+  else
+    USER_NAME="$(id -un)"
+  fi
+fi
+if [ -z "$USER_NAME" ] || [ "$USER_NAME" = root ] || [ "$(eval echo "~$USER_NAME")" = /var/root ]; then
+  echo "nie wiem, czyj jest stan claude-acc (SUDO_USER pusty albo root, przy konsoli nikogo); uruchom jako użytkownik: sudo $0 ..." >&2
+  exit 1
+fi
 as_user() {
   if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != root ]; then
     sudo -u "$USER_NAME" -H /usr/bin/python3 "$PERF" "$@"
@@ -645,6 +659,8 @@ case "$CMD $SUB" in
   "devtools add") devtools_apply ;;
   "devtools undo") devtools_undo ;;
   "devtools status" | "devtools ") devtools_status ;;
+  # czyj stan zmienia ten skrypt (diagnostyka i testy)
+  "user ") echo "$USER_NAME" ;;
   *)
     awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
     exit 2

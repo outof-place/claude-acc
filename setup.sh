@@ -215,6 +215,8 @@ case "$1" in
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     # stan limitu GPU to tylko odczyt sysctl i plisty demona
     case "${1:-} ${2:-}" in "iogpu status" | "iogpu ") exec "$(cat "$STATE/source")/perf-root.sh" "$@" ;; esac
+    # już pod sudo (`sudo claude-acc perf-root ...`): drugie sudo nadpisałoby SUDO_USER rootem
+    [ "$(id -u)" -eq 0 ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
   fans)
     shift

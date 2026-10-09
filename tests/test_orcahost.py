@@ -74,6 +74,9 @@ class Fixture(unittest.TestCase):
         patcher = mock.patch.object(orcahost, "pod_apps", side_effect=lambda home=None: list(self.pods))
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(orcahost, "owned_by_pod", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def install_pod(self, **kw):
         app = make_bundle(self.apps, **kw)
@@ -248,6 +251,12 @@ class OwnerTest(unittest.TestCase):
             self.assertEqual(orcahost.pod_apps(self.home)[0], app)
             host = orcahost.resolve(env={}, home=self.home)  # Orca bez katalogu danych: Pod
         self.assertEqual((host.kind, host.app), ("pod", app))
+
+    def test_owner_names_the_shared_hook_folder(self):
+        with mock.patch.object(self.owner, "read", return_value={"owner": "pod", "version": "1", "app": None}):
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home)]), {".orca/agent-hooks": "Pod"})
+        with mock.patch.object(self.owner, "read", return_value=None):
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home)]), {".orca/agent-hooks": "Orca"})
 
     def test_without_owner_json_the_usual_places(self):
         for owned in (None, {"owner": "pod", "version": "1", "app": None}):
