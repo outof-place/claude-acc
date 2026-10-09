@@ -6,6 +6,7 @@ gradle, pod install) i start symulatora; jeden taki build to 6-12 GB, więc czek
   sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli]
                (--shell 'KOMENDA' | -- ARGV...)
   sched.py status [--json]
+  sched.py cancel <job-id|pane> [--queued] [--kill] [--json]
   sched.py classify (--shell 'KOMENDA' | -- ARGV...)
   sched.py depot [--max-age S] [--json]
   sched.py wait [--max S] [--every S] -- 'WARUNEK'
@@ -28,6 +29,9 @@ wystartowały poza schedulerem (bramka pushu, scripts/depot-ci.sh agentów); apl
 dopóki panel jest otwarty.
 `wait` czeka na warunek najwyżej --max sekund (domyślnie 270), żeby subagent z 5-minutowym
 cache wołał go w kółko zamiast blokować się dłużej, niż żyje jego cache.
+`cancel` zdejmuje job z kolejki (jego wrapper kończy się kodem 130) albo biegnącemu wysyła SIGTERM
+przez wrapper, który przekazuje go grupie procesów komendy; job wskazuje id (j-...) albo klucz
+panelu Orki (ORCA_PANE_KEY): wtedy wszystkie joby tego panelu, z --queued tylko czekające.
 """
 
 import functools  # bez kosztu: `re` i tak go ładuje
@@ -105,6 +109,7 @@ DEPOT_SIZES = (2, 4, 8, 16, 32, 64)
 DEPOT_SETUP_S = 45  # łatka, kolejka i start maszyny
 EXIT_TIMEOUT = 75  # jak plock.py: czas oczekiwania minął
 EXIT_DEPOT_NEVER_RAN = 125  # depot-exec: komenda nie wystartowała
+EXIT_CANCELLED = 130  # zdjęty z kolejki przez `cancel`, jak przerwanie z klawiatury
 
 # szczyt drzewa procesów (GB) i czas (s) z pomiarów 2026-10-04/05 na M4 Max 48 GB
 # (docs/perf-research.md); klucz: (moduł, rodzaj, zakres, tylko kompilacja); wartość: {p: (GB, s)}
@@ -2671,12 +2676,13 @@ def backfill(job, free, now_free, shade, stuck, cfg):
 
     Gdy start głowy da się przewidzieć (shade["sure"]): "ends", jeśli job skończy się przed nim
     (z zapasem BACKFILL_SLACK), albo "beside", jeśli w tej chwili zmieści się obok niej. Gdy nie
-    (czeka na job bez zmierzonej prognozy albo taki, który biegnie dłużej, niż miał): "short", jeśli
-    job jest lekki (small_gb), jego prognoza z zapasem mieści się w head_delay_s, a głowa nie
-    wystartowałaby nawet bez jobów, które ją już wyprzedziły (`stuck`). Opóźni ją wtedy najwyżej o
-    swój czas, a gdy to wyprzedzający trzymają jej pamięć, nikt więcej nie wchodzi, więc strumień
-    krótkich jobów jej nie zagłodzi. Ciężki krótki job (e2e na 5 GB) tu nie wchodzi: w replayu
-    2026-10-09 to on, gdy przeciągnął się 27 razy, trzymał głowie najwięcej pamięci najdłużej.
+    (potrzebuje pamięci joba bez zmierzonej prognozy albo takiego, który biegnie dłużej, niż miał,
+    `shadow`): "short", jeśli job jest lekki (small_gb), jego prognoza z zapasem mieści się w
+    head_delay_s, a głowa nie wystartowałaby nawet bez jobów, które ją już wyprzedziły (`stuck`).
+    Opóźni ją wtedy najwyżej o swój czas, a gdy to wyprzedzający trzymają jej pamięć, nikt więcej
+    nie wchodzi, więc strumień krótkich jobów jej nie zagłodzi. Ciężki krótki job (e2e na 5 GB) tu
+    nie wchodzi: w replayu 2026-10-09 to on, gdy przeciągnął się 27 razy, trzymał głowie najwięcej
+    pamięci najdłużej.
     Zawsze z prognozą z własnej historii i w pamięci wolnej po rezerwach. Lekki job, który przed
     startem głowy się skończy ("ends", "short"), może wejść też w pamięci dostępnej teraz, jak mały
     job szybką ścieżką, także po 2 × starve_s: rezerwy na wzrost długich jobów i natywnego buildu
@@ -2710,7 +2716,13 @@ def shadow(state, need, free, now, ahead=(), lone=None):
 
     {"wait_s": sekundy albo None, gdy końce jobów jej nie wpuszczą, "spare_gb": miejsce obok
     (None: żadne), "after": id jobów, na których koniec czeka, "sure": start da się przewidzieć,
-    bo każdy z tych jobów ma prognozę z własnej historii i jeszcze jej nie przekroczył}."""
+    bo każdy z tych jobów ma prognozę z własnej historii i jeszcze jej nie przekroczył}.
+
+    Job bez takiej prognozy (albo już po niej) nie psuje przewidywania, gdy głowa jego pamięci nie
+    potrzebuje: bez pamięci wszystkich takich jobów i tak zmieści się w tej samej chwili. Nie czeka
+    wtedy na ich koniec (nie ma ich w "after"), ale mogą jeszcze biec obok niej, więc ich pamięć
+    nie liczy się do "spare_gb". 2026-10-09 18:26 pytest (0,08 GB) biegnący 2 s dłużej, niż miał,
+    robił z przewidywalnego startu e2e po końcu next build start „nie do przewidzenia”."""
     ends = []
     for i, r in enumerate(state["running"]):
         if r["where"] != "local":
@@ -2726,16 +2738,24 @@ def shadow(state, need, free, now, ahead=(), lone=None):
     if need <= free:
         return out
     released = 0.0
+    unsure = {}  # id -> GB jobów, których koniec trudno przewidzieć
     for left, _i, jid, gb, held, sure in ends:
         free += gb
         released += held
         out["after"].append(jid)
-        out["sure"] = out["sure"] and sure
+        if not sure:
+            unsure[jid] = gb
         if need <= free:
-            out.update(wait_s=left, spare_gb=free - need)
+            idle = sum(unsure.values())
+            if idle <= free - need:  # bez ich pamięci głowa zmieści się w tej samej chwili
+                out["after"] = [a for a in out["after"] if a not in unsure]
+                out.update(wait_s=left, spare_gb=free - need - idle)
+            else:
+                out.update(wait_s=left, spare_gb=free - need, sure=False)
             return out
     if lone is not None and ends and (lone[1] or need <= lone[0] + released):
-        out.update(wait_s=ends[-1][0], spare_gb=None)
+        # sama na Macu czeka na koniec wszystkich
+        out.update(wait_s=ends[-1][0], spare_gb=None, sure=not unsure)
         return out
     out.update(wait_s=None, spare_gb=None, sure=False)
     return out
@@ -3188,6 +3208,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                 f"natywny build albo symulator (~{pl_gb(entry['mem_predicted_gb'])}) wystartuje sam, "
                 "gdy zmieści się w pamięci; nie przerywaj go. Kolejka: claude-acc sched status"
             )
+        cancelled = False
         while entry.get("where") is None:
             time.sleep(0.5)
             if timeout and time.time() - start > timeout:
@@ -3202,6 +3223,12 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                 reap(state)
                 refresh_memory(state, cfg)
                 me = next((j for j in state["queue"] if j["id"] == jid), None)
+                if me is not None and me.get("cancelled"):
+                    state["queue"] = [j for j in state["queue"] if j["id"] != jid]
+                    update_queue_view(state, cfg)
+                    save_state(state)
+                    cancelled = True
+                    break
                 if me is None:
                     me = entry
                     state["queue"].append(me)
@@ -3238,6 +3265,9 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                 update_queue_view(state, cfg)
                 save_state(state)
                 entry = me
+        if cancelled:
+            log(f"anulowane po {human_s(time.time() - start)} w kolejce (claude-acc sched cancel)")
+            return EXIT_CANCELLED
         log(
             f"start po {human_s(time.time() - start)} czekania, {entry['where']}"
             + (f", -p {entry['p']}" if entry.get("p") else "")
@@ -3512,6 +3542,7 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
                     "cost_usd": cost,
                     "route_text": me["route"]["text"],
                     "depot_run_id": (depot_info or {}).get("run_id"),
+                    "cancelled": bool(me.get("cancelled")),
                 }
             ]
             + state["recent"]
@@ -3547,6 +3578,7 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
             "predicted_wall_s": me.get("local_wall_s") or me.get("predicted_wall_s"),
             "count1_dropped": me.get("count1_dropped", False),
             "lang": me.get("lang"),
+            "cancelled": bool(me.get("cancelled")),
         }
         if me.get("lang") == "native":
             row["native_built"] = bool(me.get("native_seen"))
@@ -4154,6 +4186,117 @@ def cmd_status(args):
     return 0
 
 
+CANCEL_WAIT_S = 5.0  # tyle `cancel` czeka, aż wrapper zdejmie się z kolejki albo job skończy
+
+
+def is_wrapper(pid):
+    """Czy pid z wpisu to wciąż wrapper `sched.py run` (pid mógł przejść na inny proces)."""
+    args = proc_args(pid) or []
+    for i, a in enumerate(args[:4]):
+        if a.endswith("sched.py") or (a.endswith("acc.py") and args[i + 1 : i + 2] == ["sched"]):
+            return True
+    return False
+
+
+def signal_job(job, sig):
+    """Sygnał do wrappera joba, gdy to wciąż on; False, gdy pid jest martwy albo cudzy."""
+    pid = job.get("pid")
+    if not pid or not alive(pid) or not is_wrapper(pid):
+        return False
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        return False
+    return True
+
+
+def kill_child(job):
+    """SIGKILL grupie procesów komendy, jeśli jej lider to wciąż dziecko wrappera."""
+    import signal
+
+    pgid = job.get("child_pgid")
+    if not pgid or not alive(pgid) or proc_bsd(pgid, BSD_PPID) != job.get("pid"):
+        return False
+    for sig in (signal.SIGCONT, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            pass
+    return True
+
+
+def cmd_cancel(args):
+    """Zdejmuje z kolejki albo przerywa joby wskazane id albo kluczem panelu Orki."""
+    import signal
+
+    as_json = "--json" in args
+    queued_only = "--queued" in args
+    hard = "--kill" in args
+    targets = [a for a in args if not a.startswith("--")]
+    if len(targets) != 1:
+        log("użycie: sched.py cancel <job-id|pane> [--queued] [--kill] [--json]")
+        return 64
+    target = targets[0]
+    by_id = re.match(r"^j-\d+-[0-9a-f]{4}$", target) is not None
+
+    def matches(job):
+        if by_id:
+            return job["id"] == target
+        return (job.get("agent") or {}).get("pane") == target
+
+    cfg = load_config()
+    found = []
+    with Locked():
+        state = load_state(cfg)
+        reap(state)
+        for job in state["queue"]:
+            if matches(job):
+                job["cancelled"] = time.time()
+                found.append({"id": job["id"], "label": job["label"], "state": "queued"})
+        if not queued_only:
+            for job in state["running"]:
+                if matches(job):
+                    job["cancelled"] = time.time()
+                    found.append({"id": job["id"], "label": job["label"], "state": "running",
+                                  "where": job["where"]})
+        update_queue_view(state, cfg)
+        save_state(state)
+        jobs = {j["id"]: j for j in state["queue"] + state["running"]}
+    for item in found:
+        if item["state"] == "running":
+            item["result"] = "signalled" if signal_job(jobs[item["id"]], signal.SIGTERM) else "gone"
+    end = time.time() + CANCEL_WAIT_S
+    left = {item["id"] for item in found}
+    while left and time.time() < end:
+        time.sleep(0.2)
+        with Locked():
+            state = load_state(cfg)
+            reap(state)
+            save_state(state)
+        now = {j["id"]: j for j in state["queue"] + state["running"]}
+        left = {jid for jid in left if jid in now}
+    for item in found:
+        if item["id"] not in left:
+            item["result"] = "dequeued" if item["state"] == "queued" else "ended"
+            continue
+        job = now[item["id"]]
+        if item["state"] == "queued":
+            # wrapper nie zdjął się sam (wisi albo nie odczytał stanu): SIGTERM, reap posprząta wpis
+            item["result"] = "terminated" if signal_job(job, signal.SIGTERM) else "gone"
+        elif hard and kill_child(job):
+            item["result"] = "killed"
+        else:
+            item["result"] = "still running"
+    if as_json:
+        print(json.dumps({"target": target, "jobs": found}, ensure_ascii=False))
+    elif not found:
+        print(f"nic nie pasuje do {target}: claude-acc sched status")
+    for item in [] if as_json else found:
+        hint = ", zostaw mu chwilę albo --kill" if item["result"] == "still running" else ""
+        print(f"{item['id']}  {item['label']}: {item['state']} -> {item['result']}{hint}")
+    return 0 if found else 1
+
+
 def cmd_classify(args):
     _opts, command, argv = parse_run_args(args)
     job = classify(command, os.getcwd(), argv=argv) if (command or argv) else None
@@ -4408,6 +4551,7 @@ COMMANDS = {
     "codex": cmd_codex,
     "run": cmd_run,
     "status": cmd_status,
+    "cancel": cmd_cancel,
     "classify": cmd_classify,
     "wait": cmd_wait,
     "rtk-excludes": cmd_rtk_excludes,

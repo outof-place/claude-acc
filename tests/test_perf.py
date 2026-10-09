@@ -51,6 +51,9 @@ class FakeSystem:
     def rtk_hook(self):
         return self.rtk
 
+    def claude_plugin(self, *args):
+        return 1, "claude nie jest dostępny w testach"
+
     def rtk_path(self):
         return "/opt/homebrew/bin/rtk" if self.rtk else None
 
@@ -135,6 +138,12 @@ class Isolated(unittest.TestCase):
         patcher = mock.patch.object(perf, "HOOKS_DIR", self.hooks_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # security-slim czyta wtyczki Claude Code i pisze marketplace w katalogu stanu: tu puste kopie
+        slim = perf.tweak("security-slim")
+        for attr, value in (("claude_dir", "dot-claude"), ("out_dir", "plugins")):
+            patcher = mock.patch.object(slim, attr, os.path.join(self.dir, value))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         # siatka bezpieczeństwa: prawdziwe ustawienia Claude nie mogą się zmienić w teście
         self.real_settings = self.stamp(os.path.expanduser("~/.claude/settings.json"))
         patcher = mock.patch.object(

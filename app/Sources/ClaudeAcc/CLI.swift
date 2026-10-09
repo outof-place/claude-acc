@@ -34,6 +34,8 @@ enum CLI {
     static let fanConfig = directory + "/fans.json"
     /// Stay Awake asks the fan daemon (root) to keep a closed lid from sleeping the Mac.
     static let awakeRequest = directory + "/awake.json"
+    /// Stay Awake as others see it (`claude-acc awake status`, the Orca plugin); the app rewrites it on every change.
+    static let awakeState = directory + "/awake-state.json"
     static let fanState = directory + "/fans-state.json"
     static let perfState = directory + "/perf-state.json"
     static let schedState = directory + "/sched/state.json"

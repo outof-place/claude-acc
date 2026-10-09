@@ -206,6 +206,23 @@ PIN_KEEP = {"target": ":3747", "level": "keep", "until": None, "reason": "film"}
 PIN_HOLD = {"target": ":3747", "level": "hold", "until": None, "reason": "film"}
 
 
+class NoteTest(unittest.TestCase):
+    """Notka na karcie worktree: tylko gdy karta jest pusta albo ma notkę devguard lub linię wtyczki Orki."""
+
+    def calls(self, comment):
+        orca = mock.Mock()
+        unit = types.SimpleNamespace(worktree={"worktreeId": "r::/w", "comment": comment})
+        dg.note({"orca_comment": True}, orca, unit, "devguard: zatrzymałem :3000")
+        return orca.call.call_args_list
+
+    def test_writes_over_its_own_note_and_the_plugin_line(self):
+        for comment in ("", "devguard: stare", "claude-acc: :3000 4.0 GB"):
+            self.assertEqual(len(self.calls(comment)), 1, comment)
+
+    def test_leaves_a_user_comment_alone(self):
+        self.assertEqual(self.calls("review the auth flow"), [])
+
+
 class RegrowTest(unittest.TestCase):
     """Ile stos może jeszcze urosnąć: każdy proces do swojego szczytu. Scheduler trzyma na to
     miejsce, więc niedoszacowanie oznacza wpuszczenie roboty, która potem wypycha serwery do swapu."""

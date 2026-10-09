@@ -1833,7 +1833,8 @@ def note(cfg, orca, unit, text):
     if not (cfg["orca_comment"] and orca and worktree):
         return
     current = worktree.get("comment") or ""
-    if current and not current.startswith("devguard"):
+    # wtyczka Orki claude-acc pisze swoją linię "claude-acc: ..." i po notce dopisze ją z powrotem
+    if current and not current.startswith(("devguard", "claude-acc:")):
         return
     orca.call(
         "worktree",
