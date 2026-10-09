@@ -56,10 +56,10 @@ POD_NAME = "Pod"
 # the hosts' own CLIs, for code that must recognise them without reading a bundle (Pod's is `podx`;
 # `pod` is CocoaPods, which the scheduler runs as a native build)
 CLI_NAMES = ("orca", "podx")
-# agent-hooks folders the hosts write into ~/.claude/settings.json, relative to HOME, and whose they are:
-# Orca's, and Pod's once its identity migration moves the entries there. Pod rewrites them before
-# claude-acc's handover makes them async again; matching both folders keeps either order working.
-HOOK_DIRS = {".orca/agent-hooks": "Orca", ".pod/agent-hooks": POD_NAME}
+# agent-hooks folders the hosts write into ~/.claude/settings.json, relative to HOME, and whose they are.
+# Pod keeps Orca's ~/.orca (Orca hard-codes it all over), so the folder is shared; hook_hosts names it
+# after Pod once Pod owns claude-acc (owner.json)
+HOOK_DIRS = {".orca/agent-hooks": "Orca"}
 
 Host = namedtuple(
     "Host",
@@ -104,16 +104,20 @@ def orca(home=None):
     )
 
 
+def owned_by_pod():
+    """owner.json when Pod owns claude-acc ({"owner": "pod", "version", "app", "at"}), else {}."""
+    try:
+        import owner
+    except ImportError:  # a copy without owner.py next to it
+        return {}
+    return owner.read() or {}
+
+
 def pod_apps(home=None):
     """Where an installed Pod would be: the app owner.json names (Pod writes it when it takes claude-acc
     over, owner.py), then /Applications and ~/Applications, in the order Launch Services prefers."""
     apps = []
-    try:
-        import owner
-
-        owned = owner.read() or {}
-    except ImportError:  # a copy without owner.py next to it
-        owned = {}
+    owned = owned_by_pod()
     if isinstance(owned.get("app"), str) and owned["app"]:
         apps.append(owned["app"].rstrip("/"))
     apps += ["/Applications/%s.app" % POD_NAME, os.path.join(_home(home), "Applications", POD_NAME + ".app")]
@@ -356,8 +360,11 @@ def keychain_services(env=None, home=None):
 
 
 def hook_hosts(hosts=None):
-    """{agent-hooks folder: host name}: HOOK_DIRS, then a folder a host on this Mac declares (hooksDir)."""
+    """{agent-hooks folder: host name}: HOOK_DIRS, then a folder a host on this Mac declares (hooksDir).
+    With Pod owning claude-acc the shared ~/.orca folder carries Pod's hooks, so it is named Pod."""
     found = dict(HOOK_DIRS)
+    if owned_by_pod():
+        found[".orca/agent-hooks"] = POD_NAME
     for h in known() if hosts is None else hosts:
         found.setdefault(h.hooks, h.name)
     return found

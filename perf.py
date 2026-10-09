@@ -779,7 +779,8 @@ HOME = janitor.HOME
 # w settings.json zostawia każdy, który kiedyś działał
 HOSTS = orcahost.known()
 HOST = HOSTS[0]
-# katalogi hooków statusu: Orki i Pod (także zanim Pod się zainstaluje), plus zgłoszone przez hosta
+# katalogi hooków statusu z nazwą hosta: ~/.orca/agent-hooks (Pod też go używa; z Pod jako właścicielem
+# claude-acc podpisany Pod) i katalog, który host zgłosi sam
 HOST_HOOKS = orcahost.hook_hosts(HOSTS)
 # zdarzenia, na których hook statusu hosta tylko zgłasza stan sesji (async_hooks niżej)
 HOST_HOOK_EVENTS = (

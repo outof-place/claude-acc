@@ -414,7 +414,7 @@ class RootRecordTest(Isolated):
 def pod_host():
     """Pod z własnym katalogiem hooków, jak gdyby fork go przemianował."""
     return orcahost.orca()._replace(kind="pod", name="Pod", app="/Applications/Pod.app", executable="Pod",
-                                    bundle_id="codes.pod.app", hooks=".pod/agent-hooks")
+                                    bundle_id="codes.pod.app")
 
 
 class OrcaStartedTest(unittest.TestCase):
@@ -565,8 +565,6 @@ class ParseTest(unittest.TestCase):
 
 # skrót prawdziwego hooka Orki: gałąź bez HOME i jej skrypt w ~/.orca/agent-hooks
 ORCA = 'if [ -z "${HOME-}" ]; then printf "{}"; else /bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"; fi'
-# ten sam hook po migracji tożsamości Pod
-POD = ORCA.replace("/.orca/", "/.pod/")
 CAVE = "/x/node /x/lib/node_modules/cavemem/dist/index.js hook run"
 
 
@@ -644,21 +642,6 @@ class AsyncHooksTest(Isolated):
         record2, changed2 = item.apply(self.cfg, FakeSystem({}), record)
         self.assertEqual(changed2, [])
         self.assertEqual(record2, record)
-        item.undo(record, FakeSystem({}))
-        self.assertEqual(self.read(self.claude), original)
-
-    def test_pods_hook_folder_goes_async_too(self):
-        """Wpisy po migracji tożsamości Pod (~/.pod/agent-hooks): Ultra robi je async jak wpisy Orki."""
-        original = claude_settings()
-        original["hooks"]["PostToolUse"][1]["hooks"][1]["command"] = POD
-        original["hooks"]["SessionStart"][0]["hooks"][0]["command"] = POD
-        self.write(self.claude, original)
-        item = perf.tweak("claude-hooks-async")
-        record, changed = item.apply(self.cfg, FakeSystem({}))
-        data = self.read(self.claude)
-        self.assertIs(data["hooks"]["PostToolUse"][1]["hooks"][1]["async"], True)
-        self.assertNotIn("async", data["hooks"]["SessionStart"][0]["hooks"][0])
-        self.assertIn("PostToolUse: Pod", changed)
         item.undo(record, FakeSystem({}))
         self.assertEqual(self.read(self.claude), original)
 
@@ -2272,25 +2255,31 @@ class DockerIdleTest(Isolated):
 class HostFixtureTest(unittest.TestCase):
     """Orca i Pod obok siebie: hooki obu idą w tle, etykiety i krok devtools mówią o hoście."""
 
-    def test_async_hooks_cover_orca_and_pod_even_without_pod(self):
-        """Pod przepisuje wpisy na ~/.pod/agent-hooks przed przejęciem claude-acc: oba katalogi są w
-        domyślnej liście już na Macu z samą Orką, więc kolejność migracji nic nie gubi."""
-        orca_only = orcahost.hook_hosts([orcahost.orca()])
-        self.assertEqual(orca_only, {".orca/agent-hooks": "Orca", ".pod/agent-hooks": "Pod"})
-        entries = perf.host_async_hooks(orca_only)
-        self.assertEqual({e["match"] for e in entries}, {".orca/agent-hooks/claude-hook", ".pod/agent-hooks/claude-hook"})
-        self.assertEqual(len(entries), 2 * len(perf.HOST_HOOK_EVENTS))
-        self.assertEqual({e["match"] for e in perf.DEFAULT_CONFIG["async_hooks"]} & {e["match"] for e in entries},
-                         {e["match"] for e in entries})
-        # Pod z katalogiem spoza listy dokłada swój, a powtórzony nie dubluje wpisów
+    def test_one_shared_hook_folder_named_after_the_owner(self):
+        """Pod zostaje przy ~/.orca: jeden katalog hooków statusu, w tle jak dotąd. Gdy claude-acc należy do
+        Pod (owner.json), ten katalog nosi jego hooki i panel podpisuje go Pod."""
+        with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
+            hosts = orcahost.hook_hosts([orcahost.orca(), pod_host()])
+        self.assertEqual(hosts, {".orca/agent-hooks": "Orca"})
+        entries = perf.host_async_hooks(hosts)
+        self.assertEqual({e["match"] for e in entries}, {".orca/agent-hooks/claude-hook"})
+        self.assertEqual(len(entries), len(perf.HOST_HOOK_EVENTS))
+        self.assertLessEqual({e["match"] for e in entries}, {e["match"] for e in perf.DEFAULT_CONFIG["async_hooks"]})
+        owned = {"owner": "pod", "version": "1.29.2", "app": None, "at": 0}
+        with mock.patch.object(orcahost, "owned_by_pod", return_value=owned):
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), pod_host()]), {".orca/agent-hooks": "Pod"})
+        # Pod, który zgłosi własny katalog (ClaudeAccHost hooksDir), dokłada go obok
         canary = pod_host()._replace(name="Pod Canary", hooks=".pod-canary/agent-hooks")
-        hosts = orcahost.hook_hosts([orcahost.orca(), pod_host(), canary])
+        with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
+            hosts = orcahost.hook_hosts([orcahost.orca(), canary])
         self.assertEqual(hosts[".pod-canary/agent-hooks"], "Pod Canary")
-        self.assertEqual(len(perf.host_async_hooks(hosts)), 3 * len(perf.HOST_HOOK_EVENTS))
+        self.assertEqual(len(perf.host_async_hooks(hosts)), 2 * len(perf.HOST_HOOK_EVENTS))
 
     def test_hook_label_names_the_host(self):
-        self.assertEqual(perf.hook_label('/bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"'), "Orca")
-        self.assertEqual(perf.hook_label('/bin/sh "${HOME-}/.pod/agent-hooks/claude-hook.sh"'), "Pod")
+        hook = '/bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"'
+        for owner_name in ("Orca", "Pod"):
+            with mock.patch.object(perf, "HOST_HOOKS", {".orca/agent-hooks": owner_name}):
+                self.assertEqual(perf.hook_label(hook), owner_name)
 
     def test_devtools_follows_the_host_app(self):
         tmp = tempfile.mkdtemp()
