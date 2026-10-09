@@ -15,7 +15,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates"
+JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates com.filip.claude-acc.jobs"
 
 APP_SRC=""
 FANCTL=""
@@ -184,7 +184,8 @@ EOF
 chmod +x "$HOME/.local/bin/claude-acc"
 
 # automaty: tick kont co 2 minuty, porządki przy logowaniu i co 3 godziny, strażnik dev serwerów cały czas,
-# perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie), aktualizacje o 4:30 co 3 dni
+# perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie), aktualizacje o 4:30 co 3 dni,
+# harmonogram blogów (jobs tick) co 2 minuty
 for job in $JOBS; do
   plist="$AGENTS/$job.plist"
   sed "s|__HOME__|$HOME|g" "$SRC/launchd/$job.plist.template" > "$plist"

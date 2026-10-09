@@ -1,0 +1,119 @@
+#!/usr/bin/python3
+"""Atrapa `claude-acc jobs run` dla tiku (tests/test_jobs_schedule.py), na szwie $CLAUDE_ACC_JOBS_RUNNER.
+
+  runner run NAZWA --slot S [--mode M]
+
+Jak runner A2a: blokada <job>/lock (zajęta: kod 73 bez zapisu), current.json w toku, zapis schematu v1
+w history.jsonl z polem slot, sprzątnięcie current.json. Zegar ściany z $CLAUDE_ACC_JOBS_NOW. Wynik
+kolejnych wywołań joba z $HOME/fake/plan.json: {"job": [{pola zapisu}, ...]} (brak: OPUBLIKOWANO,
+final); pola specjalne wpisu planu:
+  "exit": kod bez zapisu (64 albo 73, jak odmowa runnera), "gate": true (czeka, póki istnieje
+  $HOME/fake/gate-<job>), "payer": {...} (current.json i zapis), "die": true (SIGKILL dla siebie po
+  current.json, bez zapisu, jak hamulec), "pool": {"credits": [org], "subscription": [email]}
+  (wybór płatnika jak runenv.prepare: auto bierze pierwszą organizację z kredytem, bez niej
+  pierwszą subskrypcję spoza runenv/avoid.json; --mode credits albo subscription tylko to źródło;
+  nikt nie zapłaci: POMINIĘTO payer bez płatnika zamiast wyniku z planu).
+Każde wywołanie trafia do $HOME/fake/runner-calls.jsonl: {job, slot, mode, pid, ppid, pgid, sid}.
+"""
+import fcntl
+import json
+import os
+import signal
+import sys
+import time
+
+HOME = os.environ["HOME"]
+FAKE = os.path.join(HOME, "fake")
+JOBS = os.path.join(HOME, ".local/share/claude-acc/jobs")
+
+
+def now():
+    try:
+        with open(os.environ["CLAUDE_ACC_JOBS_NOW"]) as f:
+            return float(json.load(f)["wall"])
+    except (KeyError, OSError, ValueError):
+        return time.time()
+
+
+def pick(pool, mode):
+    """Płatnik jak runenv.prepare: kredyt przed subskrypcją (auto), konta z avoid.json pominięte."""
+    try:
+        with open(os.path.join(HOME, ".local/share/claude-acc/runenv/avoid.json")) as f:
+            avoided = {e for e, v in json.load(f).items() if float(v.get("until", 0)) > time.time()}
+    except (OSError, ValueError, AttributeError):
+        avoided = set()
+    if mode in ("auto", "credits") and pool.get("credits"):
+        return {"mode": "credits", "email": "1@example.com", "org_id": pool["credits"][0], "verdict": "ok"}
+    if mode in ("auto", "subscription"):
+        for email in pool.get("subscription") or []:
+            if email.lower() not in avoided:
+                return {"mode": "subscription", "email": email, "identity": email, "verdict": "ok"}
+    return None
+
+
+def main():
+    args = sys.argv[1:]
+    assert args[0] == "run", args
+    name = args[1]
+    slot = args[args.index("--slot") + 1] if "--slot" in args else None
+    mode = args[args.index("--mode") + 1] if "--mode" in args else None
+    call = {"job": name, "slot": slot, "mode": mode, "pid": os.getpid(), "ppid": os.getppid(),
+            "pgid": os.getpgid(0), "sid": os.getsid(0), "at": now()}
+    with open(os.path.join(FAKE, "runner-calls.jsonl"), "a") as f:
+        f.write(json.dumps(call) + "\n")
+    plan_path = os.path.join(FAKE, "plan.json")
+    try:
+        with open(plan_path) as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        plan = {}
+    steps = plan.get(name) or []
+    step = steps.pop(0) if steps else {}
+    with open(plan_path, "w") as f:
+        json.dump(plan, f)
+    if "exit" in step:
+        return step["exit"]
+    folder = os.path.join(JOBS, name)
+    os.makedirs(folder, exist_ok=True)
+    fd = os.open(os.path.join(folder, "lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        with open(os.path.join(FAKE, "runner-calls.jsonl"), "a") as f:
+            f.write(json.dumps(dict(call, busy=True)) + "\n")
+        return 73
+    rid = os.urandom(6).hex()
+    payer = step.get("payer", {"mode": mode if mode in ("credits", "subscription") else "credits",
+                               "email": "1@example.com", "org_id": "org-a", "verdict": "ok"})
+    if "pool" in step:
+        payer = pick(step["pool"], mode or "auto")
+        if payer is None:
+            step = {"outcome": "POMINIĘTO", "skip": "payer", "reason": f"atrapa runenv: nikt nie zapłaci (--mode {mode or 'auto'})"}
+    cur = {"v": 1, "id": rid, "job": name, "state": "running", "slot": slot, "pid": os.getpid(),
+           "started_at": now(), "phase": "run", "payer": payer, "outcome": None}
+    with open(os.path.join(folder, "current.json"), "w") as f:
+        json.dump(cur, f)
+    if step.get("die"):
+        os.kill(os.getpid(), signal.SIGKILL)
+    gate = os.path.join(FAKE, f"gate-{name}")
+    while step.get("gate") and os.path.exists(gate):
+        time.sleep(0.05)
+    outcome = step.get("outcome", "OPUBLIKOWANO")
+    final = step.get("final", outcome != "POMINIĘTO" and not step.get("retryable", False))
+    rec = {"v": 1, "id": rid, "job": name, "state": "done", "outcome": outcome,
+           "reason": step.get("reason", f"atrapa: {outcome}"), "title": step.get("title"), "urls": step.get("urls", []),
+           "pr": None, "notes": "", "wynik": [], "cost_usd": 0.5, "ledger_usd": 0.5, "budget_usd": 2.0,
+           "payer": None if outcome == "POMINIĘTO" else payer, "metering_complete": True, "run_id": None,
+           "version": None, "started_at": cur["started_at"], "ended_at": now(), "awake_seconds": 1.0,
+           "slept_seconds": 0.0, "phase": step.get("phase", "run"), "exit_code": None, "precheck": None,
+           "stopped": None, "facts": [], "override": step.get("override"), "retryable": not final,
+           "final": final, "switch_payment": step.get("switch_payment", False), "skip": step.get("skip"),
+           "banner": step.get("banner"), "live_check": None, "log": "", "pid": os.getpid(), "slot": slot}
+    with open(os.path.join(folder, "history.jsonl"), "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    os.unlink(os.path.join(folder, "current.json"))
+    return {"OPUBLIKOWANO": 0, "ZAPARKOWANO": 2, "BEZ WPISU": 4, "BŁĄD": 1, "PILNE": 5}.get(outcome, 75)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
