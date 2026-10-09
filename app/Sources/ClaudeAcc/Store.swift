@@ -16,6 +16,9 @@ final class Store {
     }
 
     private(set) var snapshot: Snapshot?
+    /// What the menu bar shows, assigned only when it changes: the label and its ring image
+    /// re-render when the numbers do, not on every reading.
+    private(set) var label = MenuLabelState()
     private(set) var refreshing = false
     /// The panel window is on screen. Closed, it stays alive offscreen and would keep rendering
     /// every frame of a running animation, so animations and clocks follow this.
@@ -70,6 +73,8 @@ final class Store {
     @ObservationIgnored var previewHoverAccount: String?
     /// Stay Awake lives as long as the app: power assertions and the hotspot watch.
     let awake: Awake
+    /// Dictation lives as long as the app too: the right ⌘ tap and the widget.
+    let dictation: Dictation
 
     @ObservationIgnored private var loginPID: Int32?
     @ObservationIgnored private var loginCancelled = false
@@ -83,6 +88,16 @@ final class Store {
     @ObservationIgnored private var live: Task<Void, Never>?
     /// The state files as last read: a file that didn't change costs one stat and wakes no view.
     @ObservationIgnored private var files: [String: StateFile] = [:]
+    /// The newest readings while the panel is closed. The closed panel is still a live view
+    /// tree, and publishing to it laid the whole of it out every minute for nothing (140 ms,
+    /// sampled); it gets them when it opens. The menu bar label reads `label`, kept current.
+    @ObservationIgnored private var latestSnapshot: Snapshot?
+    @ObservationIgnored private var latestFan: FanState?
+    @ObservationIgnored private var latestGuard: GuardState?
+    /// A panel render: everything is published at once.
+    @ObservationIgnored private var isPreview = false
+    @ObservationIgnored private var diskCheckedAt = Date.distantPast
+    @ObservationIgnored private var diskChecking = false
 
     private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -97,7 +112,10 @@ final class Store {
         updates: UpdatesState? = nil, desktop: DesktopPanel? = nil
     ) {
         awake = Awake(preview: true)
+        dictation = Dictation(preview: true)
+        isPreview = true
         snapshot = preview
+        latestSnapshot = preview
         readLocal()
         if let guardState { self.guardState = guardState }
         if let janitor { self.janitor = janitor }
@@ -112,6 +130,7 @@ final class Store {
 
     init() {
         awake = Awake()
+        dictation = Dictation()
         // quitting during a sign-in must not leave the script with `claude` behind
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
@@ -155,15 +174,18 @@ final class Store {
     /// should run: no file, unreadable, or what's shown is older than `tickSnapshotMaxAge`.
     private func readTickSnapshot() -> Bool {
         if let data = changedFile(Self.tickSnapshot), let fresh = Self.decode(Snapshot.self, from: data),
-           fresh.generatedAt > (snapshot?.generatedAt ?? 0) {
+           fresh.generatedAt > (latestSnapshot?.generatedAt ?? 0) {
             show(fresh)
         }
-        return Date.now.timeIntervalSince1970 - (snapshot?.generatedAt ?? 0) <= Self.tickSnapshotMaxAge
+        return Date.now.timeIntervalSince1970 - (latestSnapshot?.generatedAt ?? 0) <= Self.tickSnapshotMaxAge
     }
 
     private func show(_ fresh: Snapshot) {
-        snapshot = fresh
-        problem = nil
+        latestSnapshot = fresh
+        // with the panel closed only the menu bar label reads it; the panel takes it when it opens
+        if panelOpen || isPreview || snapshot == nil { snapshot = fresh }
+        if problem != nil { problem = nil }
+        updateLabel()
         for (setting, pick) in settingPicks where pick == value(of: setting) { settingPicks[setting] = nil }
     }
 
@@ -180,31 +202,48 @@ final class Store {
             let result = await CLI.run(["status", "--json"])
             guard result.status == 0 else {
                 problem = result.message.isEmpty ? "Couldn't read account limits" : result.message
+                updateLabel()
                 continue
             }
             do {
                 show(try Self.decoder.decode(Snapshot.self, from: Data(result.stdout.utf8)))
             } catch {
                 problem = "The script returned unreadable data: \(error.localizedDescription)"
+                updateLabel()
             }
         } while refreshAgain
     }
 
     /// Cleanup and guard state from their files, and free disk space: no script runs.
     /// Observation tells every view that reads a property about every assignment, equal or
-    /// not, so only what changed is assigned: an unchanged file isn't even read again.
+    /// not, so only what changed is assigned: an unchanged file isn't even read again. With the
+    /// panel closed only what the menu bar label needs is read, and kept back from the panel.
     func readLocal() {
+        let live = panelOpen || isPreview
+        if let data = changedFile(CLI.fanState) {
+            latestFan = Self.decode(FanState.self, from: data)
+            if live { fanState = latestFan }
+        }
+        if let data = changedFile(CLI.guardState) {
+            latestGuard = Self.decode(GuardState.self, from: data)
+            if live { guardState = latestGuard }
+        }
+        updateLabel()
+        guard live else { return }
         if let data = changedFile(CLI.janitorState) {
             janitor = Self.decode(JanitorState.self, from: data)
-        }
-        if let data = changedFile(CLI.fanState) {
-            fanState = Self.decode(FanState.self, from: data)
         }
         if let pick = fanPick, pick == fanMode { fanPick = nil }
         if let data = changedFile(CLI.hotspotState) {
             hotspot = Self.decode(HotspotState.self, from: data)
         }
         if let pick = hotspotPick, pick == hotspot?.enabled { hotspotPick = nil }
+        if let data = changedFile(CLI.hotspotConfig) {
+            let enabled = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["enabled"] as? Bool ?? false
+            if enabled != hotspotConfigEnabled { hotspotConfigEnabled = enabled }
+        }
+        let installed = FileManager.default.fileExists(atPath: CLI.hotspotDaemon)
+        if installed != hotspotInstalled { hotspotInstalled = installed }
         if let data = changedFile(CLI.schedState) {
             sched = Self.decode(SchedState.self, from: data)
         }
@@ -228,19 +267,62 @@ final class Store {
         if let data = changedFile(CLI.perfState) {
             ultra = Self.decode(PerfFile.self, from: data)?.ultra
         }
-        if let data = changedFile(CLI.guardState) {
-            guardState = Self.decode(GuardState.self, from: data)
-        }
         if let mode = guardModeOverride, mode == guardState?.snapshot?.mode { guardModeOverride = nil }
-        let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]
-        if let values = try? URL(fileURLWithPath: "/System/Volumes/Data").resourceValues(forKeys: keys),
-           let free = values.volumeAvailableCapacityForImportantUsage, let total = values.volumeTotalCapacity, total > 0 {
-            let space = DiskSpace(free: Double(free), total: Double(total))
+        refreshDisk()
+    }
+
+    /// Free space for important use is what Finder shows, and asking for it takes 15-58 ms
+    /// (CacheDeleteCopyAvailableSpaceForVolume): off the main actor, at most once a minute,
+    /// or now when `force` (the panel opened, a cleanup ran).
+    func refreshDisk(force: Bool = false) {
+        guard !diskChecking, force || Date.now.timeIntervalSince(diskCheckedAt) > 60 else { return }
+        if isPreview {
+            if let (free, total) = Self.readDiskSpace() { disk = DiskSpace(free: free, total: total) }
+            return
+        }
+        diskChecking = true
+        Task { [weak self] in
+            let reading = await Self.diskSpace()
+            guard let self else { return }
+            self.diskChecking = false
+            self.diskCheckedAt = .now
+            guard let (free, total) = reading else { return }
+            let space = DiskSpace(free: free, total: total)
             // free space moves by the byte; the card shows tenths of a gigabyte
-            if disk?.total != space.total || disk.map({ Format.bytes($0.free) }) != Format.bytes(space.free) {
-                disk = space
+            if self.disk?.total != space.total || self.disk.map({ Format.bytes($0.free) }) != Format.bytes(space.free) {
+                self.disk = space
             }
         }
+    }
+
+    @concurrent
+    private static func diskSpace() async -> (free: Double, total: Double)? { readDiskSpace() }
+
+    nonisolated private static func readDiskSpace() -> (free: Double, total: Double)? {
+        let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey, .volumeTotalCapacityKey]
+        guard let values = try? URL(fileURLWithPath: "/System/Volumes/Data").resourceValues(forKeys: keys),
+              let free = values.volumeAvailableCapacityForImportantUsage, let total = values.volumeTotalCapacity, total > 0
+        else { return nil }
+        return (Double(free), Double(total))
+    }
+
+    /// The menu bar's numbers from the newest readings; assigned only when they change.
+    private func updateLabel() {
+        let used = latestSnapshot?.active?.worstUsed
+        let text: String = if let snapshot = latestSnapshot {
+            snapshot.foreignRuntime ? "?" : Format.percent(used)
+        } else {
+            problem == nil ? "…" : "!"
+        }
+        var hot: Int?
+        if let fan = latestFan, Date.now.timeIntervalSince1970 - fan.at < 15 {
+            let value = [fan.cpu, fan.gpu].compactMap(\.self).max() ?? 0
+            if value >= 90 { hot = Int(value.rounded()) }
+        }
+        let badge: MenuLabelState.Badge? = latestGuard?.snapshot?.pressure.level == 2
+            ? .memory : latestSnapshot?.anyNeedsLogin == true ? .login : nil
+        let fresh = MenuLabelState(used: used, text: text, badge: badge, hot: hot)
+        if fresh != label { label = fresh }
     }
 
     /// The file's bytes when they differ from the last read, nil when they don't or it's gone.
@@ -262,6 +344,11 @@ final class Store {
     /// While the panel is open the guard's numbers move every few seconds.
     func panelAppeared() {
         panelOpen = true
+        // what came in while it was closed
+        if let latestSnapshot { snapshot = latestSnapshot }
+        fanState = latestFan
+        guardState = latestGuard
+        refreshDisk(force: true)
         _ = readTickSnapshot()  // a tick that just ran saves the script run
         let age = Date.now.timeIntervalSince1970 - (snapshot?.generatedAt ?? 0)
         if age > 30 { Task { await refresh() } }
@@ -437,6 +524,7 @@ final class Store {
         let result = await CLI.run(["sweep", "--force"], script: CLI.janitor)
         sweeping = false
         readLocal()
+        refreshDisk(force: true)
         if result.status != 0 {
             notice = Notice(text: result.message.isEmpty ? "Cleanup failed" : result.message, isError: true)
         } else if result.message == "porządki już trwają" {
@@ -598,7 +686,9 @@ final class Store {
 
     // MARK: Hotspot turbo
 
-    var hotspotInstalled: Bool { FileManager.default.fileExists(atPath: CLI.hotspotDaemon) }
+    /// Both read in `readLocal`, not in the card's body: a stat and a JSON parse on every render.
+    private(set) var hotspotInstalled = false
+    private(set) var hotspotConfigEnabled = false
 
     /// The daemon writes every 2 seconds; much older than that means it isn't running.
     var hotspotLive: HotspotState? {
@@ -609,7 +699,7 @@ final class Store {
     var hotspotEnabled: Bool {
         if let pick = hotspotPick { return pick }
         if let state = hotspotLive { return state.enabled }
-        return Self.hotspotConfig()["enabled"] as? Bool ?? false
+        return hotspotConfigEnabled
     }
 
     private static func hotspotConfig() -> [String: Any] {

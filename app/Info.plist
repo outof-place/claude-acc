@@ -22,5 +22,18 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.filip.claude-acc.dictate</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>claude-acc</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Dictation records your voice while you hold the right Command key and sends it to AI Gateway for a transcript.</string>
 </dict>
 </plist>

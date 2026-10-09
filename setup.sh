@@ -65,6 +65,13 @@ cp "$SRC"/*.py "$STATE/"
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 # drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
 [ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
+# dyktowanie w aplikacji: słownik, dźwięki i nagranie do testu; własny słownik (slownik-user.txt),
+# nagrania czekające na ponowienie i log czasów zostają
+if [ -d "$SRC/dictation" ]; then
+  mkdir -p "$STATE/dictation/sounds"
+  cp "$SRC/dictation/slownik.txt" "$SRC/dictation/test.wav" "$STATE/dictation/"
+  cp "$SRC"/dictation/sounds/*.wav "$STATE/dictation/sounds/"
+fi
 [ -n "$FANCTL" ] && cp "$FANCTL" "$STATE/fanctl"
 # natywny pomocnik bramy pulpitu; podpis (stabilny designated requirement) trzyma uprawnienia TCC
 [ -n "$DESKTOP" ] && cp "$DESKTOP" "$STATE/claude-acc-desktop.new" && mv -f "$STATE/claude-acc-desktop.new" "$STATE/claude-acc-desktop"
@@ -144,6 +151,8 @@ case "$1" in
   updates) shift; exec "$PY" "$RUN" updates "$@" ;;
   mail) shift; exec "$PY" "$RUN" mail "$@" ;;
   browser) shift; exec "$PY" "$RUN" browser "$@" ;;
+  # dyktowanie w aplikacji: toggle (domyślnie), start, stop, cancel; w tle, bez fokusu
+  dictate) exec open -g "claude-acc://dictate/${2:-toggle}" ;;
   desktop) shift; exec "$PY" "$RUN" desktop "$@" ;;
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
@@ -186,6 +195,9 @@ APP="$HOME/Applications/Claude Acc.app"
 pkill -x ClaudeAcc 2>/dev/null || true
 rm -rf "$APP"
 ditto "$APP_SRC" "$APP"
+# podpis, który trzyma zgody macOS dyktowania (Mikrofon, Dostępność, Monitorowanie wejścia) przez
+# aktualizacje: certyfikat z Pęku kluczy albo ad hoc ze stałym designated requirement (sign-app.sh)
+[ -x "$SRC/sign-app.sh" ] && { "$SRC/sign-app.sh" "$APP" || echo "uwaga: podpis aplikacji nie wyszedł, zgody dyktowania mogą wymagać ponownego nadania" >&2; }
 # tuż po pkill LaunchServices potrafi odrzucić pierwsze open (-600)
 open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
 

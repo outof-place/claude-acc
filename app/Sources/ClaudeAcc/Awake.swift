@@ -13,7 +13,7 @@ final class Awake {
     /// an Android with the metered hint, any network in Low Data Mode.
     private(set) var onHotspot = false
     private(set) var hotspotVia: String?
-    private(set) var lastKeepAlive: Date?
+    @ObservationIgnored private(set) var lastKeepAlive: Date?
     private(set) var keepAliveFailing = false
     /// Turned off by hand while on a hotspot: stays off until the next hotspot.
     private(set) var hotspotDismissed = false
@@ -128,8 +128,9 @@ final class Awake {
         } catch {
             ok = false
         }
+        // the card reads the time on its own 5 s clock: no need to wake it every 25 s
         lastKeepAlive = .now
-        keepAliveFailing = !ok
+        if keepAliveFailing == ok { keepAliveFailing = !ok }
     }
 
     /// Power assertions follow the state: system sleep always, the display only on request.

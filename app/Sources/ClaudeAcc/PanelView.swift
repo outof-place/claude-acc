@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The menu bar panel: Claude accounts, dev servers and disk, then the Mac itself, and one footer bar.
@@ -10,7 +11,13 @@ struct PanelView: View {
     var frozenNow: Date?
     @Environment(\.renderingToFile) private var renderingToFile
 
-    static let columnHeight: CGFloat = 760
+    /// As tall as the screen under the menu bar allows (the padding, the footer and a little
+    /// air taken off), between 760 and 1000: the cards that grew since 760 (Stay Awake's hotspot
+    /// rows, Dictation) fit on a laptop without scrolling. A PNG render keeps 760.
+    static var columnHeight: CGFloat {
+        let screen = NSScreen.main?.visibleFrame.height ?? 900
+        return min(1000, max(760, screen - 112))
+    }
 
     var body: some View {
         TimelineView(PanelClock(running: store.panelOpen)) { context in
@@ -45,6 +52,7 @@ struct PanelView: View {
                     // Ultra scrolls inside its card, so this column absorbs the Desktop card;
                     // the third one cannot: Load & Heat has a fixed chart and would spill out.
                     Column(width: 300) {
+                        DictationCard(dictation: store.dictation).fixedSize(horizontal: false, vertical: true)
                         UltraCard(store: store)
                         if store.desktop?.installed == true {
                             DesktopCard(store: store).fixedSize(horizontal: false, vertical: true)
@@ -54,7 +62,7 @@ struct PanelView: View {
                 }
                 // live: fixed height, lists scroll inside their cards; PNG: as tall as the content
                 .frame(height: renderingToFile ? nil : Self.columnHeight)
-                .frame(minHeight: renderingToFile ? Self.columnHeight : nil)
+                .frame(minHeight: renderingToFile ? 760 : nil)
                 .fixedSize(horizontal: false, vertical: renderingToFile)
                 if let notice = store.notice {
                     Banner(
