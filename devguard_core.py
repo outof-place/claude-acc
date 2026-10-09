@@ -1741,10 +1741,22 @@ def terminate(unit, table, grace=10, reap=10):
 
 def notify_quiet(title, text):
     """Powiadomienie bez czekania na osascript (przy duszącym się Macu startuje sekundami) i bez
-    zabierania fokusu: `display notification` nie aktywuje żadnej aplikacji."""
+    zabierania fokusu: `display notification` nie aktywuje żadnej aplikacji. Tekst i tytuł idą jako
+    argumenty skryptu: json.dumps zamieniłby "ą" na \\u0105, którego AppleScript nie rozumie."""
     try:
         subprocess.Popen(
-            ["osascript", "-e", f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
+            [
+                "osascript",
+                "-e",
+                "on run argv",
+                "-e",
+                "display notification (item 1 of argv) with title (item 2 of argv)",
+                "-e",
+                "end run",
+                "--",
+                text,
+                title,
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

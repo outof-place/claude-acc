@@ -600,6 +600,18 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(names(state["steps"]), ["go"])
         self.assertNotIn("last_run", state)
 
+    def test_polish_letters_and_quotes_reach_osascript_as_arguments(self):
+        # json.dumps wstawiał do skryptu \u0105 zamiast "ą", AppleScript go nie parsował i nic się nie pokazywało
+        env = Env(self)
+        text = 'Żółć, ą, ł, ż i "cudzysłów"'
+        script = f"import sys; sys.path.insert(0, {os.path.dirname(HERE)!r}); import updates; updates.notify('Tytuł ą', sys.argv[1])"
+        run_env = {"HOME": env.home, "PATH": "/usr/bin:/bin", "CLAUDE_ACC_TOOL_PATH": f"{FAKES}:/usr/bin:/bin"}
+
+        subprocess.run(["/usr/bin/python3", "-c", script, text], env=run_env, check=True)
+
+        [note] = env.notifications()
+        self.assertEqual(note.split(" -- ", 1)[1], f"{text} Tytuł ą")
+
 
 if __name__ == "__main__":
     unittest.main()

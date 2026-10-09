@@ -163,14 +163,26 @@ def log(line, path=LOG_PATH):
 
 
 def notify(title, text):
-    subprocess.run(
+    # tekst i tytuł idą jako argumenty skryptu, nie w jego treści: json.dumps zamieniłby "ą" na \u0105,
+    # którego AppleScript nie rozumie
+    out = subprocess.run(
         [
             "osascript",
             "-e",
-            f"display notification {json.dumps(text)} with title {json.dumps(title)}",
+            "on run argv",
+            "-e",
+            "display notification (item 1 of argv) with title (item 2 of argv)",
+            "-e",
+            "end run",
+            "--",
+            text,
+            title,
         ],
         capture_output=True,
+        text=True,
     )
+    if out.returncode != 0:
+        log(f"osascript nie pokazał powiadomienia ({out.returncode}): {out.stderr.strip()}")
 
 
 def write_json(path, data, **kwargs):
