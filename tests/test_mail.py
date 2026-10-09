@@ -298,6 +298,19 @@ class GmailParsing(unittest.TestCase):
         self.assertIn("a &lt; b<br>", rich)
         self.assertNotIn("a < b", rich)
 
+    def test_draft_survives_a_signature_that_cannot_be_read(self):
+        # błąd odczytu stopki (403, sieć) blokował cały szkic
+        gw, fake = gateway()
+
+        def broken(addr):
+            raise mail.MailError("GET /settings/sendAs: HTTP 403 forbidden")
+
+        fake.signature = broken
+        out = gw.run("mail_draft", {"mailbox": "ops@example.com", "to": ["a@b.example"], "body": "Thanks"})
+        self.assertEqual(out["draft_id"], "d1")
+        self.assertIn("HTTP 403", out["signature_missing"])
+        self.assertEqual(fake.calls[-1][2].get_content_type(), "text/plain")
+
     def test_gmail_signature_comes_from_send_as(self):
         prov = mail.GmailProvider({}, 1000, tokens=object())
         calls = []

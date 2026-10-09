@@ -2130,6 +2130,11 @@ class Gateway:
                 if args.get("reply_to_message_id")
                 else None
             )
+            # szkic bez stopki jest lepszy niż żaden: błąd odczytu stopki tylko zgłaszamy
+            try:
+                signature, signature_error = prov.signature(addr), None
+            except MailError as exc:
+                signature, signature_error = None, str(exc)
             msg, recipients = build_message(
                 addr,
                 args.get("to"),
@@ -2137,14 +2142,17 @@ class Gateway:
                 args.get("subject"),
                 args.get("body", ""),
                 reply,
-                prov.signature(addr),
+                signature,
             )
-            return dict(
+            out = dict(
                 base,
                 to=recipients,
                 subject=msg["Subject"],
                 **prov.draft(addr, msg, reply),
             )
+            if signature_error:
+                out["signature_missing"] = signature_error
+            return out
         if name == "mail_send":
             approved_by = None
             if self.cfg["mailboxes"][addr]["send"] == "ask":
