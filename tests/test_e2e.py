@@ -851,6 +851,103 @@ class DepotTest(unittest.TestCase):
 TOKEN_FALLBACK = "Claude Acc token fallback"
 
 
+class WhoJsonTest(unittest.TestCase):
+    """`who --json`: e-mail konta, którego token leży teraz we wpisach Claude Code. Polid pyta o to
+    przed i po każdym wywołaniu modelu (sprawy prywatne tylko na koncie Filipa), więc odpowiedź ma
+    być szybka, bez sieci, bez czekania na blokadę przebiegu i bez pamięci, która po przełączeniu
+    kłamie (`status --json` trwał 0,4-4,2 s, `who` czekał na blokadę do 25 s)."""
+
+    def who(self, w, **extra):
+        r = w.run("who", "--json", **extra)
+        return r.returncode, json.loads(r.stdout)
+
+    def test_names_the_account_in_the_entry_without_network_lock_or_stale_state(self):
+        import fcntl
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.state(active_email="b@x")  # stan sprzed przełączenia w Orca: tylko podpowiedź
+        w.write()
+        # inny przebieg (tick, status) trzyma blokadę: who --json na nią nie czeka
+        lock = open(os.path.join(w.state_dir, "lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+
+        start = time.time()
+        code, got = self.who(w)
+
+        self.assertLess(time.time() - start, 5)
+        self.assertEqual((code, got), (0, {"email": "a@x", "id": w.ids["a@x"], "real_email": None,
+                                           "source": "keychain"}))
+        self.assertEqual(json.load(open(os.path.join(w.fake, "server.json")))["log"], [])  # bez sieci
+        self.assertEqual({c for c, _ in w.keychain_calls()}, {"find-generic-password"})  # tylko odczyt
+
+    def test_follows_a_switch_and_reports_the_real_email(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        self.assertEqual(w.run("switch", "b@x").returncode, 0)
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()), "email": "real-b@x"}})
+        w.forget_keychain_calls()
+
+        code, got = self.who(w)
+
+        self.assertEqual((code, got["email"], got["real_email"]), (0, "b@x", "real-b@x"))
+        # oba wpisy runtime i kopia konta z ostatniego przełączenia; kopii pozostałych kont nie czyta
+        self.assertEqual(sorted(k for _, k in w.keychain_calls()),
+                         sorted([f"{BASE}|{USER}", f"{scoped(w.config_dir)}|{USER}", f"{MANAGED}|{w.ids['b@x']}"]))
+
+    def test_unknown_token_or_no_login_gives_no_email(self):
+        w = Env()
+        w.account("a@x")
+        w.runtime({"claudeAiOauth": {"accessToken": "at-foreign", "refreshToken": "rt-foreign",
+                                     "expiresAt": int((time.time() + 3600) * 1000)}})
+        w.write()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "unknown_token"))
+
+        w = Env()
+        w.account("a@x")
+        w.write()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "no_login"))
+
+        # kopia i obcy wpis bez refresh tokenu: brak tokenu po obu stronach to nie ta sama para
+        w = Env()
+        w.account("a@x")
+        copy = json.loads(w.keychain[f"{MANAGED}|{w.ids['a@x']}"])
+        del copy["claudeAiOauth"]["refreshToken"]
+        w.keychain[f"{MANAGED}|{w.ids['a@x']}"] = json.dumps(copy)
+        w.runtime({"claudeAiOauth": {"accessToken": "at-foreign", "expiresAt": int((time.time() + 3600) * 1000)}})
+        w.write()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "unknown_token"))
+
+    def test_entries_holding_different_accounts_are_never_reported_as_one(self):
+        # przełączenie pisze wpisy po kolei: przez chwilę każdy trzyma inne konto
+        w = Env()
+        a = w.account("a@x")
+        b = w.account("b@x")
+        w.runtime(a, services=[BASE])
+        w.runtime(b, services=[scoped(w.config_dir)])
+        w.write()
+        start = time.time()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "switching"))
+        self.assertLess(time.time() - start, 5)  # czeka chwilę, aż przełączenie się skończy, nie dłużej
+        # przełączenie kończy się w trakcie czekania: odpowiedź to konto po przełączeniu
+        p = w.spawn("who", "--json")
+        time.sleep(0.5)
+        keychain = json.load(open(os.path.join(w.fake, "keychain.json")))
+        keychain[f"{BASE}|{USER}"] = json.dumps(b)
+        json.dump(keychain, open(os.path.join(w.fake, "keychain.json"), "w"))
+        out, _ = p.communicate(timeout=30)
+        self.assertEqual((p.returncode, json.loads(out)["email"]), (0, "b@x"))
+
+
 class TokenTest(unittest.TestCase):
     def test_token_comes_from_account_with_most_headroom_other_than_local(self):
         w = Env()
