@@ -72,6 +72,8 @@ struct SchedState: Decodable {
         let memNowGb: Double?
         let paused: Bool?
         let pauseReason: String?
+        /// Seconds without CPU and without output (sched `stall_s`); nil while the job works.
+        let stalledS: Double?
         let depot: Depot?
         let position: Int?
         let waitedS: Double?
@@ -374,7 +376,7 @@ private struct RunningRow: View {
                 }
                 HStack(spacing: 8) {
                     UsageBar(
-                        fraction: job.progress ?? 0, tint: job.paused == true ? .orange : Format.violet,
+                        fraction: job.progress ?? 0, tint: job.paused == true || job.stalledS != nil ? .orange : Format.violet,
                         height: 5, live: true)
                     Text(remaining)
                         .font(.caption2)
@@ -392,6 +394,13 @@ private struct RunningRow: View {
                     Label(job.pauseReason.map { "Paused: \($0)" } ?? "Paused", systemImage: "pause.circle.fill")
                         .font(.caption2)
                         .foregroundStyle(.orange)
+                } else if let stalled = job.stalledS {
+                    Label(
+                        "Stalled \(Format.age(Int(stalled.rounded()))): no CPU, no output; its memory is back in the pool",
+                        systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
                 } else if let route = job.route?.text, job.onDepot || job.route?.why != "fits" {
                     Text(route)
                         .font(.caption2)
