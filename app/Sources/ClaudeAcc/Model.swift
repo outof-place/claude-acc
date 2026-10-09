@@ -149,9 +149,24 @@ struct JanitorState: Decodable {
     struct Alert: Decodable, Hashable {
         let kind: String
         let free: Double?
+        /// low_disk: janitor.py's `low_disk_gb` in bytes, the line the sweep found `free` under.
+        let limit: Double?
         let projects: [String]?
         let task: String?
         let error: String?
+
+        /// The free space a low-disk alert reports, nil when it has nothing to say. The sweep
+        /// measured `free` up to 3 hours ago (2026-10-09: "Only 9.3 GB left on disk" under a
+        /// card that read 44 GB), so with today's reading at hand the alert says that number,
+        /// and only while it is still under the janitor's limit.
+        func lowDiskFree(now disk: DiskSpace?) -> Double? {
+            guard kind == "low_disk" else { return nil }
+            guard let disk else { return free }
+            return disk.free < (limit ?? Self.defaultLimit) ? disk.free : nil
+        }
+
+        /// janitor.py's default `low_disk_gb`, for an alert from before the limit came with it.
+        private static let defaultLimit = 40 * gigabyte
     }
 
     let lastSweep: Sweep?
@@ -376,9 +391,26 @@ struct Ultra: Decodable {
     }
 }
 
-/// perf-state.json holds more (applied tweaks, benchmarks); the panel needs only Ultra.
+/// perf-state.json holds more (applied tweaks, benchmarks); the panel needs Ultra and, for a
+/// render, the default route `perf keep` last saw.
 struct PerfFile: Decodable {
     let ultra: Ultra?
+    let link: TetherLink?
+}
+
+// MARK: - The default route (`perf.py link --json`, and `link` in perf-state.json)
+
+/// Where the default route goes and whether that is the phone: the answer tether-profile acts
+/// on (perf.py `link_now`: an iPhone USB or Bluetooth PAN port, or the iPhone hotspot's gateway
+/// 172.20.10.1, also over Wi-Fi). Stay Awake shows and follows this instead of a rule of its own.
+struct TetherLink: Decodable, Equatable {
+    let tethered: Bool
+    /// The hardware port from networksetup: "iPhone USB", "Wi-Fi", "Bluetooth PAN".
+    let port: String?
+    let iface: String?
+
+    /// What the hotspot line says after "via": the port, or the interface when it has none.
+    var via: String? { port ?? iface }
 }
 
 // MARK: - Hotspot turbo (`hotspot-state.json`, written by the root hotspot daemon)

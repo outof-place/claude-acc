@@ -109,9 +109,9 @@ final class Store {
     init(
         preview: Snapshot, guardState: GuardState? = nil, janitor: JanitorState? = nil, fans: FanState? = nil,
         ultra: Ultra? = nil, load: LoadReading? = nil, sched: SchedState? = nil, depot: DepotRuns? = nil,
-        updates: UpdatesState? = nil, desktop: DesktopPanel? = nil
+        updates: UpdatesState? = nil, desktop: DesktopPanel? = nil, link: TetherLink? = nil
     ) {
-        awake = Awake(preview: true)
+        awake = Awake(preview: true, link: link)
         dictation = Dictation(preview: true)
         isPreview = true
         snapshot = preview

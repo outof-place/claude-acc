@@ -34,6 +34,7 @@ Komendy:
   undo <nazwa>|--all                  cofnij
   ultra on|off|status [--json]        wszystkie poprawki dla agentów naraz i ich wyniki
   keep                                pilnuj włączonych poprawek (dla launchd co 5 min)
+  link [--json]                       którędy idzie trasa domyślna i czy to tethering (dla panelu)
   list                                poprawki z opisem i zmierzonym efektem
 """
 
@@ -4353,6 +4354,19 @@ def cmd_keep(cfg, args, system=None):
     return 0
 
 
+def cmd_link(cfg, args, system=None):
+    """Którędy idzie trasa domyślna i czy to tethering: ta sama odpowiedź, na którą działa
+    tether-profile (link_now). Panel pyta przy każdej zmianie ścieżki sieciowej, zamiast
+    zgadywać po swojemu; niczego nie zapisuje, bo perf-state.json należy do keep."""
+    link = (system or System()).link()
+    if "--json" in args:
+        print(json.dumps(link, ensure_ascii=False))
+        return 0
+    kind = "tethering" if link.get("tethered") else "zwykłe łącze"
+    print(f"{link.get('port') or '?'} ({link.get('iface')}, brama {link.get('gateway')}), {kind}")
+    return 0
+
+
 def cmd_list(cfg, args, system=None):
     for item in TWEAKS:
         root = " (root: " + item.command + ")" if item.root else ""
@@ -4444,6 +4458,7 @@ COMMANDS = {
     "apply": cmd_apply,
     "undo": cmd_undo,
     "keep": cmd_keep,
+    "link": cmd_link,
     "list": cmd_list,
     "ultra": cmd_ultra,
     "shaper-rate": cmd_shaper_rate,

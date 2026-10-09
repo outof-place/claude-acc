@@ -2004,6 +2004,29 @@ class TetherProfileTest(Isolated):
             link = perf.link_now()
         self.assertEqual((link["tethered"], link["port"]), (False, "Wi-Fi"))
 
+    def test_link_command_gives_the_panel_tether_profiles_answer(self):
+        """2026-10-09: panel pisał "Not on a hotspot" na hotspocie z iPhone'a, bo pytał macOS,
+        czy ścieżka jest droga, zamiast reguły tether-profile. Teraz pyta `perf link --json`;
+        po Wi-Fi do iPhone'a (brama 172.20.10.1) słyszy "tethered" z tej samej reguły, która
+        włącza tether-profile."""
+        self.write(self.claude, claude_settings())
+        ports = "Hardware Port: Wi-Fi\nDevice: en0\n\nHardware Port: iPhone USB\nDevice: en8\n"
+
+        def run(args, **kw):
+            if args[0] == "route":
+                return "   route to: default\n  gateway: 172.20.10.1\n  interface: en0\n"
+            return ports
+
+        with mock.patch.object(perf.janitor, "run", side_effect=run):
+            code, out = self.run_cmd(perf.cmd_link, "--json")
+            profile = perf.tweak("tether-profile")
+            record, _ = profile.apply(self.cfg, perf.System())
+        link = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual((link["tethered"], link["port"], link["iface"]), (True, "Wi-Fi", "en0"))
+        self.assertEqual(record["link"]["tethered"], link["tethered"])
+        self.assertIs(perf.COMMANDS["link"], perf.cmd_link)
+
 
 class SubagentCacheTest(Isolated):
     def test_setting_added_and_removed_exactly(self):
