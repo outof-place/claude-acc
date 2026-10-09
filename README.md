@@ -313,7 +313,7 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `next` | `.next` and `.next-*` next to a `package.json`, unchanged for 24 hours; Turbopack's persistent cache in `.next/cache` and `.next/dev/cache` (what new worktrees seed from) stays until it is unchanged for 7 days | every run |
 | `caches` | `.turbo`, `node_modules/.cache`, `node_modules/.vite`, unchanged for 7 days | daily |
 | `node_modules` | every `node_modules` of a project where no file changed and git didn't move for 30 days | daily |
-| `tmp` | `go-build*` in `$TMPDIR` older than 6 hours | every run |
+| `tmp` | `go-build*` and `go-link-*` dirs and `instruments*.ktrace` traces in `$TMPDIR`, untouched for 6 hours | every run |
 | `caps` | the oldest entries of folders listed in `caps` once a folder is over its limit (the guard also runs it every 10 minutes) | every run |
 | `go` | the least recently used entries of the Go build cache once it's over 20 GB, down to 12 GB, so agents keep their warm builds (Go trims entries unused for 5 days on its own) | daily |
 | `npm` | `npm cache verify`, npx packages unused for 30 days (not the ones a running process uses, like MCP servers), npm logs older than a week | daily |
