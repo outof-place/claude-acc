@@ -301,6 +301,75 @@ class JanitorTest(unittest.TestCase):
         self.assertTrue(self.env.exists("idle2/.next"))
 
 
+class UnavailableSimulatorsTest(unittest.TestCase):
+    """2026-10-09: runtime iOS zniknął na chwilę po zmianie Xcode, a `simctl delete unavailable`
+    skasował symulatory agentów. Fałszywy simctl zapisuje wywołania i podaje listę niedostępnych."""
+
+    POOL = "AAAAAAAA-0000-0000-0000-000000000001"
+    LEASED = "BBBBBBBB-0000-0000-0000-000000000002"
+    MINE = "CCCCCCCC-0000-0000-0000-000000000003"
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="sims-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.leases = os.path.join(self.root, "leases")
+        os.makedirs(self.leases)
+        self.calls = []
+        names = {self.POOL: "Portivo-E2E-iPhone", self.LEASED: "Scratch", self.MINE: "My iPhone"}
+        listing = json.dumps(
+            {"devices": {"iOS-26-0": [{"udid": u, "name": n} for u, n in names.items()]}}
+        )
+
+        def fake_run(cmd, timeout=600):
+            self.calls.append(cmd[1:])
+            return listing if cmd[2:4] == ["list", "devices"] else ""
+
+        os.makedirs(os.path.join(self.root, "Library/Developer/CoreSimulator"))
+        patched = {
+            "HOME": self.root,
+            "which": lambda name: "xcrun",
+            "run": fake_run,
+            "log": lambda line, path=None: None,
+            "SIMULATORS_STATE_PATH": os.path.join(self.root, "janitor-simulators.json"),
+        }
+        for name, value in patched.items():
+            self.addCleanup(setattr, janitor, name, getattr(janitor, name))
+            setattr(janitor, name, value)
+        cfg = dict(janitor.DEFAULT_CONFIG, simulator_leases=self.leases)
+        self.sw = janitor.Sweep(cfg, dry_run=False)
+
+    def deleted(self):
+        return [c[2] for c in self.calls if c[:2] == ["simctl", "delete"]]
+
+    def sweep(self):
+        self.janitor.task_xcode(self.sw, None)
+
+    def test_never_runs_the_blanket_delete(self):
+        self.sweep()
+        self.sweep()
+        self.assertNotIn(["simctl", "delete", "unavailable"], self.calls)
+
+    def test_first_sighting_deletes_nothing(self):
+        self.sweep()
+        self.assertEqual(self.deleted(), [])
+
+    def test_second_sighting_deletes_only_foreign_unleased(self):
+        open(os.path.join(self.leases, self.LEASED + ".json"), "w").write("{}")
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.deleted(), [self.MINE])
+
+    def test_device_that_came_back_starts_over(self):
+        self.sweep()
+        self.janitor.write_json(self.janitor.SIMULATORS_STATE_PATH, [])  # w międzyczasie wrócił
+        self.sweep()
+        self.assertEqual(self.deleted(), [])
+
+
 def compressed(path):
     return bool(os.stat(path).st_flags & stat.UF_COMPRESSED)
 

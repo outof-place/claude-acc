@@ -324,6 +324,7 @@ Configuration lives in `~/.local/share/claude-acc/janitor.json`. Every key is op
 | `npx_idle_days` | `30` | Age of an npx package |
 | `go_cache_max_gb` / `go_cache_keep_percent` | `20` / `60` | Go build cache size that triggers a trim, and how much of it the trim keeps (the most recently used entries) |
 | `derived_data_idle_days` | `14` | Age of Xcode DerivedData |
+| `simulator_pool_prefix` / `simulator_leases` | `Portivo-` / `~/.cache/portivo-mobile/leases` | Xcode task: an unavailable simulator is deleted one by one, only if it was already unavailable on the previous run, its name does not start with the prefix and no `portivo-mobile` lease file exists for it (a runtime that vanishes for a moment during an Xcode switch must not take the agents' simulators along) |
 | `log_days` | `30` | Age of logs in `~/Library/Logs` |
 | `min_battery_percent` | `30` | On battery below this, the run waits for the charger |
 | `notify_min_gb` | `2` | A run that frees at least this much sends a notification |
