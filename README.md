@@ -37,6 +37,8 @@ Setup copies the scripts to `~/.local/share/claude-acc`, adds a `claude-acc` com
 
 After `brew upgrade claude-acc`, run `claude-acc-setup` again to put the new version in place. `claude-acc uninstall` removes the launchd jobs, the app, the command and the limit pause hooks and keeps your settings in `~/.local/share/claude-acc`; `claude-acc fans uninstall` gives the fans back to macOS first.
 
+**Inside Pod.** Pod, the Orca-based app from outofplace, carries claude-acc inside the app bundle and installs it with that bundle's own `setup.sh --owner pod`. `scripts/payload.sh` builds that bundle: the formula's libexec layout, the Swift products, a `VERSION` file and `claude-acc-payload-<version>.tar.gz` with its sha256. From then on `~/.local/share/claude-acc/owner.json` names Pod as the owner, and `claude-acc-setup` or `./install.sh` stop with exit code 3 instead of overwriting Pod's scripts, hooks and jobs. `owner.py clear` gives the install back to Homebrew or the source checkout.
+
 ## What it does
 
 | | |
