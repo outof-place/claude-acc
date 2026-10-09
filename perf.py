@@ -58,6 +58,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import janitor
+import orcahost
 
 STATE_DIR = janitor.STATE_DIR
 STATE_PATH = os.path.join(STATE_DIR, "perf-state.json")
@@ -774,6 +775,31 @@ def bench_network(runs=1, flags=()):
 # ---------- poprawki ----------
 
 HOME = janitor.HOME
+# host agentów (orcahost.py): Orca albo Pod, a obok wszystkie hosty z tego Maca, bo hooki
+# w settings.json zostawia każdy, który kiedyś działał
+HOSTS = orcahost.known()
+HOST = HOSTS[0]
+# zdarzenia, na których hook statusu hosta tylko zgłasza stan sesji (async_hooks niżej)
+HOST_HOOK_EVENTS = (
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStart",
+    "SubagentStop",
+)
+
+
+def host_async_hooks(hosts):
+    """Wpisy async_hooks dla hooków statusu każdego hosta (Orca i Pod mogą mieć osobne katalogi)."""
+    return [
+        {"event": event, "match": f"{hooks}/claude-hook"}
+        for hooks in dict.fromkeys(h.hooks for h in hosts)
+        for event in HOST_HOOK_EVENTS
+    ]
+
+
 CLAUDE_SETTINGS = os.path.join(HOME, ".claude/settings.json")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude/projects")
 DEVGUARD_CONFIG = os.path.join(STATE_DIR, "devguard.json")
@@ -831,18 +857,7 @@ DEFAULT_CONFIG = {
         },
         {"event": "Stop", "match": "cavemem/dist/index.js hook run stop"},
     ]
-    + [
-        {"event": event, "match": ".orca/agent-hooks/claude-hook"}
-        for event in (
-            "PreToolUse",
-            "PostToolUse",
-            "PostToolUseFailure",
-            "UserPromptSubmit",
-            "Stop",
-            "SubagentStart",
-            "SubagentStop",
-        )
-    ],
+    + host_async_hooks(HOSTS),
     # limity dev serwerów strażnika w Ultra: procent RAM na wszystkie (strażnik domyślnie
     # ma 35) i GB, powyżej których jeden serwer jest spuchnięty (domyślnie 5)
     "devguard_budget_percent": 25,
@@ -1322,8 +1337,9 @@ class AsyncHooks:
 def hook_label(command):
     if "cavemem" in command and "hook run " in command:
         return "cavemem " + command.split("hook run ")[-1].split()[0]
-    if ".orca/agent-hooks/" in command:
-        return "Orca"
+    host = next((h for h in HOSTS if f"{h.hooks}/" in command), None)
+    if host:
+        return host.name
     # transkrypt zapisuje hook bez powłoki jako program i argumenty po spacji
     if PAUSE_HOOKS in command or f"{NATIVE_HOOK} pause " in command or f"{PAUSE_NATIVE} " in command:
         return "pauza limitów"
@@ -1598,8 +1614,8 @@ class Deferred(Exception):
     """Cofnięcie musi poczekać (Docker działa); `keep` dokończy je później."""
 
 
-ORCA_DATA = os.path.join(HOME, "Library/Application Support/orca/orca-data.json")
-ORCA_APP = "/Applications/Orca.app"
+ORCA_DATA = os.path.join(HOST.user_data, HOST.data_file)
+ORCA_APP = HOST.app
 # `git maintenance start` stawia harmonogram jako LaunchAgenty org.git-scm.git.{hourly,daily,weekly}
 GIT_MAINTENANCE_PLIST = os.path.join(HOME, "Library/LaunchAgents/org.git-scm.git.hourly.plist")
 
@@ -2690,7 +2706,7 @@ TWEAKS = [
     ),
     RootTweak(
         "devtools",
-        "Orca na liście Narzędzi deweloperskich: binarki zbudowane przez agentów (testy Go, "
+        f"{HOST.name} na liście Narzędzi deweloperskich: binarki zbudowane przez agentów (testy Go, "
         "go run, natywne moduły node) startują bez oceny Gatekeepera",
         "pierwsze uruchomienie nowej binarki Go w terminalu Orki 196 ms p50, w Terminalu "
         "(narzędzie deweloperskie) 4 ms; ocena to skan XProtect i zapytanie do Apple o notaryzację",
@@ -3267,7 +3283,7 @@ def record_gatekeeper(cfg, state, result):
     if (
         not record
         or record.get("result")
-        or result.get("responsible") != "Orca"
+        or result.get("responsible") != orcahost.bundle_name(ORCA_APP)
         or result.get("first_ms") is None
     ):
         return False
@@ -3460,7 +3476,7 @@ def spotlight_result(cfg, state, force=False):
 
 def orca_started():
     """Kiedy (epoch) wystartował główny proces Orki; None, gdy nie działa."""
-    main = os.path.join(ORCA_APP, "Contents/MacOS/Orca")
+    main = os.path.join(ORCA_APP, "Contents/MacOS", HOST.executable)
     for pid, command in own_processes().items():
         if command != main and not command.startswith(main + " "):
             continue
@@ -3485,7 +3501,7 @@ def pending_manual(state):
     # Orka dodana ręcznie, bez perf-root: pomiar z jej terminala bez kary jest dowodem
     gatekeeper = state["bench"].get("gatekeeper", {}).get("result", {})
     exempt = (
-        gatekeeper.get("responsible") == "Orca"
+        gatekeeper.get("responsible") == orcahost.bundle_name(ORCA_APP)
         and gatekeeper.get("penalty_ms") is not None
         and gatekeeper["penalty_ms"] < GATEKEEPER_EXEMPT_MS
     )
@@ -3844,9 +3860,9 @@ def cmd_ultra(cfg, args, system=None):
 
 
 MANUAL = {
-    "devtools": "Ustawienia > Prywatność i ochrona > Narzędzia deweloperskie > + > Orca "
+    "devtools": f"Ustawienia > Prywatność i ochrona > Narzędzia deweloperskie > + > {HOST.name} "
     "(`claude-acc perf-root devtools add` w Terminalu otwiera panel i zapisuje zmianę)",
-    "devtools-restart": "zrestartuj Orkę: Narzędzia deweloperskie działają dopiero dla Orki "
+    "devtools-restart": f"zrestartuj {HOST.name}: Narzędzia deweloperskie działają dopiero dla aplikacji "
     "uruchomionej po zmianie (restart zamyka sesje w jej terminalach)",
     "spotlight-privacy": "Ustawienia > Spotlight > Prywatność wyszukiwania: dodaj katalogi "
     "z `spotlight_noise` (magazyn pnpm, moduły Go)",

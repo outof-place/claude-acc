@@ -21,8 +21,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "accswitch.py")
 ACC = os.path.join(os.path.dirname(HERE), "acc.py")
 FAKES = os.path.join(HERE, "fakes")
+sys.path.insert(0, os.path.dirname(HERE))
+import orcahost  # noqa: E402
+
 USER = "tester"
-MANAGED = "Orca Claude Code Managed Credentials"
+MANAGED = orcahost.orca().keychain_service
+# Pod, który przemianował usługę kont i katalog danych (ClaudeAccHost w Info.plist)
+POD_MANAGED = "Pod Claude Code Managed Credentials"
 BASE = "Claude Code-credentials"
 # dłużej niż pół godziny, przez które automat i panel ufają odczytom kont bez pracy
 PAST_IDLE = 31 * 60
@@ -33,10 +38,18 @@ def scoped(config_dir):
 
 
 class Env:
-    """Świat jednego testu: konta, serwer i Pęk kluczy w plikach."""
+    """Świat jednego testu: konta, serwer i Pęk kluczy w plikach. Host kont to Orca, a z pod=True
+    Pod z własną usługą Pęku kluczy i katalogiem danych, wskazany przez CLAUDE_ACC_HOST_APP."""
 
-    def __init__(self):
+    def __init__(self, pod=False):
         self.home = tempfile.mkdtemp(prefix="claude-acc-test-")
+        self.user_data = orcahost.orca(self.home).user_data
+        self.service = MANAGED
+        self.host_env = {}
+        if pod:
+            self.host_env = {"CLAUDE_ACC_HOST_APP": self.pod_app()}
+            self.user_data = os.path.join(self.home, "Library", "Application Support", "Pod")
+            self.service = POD_MANAGED
         self.fake = os.path.join(self.home, "fake")
         self.state_dir = os.path.join(self.home, ".local/share/claude-acc")
         os.makedirs(self.fake)
@@ -53,13 +66,24 @@ class Env:
         self.keychain = {}
         self.ids = {}
 
+    def pod_app(self):
+        import plistlib
+
+        app = os.path.join(self.home, "Applications", "Pod.app")
+        os.makedirs(os.path.join(app, "Contents"))
+        info = {"CFBundleName": "Pod", "CFBundleExecutable": "Pod", "CFBundleIdentifier": "codes.pod.app",
+                "ClaudeAccHost": {"userData": "~/Library/Application Support/Pod", "keychainService": POD_MANAGED}}
+        with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump(info, f)
+        return app
+
     # --- budowanie świata ---
 
     def account(self, email, session_used=10, weekly_used=10, alive=True, expired=False, mcp=None,
                 expires_in=8 * 3600):
         acct_id = f"id-{email.split('@')[0]}"
         self.ids[email] = acct_id
-        info = os.path.join(self.home, "Library/Application Support/orca/claude-accounts", acct_id, "auth")
+        info = os.path.join(self.user_data, "claude-accounts", acct_id, "auth")
         os.makedirs(info)
         json.dump({"emailAddress": email}, open(os.path.join(info, "oauth-account.json"), "w"))
         self.server["counter"] += 1
@@ -76,7 +100,7 @@ class Env:
         blob = {"claudeAiOauth": {"accessToken": access, "refreshToken": refresh, "expiresAt": int(expires)}}
         if mcp is not None:
             blob["mcpOAuth"] = mcp
-        self.keychain[f"{MANAGED}|{acct_id}"] = json.dumps(blob)
+        self.keychain[f"{self.service}|{acct_id}"] = json.dumps(blob)
         return blob
 
     def runtime(self, blob, mcp=None, services=None):
@@ -89,7 +113,7 @@ class Env:
 
     def orca_selects(self, email):
         """Orca w trybie kont zarządzanych: wybrane konto w jej ustawieniach, jak zapisuje je Orca."""
-        profile = os.path.join(self.home, "Library/Application Support/orca/profiles/local-default")
+        profile = os.path.join(self.user_data, "profiles", "local-default")
         os.makedirs(profile, exist_ok=True)
         selected = self.ids[email] if email else None
         json.dump({"settings": {"activeClaudeManagedAccountId": selected,
@@ -110,6 +134,7 @@ class Env:
 
     def env(self, **extra):
         env = {"HOME": self.home, "USER": USER, "PATH": f"{FAKES}:/usr/bin:/bin"}
+        env.update(self.host_env)
         env.update(extra)
         return env
 
@@ -190,7 +215,7 @@ class Env:
         return json.loads(raw) if raw else None
 
     def managed(self, email):
-        return self.entry(MANAGED, self.ids[email])
+        return self.entry(self.service, self.ids[email])
 
     def calls(self, suffix):
         log = json.load(open(os.path.join(self.fake, "server.json")))["log"]
@@ -1567,6 +1592,62 @@ class PauseTest(unittest.TestCase):
 
         self.assertIsNone(w.pause())
         self.assertTrue(w.saved_state().get("hands_off_notified"))  # to była gałąź obcego konta
+
+
+class PodHostTest(unittest.TestCase):
+    """Konta w Pod: jego katalog danych i usługa Pęku kluczy zamiast Orki, reszta bez zmian."""
+
+    def test_status_reads_pods_accounts_and_names_it(self):
+        w = Env(pod=True)
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(sorted(x["email"] for x in snap["accounts"]), ["a@x", "b@x"])
+        self.assertEqual([x["email"] for x in snap["accounts"] if x["active"]], ["a@x"])
+        self.assertEqual(snap["host"], {"name": "Pod", "bundle_id": "codes.pod.app"})
+        self.assertFalse(any(k.startswith(MANAGED + "|") for k in json.load(open(os.path.join(w.fake, "keychain.json")))))
+
+    def test_switch_takes_the_token_from_pods_copy(self):
+        w = Env(pod=True)
+        a = w.account("a@x")
+        b = w.account("b@x")
+        w.runtime(a)
+        w.write()
+
+        r = w.run("switch", "b@x")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+        self.assertTrue(any(f"{POD_MANAGED}|" in call for _cmd, call in w.keychain_calls()))
+        self.assertFalse(any(f"{MANAGED}|" in call for _cmd, call in w.keychain_calls()))
+
+    def test_switch_refuses_while_pod_has_its_own_account_selected(self):
+        w = Env(pod=True)
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        w.orca_selects("a@x")
+
+        r = w.run("switch", "b@x")
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Pod ma wybrane konto a@x", r.stdout)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], a["claudeAiOauth"])
+
+    def test_orca_status_names_orca(self):
+        w = Env()
+        a = w.account("a@x")
+        w.runtime(a)
+        w.write()
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(snap["host"], {"name": "Orca", "bundle_id": orcahost.ORCA_BUNDLE_ID})
 
 
 if __name__ == "__main__":

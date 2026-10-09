@@ -344,11 +344,14 @@ class AgentPermissions(unittest.TestCase):
     def test_host_is_the_outermost_app_not_python_or_a_helper(self):
         from unittest import mock
 
+        import orcahost
+
+        orca = orcahost.orca()
         ps = "\n".join([
             "500 400 /Library/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
             "400 300 /bin/zsh",
-            "300 200 /Applications/Orca.app/Contents/Frameworks/Orca Helper.app/Contents/MacOS/Orca Helper",
-            "200 1 /Applications/Orca.app/Contents/MacOS/Orca",
+            f"300 200 {orca.app}/Contents/Frameworks/Orca Helper.app/Contents/MacOS/Orca Helper",
+            f"200 1 {orcahost.main_path(orca)}",
         ])
         with mock.patch.object(desktop.subprocess, "run", return_value=mock.Mock(stdout=ps)):
             self.assertEqual(desktop.host_app(500), "Orca")

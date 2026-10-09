@@ -29,6 +29,7 @@ SCRIPT = os.path.join(ROOT, "perf.py")
 ACC = os.path.join(ROOT, "acc.py")
 sys.path.insert(0, ROOT)
 
+import orcahost
 import perf
 
 
@@ -410,19 +411,28 @@ class RootRecordTest(Isolated):
         self.assertEqual(perf.pending_manual(state), [])
 
 
+def pod_host():
+    """Pod z własnym katalogiem hooków, jak gdyby fork go przemianował."""
+    return orcahost.orca()._replace(kind="pod", name="Pod", app="/Applications/Pod.app", executable="Pod",
+                                    bundle_id="codes.pod.app", hooks=".pod/agent-hooks")
+
+
 class OrcaStartedTest(unittest.TestCase):
     def test_parses_etime(self):
-        main = "/Applications/Orca.app/Contents/MacOS/Orca"
-        procs = {7: "/usr/bin/other", 9: main + " --flag"}
-        for etime, seconds in (("05:10", 310), ("01:00:00", 3600), ("2-00:00:01", 172801)):
-            with mock.patch.object(perf, "own_processes", return_value=procs), mock.patch.object(
-                perf.janitor, "run", return_value=f"   {etime}\n"
-            ) as run:
-                started = perf.orca_started()
-            self.assertEqual(run.call_args[0][0][-1], "9")
-            self.assertAlmostEqual(time.time() - started, seconds, delta=2)
-        with mock.patch.object(perf, "own_processes", return_value={7: "/usr/bin/other"}):
-            self.assertIsNone(perf.orca_started())
+        for host in (orcahost.orca(), pod_host()):
+            main = orcahost.main_path(host)
+            other = orcahost.main_path(pod_host() if host.kind == "orca" else orcahost.orca())
+            procs = {7: "/usr/bin/other", 8: other, 9: main + " --flag"}
+            for etime, seconds in (("05:10", 310), ("01:00:00", 3600), ("2-00:00:01", 172801)):
+                with mock.patch.object(perf, "HOST", host), mock.patch.object(perf, "ORCA_APP", host.app), \
+                        mock.patch.object(perf, "own_processes", return_value=procs), \
+                        mock.patch.object(perf.janitor, "run", return_value=f"   {etime}\n") as run:
+                    started = perf.orca_started()
+                self.assertEqual(run.call_args[0][0][-1], "9", host.name)
+                self.assertAlmostEqual(time.time() - started, seconds, delta=2)
+            with mock.patch.object(perf, "HOST", host), mock.patch.object(perf, "ORCA_APP", host.app), \
+                    mock.patch.object(perf, "own_processes", return_value={7: "/usr/bin/other", 8: other}):
+                self.assertIsNone(perf.orca_started(), host.name)
 
 
 class GatekeeperTest(unittest.TestCase):
@@ -2240,6 +2250,41 @@ class DockerIdleTest(Isolated):
 
     def test_not_in_ultra(self):
         self.assertNotIn("docker-idle", perf.ULTRA)
+
+
+class HostFixtureTest(unittest.TestCase):
+    """Orca i Pod obok siebie: hooki obu idą w tle, etykiety i krok devtools mówią o hoście."""
+
+    def test_async_hooks_cover_every_host(self):
+        orca_only = perf.host_async_hooks([orcahost.orca()])
+        self.assertEqual({e["match"] for e in orca_only}, {".orca/agent-hooks/claude-hook"})
+        self.assertEqual(len(orca_only), len(perf.HOST_HOOK_EVENTS))
+        both = perf.host_async_hooks([orcahost.orca(), pod_host(), orcahost.orca()])
+        self.assertEqual({e["match"] for e in both}, {".orca/agent-hooks/claude-hook", ".pod/agent-hooks/claude-hook"})
+        self.assertEqual(len(both), 2 * len(perf.HOST_HOOK_EVENTS))
+        # Pod bez własnego katalogu (fork z nazwami Orki) nie dubluje wpisów
+        same = pod_host()._replace(hooks=orcahost.orca().hooks)
+        self.assertEqual(perf.host_async_hooks([orcahost.orca(), same]), orca_only)
+
+    def test_hook_label_names_the_host(self):
+        with mock.patch.object(perf, "HOSTS", [orcahost.orca(), pod_host()]):
+            self.assertEqual(perf.hook_label('/bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"'), "Orca")
+            self.assertEqual(perf.hook_label('/bin/sh "${HOME-}/.pod/agent-hooks/claude-hook.sh"'), "Pod")
+
+    def test_devtools_follows_the_host_app(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        state = {"applied": {}, "bench": {}, "ultra": {"results": {}}}
+        for host in (orcahost.orca(), pod_host()):
+            app = os.path.join(tmp, os.path.basename(host.app))
+            os.makedirs(app, exist_ok=True)
+            with self.subTest(host=host.name), mock.patch.object(perf, "HOST", host._replace(app=app)), \
+                    mock.patch.object(perf, "ORCA_APP", app), mock.patch.object(perf, "orca_started", return_value=None):
+                state["bench"] = {"gatekeeper": {"result": {"responsible": host.name, "penalty_ms": 0.5}}}
+                self.assertNotIn("devtools", perf.pending_manual(state))
+                other = "Pod" if host.kind == "orca" else "Orca"
+                state["bench"] = {"gatekeeper": {"result": {"responsible": other, "penalty_ms": 0.5}}}
+                self.assertIn("devtools", perf.pending_manual(state))
 
 
 if __name__ == "__main__":

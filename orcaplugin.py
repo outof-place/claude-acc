@@ -25,6 +25,9 @@ import sys
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import orcahost  # noqa: E402
+
 SOURCE = os.path.join(HERE, "orca-plugin")
 
 
@@ -39,8 +42,10 @@ def plugin_key():
 
 
 PLUGIN_KEY = plugin_key()
-DEFAULT_USER_DATA = os.path.join(HOME, "Library/Application Support/orca")
-APPS = ("/Applications/Orca.app", os.path.join(HOME, "Applications/Orca.app"))
+# host wtyczki (orcahost.py): Orca albo Pod, z jego katalogiem danych; pakiet też w ~/Applications
+HOST = orcahost.resolve()
+DEFAULT_USER_DATA = HOST.user_data
+APPS = tuple(dict.fromkeys((HOST.app, os.path.join(HOME, "Applications", os.path.basename(HOST.app)))))
 # pliki drzewa wtyczki; testy i nakładka manifestu zostają w repo
 SHIPPED = ("worker.mjs", "lib", "panel")
 TREE_PREFIX = b"orca-plugin-tree-v1\0"
@@ -215,7 +220,7 @@ def cmd_install(opts):
     if not app and not opts["user_data"]:
         if opts["refresh"]:
             return 0
-        print("Orca nie jest zainstalowana (/Applications/Orca.app); wskaż ją: --app PATH albo --user-data DIR")
+        print(f"brak aplikacji {HOST.name} ({HOST.app}); wskaż ją: --app PATH albo --user-data DIR")
         return 1
     if opts["refresh"] and not os.path.isdir(plugin_dir(user_data)):
         return 0

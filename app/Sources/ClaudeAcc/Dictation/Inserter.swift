@@ -18,7 +18,8 @@ enum Inserter {
     /// Marks the ⌘V this app posts, so the right ⌘ tap doesn't take it for typing.
     nonisolated static let marker: Int64 = 0x4443_5441 // "DCTA"
 
-    /// Terminals: their text areas take no Accessibility writes, so they go straight to ⌘V.
+    /// Terminals: their text areas take no Accessibility writes, so they go straight to ⌘V. The host app
+    /// (`HostApp.current`, Pod as well as Orca) counts as one too.
     static let terminals: Set<String> = [
         "com.stablyai.orca", "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
         "dev.warp.Warp-Stable", "net.kovidgoyal.kitty", "com.github.wez.wezterm", "io.alacritty", "co.zeit.hyper",
@@ -32,7 +33,7 @@ enum Inserter {
             copy(text)
             return .clipboard
         }
-        let isTerminal = front?.bundleIdentifier.map(terminals.contains) ?? false
+        let isTerminal = front?.bundleIdentifier.map { terminals.contains($0) || $0 == HostApp.current.bundleId } ?? false
         if !isTerminal, await typeIntoFocused(text, terms: terms) { return .typed }
         // a terminal shows no draft to Accessibility: the text goes in as at an empty prompt
         let piece = TextRules.joinInsert(before: "", after: "", raw: text, terms: terms)

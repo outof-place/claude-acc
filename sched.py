@@ -43,6 +43,17 @@ import sys
 import time
 import types
 
+# host agentów (Orca albo Pod) z orcahost.py obok: tylko stałe, import bez dysku (~0,2 ms). sched.py
+# wczytany sam (loader bez __file__, kopia bez sąsiadów) zostaje przy nazwach Orki: scheduler, przez
+# który idzie każda komenda Go agenta, nie może paść przez brak pliku obok
+try:
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import orcahost
+
+    HOST_CLIS, PANE_ENV = orcahost.CLI_NAMES, orcahost.PANE_ENV
+except (NameError, ImportError):
+    HOST_CLIS, PANE_ENV = ("orca", "pod"), "ORCA_PANE_KEY"
+
 # ctypes, subprocess, hashlib, random, threading, signal i fcntl ładują się w funkcjach, które
 # ich używają: hook (hook_rewrite) idzie przy każdej komendzie Go agenta i potrzebuje tylko
 # klasyfikacji, a te importy to razem ~20 ms (sam ctypes.util z find_library ~10 ms)
@@ -1386,7 +1397,7 @@ def parse_generic(words, here):
     path = words[0]
     if prog in ("gradle", "gradlew"):
         return None  # Gradle zna parse_native: buildy aplikacji tak, reszta zadań nie
-    if prog in ("claude-acc", "claude", "codex", "orca", "git", "gh", "rtk"):
+    if prog in ("claude-acc", "claude", "codex", "git", "gh", "rtk") + HOST_CLIS:
         return None  # po pełnej ścieżce to dalej te same programy, nie skrypt projektu
     if "/" in path or path.endswith(".sh"):
         # skrypt albo program projektu: ./scripts/e2e.sh, bin/capture, tools/verify
@@ -3022,7 +3033,7 @@ def agent_info(session, name):
         "session": (session or "")[:8] or None,
         "name": name,
         "worktree": os.getcwd().replace(HOME, "~", 1),
-        "pane": os.environ.get("ORCA_PANE_KEY"),
+        "pane": os.environ.get(PANE_ENV),
     }
 
 
