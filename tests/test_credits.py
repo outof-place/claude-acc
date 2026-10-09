@@ -33,6 +33,8 @@ PY = "/usr/bin/python3"
 KEY_A = "sk-ant-api03-fake-own-a"
 KEY_D = "sk-ant-api03-fake-own-d"
 KEY_B = "sk-ant-api03-fake-client-b"
+KEY_U = "sk-ant-usr-fake-own-u"  # klucz powiązany z użytkownikiem, tak jak wydaje go teraz Console
+SOURCE = "polid/anthropic-key-1@outofplace.space"  # usługa/konto wpisu, z którego importujemy
 CONTRACT = {"email", "org_id", "scope", "granted_usd", "spent_usd", "remaining_usd", "cycle_resets_at", "checked_at", "state"}
 
 
@@ -60,7 +62,7 @@ class World:
         self.credits = os.path.join(self.state, "credits")
         os.makedirs(self.fake)
         os.makedirs(self.state)
-        self.api({"keys": {KEY_A: "org-a", KEY_D: "org-d", KEY_B: "org-b"}})
+        self.api({"keys": {KEY_A: "org-a", KEY_D: "org-d", KEY_B: "org-b", KEY_U: "org-u"}})
 
     def api(self, data):
         write_json(os.path.join(self.fake, "credits-api.json"), data)
@@ -81,6 +83,17 @@ class World:
     def keychain(self):
         path = os.path.join(self.fake, "keychain.json")
         return json.loads(read(path)) if os.path.exists(path) else {}
+
+    def stash(self, service, account, secret):
+        """Wpis w Pęku kluczy, który założył ktoś inny niż claude-acc, np. Polid."""
+        keychain = self.keychain()
+        keychain[f"{service}|{account}"] = secret
+        write_json(os.path.join(self.fake, "keychain.json"), keychain)
+
+    def recorded(self, name):
+        """Dziennik wywołań atrapy (argumenty `security` i `curl`, okno z kluczem); pusty, gdy jej nie wołano."""
+        path = os.path.join(self.fake, name)
+        return read(path) if os.path.exists(path) else ""
 
     def registry(self):
         path = os.path.join(self.credits, "accounts.json")
@@ -181,6 +194,8 @@ class AddingKeys(unittest.TestCase):
             (KEY_D, {}, "workspace"),  # klucz bez workspace: każde wywołanie wymaga nagłówka workspace
             ("sk-ant-api03-fake-revoked", {}, "401"),
             ("sk-ant-admin01-fake", {}, "Admin"),
+            ("sk-ant-usr-fake-revoked", {}, "401"),
+            ("sk-ant-oat01-fake", {}, "sk-ant-usr"),  # token logowania, nie klucz API
             ("hunter2", {}, "sk-ant-api"),
             (KEY_A, {"FAKE_DIALOG_CANCEL": "1"}, "anulowane"),
         )
@@ -201,6 +216,92 @@ class AddingKeys(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("bez sprawdzenia", r.stdout)
         self.assertEqual(self.w.registry()["a@example.com"]["org_id"], "org-a")
+
+    def test_user_linked_key_is_accepted_and_stays_out_of_argv_files_and_output(self):
+        r = self.w.add("u@example.com", KEY_U, "--scope", "own")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.w.registry()["u@example.com"]["org_id"], "org-u")
+        self.assertEqual(self.w.keychain(), {"claude-acc-credits|u@example.com": KEY_U})
+        r2 = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", CHILD, KEY_U, "0", input="")
+        self.assertIn("key=expected", r2.stdout)  # dziecko dostaje ten sam klucz
+        for out in (r.stdout + r.stderr, r2.stdout + r2.stderr):
+            self.assertNotIn(KEY_U, out)
+        for log in ("security-argv.log", "curl-argv.log"):
+            self.assertNotIn(KEY_U, self.w.recorded(log), log)
+
+    def test_message_for_a_rejected_key_names_both_accepted_shapes(self):
+        for key in ("sk-ant-admin01-fake", "hunter2"):
+            r = self.w.add("u@example.com", key, "--scope", "own")
+            self.assertEqual(r.returncode, 1, key)
+            self.assertIn("sk-ant-api", r.stderr, key)
+            self.assertIn("sk-ant-usr", r.stderr, key)
+
+    def test_import_from_another_keychain_item_needs_no_dialog_and_no_key_in_argv(self):
+        self.w.stash("polid", "anthropic-key-1@outofplace.space", KEY_U)
+        r = self.w.run("add", "u@example.com", "--scope", "own", "--from-keychain", SOURCE)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.w.recorded("dialog.log"), "")  # żadnego okna
+        self.assertTrue(self.w.recorded("curl-argv.log"))  # sprawdzony w API jak przy oknie
+        self.assertEqual(self.w.registry()["u@example.com"]["org_id"], "org-u")
+        self.assertEqual(self.w.keychain(), {
+            "polid|anthropic-key-1@outofplace.space": KEY_U,  # źródło zostaje
+            "claude-acc-credits|u@example.com": KEY_U,
+        })
+        argv = self.w.recorded("security-argv.log").splitlines()
+        self.assertIn("find-generic-password -s polid -a anthropic-key-1@outofplace.space -w", argv)
+        self.assertIn("-i", argv)  # zapis idzie stdin-em `security -i`
+        self.assertFalse([line for line in argv if line.startswith("add-generic-password")])
+        for log in ("security-argv.log", "curl-argv.log"):
+            self.assertNotIn(KEY_U, self.w.recorded(log), log)
+        self.assertNotIn(KEY_U, r.stdout + r.stderr)
+        self.assertIn(SOURCE, r.stdout)  # mówi, że wpis źródłowy zostaje
+        fixtures = {os.path.join(self.w.fake, n) for n in ("keychain.json", "credits-api.json")}
+        for folder, _, files in os.walk(self.w.home):
+            for name in files:
+                path = os.path.join(folder, name)
+                if path not in fixtures:
+                    self.assertNotIn(KEY_U, read(path), path)
+        # i dalej płaci tym kluczem
+        r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", CHILD, KEY_U, "0", input="")
+        self.assertIn("key=expected", r.stdout)
+
+    def test_import_replaces_the_key_already_stored_for_that_account(self):
+        self.assertEqual(self.w.add("u@example.com", KEY_A, "--scope", "own").returncode, 0)  # konto zajęte starym kluczem
+        self.w.stash("polid", "anthropic-key-1@outofplace.space", KEY_U)
+        r = self.w.run("add", "u@example.com", "--scope", "own", "--from-keychain", SOURCE)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.w.keychain()["claude-acc-credits|u@example.com"], KEY_U)
+        self.assertEqual(self.w.registry()["u@example.com"]["org_id"], "org-u")
+
+    def test_import_stores_nothing_when_the_source_is_missing_unusable_or_rejected(self):
+        self.w.stash("polid", "secret-not-a-key", "hunter2")
+        self.w.stash("polid", "revoked", "sk-ant-usr-fake-revoked")
+        self.w.stash("polid", "admin", "sk-ant-admin01-fake")
+        before = self.w.keychain()
+        cases = (
+            ("polid/nope", "polid/nope"),  # wpisu nie ma
+            ("polid/secret-not-a-key", "sk-ant-api"),  # to nie klucz API
+            ("polid/admin", "Admin"),
+            ("polid/revoked", "401"),  # API odrzuca
+        )
+        for source, why in cases:
+            r = self.w.run("add", "u@example.com", "--scope", "own", "--from-keychain", source)
+            self.assertEqual(r.returncode, 1, source)
+            self.assertIn(why, r.stderr, source)
+            for secret in ("hunter2", "sk-ant-usr-fake-revoked", "sk-ant-admin01-fake"):
+                self.assertNotIn(secret, r.stdout + r.stderr, source)
+        self.assertEqual(self.w.keychain(), before)
+        self.assertEqual(self.w.registry(), {})
+        self.assertEqual(self.w.recorded("dialog.log"), "")  # brak wpisu nie otwiera okna na wklejenie
+        self.assertNotIn("hunter2", self.w.recorded("curl-argv.log"))  # nie-klucz nie wychodzi do sieci
+
+    def test_import_flag_wants_service_and_account(self):
+        for value in ("polid", "polid/", "/account"):
+            r = self.w.run("add", "u@example.com", "--scope", "own", "--from-keychain", value)
+            self.assertEqual(r.returncode, 2, value)
+            self.assertIn("USŁUGA/KONTO", r.stderr, value)
+        self.assertEqual(self.w.run("add", "u@example.com", "--scope", "own", "--from-keychain").returncode, 2)
+        self.assertEqual(self.w.recorded("security-argv.log"), "")  # nic nie dotknęło Pęku kluczy
 
     def test_scope_is_required(self):
         for flags in ((), ("--scope", "Own Stuff")):
@@ -427,7 +528,9 @@ class Guard(unittest.TestCase):
                         "claude-acc credits helper --purpose polid-x"):
             self.assertEqual(self.decide(command), "deny", command)
             self.assertTrue(gate.search(command), command)  # natywny front oddaje ją Pythonowi
-        for command in ("claude-acc credits exec --purpose polid-x -- true", "claude-acc credits status --json"):
+        for command in ("claude-acc credits exec --purpose polid-x -- true", "claude-acc credits status --json",
+                        # import z cudzego wpisu niczego nie wypisuje: klucz idzie z Pęku kluczy do Pęku kluczy
+                        f"claude-acc credits add u@example.com --scope own --from-keychain {SOURCE}"):
             self.assertEqual(self.decide(command), "allow", command)
 
 

@@ -46,7 +46,11 @@ while [ $# -gt 0 ]; do
       # bramki agentów: MCP, skille i hook podpowiedzi (skrzynki, Pęk kluczy i konfiguracja zostają)
       [ -f "$STATE/mail.py" ] && /usr/bin/python3 "$STATE/mail.py" uninstall >/dev/null 2>&1 || true
       [ -f "$STATE/browser.py" ] && /usr/bin/python3 "$STATE/browser.py" uninstall >/dev/null 2>&1 || true
+      # hook schedulera w Codeksie (claude-acc sched codex install), jeśli był
+      [ -f "$STATE/sched.py" ] && /usr/bin/python3 "$STATE/sched.py" codex uninstall >/dev/null 2>&1 || true
       [ -f "$STATE/desktop.py" ] && /usr/bin/python3 "$STATE/desktop.py" uninstall >/dev/null 2>&1 || true
+      # wspólne serwery MCP wracają do stdio w ~/.claude.json, zanim zniknie ich automat
+      [ -f "$STATE/mcpshare.py" ] && /usr/bin/python3 "$STATE/mcpshare.py" unshare --all >/dev/null 2>&1 || true
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -95,6 +99,12 @@ ln -sfn "$PY" "$STATE/python"
 # the hook's native front reads the words that send a command to Python from here
 "$STATE/python" "$STATE/acc.py" devguard words > "$STATE/hook-words.json.new" 2>/dev/null \
   && mv -f "$STATE/hook-words.json.new" "$STATE/hook-words.json" || rm -f "$STATE/hook-words.json.new"
+# wyjątki rtk: komend, które owija scheduler, hook rtk nie przepisuje (dwa hooki z updatedInput na
+# jednej komendzie dają losowy wynik). Linia w [hooks] configu rtk idzie z tej wersji schedulera
+if command -v rtk >/dev/null 2>&1 || [ -x /opt/homebrew/bin/rtk ]; then
+  "$STATE/python" "$STATE/acc.py" sched rtk-excludes --write \
+    || echo "rtk: wyjątki schedulera niewpisane, szczegóły wyżej" >&2
+fi
 
 # pauza limitów: hooki w sesjach Claude Code dopisane do settings.json obok Twoich
 # (kopia sprzed pierwszej zmiany: settings.json.bak-claude-acc). Paczka bez hook.py
@@ -121,6 +131,7 @@ fi
 
 # jedna komenda na wszystko: konta, kredyty API (credits), porządki (mac, clean), strażnik (guard),
 # wydajność (perf, perf-root), wiatraki (fans), hotspot iPhone'a (hotspot), aktualizacje (update, updates),
+# wspólne serwery MCP (mcp),
 # a `claude-acc uninstall` zdejmuje to, co postawił ten skrypt
 cat > "$HOME/.local/bin/claude-acc" <<'EOF'
 #!/bin/sh
@@ -134,6 +145,8 @@ case "$1" in
   guard) shift; exec "$PY" "$RUN" devguard "$@" ;;
   perf) shift; exec "$PY" "$RUN" perf "$@" ;;
   sched) shift; exec "$PY" "$RUN" sched "$@" ;;
+  # ciężka komenda spoza agentów (terminal, skrypt, automatyzacja Orki) przez scheduler pamięci
+  run) shift; exec "$PY" "$RUN" sched run "$@" ;;
   update) shift; exec "$PY" "$RUN" updates run --force "$@" ;;
   updates) shift; exec "$PY" "$RUN" updates "$@" ;;
   mail) shift; exec "$PY" "$RUN" mail "$@" ;;
@@ -144,10 +157,14 @@ case "$1" in
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
+  # wspólne serwery MCP: jeden proces stdio dla wszystkich sesji Claude Code
+  mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
+    # stan limitu GPU to tylko odczyt sysctl i plisty demona
+    case "${1:-} ${2:-}" in "iogpu status" | "iogpu ") exec "$(cat "$STATE/source")/perf-root.sh" "$@" ;; esac
     exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
   fans)
     shift
