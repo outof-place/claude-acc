@@ -58,6 +58,10 @@ class FakeProvider:
 
     def __init__(self):
         self.calls = []
+        self.sig = None
+
+    def signature(self, addr):
+        return self.sig
 
     def search(self, addr, query, max_results, page_token):
         self.calls.append(("search", addr, query, max_results))
@@ -269,6 +273,58 @@ class GmailParsing(unittest.TestCase):
         self.assertEqual(msg["Subject"], "Re: SIDO number")
         self.assertEqual(out["to"], ["ComReg <sid@comreg.ie>"])
         self.assertEqual(out["thread_id"], "t1")
+
+    def test_draft_without_signature_stays_plain_text(self):
+        gw, fake = gateway()
+        gw.run("mail_draft", {"mailbox": "ops@example.com", "to": ["a@b.example"], "body": "Thanks"})
+        self.assertEqual(fake.calls[-1][2].get_content_type(), "text/plain")
+
+    def test_draft_carries_mailbox_signature(self):
+        # szkic z API bez stopki wyglądał jak napisany przez kogoś innego niż właściciel skrzynki
+        gw, fake = gateway()
+        fake.sig = (
+            '<table><tr><td><a href="https://x.example/in">Filip Maszota</a></td></tr>'
+            "<tr><td>Chief Technology Officer</td></tr></table>"
+        )
+        gw.run("mail_draft", {"mailbox": "ops@example.com", "to": ["a@b.example"], "body": "a < b\nc"})
+        msg = fake.calls[-1][2]
+        self.assertEqual(msg.get_content_type(), "multipart/alternative")
+        plain = msg.get_body(("plain",)).get_content()
+        rich = msg.get_body(("html",)).get_content()
+        self.assertTrue(plain.startswith("a < b\nc\n\n"))
+        self.assertIn("Filip Maszota\nChief Technology Officer", plain)
+        self.assertNotIn("<td>", plain)
+        self.assertIn(fake.sig, rich)
+        self.assertIn("a &lt; b<br>", rich)
+        self.assertNotIn("a < b", rich)
+
+    def test_draft_survives_a_signature_that_cannot_be_read(self):
+        # błąd odczytu stopki (403, sieć) blokował cały szkic
+        gw, fake = gateway()
+
+        def broken(addr):
+            raise mail.MailError("GET /settings/sendAs: HTTP 403 forbidden")
+
+        fake.signature = broken
+        out = gw.run("mail_draft", {"mailbox": "ops@example.com", "to": ["a@b.example"], "body": "Thanks"})
+        self.assertEqual(out["draft_id"], "d1")
+        self.assertIn("HTTP 403", out["signature_missing"])
+        self.assertEqual(fake.calls[-1][2].get_content_type(), "text/plain")
+
+    def test_gmail_signature_comes_from_send_as(self):
+        prov = mail.GmailProvider({}, 1000, tokens=object())
+        calls = []
+
+        def call(addr, level, method, path, **kw):
+            calls.append((level, method, path))
+            return {"signature": sig}
+
+        prov.call = call
+        sig = "<b>Filip</b>"
+        self.assertEqual(prov.signature("filip@x.example"), "<b>Filip</b>")
+        self.assertEqual(calls[-1], ("read", "GET", "/settings/sendAs/filip%40x.example"))
+        sig = ""
+        self.assertIsNone(prov.signature("filip@x.example"))
 
 
 class ImapQuery(unittest.TestCase):
