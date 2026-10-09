@@ -2516,7 +2516,7 @@ class HostTest(Paths):
     def test_host_cli_by_full_path_is_not_a_project_script(self):
         import orcahost
 
-        for app, cli in ((orcahost.orca().app, "orca"), ("/Applications/Pod.app", "pod")):
+        for app, cli in ((orcahost.orca().app, "orca"), ("/Applications/Pod.app", "podx")):
             for command in (f"{app}/Contents/Resources/bin/{cli} terminal list --json", f"{cli} worktree ps"):
                 with self.subTest(command=command):
                     self.assertIsNone(S.classify(command, self.repo))

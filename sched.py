@@ -52,7 +52,7 @@ try:
 
     HOST_CLIS, PANE_ENV = orcahost.CLI_NAMES, orcahost.PANE_ENV
 except (NameError, ImportError):
-    HOST_CLIS, PANE_ENV = ("orca", "pod"), "ORCA_PANE_KEY"
+    HOST_CLIS, PANE_ENV = ("orca", "podx"), "ORCA_PANE_KEY"
 
 # ctypes, subprocess, hashlib, random, threading, signal i fcntl ładują się w funkcjach, które
 # ich używają: hook (hook_rewrite) idzie przy każdej komendzie Go agenta i potrzebuje tylko

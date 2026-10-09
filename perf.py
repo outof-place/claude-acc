@@ -779,6 +779,8 @@ HOME = janitor.HOME
 # w settings.json zostawia każdy, który kiedyś działał
 HOSTS = orcahost.known()
 HOST = HOSTS[0]
+# katalogi hooków statusu: Orki i Pod (także zanim Pod się zainstaluje), plus zgłoszone przez hosta
+HOST_HOOKS = orcahost.hook_hosts(HOSTS)
 # zdarzenia, na których hook statusu hosta tylko zgłasza stan sesji (async_hooks niżej)
 HOST_HOOK_EVENTS = (
     "PreToolUse",
@@ -791,11 +793,11 @@ HOST_HOOK_EVENTS = (
 )
 
 
-def host_async_hooks(hosts):
-    """Wpisy async_hooks dla hooków statusu każdego hosta (Orca i Pod mogą mieć osobne katalogi)."""
+def host_async_hooks(dirs):
+    """Wpisy async_hooks dla hooków statusu z każdego katalogu (Orca i Pod mają osobne)."""
     return [
         {"event": event, "match": f"{hooks}/claude-hook"}
-        for hooks in dict.fromkeys(h.hooks for h in hosts)
+        for hooks in dict.fromkeys(dirs)
         for event in HOST_HOOK_EVENTS
     ]
 
@@ -857,7 +859,7 @@ DEFAULT_CONFIG = {
         },
         {"event": "Stop", "match": "cavemem/dist/index.js hook run stop"},
     ]
-    + host_async_hooks(HOSTS),
+    + host_async_hooks(HOST_HOOKS),
     # limity dev serwerów strażnika w Ultra: procent RAM na wszystkie (strażnik domyślnie
     # ma 35) i GB, powyżej których jeden serwer jest spuchnięty (domyślnie 5)
     "devguard_budget_percent": 25,
@@ -1337,9 +1339,9 @@ class AsyncHooks:
 def hook_label(command):
     if "cavemem" in command and "hook run " in command:
         return "cavemem " + command.split("hook run ")[-1].split()[0]
-    host = next((h for h in HOSTS if f"{h.hooks}/" in command), None)
-    if host:
-        return host.name
+    hooks = next((d for d in HOST_HOOKS if f"{d}/" in command), None)
+    if hooks:
+        return HOST_HOOKS[hooks]
     # transkrypt zapisuje hook bez powłoki jako program i argumenty po spacji
     if PAUSE_HOOKS in command or f"{NATIVE_HOOK} pause " in command or f"{PAUSE_NATIVE} " in command:
         return "pauza limitów"
