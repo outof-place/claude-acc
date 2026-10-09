@@ -178,7 +178,7 @@ test('long actions start in the background and report back', async () => {
 test('a brake rising to stage 2 notifies once', async () => {
   const h = harness({ live: false })
   await h.plugin.tick()
-  writeFileSync(join(h.plugin.poller.dir, 'devguard-state.json'), JSON.stringify(guard({ stage: 2 })))
+  writeFileSync(join(h.plugin.core.stateDir, 'devguard-state.json'), JSON.stringify(guard({ stage: 2 })))
   await h.plugin.tick()
   await h.plugin.tick()
   const brakes = h.calls.filter(([m, p]) => m === 'notifications.show' && p.title === 'Memory brake')

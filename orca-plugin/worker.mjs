@@ -1,17 +1,11 @@
 // claude-acc in Orca: status bar, live panel, Cmd-J commands, worktree card lines and notices,
 // all from the state files claude-acc's daemons write (no `claude-acc status --json`: it takes a
 // lock and reads the Keychain). Orca builds without status bar items or live panel messaging get
-// everything else: the features are detected at runtime.
+// everything else: the features are detected at runtime. The data itself comes from lib/core.mjs;
+// this file is only the Orca plugin side (host API, runtime RPC, panel transport).
 
-import { homedir } from 'node:os'
-import { actionArgv } from './lib/actions.mjs'
-import { runAcc } from './lib/acc.mjs'
-import { cardLine, mergeComment } from './lib/cards.mjs'
-import { StatePoller, stateDir } from './lib/files.mjs'
-import { buildModel } from './lib/model.mjs'
-import { noticeBasis, notifications } from './lib/notify.mjs'
+import { createAccCore, cardLine, mergeComment, noticeBasis, notifications, statusBarItems } from './lib/core.mjs'
 import { OrcaRpc } from './lib/orca-rpc.mjs'
-import { statusBarItems } from './lib/statusbar.mjs'
 
 export const PANEL_ID = 'claude-acc'
 const POLL_MS = 2000
@@ -39,12 +33,9 @@ export async function deactivate() {
 export class AccPlugin {
   constructor(orca, options = {}) {
     this.orca = orca
-    this.home = options.home ?? homedir()
-    this.poller = options.poller ?? new StatePoller(stateDir(this.home))
+    this.core = options.core ?? createAccCore(options)
     this.rpc = options.rpc ?? new OrcaRpc()
-    this.run = options.run ?? ((argv, opts) => runAcc(argv, { home: this.home, ...opts }))
-    this.now = options.now ?? (() => Date.now() / 1000)
-    this.context = { worktrees: [], panes: new Map(), home: this.home, activeWorktreeId: null }
+    this.context = { worktrees: [], panes: new Map(), activeWorktreeId: null }
     this.model = null
     this.timers = []
     this.lastHostCall = 0
@@ -161,12 +152,12 @@ export class AccPlugin {
     this.busy = true
     try {
       await this.loadStore()
-      let changed = await this.poller.poll()
+      let changed = await this.core.poll()
       if (Date.now() - this.lastOrcaRefresh >= ORCA_REFRESH_MS) {
         changed = (await this.refreshOrca()) || changed
       }
       if (changed || !this.model || Date.now() - this.lastPublish >= REPUBLISH_MS) {
-        this.model = buildModel(this.poller.data, this.context, this.now())
+        this.model = this.core.model(this.context)
         this.lastPublish = Date.now()
         await this.publish(this.model)
       }
@@ -286,8 +277,8 @@ export class AccPlugin {
 
   /** Runs one action and reports the outcome as a notification (Cmd-J shows no result). */
   async act(action, args = {}, { quiet = false } = {}) {
-    const { argv, long } = actionArgv(action, args)
-    const job = this.run(argv, { timeoutMs: long ? 30 * 60_000 : 120_000 }).then(async (result) => {
+    const { argv, long } = this.core.resolve(action, args)
+    const job = this.core.act(action, args).then(async (result) => {
       if (!quiet || !result.ok) await this.show(result.ok ? `claude-acc ${argv[0]}` : `claude-acc ${argv[0]} failed`, result.message || (result.ok ? 'done' : `exit ${result.code}`))
       this.lastPublish = 0
       void this.tick()
@@ -328,7 +319,7 @@ export class AccPlugin {
   async groupForActive() {
     const wt = await this.activeWorktree()
     if (!wt) return { wt: null, group: null }
-    this.model = buildModel(this.poller.data, this.context, this.now())
+    this.model = this.core.model(this.context)
     return { wt, group: this.model.worktrees.find((g) => g.id === wt.id) ?? null }
   }
 
@@ -339,8 +330,7 @@ export class AccPlugin {
     if (!units.length) return this.show(`No dev server in ${wt.name}`, verb === 'recycle' ? 'Nothing the guard can restart runs in this worktree' : 'Nothing to stop')
     const results = []
     for (const unit of units) {
-      const { argv } = actionArgv('guard', { verb, target: unit.target })
-      const result = await this.run(argv)
+      const result = await this.core.act('guard', { verb, target: unit.target })
       results.push(`${unit.title} ${unit.portLabel}: ${result.ok ? (verb === 'recycle' ? 'restarted' : 'stopped') : result.message || 'failed'}`)
     }
     await this.show(verb === 'recycle' ? `Restart in ${wt.name}` : `Stop in ${wt.name}`, results.join('\n'))
@@ -355,7 +345,7 @@ export class AccPlugin {
     if (!jobs.length) return this.show(`No builds in ${wt.name}`, 'The scheduler has nothing running or queued for this worktree')
     const lines = []
     for (const job of jobs) {
-      const result = await this.run(actionArgv('cancel', { target: job.id }).argv)
+      const result = await this.core.act('cancel', { target: job.id })
       let outcome = result.message
       try {
         outcome = JSON.parse(result.stdout).jobs.map((j) => j.result).join(', ') || 'not found'
@@ -399,13 +389,13 @@ export class AccPlugin {
     if (message.type === 'action') {
       const id = typeof message.id === 'string' ? message.id.slice(0, 64) : null
       try {
-        const { argv, long } = actionArgv(String(message.action), message.args)
+        const { long } = this.core.resolve(String(message.action), message.args)
         if (long) {
           this.postToPanel({ type: 'result', id, ok: true, message: 'Started; a notification follows when it finishes' })
           await this.act(String(message.action), message.args)
           return
         }
-        const result = await this.run(argv)
+        const result = await this.core.act(String(message.action), message.args)
         this.postToPanel({ type: 'result', id, ok: result.ok, message: result.message })
         this.lastPublish = 0
         void this.tick()

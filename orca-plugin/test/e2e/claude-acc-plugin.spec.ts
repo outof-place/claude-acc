@@ -14,6 +14,8 @@ const ACC_REPO = process.env.CLAUDE_ACC_REPO ?? ''
 const SHOTS = join(ACC_REPO, 'docs')
 test.skip(!ACC_REPO, 'CLAUDE_ACC_REPO is not set')
 const GB = 1024 ** 3
+const MANIFEST = ACC_REPO ? JSON.parse(readFileSync(join(ACC_REPO, 'orca-plugin/orca-plugin.json'), 'utf8')) : { publisher: '', id: '' }
+const KEY = `${MANIFEST.publisher}.${MANIFEST.id}`
 
 function seedClaudeAcc(home: string, repoPath: string): string {
   const now = Date.now() / 1000
@@ -88,7 +90,7 @@ test('claude-acc plugin: status bar, live panel, actions and worktree card', asy
   // claude-acc's installer, not Orca's: the hash-addressed tree must pass Orca's own discovery and integrity check
   const out = execFileSync('/usr/bin/python3', [join(ACC_REPO, 'orcaplugin.py'), 'install', '--user-data', userData, '--live', 'on'], { encoding: 'utf8' })
   expect(out).toContain('z paskiem statusu')
-  const listed = await orcaPage.evaluate(async () => (await window.api.plugins.refresh()).find((p) => p.pluginKey === 'outof-place.claude-acc'))
+  const listed = await orcaPage.evaluate(async (key) => (await window.api.plugins.refresh()).find((p) => p.pluginKey === key), KEY)
   expect(listed?.status).toBe('pending')
 
   await orcaPage.evaluate(() => {
@@ -97,7 +99,7 @@ test('claude-acc plugin: status bar, live panel, actions and worktree card', asy
     state?.openSettingsPage()
   })
   await orcaPage.getByRole('tab', { name: /^Installed/ }).click()
-  const row = orcaPage.locator('[data-plugin-key="outof-place.claude-acc"]')
+  const row = orcaPage.locator(`[data-plugin-key="${KEY}"]`)
   await row.getByRole('button', { name: 'Review & enable' }).click()
   const consent = orcaPage.getByRole('dialog', { name: 'Review permissions' })
   await expect(consent).toBeVisible()
@@ -105,12 +107,12 @@ test('claude-acc plugin: status bar, live panel, actions and worktree card', asy
   await expect(row).toContainText('Enabled')
   await orcaPage.evaluate(() => window.__store?.getState().closeSettingsPage())
 
-  const account = orcaPage.locator('[data-plugin-status-item="outof-place.claude-acc/account"]')
+  const account = orcaPage.locator(`[data-plugin-status-item="${KEY}/account"]`)
   await expect(account).toContainText(/Claude 84% · switch 2[45]m/, { timeout: 30_000 })
-  const memory = orcaPage.locator('[data-plugin-status-item="outof-place.claude-acc/memory"]')
+  const memory = orcaPage.locator(`[data-plugin-status-item="${KEY}/memory"]`)
   await expect(memory).toContainText('Memory tight')
   await expect(memory).toHaveAttribute('data-severity', 'warning')
-  await expect(orcaPage.locator('[data-plugin-status-item="outof-place.claude-acc/awake"]')).toContainText('Awake for 1h')
+  await expect(orcaPage.locator(`[data-plugin-status-item="${KEY}/awake"]`)).toContainText('Awake for 1h')
   await account.locator('xpath=..').screenshot({ path: join(SHOTS, 'orca-plugin-statusbar.png') })
 
   // a status bar click opens the panel; the worker pushes the model into it
@@ -128,7 +130,7 @@ test('claude-acc plugin: status bar, live panel, actions and worktree card', asy
   await frame.getByRole('button', { name: 'Cancel' }).click()
   await expect.poll(() => (existsSync(log) ? readFileSync(log, 'utf8') : '')).toContain('sched cancel j-1791568100-c3d4 --json')
 
-  const viaCommand = await orcaPage.evaluate(() => window.api.plugins.invokeCommand({ pluginKey: 'outof-place.claude-acc', commandId: 'claude-acc.switch-next' }))
+  const viaCommand = await orcaPage.evaluate((key) => window.api.plugins.invokeCommand({ pluginKey: key, commandId: 'claude-acc.switch-next' }), KEY)
   expect(viaCommand).toMatchObject({ ok: true })
   expect(readFileSync(log, 'utf8')).toContain('switch --auto')
 
