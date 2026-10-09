@@ -21,6 +21,8 @@ final class Awake {
     var autoOnHotspot: Bool { didSet { save(); apply() } }
     var keepDisplayOn: Bool { didSet { save(); apply() } }
     var keepHotspotAlive: Bool { didSet { save() } }
+    /// A session started by hand also survives closing the lid, through the fan daemon.
+    var lidClosed: Bool { didSet { save(); apply() } }
 
     var manualActive: Bool { manualUntil.map { $0 > .now } ?? false }
     var hotspotActive: Bool { autoOnHotspot && onHotspot && !hotspotDismissed }
@@ -31,6 +33,9 @@ final class Awake {
     @ObservationIgnored private let monitor = NWPathMonitor()
     @ObservationIgnored private var ticker: Task<Void, Never>?
     @ObservationIgnored private let defaults = UserDefaults.standard
+    @ObservationIgnored private let preview: Bool
+    /// The `until` last sent to the daemon, 0 for no request; nil before the first write.
+    @ObservationIgnored private var lidRequested: Double?
 
     private static let probe = URL(string: "http://captive.apple.com/hotspot-detect.html")!
     private static let session: URLSession = {
@@ -44,6 +49,8 @@ final class Awake {
         autoOnHotspot = defaults.object(forKey: "awake.autoOnHotspot") as? Bool ?? true
         keepDisplayOn = defaults.bool(forKey: "awake.keepDisplayOn")
         keepHotspotAlive = defaults.object(forKey: "awake.keepHotspotAlive") as? Bool ?? true
+        lidClosed = defaults.object(forKey: "awake.lidClosed") as? Bool ?? true
+        self.preview = preview
         let until = defaults.double(forKey: "awake.until")
         manualUntil = until > 0 ? Date(timeIntervalSince1970: until) : nil
         guard !preview else { return }
@@ -129,6 +136,22 @@ final class Awake {
     private func apply() {
         set(&systemAssertion, type: "PreventUserIdleSystemSleep", on: isOn)
         set(&displayAssertion, type: "PreventUserIdleDisplaySleep", on: isOn && keepDisplayOn)
+        requestLid()
+    }
+
+    /// An assertion stops idle sleep only: a closed lid sleeps a MacBook on battery anyway. The fan
+    /// daemon (root) holds `SleepDisabled` while this file asks for it, and only as long as this
+    /// pid runs. A session that started itself on a hotspot doesn't ask: a Mac awake in a bag has
+    /// to be a choice. Written when the request changes, not on every tick.
+    private func requestLid() {
+        guard !preview else { return }
+        let until = manualActive && lidClosed ? manualUntil?.timeIntervalSince1970 ?? 0 : 0
+        guard until != lidRequested else { return }
+        let request: [String: Any] = ["lid": until > 0, "until": until, "pid": Int(getpid())]
+        guard let data = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]),
+              (try? data.write(to: URL(fileURLWithPath: CLI.awakeRequest), options: .atomic)) != nil
+        else { return }
+        lidRequested = until
     }
 
     private func set(_ id: inout IOPMAssertionID, type: String, on: Bool) {
@@ -150,6 +173,7 @@ final class Awake {
         defaults.set(autoOnHotspot, forKey: "awake.autoOnHotspot")
         defaults.set(keepDisplayOn, forKey: "awake.keepDisplayOn")
         defaults.set(keepHotspotAlive, forKey: "awake.keepHotspotAlive")
+        defaults.set(lidClosed, forKey: "awake.lidClosed")
         defaults.set(manualUntil?.timeIntervalSince1970 ?? 0, forKey: "awake.until")
     }
 }

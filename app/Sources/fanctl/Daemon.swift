@@ -11,6 +11,7 @@ import Foundation
 /// - a fixed setting never lets a chip cook: at 95 °C on the hottest CPU/GPU sensor the fans go to
 ///   full speed (not to auto, which might spin slower than the setting), and back below 85 °C;
 /// - on SIGTERM/SIGINT (launchd unload, uninstall) fans we set go back to macOS before exiting;
+/// - Stay Awake with the lid closed rides along: `Lid` follows the app's `awake.json`;
 /// - the state file is written atomically by rename, so a symlink planted in the user's folder
 ///   can't make root write anywhere else.
 ///
@@ -20,6 +21,7 @@ import Foundation
 /// setting below 100% reads the temperature sensors (the 95 °C rule); the rest only checks the fans.
 final class Daemon {
     private let fans: Fans
+    private let lid: Lid
     private let configPath: String
     private let statePath: String
     private var picked: Fans.Mode?
@@ -42,6 +44,10 @@ final class Daemon {
         self.fans = fans
         configPath = config
         statePath = state
+        // `SleepDisabled` outlives a restart: the last state file says whether it was ours
+        let previous = FileManager.default.contents(atPath: state).flatMap { try? JSONDecoder().decode(Reading.self, from: $0) }
+        let folder = (config as NSString).deletingLastPathComponent
+        lid = Lid(requestPath: folder + "/awake.json", heldBefore: previous?.lidHeld == true)
     }
 
     func run() -> Never {
@@ -51,6 +57,7 @@ final class Daemon {
             source.setEventHandler {
                 MainActor.assumeIsolated {
                     if case .fixed = self.applied, !self.conflict { try? self.fans.apply(.auto) }
+                    self.lid.release()
                     exit(0)
                 }
             }
@@ -121,6 +128,8 @@ final class Daemon {
             reading.boosting = boosting && mode != .auto
         }
         reading.conflict = conflict
+        lid.tick()
+        reading.lidHeld = lid.held ? true : nil
         if sampling {
             sampledAt = uptime
             let rpm = reading.fans.isEmpty ? 0 : reading.fans.map(\.rpm).reduce(0, +) / Double(reading.fans.count)
@@ -139,6 +148,7 @@ final class Daemon {
         return reading.mode != saved.mode || reading.percent != saved.percent
             || reading.boosting != saved.boosting || reading.conflict != saved.conflict
             || reading.error != saved.error || reading.fans.map(\.manual) != saved.fans.map(\.manual)
+            || reading.lidHeld != saved.lidHeld
     }
 
     private func write(_ target: Fans.Mode, _ reading: inout Reading) {
