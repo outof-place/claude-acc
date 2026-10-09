@@ -28,6 +28,23 @@ Od tej pamięci odejmują się tylko prognozy świeżo wpuszczonych małych job�
 dłużej niż `starve_s` zostawia sobie miejsce i tutaj, a po `2 × starve_s` jej rezerwacja jest twarda:
 żaden mały job jej już nie wyprzedza, więc strumień krótkich testów nie zagłodzi dużego.
 
+Rezerwacja nie trzyma jednak pamięci, której głowa jeszcze nie użyje (backfill w stylu EASY). Job za
+zablokowaną głową, także nie mały, startuje, gdy mieści się w `free_for_admission_gb`, ma prognozę z
+własnych biegów (`predicted_from: history:N`) i nie opóźni startu głowy:
+
+- start głowy da się przewidzieć (każdy job, na którego koniec czeka, ma prognozę z historii i jeszcze
+  jej nie przekroczył): job skończy się przed nim z zapasem (`2 × predicted_wall_s + 10 s`), albo w
+  chwili jej startu zmieści się obok niej (wolne wtedy minus to, czego potrzebuje głowa);
+- nie da się (czeka na job ze zgadniętą prognozą albo taki, który biegnie dłużej, niż miał): tylko
+  lekki job (`small_gb`), którego `2 × predicted_wall_s + 10 s` mieści się w `head_delay_s`, i tylko
+  póki głowa nie zmieściłaby się nawet bez jobów, które ją już wyprzedziły (`passed` w `running[]`).
+  Opóźni ją najwyżej o swój czas; gdy to wyprzedzający trzymają jej pamięć, nikt więcej nie wchodzi
+  i głowa startuje, gdy się skończą.
+
+Natywne buildy i symulatory nie wchodzą przez backfill, a za natywną głową wstrzymaną przez strażnika
+backfillu nie ma. 2026-10-09 głowa `next build` (11,7 GB przy 5,9 wolnych) trzymała tak po
+`2 × starve_s` 25 krótkich jobów (ruff, `go vet` jednego pakietu, skrypty Pythona) do 25 minut.
+
 Pliki w `~/.local/share/claude-acc/sched/`:
 
 | plik | kto pisze | po co |
@@ -126,6 +143,7 @@ Tylko w `running[]`:
 | `mem_now_gb`, `mem_peak_gb` | suma `phys_footprint` procesów joba (drzewo i grupa procesów) teraz i najwięcej do tej pory; 0 dla Depot |
 | `cpu_cores` | średnio zajęte rdzenie od startu (CPU / czas) |
 | `paused`, `pause_reason` | SIGSTOP przy rosnącym swapie; tekst, np. `swap +0,6 GB in 2 min` |
+| `passed` | id joba, który ten job wyprzedził (backfill sprawdza, czy to wyprzedzający trzymają pamięć głowy) |
 | `depot` | dla `where=depot`: `{target, job, cores, run_id, url, units, cost_usd}`; `target` to `depot-exec` albo `depot-ci`; `units` i `cost_usd` rosną w trakcie |
 
 Tylko w `queue[]`:
@@ -135,7 +153,7 @@ Tylko w `queue[]`:
 | `position` | 1 = następny do wpuszczenia |
 | `enqueued_at`, `waited_s` | kiedy się zgłosił i ile już czeka |
 | `eta_start_s` | przewidywane sekundy do startu |
-| `reason` | `{code, need_gb, free_gb, after[], text}`; `code`: `memory` (czeka na pamięć), `head` (pamięć zarezerwowana dla joba, który czeka najdłużej), `pressure` (devguard: presja), `deciding` (scheduler jeszcze liczy trasę), `native` (inny natywny build trzyma miejsce), `simulators` (`portivo-mobile up` czeka na wolny symulator); `after` to id jobów, na których koniec czeka |
+| `reason` | `{code, need_gb, free_gb, after[], text}`; `code`: `memory` (czeka na pamięć), `head` (mieści się, ale mógłby opóźnić start joba, który czeka najdłużej, patrz backfill wyżej), `pressure` (devguard: presja), `deciding` (scheduler jeszcze liczy trasę), `native` (inny natywny build trzyma miejsce), `simulators` (`portivo-mobile up` czeka na wolny symulator); `after` to id jobów, na których koniec czeka |
 
 ### `route`
 
@@ -173,8 +191,9 @@ Trasa mówi wtedy `local only (<powód>)`, także gdy job nie zmieści się na p
 | `recent[]` | `{id, label, where, rc, finished_at, wall_s, peak_gb, predicted_gb, waited_s, cost_usd, route_text, depot_run_id}` |
 | `today.jobs_local`, `today.jobs_depot` | liczba skończonych jobów |
 | `today.wait_s` | suma prawdziwego czekania |
-| `today.old_lock_wait_s` | czekanie, które byłoby przy starym zamku: scheduler prowadzi wirtualny zamek FIFO (start = max(przyjście, zwolnienie poprzedniego), z prawdziwymi czasami biegów) |
-| `today.wait_saved_s` | `old_lock_wait_s - wait_s` |
+| `today.old_lock_wait_s` | czekanie jobów Go przy starym zamku `plock go` (jeden job Go naraz): wirtualny zamek w kolejności przyjścia (start = max(przyjście, zwolnienie poprzedniego), z prawdziwymi czasami biegów). Tylko joby Go, bo tylko one szły przez ten zamek; job skończony wcześniej niż starszy od niego czeka w `_internal.old_lock.pending`, aż ten się skończy |
+| `today.go_wait_s` | prawdziwe czekanie tych samych jobów Go |
+| `today.wait_saved_s` | `old_lock_wait_s - go_wait_s` |
 | `today.depot_units`, `today.depot_cost_usd` | zużycie Depot przez scheduler |
 | `today.local_kept_usd` | koszt Depot, którego uniknęły lokalne biegi klas, które stary hak `depot-heavy-go.sh` wysyłał na Depot |
 | `today.overtakes`, `today.pauses`, `today.peak_concurrency`, `today.max_reserved_gb` | liczniki dnia |
@@ -247,7 +266,9 @@ headroom_gb          4      zapas pamięci, którego scheduler nie rusza
 lambda_s_per_unit    6      ile sekund czekania jest warta jedna jednostka Depot ($0,006)
 small_gb             4.5    mały job: tyle GB lub mniej...
 small_wall_s         120    ...i tyle sekund lub mniej; mały może wyprzedzać
-starve_s             120    po tylu sekundach czekania job rezerwuje pamięć i nikt go nie wyprzedza
+starve_s             120    po tylu sekundach czekania job rezerwuje pamięć; wyprzedza go już tylko backfill
+head_delay_s         60     gdy startu głowy nie da się przewidzieć, wyprzedza ją tylko lekki job,
+                            którego 2 × prognoza + 10 s mieści się w tylu sekundach
 drop_count1          true   zdejmuj -count=1 w iteracji agenta dla pakietów bez bazy
 pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ciężki job dostaje SIGSTOP
 depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)
