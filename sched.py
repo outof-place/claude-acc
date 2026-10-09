@@ -2633,7 +2633,7 @@ def plan(state, cfg, now):
             continue
         how = None
         if shade is not None and not native:
-            how = backfill(job, free, shade, stuck, cfg)
+            how = backfill(job, free, now_free, shade, stuck, cfg)
         if how or (job.get("small") and not held and (need <= free - reserve or quick)):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
@@ -2655,7 +2655,7 @@ def measured(job):
     return str(job.get("predicted_from") or "").startswith("history")
 
 
-def backfill(job, free, shade, stuck, cfg):
+def backfill(job, free, now_free, shade, stuck, cfg):
     """Jak job wejdzie przed zablokowaną głowę, nie opóźniając jej startu, albo None.
 
     Gdy start głowy da się przewidzieć (shade["sure"]): "ends", jeśli job skończy się przed nim
@@ -2666,18 +2666,25 @@ def backfill(job, free, shade, stuck, cfg):
     swój czas, a gdy to wyprzedzający trzymają jej pamięć, nikt więcej nie wchodzi, więc strumień
     krótkich jobów jej nie zagłodzi. Ciężki krótki job (e2e na 5 GB) tu nie wchodzi: w replayu
     2026-10-09 to on, gdy przeciągnął się 27 razy, trzymał głowie najwięcej pamięci najdłużej.
-    Zawsze tylko w pamięci wolnej po rezerwach i z prognozą z własnej historii."""
+    Zawsze z prognozą z własnej historii i w pamięci wolnej po rezerwach. Lekki job, który przed
+    startem głowy się skończy ("ends", "short"), może wejść też w pamięci dostępnej teraz, jak mały
+    job szybką ścieżką, także po 2 × starve_s: rezerwy na wzrost długich jobów i natywnego buildu
+    spoza schedulera potrafią zepchnąć wolną pamięć poniżej zera przy kilkunastu GB dostępnych
+    (2026-10-09 18:20: ruff i pytest po 0,1 GB stały wtedy za next build)."""
     need = job["mem_predicted_gb"]
-    if need > free or not measured(job):
+    if not measured(job):
         return None
+    light = need <= cfg["small_gb"]
+    fits = need <= free
+    fits_now = fits or (light and need <= now_free)
     slack = BACKFILL_SLACK[0] * (job.get("predicted_wall_s") or 0) + BACKFILL_SLACK[1]
     if shade["sure"]:
-        if slack <= shade["wait_s"]:
+        if fits_now and slack <= shade["wait_s"]:
             return "ends"
-        if shade["spare_gb"] is not None and need <= shade["spare_gb"]:
+        if fits and shade["spare_gb"] is not None and need <= shade["spare_gb"]:
             return "beside"
         return None
-    if stuck and need <= cfg["small_gb"] and slack <= cfg["head_delay_s"]:
+    if stuck and light and fits_now and slack <= cfg["head_delay_s"]:
         return "short"
     return None
 

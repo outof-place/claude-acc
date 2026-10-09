@@ -808,6 +808,29 @@ class BackfillTest(Paths):
         passer["passed"] = None  # ten sam job, ale nie wyprzedził buildu: build i tak by się nie zmieścił
         self.assertEqual(S.plan(st, self.cfg, time.time()), {"ruff": ("overtake", "build")})
 
+    def test_light_jobs_start_in_memory_free_now_when_reserves_push_free_below_zero(self):
+        """2026-10-09 18:20 (1.25.1 przy starve_s 120): xcodebuild spoza schedulera (rezerwa na
+        wzrost do szczytu buildu) i świeży skrypt bez zajętej jeszcze pamięci zepchnęły wolną pamięć
+        po rezerwach poniżej zera przy ~14 GB dostępnych teraz. Po 2 × starve_s szybka ścieżka była
+        zamknięta, a backfill chciał miejsca po rezerwach, więc ruff i pytest (0,1-0,5 GB, sekundy)
+        stały za next build (11,6 GB), choć skończyłyby się, zanim ten mógł ruszyć."""
+        queue = [self.queued("build", 11.6, 154, ago=460), self.queued("ruff", 0.46, 1.3),
+                 self.queued("pytest", 0.08, 2.3), self.queued("e2e", 5.76, 47)]  # e2e: ciężki
+        for why, level, running in (
+            # start głowy nie do przewidzenia: skrypt przekroczył prognozę (krótki job, bramka)
+            ("skrypt po prognozie", 37, [self.running("up", 5.9, 4, elapsed=300, mem_now_gb=0.0)]),
+            # przewidywalny: skrypt skończy się za 20 min (job kończy się przed głową)
+            ("skrypt z prognozą", 30, [self.running("script", 10.0, 1800, elapsed=600)]),
+        ):
+            self.set_memory(level, native={"gb": 2.5, "active": True})
+            st = self.state()
+            st["running"] = running
+            S.refresh_memory(st, self.cfg)
+            self.assertLess(st["memory"]["free_for_admission_gb"], 0, why)
+            st["queue"] = [dict(j) for j in queue]
+            self.assertEqual(S.plan(st, self.cfg, time.time()),
+                             {"ruff": ("overtake", "build"), "pytest": ("overtake", "build")}, why)
+
     def test_native_jobs_and_a_held_native_head_keep_their_rules(self):
         st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600)], [
             self.queued("build", 11.7, 154, ago=1500),
