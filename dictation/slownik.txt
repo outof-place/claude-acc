@@ -1,0 +1,146 @@
+# Słownik dyktowania Claude Acc: terminy, których pisownię model ma trafić. Jeden termin w wierszu.
+# Własne terminy (nazwy z Twoich repo, klientów, ludzi) trzymaj w
+# ~/.local/share/claude-acc/dictation/slownik-user.txt: setup go nie nadpisuje.
+Claude Code
+Claude
+CLAUDE.md
+AGENTS.md
+README
+subagent
+skill
+hook
+prompt
+commit
+push
+rebase
+cherry-pick
+worktree
+git status
+git diff
+pnpm
+pnpm check-types
+pnpm lint
+check-types
+go test
+GOFLAGS
+rtk
+ctx7
+Turborepo
+turbo
+oxlint
+oxfmt
+tsgolint
+TypeScript
+Next.js
+React
+Tailwind
+Radix
+useEffect
+useLayoutEffect
+useState
+useMemo
+useCallback
+react-query
+zod
+Server Actions
+Expo
+Metro
+iOS
+Android
+Figma
+Playwright
+e2e
+Go
+Fiber
+huma
+ent
+Atlas
+atlas.sum
+Postgres
+PostGIS
+RLS
+Redis
+asynq
+River
+outbox
+webhook
+handler
+middleware
+repository
+tenant
+IDOR
+i18n
+OpenAPI
+Stripe
+Stripe Connect
+PaymentIntent
+idempotency key
+BLIK
+KSeF
+KYC
+Cognito
+Resend
+Mailpit
+Twilio
+PostHog
+Vercel
+AI Gateway
+AWS
+Aurora
+Fargate
+SSM
+S3
+Bedrock
+Depot
+Depot CI
+Orca
+Linear
+Notion
+Discord
+Sentry
+MCP
+JSON
+YAML
+SQL
+CSV
+PDF
+API
+UI
+UX
+CI
+PR
+localhost
+healthz
+expand/contract
+fix
+refactor
+claude-acc
+devguard
+fanctl
+janitor
+Ultra
+Ghostty
+iTerm
+Homebrew
+brew
+uv
+Docker
+Swift
+Xcode
+Python
+Node.js
+npm
+npx
+Vite
+Vitest
+ESLint
+Prettier
+GitHub
+GitHub Actions
+Kubernetes
+Terraform
+launchd
+Spotlight
+APFS
+LZFSE
+MLX

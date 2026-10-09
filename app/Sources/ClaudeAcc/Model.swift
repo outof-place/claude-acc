@@ -106,6 +106,10 @@ struct Account: Decodable, Identifiable {
     let session: UsageWindow?
     let weekly: UsageWindow?
     let dataAge: Int?
+    /// A full window keeps the numbers exact until this reset, so the script doesn't read them again.
+    let fullUntil: Double?
+    /// Old numbers that could have changed since: a full account's numbers can't.
+    var dataStale: Bool { (dataAge ?? 0) > 900 && fullUntil == nil }
     /// Monthly anniversary of the subscription start: the API has no billing date.
     let renewsAt: Double?
     let subscriptionStatus: String?
@@ -266,7 +270,7 @@ struct Ultra: Decodable {
     /// perf.py's ULTRA list, in the order it applies them.
     static let order = [
         "bg-helpers", "claude-hooks-async", "claude-hooks-native", "node-compile-cache", "devguard-budget",
-        "devguard-max-server", "git-speed", "fast-npx-hooks", "claude-limits", "workflow-size",
+        "devguard-max-server", "git-speed", "fast-npx-hooks", "claude-limits", "workflow-size", "claude-ui",
     ]
 
     static let catalog: [String: Tweak] = [
@@ -286,7 +290,8 @@ struct Ultra: Decodable {
         "docker-vm": Tweak(
             title: "Docker VM", detail: "The VM gives back what containers don't use", unit: "GB", isSetting: true),
         "git-speed": Tweak(
-            title: "Git", detail: "untrackedCache and fsmonitor in the repos you list", unit: "ms git status"),
+            title: "Git", detail: "fsmonitor and background maintenance in the repos you list, parallel checkout",
+            unit: "ms git status"),
         "fast-npx-hooks": Tweak(
             title: "Fast format hooks", detail: "Formatting hooks find eslint and prettier in milliseconds, not seconds",
             unit: "ms per formatted edit"),
@@ -296,6 +301,12 @@ struct Ultra: Decodable {
         "workflow-size": Tweak(
             title: "Large workflows", detail: "Workflows plan for up to 50 agents instead of 10", unit: "",
             isSetting: true),
+        "claude-ui": Tweak(
+            title: "Calm Claude Code UI", detail: "Fewer spinner and shimmer frames to repaint, no spinner tips", unit: "",
+            isSetting: true),
+        "iogpu": Tweak(
+            title: "More memory for the GPU", detail: "Local models stay on Metal, set again at every boot (root)",
+            unit: "MiB for the GPU", isSetting: true),
         "devtools": Tweak(
             title: "Go tests skip Gatekeeper", detail: "Orca is a developer tool, so fresh test binaries start without a check",
             unit: "ms first run of a new binary"),

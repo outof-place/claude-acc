@@ -47,6 +47,15 @@ Linków nie otwiera, załączniki zapisuje do kwarantanny (0600). Każde wywoła
 dziennika audytu (bez treści), a stan dla panelu do mail/state.json.
 """
 
+# Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę:
+# pomoc, status i start serwera MCP nie płacą za IMAP, SMTP, TLS i parser maili. Bez json,
+# threading i concurrent.futures (mcpbase i tak ładuje je od razu) i html.parser (klasa niżej).
+__lazy_modules__ = [
+    "base64", "datetime", "email", "email.message", "email.policy", "email.utils", "hashlib", "hmac",
+    "imaplib", "secrets", "shlex", "smtplib", "ssl", "subprocess", "urllib.error", "urllib.parse",
+    "urllib.request",
+]
+
 import base64
 import email
 import email.policy
@@ -2130,6 +2139,11 @@ class Gateway:
                 if args.get("reply_to_message_id")
                 else None
             )
+            # szkic bez stopki jest lepszy niż żaden: błąd odczytu stopki tylko zgłaszamy
+            try:
+                signature, signature_error = prov.signature(addr), None
+            except MailError as exc:
+                signature, signature_error = None, str(exc)
             msg, recipients = build_message(
                 addr,
                 args.get("to"),
@@ -2137,14 +2151,17 @@ class Gateway:
                 args.get("subject"),
                 args.get("body", ""),
                 reply,
-                prov.signature(addr),
+                signature,
             )
-            return dict(
+            out = dict(
                 base,
                 to=recipients,
                 subject=msg["Subject"],
                 **prov.draft(addr, msg, reply),
             )
+            if signature_error:
+                out["signature_missing"] = signature_error
+            return out
         if name == "mail_send":
             approved_by = None
             if self.cfg["mailboxes"][addr]["send"] == "ask":
