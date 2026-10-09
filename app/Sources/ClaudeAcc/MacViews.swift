@@ -194,7 +194,7 @@ private struct ServerRow: View {
         .contentShape(.rect(cornerRadius: 14, style: .continuous))
         .onHover { hovering = $0 }
         .animation(.snappy(duration: 0.18), value: hovering)
-        .help(unit.command.map { "\($0)\n\(unit.terminal.map { "Orca terminal “\($0)”" } ?? unit.host)" } ?? "")
+        .help(unit.command.map { "\($0)\n\(unit.terminal.map { "\(HostApp.current.name) terminal “\($0)”" } ?? unit.host)" } ?? "")
     }
 
     private var dotColor: Color {

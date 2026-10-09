@@ -28,7 +28,7 @@
 # zostawia LaunchDaemon, bo jądro zapomina wartość przy restarcie. Sysctl opisuje README
 # mlx-lm (macOS 15+). undo zdejmuje demona i wraca do domyślnego 0.
 #
-# devtools: aplikacja (domyślnie Orca) na liście Narzędzi deweloperskich. Za każdą nową
+# devtools: aplikacja (domyślnie host agentów z orcahost.py: Orca albo Pod) na liście Narzędzi deweloperskich. Za każdą nową
 # binarką testu Go, `go run` czy natywnym modułem node uruchomionym w terminalu agenta stoi
 # Orca; dopóki jej tam nie ma, macOS ocenia każdą taką binarkę przy pierwszym exec (skan
 # XProtect i zapytanie do Apple o notaryzację): 196 ms p50 na binarkę, w Terminalu 4 ms.
@@ -52,7 +52,7 @@
 #        limit pamięci GPU (domyślnie RAM bez 8 GB, najwyżej 85%), także po restarcie
 #   sudo ./perf-root.sh iogpu undo
 #   ./perf-root.sh iogpu status
-#   ./perf-root.sh devtools add|undo|status [--app /Applications/Orca.app]
+#   ./perf-root.sh devtools add|undo|status [--app <ścieżka do .app>]
 #        bez sudo, w Terminalu (czyta TCC.db): otwiera Ustawienia > Prywatność i ochrona >
 #        Narzędzia deweloperskie, czeka na "+" (undo: "-") i zapisuje zmianę w stanie
 # Bez --rate limit to `shaper_percent` (90%) uploadu z ostatniego `perf.py bench network`
@@ -67,7 +67,7 @@ PERSIST=0
 RATE=""
 IFACE=""
 VNODES=786432
-DEVTOOLS_APP=/Applications/Orca.app
+DEVTOOLS_APP=""
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -93,6 +93,15 @@ as_user() {
     sudo -u "$USER_NAME" -H /usr/bin/python3 "$PERF" "$@"
   else
     /usr/bin/python3 "$PERF" "$@"
+  fi
+}
+
+# host agentów (Orca albo Pod) według orcahost.py, czytany jako użytkownik: jego HOME i ~/Applications
+host_app() {
+  if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != root ]; then
+    sudo -u "$USER_NAME" -H /usr/bin/python3 "$HERE/orcahost.py" app
+  else
+    /usr/bin/python3 "$HERE/orcahost.py" app
   fi
 }
 
@@ -615,6 +624,10 @@ devtools_status() {
   sqlite3 "$DEVTOOLS_DB" "select client, auth_value from access where service='kTCCServiceDeveloperTool'" |
     sed 's/|2$/ (dozwolone)/; s/|0$/ (wyłączone)/'
 }
+
+if [ "$CMD" = devtools ] && [ -z "$DEVTOOLS_APP" ]; then
+  DEVTOOLS_APP="$(host_app)"
+fi
 
 case "$CMD $SUB" in
   "shaper apply") shaper_apply ;;

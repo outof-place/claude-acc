@@ -1880,5 +1880,76 @@ class InventoryTest(unittest.TestCase):
         self.assertIn("symulatory 3,0 GB", dg.inventory_line(inv).replace(".", ","))
 
 
+class HostFixtureTest(unittest.TestCase):
+    """Orca i Pod (orcahost): CLI, gniazdo, proces główny i ochrona procesów idą za hostem."""
+
+    def setUp(self):
+        import orcahost
+
+        self.orcahost = orcahost
+        self.dir = tempfile.mkdtemp(prefix="dg-host-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        app = os.path.join(self.dir, "Pod.app")
+        bin_dir = os.path.join(app, "Contents", "Resources", "bin")
+        os.makedirs(bin_dir)
+        self.pod_cli = os.path.join(bin_dir, "pod")
+        with open(self.pod_cli, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(self.pod_cli, 0o755)
+        self.orca = orcahost.orca(self.dir)
+        self.pod = self.orca._replace(kind="pod", name="Pod", app=app, executable="Pod", bundle_id="codes.pod.app",
+                                      user_data=os.path.join(self.dir, "Library", "Application Support", "pod"), cli="pod")
+        env = {k: v for k, v in os.environ.items() if k not in ("DEVGUARD_ORCA", orcahost.USER_DATA_ENV)}
+        patcher = mock.patch.dict(os.environ, env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def guard_for(self, host):
+        with mock.patch.object(dg.orcahost, "host", return_value=host):
+            return dg.Orca()
+
+    def rows(self, host):
+        main = self.orcahost.main_path(host)
+        return [(10, 1, main), (11, 10, os.path.join(host.app, "Contents/Frameworks/Helper.app/Contents/MacOS/Helper"))]
+
+    def test_cli_socket_and_marker_follow_the_host(self):
+        orca, pod = self.guard_for(self.orca), self.guard_for(self.pod)
+        self.assertEqual(orca.bin, dg.janitor.which("orca"))
+        self.assertEqual(pod.bin, self.pod_cli)
+        self.assertEqual(orca.metadata, os.path.join(self.orca.user_data, "orca-runtime.json"))
+        self.assertEqual(pod.metadata, os.path.join(self.pod.user_data, "orca-runtime.json"))
+        self.assertEqual((orca.marker, pod.marker), ("Orca.app/Contents/MacOS/Orca", "Pod.app/Contents/MacOS/Pod"))
+        self.assertTrue(orca.direct and pod.direct)
+
+    def test_refresh_asks_only_the_host_that_runs(self):
+        for host, other in ((self.pod, self.orca), (self.orca, self.pod)):
+            with self.subTest(host=host.name), mock.patch.object(dg.orcahost, "host", return_value=host):
+                guard = dg.Orca()
+                guard.bin = guard.bin or "/x/orca"
+                asked = []
+                guard.call = lambda *args, **_kw: asked.append(args) or {"tabs": [], "worktrees": []}
+                guard.refresh(self.rows(other), NOW, 10)
+                self.assertEqual((guard.ok, asked), (False, []))
+                guard.refresh(self.rows(host), NOW, 10)
+                self.assertTrue(guard.ok)
+                self.assertIn(("worktree", "ps"), asked)
+
+    def test_switch_to_pod_without_restarting_the_guard(self):
+        with mock.patch.object(dg.orcahost, "host", return_value=self.orca):
+            guard = dg.Orca()
+        with mock.patch.object(dg.orcahost, "host", return_value=self.pod):
+            guard.call = lambda *args, **_kw: {"tabs": [], "worktrees": []}
+            guard.refresh(self.rows(self.pod), NOW, 10)
+        self.assertEqual((guard.bin, guard.marker, guard.ok), (self.pod_cli, "Pod.app/Contents/MacOS/Pod", True))
+
+    def test_host_processes_are_sacred_and_count_as_host_clients(self):
+        for host in (self.orca, self.pod._replace(app="/Applications/Pod.app")):
+            for _pid, _ppid, command in self.rows(host):
+                with self.subTest(command=command):
+                    self.assertTrue(dg.SACRED.search(command))
+                    self.assertEqual(dg.client_kind(command), "orca")
+        self.assertEqual(dg.client_kind("/Applications/iPod.app/Contents/MacOS/iPod"), "tool")
+
+
 if __name__ == "__main__":
     unittest.main()

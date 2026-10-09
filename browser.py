@@ -63,6 +63,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 
 import mcpbase
+import orcahost
 
 VERSION = "1.0.0"
 HOME = os.path.expanduser("~")
@@ -3017,7 +3018,7 @@ def cmd_config(cmd, args):
 
 
 # sesja agenta, z której przyszło wywołanie z wiersza: zmienna i przedrostek właściciela, od najdokładniejszej
-CLI_SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), ("ORCA_TERMINAL_HANDLE", "orca"), ("TERM_SESSION_ID", "term"))
+CLI_SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), (orcahost.TERMINAL_ENV, "orca"), ("TERM_SESSION_ID", "term"))
 
 
 def cli_owner(env=None):

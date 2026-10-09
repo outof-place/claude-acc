@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import janitor
+import orcahost
 from devguard import __doc__ as USAGE
 from devguard import dev_starts, sched_rewrite
 
@@ -140,10 +141,12 @@ LAUNCHER = re.compile(
 )
 SHELL = re.compile(r"^-?(\S*/)?(zsh|bash|fish|sh)(\s+-[a-z]+)*\s*$")
 AGENT = re.compile(r"(^|/)(claude|codex)(\s|$)")
-# tego nie zabijamy nigdy, nawet gdyby trafiło do drzewa serwera
+# tego nie zabijamy nigdy, nawet gdyby trafiło do drzewa serwera; aplikacje hosta (Orca, Pod) daje orcahost
 SACRED = re.compile(
-    r"(^|/)(claude|codex|login|launchd)(\s|$)|Orca\.app|^-?(\S*/)?(zsh|bash|fish)(\s|$)"
+    r"(^|/)(claude|codex|login|launchd)(\s|$)|" + orcahost.APPS + r"|^-?(\S*/)?(zsh|bash|fish)(\s|$)"
 )
+# proces z pakietu hosta: główny, pomocnicy (karty podglądu), CLI
+HOST_APP = re.compile(orcahost.APPS)
 BROWSER = re.compile(
     r"Brave Browser|Google Chrome(?! for Testing)|Safari|com\.apple\.WebKit|firefox|Arc\.app|Microsoft Edge|Chromium|Vivaldi|Opera"
 )
@@ -607,18 +610,13 @@ class Orca:
     """
 
     def __init__(self):
-        # DEVGUARD_ORCA podmienia CLI (testy); pusta wartość wyłącza Orkę
-        self.bin = os.environ.get("DEVGUARD_ORCA", janitor.which("orca"))
+        self.host = None
+        self.attach(orcahost.host())
         # gniazdo tylko przy prawdziwym CLI i lokalnej Orce: podróbka w testach i Orka
         # zdalna (parowanie, środowisko) idą zawsze przez CLI
         self.direct = "DEVGUARD_ORCA" not in os.environ and not any(
-            os.environ.get(name)
-            for name in ("ORCA_PAIRING_CODE", "ORCA_REMOTE_PAIRING", "ORCA_ENVIRONMENT")
+            os.environ.get(name) for name in orcahost.REMOTE_ENV
         )
-        user_data = os.environ.get("ORCA_USER_DATA_PATH") or os.path.join(
-            janitor.HOME, "Library/Application Support/orca"
-        )
-        self.metadata = os.path.join(user_data, "orca-runtime.json")
         self.ok = False
         self.at = 0
         self.sessions_at = 0
@@ -626,6 +624,17 @@ class Orca:
         self.worktrees = []
         self.terminals = []
         self.sessions = {}  # pid procesu terminala (login) -> ptyId
+
+    def attach(self, host):
+        """Orca albo Pod (orcahost.py): CLI, gniazdo z orca-runtime.json i proces główny. Odświeżenie
+        woła to co cykl, więc przejście z Orki na Pod nie wymaga restartu strażnika."""
+        if host == self.host:
+            return
+        self.host = host
+        # DEVGUARD_ORCA podmienia CLI (testy); pusta wartość wyłącza Orkę
+        self.bin = os.environ.get("DEVGUARD_ORCA", orcahost.cli_path(host, janitor.which))
+        self.metadata = orcahost.runtime_path(host)
+        self.marker = orcahost.main_marker(host)
 
     def call(self, *args, timeout=10):
         if not self.bin:
@@ -704,9 +713,8 @@ class Orca:
             return None
 
     def refresh(self, rows, now, every, sessions_every=60):
-        if not self.bin or not any(
-            "Orca.app/Contents/MacOS/Orca" in command for _pid, _ppid, command in rows
-        ):
+        self.attach(orcahost.host())
+        if not self.bin or not any(self.marker in command for _pid, _ppid, command in rows):
             self.ok = False
             return
         # także po nieudanym odczycie: Orka, która nie odpowiada, nie dostaje 3 wywołań co 5 s
@@ -851,8 +859,8 @@ def sockets():
 def client_kind(command):
     if SIM_DEVICE.search(command):
         return "simulator"  # aplikacja w symulatorze iOS, zwykle z Metro
-    if "Orca.app" in command:
-        return "orca"
+    if HOST_APP.search(command):
+        return "orca"  # rodzaj klienta, także dla Pod: tak czyta go aplikacja
     if HEADLESS.search(command):
         return "headless"
     if BROWSER.search(command):
@@ -1774,7 +1782,7 @@ def stop(unit, world):
 def recycle(unit, world, state):
     orca = world.orca
     if not (unit.recyclable and orca):
-        return False, "nie mam terminala Orki, w którym mógłbym go postawić"
+        return False, f"nie mam terminala {orcahost.host().name}, w którym mógłbym go postawić"
     shell_cwd = proc_cwd(unit.shell)
     left = terminate(unit, world.table)
     unit.killed = True
@@ -1796,7 +1804,7 @@ def recycle(unit, world, state):
         "--enter",
     )
     if not (sent and sent.get("send", {}).get("accepted")):
-        return False, f"Orca nie przyjęła komendy; wpisz ręcznie: {text}"
+        return False, f"{orcahost.host().name} nie przyjmuje komendy; wpisz ręcznie: {text}"
     state.setdefault("recycles", []).append([world.now, unit.app_key])
     state.setdefault("pending", []).append(
         {"at": world.now, "app": unit.app_key, "label": unit.label, "command": text}
@@ -2406,7 +2414,7 @@ def print_status(snap):
         print(inventory_line(snap["inventory"]))
     print(
         f"Dev serwery: {h(snap['total'])} z budżetu {h(snap['budget'])}"
-        f" | Orca: {'tak' if snap['orca'] else 'nie'} | tryb: {snap['mode']}"
+        f" | {orcahost.host().name}: {'tak' if snap['orca'] else 'nie'} | tryb: {snap['mode']}"
     )
     plans = {pl["unit"]: pl for pl in snap["plans"]}
     for u in snap["units"]:

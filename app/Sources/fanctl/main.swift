@@ -5,9 +5,12 @@ import Foundation
 //   fanctl read [--json]          fans and the hottest CPU/GPU sensors (no root needed)
 //   fanctl keys                   every SMC key with its type (diagnostics)
 //   fanctl set auto|<percent>     hand the fans back to macOS, or hold them at a share of their range (root)
-//   fanctl daemon --config F --state F
+//   fanctl daemon --config F --state F [--team ID]...
 //                                 root LaunchDaemon: follows the mode in F, writes readings to the
-//                                 state file, and never lets a chip run hot on a fixed setting
+//                                 state file, and never lets a chip run hot on a fixed setting;
+//                                 --team adds a signing team the app may come with (Lid, Requester)
+//   fanctl lid-check <pid> [--team ID]...
+//                                 whether that process may hold the lid, and its signer (diagnostics)
 
 let args = Array(CommandLine.arguments.dropFirst())
 
@@ -18,6 +21,19 @@ func fail(_ message: String) -> Never {
 
 func option(_ name: String) -> String? {
     args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+}
+
+/// Every value of a repeatable option.
+func options(_ name: String) -> [String] {
+    args.indices.filter { args[$0] == name && $0 + 1 < args.count }.map { args[$0 + 1] }
+}
+
+// no SMC needed: the lid check reads only code signatures
+if args.first == "lid-check" {
+    guard args.count > 1, let pid = pid_t(args[1]) else { fail("lid-check <pid> [--team ID]") }
+    let trusted = Requester.trusted(pid: pid, teams: Set(options("--team")))
+    print("pid \(pid) \(Requester.processName(pid) ?? "?"): \(Requester.signer(pid: pid)); lid: \(trusted ? "allowed" : "refused")")
+    exit(trusted ? 0 : 1)
 }
 
 do {
@@ -48,7 +64,7 @@ do {
         guard let config = option("--config"), let state = option("--state") else {
             fail("daemon --config <fans.json> --state <fans-state.json>")
         }
-        Daemon(fans: Fans(smc: smc), config: config, state: state).run()
+        Daemon(fans: Fans(smc: smc), config: config, state: state, teams: Set(options("--team"))).run()
     default:
         fail("unknown command \(args[0])")
     }
