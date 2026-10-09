@@ -14,6 +14,7 @@ import io
 import json
 import os
 import pty
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,9 @@ SCRIPT = os.path.join(ROOT, "credits.py")
 ACCSWITCH = os.path.join(ROOT, "accswitch.py")
 FAKES = os.path.join(HERE, "fakes")
 FAKES_CREDITS = os.path.join(HERE, "fakes-credits")
-PY = "/usr/bin/python3"
+# interpreter skryptów pod testem; CLAUDE_ACC_TEST_PYTHON sprawdza ten, na którym biegnie instalacja
+# (~/.local/share/claude-acc/python), a komendy helpera i strażnika biorą sys.executable
+PY = os.environ.get("CLAUDE_ACC_TEST_PYTHON") or "/usr/bin/python3"
 
 KEY_A = "sk-ant-api03-fake-own-a"
 KEY_D = "sk-ant-api03-fake-own-d"
@@ -503,6 +506,121 @@ class Helper(unittest.TestCase):
         os.close(leader)
         self.assertEqual(proc.returncode, 2)
         self.assertNotIn(KEY_D.encode(), shown + err)
+
+
+class HelperRun(unittest.TestCase):
+    """`helper --run ID`: komenda w ustawieniach biegu sama wskazuje bieg i zapisuje, kto zapłacił."""
+
+    def setUp(self):
+        self.w = World()
+        self.w.pool()
+
+    def run_json(self, run_id, pid, start):
+        """runenv/runs/<id>/run.json tak, jak zapisuje go prepare(): właściciel biegu (pid i czas startu)."""
+        path = os.path.join(self.w.state, "runenv", "runs", run_id)
+        os.makedirs(path, exist_ok=True)
+        write_json(os.path.join(path, "run.json"), {"run_id": run_id, "owner_pid": pid, "owner_start": start})
+        self.addCleanup(shutil.rmtree, path, True)
+
+    def test_run_flag_records_the_paying_org_and_the_log_line_stays_as_it_was(self):
+        sys.path.insert(0, ROOT)
+        import runenv
+
+        run_id = "0123456789abcdef"
+        self.run_json(run_id, os.getpid(), runenv.pid_state(os.getpid())[1])  # bieg trwa: właścicielem jest ten test
+        r = self.w.run("helper", "--purpose", "polid-t", "--org", "org-a", "--run", run_id)
+        self.assertEqual((r.returncode, r.stdout), (0, KEY_A))
+        marker = os.path.join(self.w.credits, "runs", run_id)
+        lines = [json.loads(x) for x in read(marker).splitlines()]
+        self.assertEqual([(x["org_id"], x["email"], x["purpose"]) for x in lines], [("org-a", "a@example.com", "polid-t")])
+        self.assertNotIn(KEY_A, read(marker))
+        last = read(os.path.join(self.w.credits, "credits.log")).splitlines()[-1]
+        self.assertRegex(last, r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d  helper polid-t: a@example\.com \(org-a\)$")
+        for bad in ("xyz", "0123", "0123456789ABCDEF"):
+            r = self.w.run("helper", "--purpose", "polid-t", "--run", bad)
+            self.assertEqual((r.returncode, r.stdout), (2, ""), bad)
+
+    def test_run_flag_gives_no_key_once_the_run_is_over_or_its_owner_died(self):
+        # R-O4: `claude`, który przeżył zabitego właściciela biegu, nie płaci dalej z puli
+        run_id = "fedcba9876543210"
+        gone = subprocess.Popen(["/usr/bin/true"])
+        gone.wait()
+        for case, owner in (("brak run.json", None), ("właściciel nie żyje", (gone.pid, None)),
+                            ("ten pid, ale inny proces (czas startu)", (os.getpid(), 1))):
+            if owner:
+                self.run_json(run_id, *owner)
+            r = self.w.run("helper", "--purpose", "polid-t", "--org", "org-a", "--run", run_id)
+            self.assertEqual((r.returncode, r.stdout), (75, ""), case)
+            self.assertIn("klucza nie wydaję", r.stderr, case)
+        self.assertFalse(os.path.exists(os.path.join(self.w.credits, "runs", run_id)))  # nikt nie zapłacił
+        self.assertIn(f"odmowa, bieg {run_id}", read(os.path.join(self.w.credits, "credits.log")))
+        # bez --run (exec --no-env, Polid) helper działa jak dotąd
+        r = self.w.run("helper", "--purpose", "polid-t", "--org", "org-a")
+        self.assertEqual((r.returncode, r.stdout), (0, KEY_A))
+
+
+class PlanEnd(unittest.TestCase):
+    """Anulowany plan nie dostaje nowego przydziału w rocznicę cyklu (credits.py view)."""
+
+    def setUp(self):
+        self.w = World()
+        self.assertEqual(self.w.add("a@example.com", KEY_A, "--scope", "own").returncode, 0)
+        # jak 1@ na dysku: resets_at z `balance --expires-at` (rocznica cyklu) i odczyt 168,94 sprzed
+        # rocznicy; rocznica była wczoraj, nowego odczytu nie ma
+        path = os.path.join(self.w.credits, "accounts.json")
+        registry = json.loads(read(path))
+        registry["accounts"]["a@example.com"].update(
+            resets_at=day(-1), balance={"at": time.time() - 3 * 86400, "remaining_usd": 168.94})
+        write_json(path, registry)
+
+    def test_without_a_plan_end_the_anniversary_grants_as_before(self):
+        a = self.w.account("a@example.com")
+        self.assertEqual((a["granted_usd"], a["remaining_usd"]), (200.0, 200.0))
+        # nowy cykl od wczorajszej rocznicy: następna za mniej więcej miesiąc
+        resets = datetime.fromisoformat(a["cycle_resets_at"]).replace(tzinfo=None)
+        self.assertGreater(resets, datetime.now() + timedelta(days=26))
+
+    def test_after_the_plan_end_nothing_is_left_and_exec_exits_75_with_the_usual_message(self):
+        r = self.w.run("balance", "a@example.com", "--plan-ends-at", day(-1))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = self.w.status()
+        self.assertEqual(set(data), {"total_remaining_usd", "accounts"})
+        self.assertEqual(set(data["accounts"][0]), CONTRACT)  # klucze kontraktu bez zmian
+        a = data["accounts"][0]
+        self.assertEqual((a["granted_usd"], a["remaining_usd"], a["cycle_resets_at"]), (0.0, 0.0, None))
+        self.assertEqual(data["total_remaining_usd"], 0.0)
+        marker = os.path.join(self.w.home, "ran")
+        r = self.w.run("exec", "--no-env", "--purpose", "polid-t", "--", "touch", marker)
+        self.assertEqual(r.returncode, 75)
+        self.assertIn("brak kredytu API", r.stderr)
+        self.assertFalse(os.path.exists(marker))
+        self.assertEqual(self.w.run("key", "--purpose", "polid-t", "--json").returncode, 75)
+        self.assertIn("plan do", self.w.run("status").stdout)
+
+    def test_a_reading_after_the_end_counts_and_none_lifts_the_end(self):
+        self.assertEqual(self.w.run("balance", "a@example.com", "--plan-ends-at", day(-1)).returncode, 0)
+        self.assertEqual(self.w.run("balance", "a@example.com", "--remaining-usd", "50").returncode, 0)
+        self.assertEqual(self.w.run("record", "--org", "org-a", "--usd", "10", "--purpose", "polid-x").returncode, 0)
+        self.assertEqual(self.w.account("a@example.com")["remaining_usd"], 40.0)
+        r = self.w.run("balance", "a@example.com", "--plan-ends-at", "none")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("plan_ends_at", self.w.registry()["a@example.com"])
+        self.assertIsNotNone(self.w.account("a@example.com")["cycle_resets_at"])
+
+    def test_a_plan_ending_soon_is_spent_first(self):
+        self.assertEqual(self.w.add("d@example.com", KEY_D, "--scope", "own", "--resets-at", day(3)).returncode, 0)
+        r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", "import os; print(os.environ['CLAUDE_ACC_CREDITS_ORG'])")
+        self.assertEqual(r.stdout.strip(), "org-d")  # d wygasa za 3 dni, a dopiero w następnej rocznicy
+        self.assertEqual(self.w.run("balance", "a@example.com", "--plan-ends-at", day(1)).returncode, 0)
+        r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", "import os; print(os.environ['CLAUDE_ACC_CREDITS_ORG'])")
+        self.assertEqual(r.stdout.strip(), "org-a")  # kredyt a przepada jutro z końcem planu
+
+    def test_balance_still_needs_an_amount_without_a_plan_end(self):
+        r = self.w.run("balance", "a@example.com")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--remaining-usd", r.stderr)
+        r = self.w.run("balance", "a@example.com", "--plan-ends-at", "jutro")
+        self.assertEqual(r.returncode, 2)
 
 
 class Guard(unittest.TestCase):
