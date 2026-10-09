@@ -3,7 +3,7 @@
   "id": "claude-acc",
   "publisher": "outof-place",
   "name": "Claude Acc",
-  "version": "1.29.1",
+  "version": "1.29.2",
   "description": "claude-acc in Orca: Claude account limits and switching, dev servers per worktree, the build scheduler queue and Mac health, with commands for each.",
   "author": { "name": "outof-place", "url": "https://github.com/outof-place/claude-acc" },
   "repository": "https://github.com/outof-place/claude-acc",
