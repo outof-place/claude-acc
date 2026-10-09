@@ -24,9 +24,21 @@ import struct
 import sys
 
 HOME = os.path.expanduser("~")
-PLUGIN_KEY = "outof-place.claude-acc"
 HERE = os.path.dirname(os.path.realpath(__file__))
 SOURCE = os.path.join(HERE, "orca-plugin")
+
+
+def plugin_key():
+    """`<publisher>.<id>` z manifestu: jedyne miejsce, gdzie stoi tożsamość wtyczki (i nazwa katalogu)."""
+    try:
+        with open(os.path.join(SOURCE, "orca-plugin.json")) as f:
+            m = json.load(f)
+        return f"{m['publisher']}.{m['id']}"
+    except (OSError, ValueError, KeyError):
+        return "outof-place.claude-acc"
+
+
+PLUGIN_KEY = plugin_key()
 DEFAULT_USER_DATA = os.path.join(HOME, "Library/Application Support/orca")
 APPS = ("/Applications/Orca.app", os.path.join(HOME, "Applications/Orca.app"))
 # pliki drzewa wtyczki; testy i nakładka manifestu zostają w repo

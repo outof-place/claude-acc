@@ -14,6 +14,8 @@ const ACC_REPO = process.env.CLAUDE_ACC_REPO ?? ''
 const SHOTS = join(ACC_REPO, 'docs')
 test.skip(!ACC_REPO, 'CLAUDE_ACC_REPO is not set')
 const GB = 1024 ** 3
+const MANIFEST = ACC_REPO ? JSON.parse(readFileSync(join(ACC_REPO, 'orca-plugin/orca-plugin.json'), 'utf8')) : { publisher: '', id: '' }
+const KEY = `${MANIFEST.publisher}.${MANIFEST.id}`
 
 function seedClaudeAcc(home: string, repoPath: string): string {
   const now = Date.now() / 1000
@@ -86,7 +88,7 @@ test('claude-acc plugin on stock Orca: base manifest, commands, cards, degraded 
   // --live auto against this build's main bundle: no panelMessaging, so the stock-safe manifest
   const out = execFileSync('/usr/bin/python3', [join(ACC_REPO, 'orcaplugin.py'), 'install', '--user-data', userData, '--app', '/nonexistent'], { encoding: 'utf8' })
   expect(out).toContain('bez paska statusu')
-  const listed = await orcaPage.evaluate(async () => (await window.api.plugins.refresh()).find((p) => p.pluginKey === 'outof-place.claude-acc'))
+  const listed = await orcaPage.evaluate(async (key) => (await window.api.plugins.refresh()).find((p) => p.pluginKey === key), KEY)
   expect(listed?.status).toBe('pending')
   await orcaPage.evaluate(() => {
     const state = window.__store?.getState()
@@ -94,7 +96,7 @@ test('claude-acc plugin on stock Orca: base manifest, commands, cards, degraded 
     state?.openSettingsPage()
   })
   await orcaPage.getByRole('tab', { name: /^Installed/ }).click()
-  const row = orcaPage.locator('[data-plugin-key="outof-place.claude-acc"]')
+  const row = orcaPage.locator(`[data-plugin-key="${KEY}"]`)
   await row.getByRole('button', { name: 'Review & enable' }).click()
   const consent = orcaPage.getByRole('dialog', { name: 'Review permissions' })
   await consent.getByRole('button', { name: 'Enable plugin' }).click()
@@ -102,10 +104,10 @@ test('claude-acc plugin on stock Orca: base manifest, commands, cards, degraded 
   await orcaPage.evaluate(() => window.__store?.getState().closeSettingsPage())
 
   // the first command starts the worker; it then runs the CLI and keeps the card line current
-  const viaCommand = await orcaPage.evaluate(() => window.api.plugins.invokeCommand({ pluginKey: 'outof-place.claude-acc', commandId: 'claude-acc.switch-next' }))
+  const viaCommand = await orcaPage.evaluate((key) => window.api.plugins.invokeCommand({ pluginKey: key, commandId: 'claude-acc.switch-next' }), KEY)
   expect(viaCommand).toMatchObject({ ok: true })
   expect(readFileSync(log, 'utf8')).toContain('switch --auto')
-  const restart = await orcaPage.evaluate(() => window.api.plugins.invokeCommand({ pluginKey: 'outof-place.claude-acc', commandId: 'claude-acc.restart-dev-server' }))
+  const restart = await orcaPage.evaluate((key) => window.api.plugins.invokeCommand({ pluginKey: key, commandId: 'claude-acc.restart-dev-server' }), KEY)
   expect(restart).toMatchObject({ ok: true })
   expect(readFileSync(log, 'utf8')).toContain('guard recycle :3000')
   await expect
