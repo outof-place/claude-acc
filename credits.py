@@ -5,11 +5,13 @@
     claude-acc credits add <email> --scope own|KLIENT [--org ID] [--granted-usd 200] [--resets-at DATA] [--new-key] [--from-keychain USŁUGA/KONTO]
     claude-acc credits pending <email> [--scope own|KLIENT]
     claude-acc credits remove <email>
-    claude-acc credits balance <email> --remaining-usd KWOTA [--expires-at DATA]
+    claude-acc credits balance <email> [--remaining-usd KWOTA] [--expires-at DATA] [--plan-ends-at DATA|none]
     claude-acc credits record --org ID --usd KWOTA --purpose NAZWA
     claude-acc credits exec --purpose NAZWA [--scope own|KLIENT] [--org ID] [--min-remaining-usd 5] [--no-env] -- <komenda...>
-    claude-acc credits helper --purpose NAZWA [--scope own|KLIENT] [--org ID]
+    claude-acc credits helper --purpose NAZWA [--scope own|KLIENT] [--org ID] [--run ID]
     claude-acc credits key --purpose NAZWA [--scope own|KLIENT] [--org ID] [--min-remaining-usd 5] [--json]
+    claude-acc credits run --purpose NAZWA --budget-usd N [--mode auto|credits|subscription] [--awake-minutes 120] [--summary PLIK] -- <komenda...>
+    claude-acc credits canary [--version X.Y.Z] [--mode auto|credits|subscription]
 
 Plan Max daje co cykl rozliczeniowy kredyt w jednej, powiązanej organizacji Console ($200 dla
 Max 20x, $100 dla Max 5x). Kredyt nie przechodzi na kolejny cykl, więc `exec` bierze organizację,
@@ -44,6 +46,15 @@ Odczyt z Console wpisuje `balance`; między odczytami zostało = odczyt minus wy
 przez `record` po odczycie (a bez odczytu w tym cyklu: przyznane minus wydatki od początku cyklu).
 Wyczerpanie zauważone przez `exec` zapisuje się jak odczyt 0. Cykl to miesięczna rocznica daty
 z `--resets-at`/`--expires-at`, a bez niej startu subskrypcji konta z `claude-acc status`.
+Anulowany plan nie dostaje nowego przydziału w rocznicę: `balance --plan-ends-at DATA` zapisuje
+koniec planu, po którym zostało 0 aż do odczytu z Console zrobionego po tej dacie (`none`
+zdejmuje koniec, np. po wznowieniu planu). Data z `--expires-at` to nadal tylko rocznica cyklu.
+
+`run` i `canary` to środowisko biegu bez człowieka (runenv.py): płatnik wybrany przed startem
+(kredyt, inaczej subskrypcja, inaczej 75), licznik kosztu z OpenTelemetry i sprawdzenie płatnika.
+`helper --run ID` (komenda w ustawieniach biegu) dopisuje do znacznika biegu, która organizacja
+oddała klucz, żeby bieg mógł to sprawdzić, i wydaje klucz tylko biegowi, który trwa (run.json i
+żywy właściciel): proces, który przeżył zabitego właściciela, nie płaci dalej.
 """
 
 import calendar
@@ -271,8 +282,25 @@ def view(email, spec, accounts, spend_since, now):
     if row["state"] == "pending":
         row["checked_at"] = iso_ts(spec.get("checked_at"))
         return row
-    granted = float(spec.get("granted_usd") or DEFAULT_GRANT)
     reading = spec.get("balance") or {}
+    ends = parse_when(spec["plan_ends_at"]) if spec.get("plan_ends_at") else None
+    if ends:
+        row["_plan_ends"] = ends.timestamp()
+    if ends and now >= ends:
+        # plan się skończył: rocznica nie przynosi nowego przydziału; zostaje tylko to, co pokazał
+        # odczyt z Console zrobiony po końcu planu, minus wydatki zgłoszone po nim
+        after = bool(reading.get("at")) and reading["at"] >= ends.timestamp()
+        base, since = (float(reading["remaining_usd"]), reading["at"]) if after else (0.0, ends.timestamp())
+        remaining = max(base - spend_since(since).get(spec.get("org_id"), 0.0), 0.0)
+        row.update(
+            granted_usd=round(base, 4), spent_usd=round(base - remaining, 4), remaining_usd=round(remaining, 4),
+            cycle_resets_at=None, checked_at=iso_ts(reading["at"]) if after else None, _ends=None,
+        )
+        return row
+    if ends and end and ends < end:
+        # kredyt ostatniego cyklu przepada z końcem planu: wtedy go zużywamy w pierwszej kolejności
+        row.update(cycle_resets_at=iso(ends), _ends=ends.timestamp())
+    granted = float(spec.get("granted_usd") or DEFAULT_GRANT)
     cycle_start = start.timestamp() if start else spec.get("added_at")
     if reading.get("at") and (cycle_start is None or reading["at"] >= cycle_start):
         # odczyt z Console w tym cyklu: od niego odejmujemy tylko to, co zgłoszono później
@@ -585,9 +613,10 @@ def cmd_status(args):
         if r["state"] == "pending":
             print(f"{r['email']:<32}{r['scope']:<9}{'-':>10}{'-':>10}{'-':>10}  {reset:<12}{'-':<16}pending (sprawdzone {checked})")
             continue
+        plan = f", plan do {datetime.fromtimestamp(r['_plan_ends']):%d.%m}" if r.get("_plan_ends") else ""
         print(
             f"{r['email']:<32}{r['scope']:<9}{money(r['granted_usd']):>10}{money(r['spent_usd']):>10}"
-            f"{money(r['remaining_usd']):>10}  {reset:<12}{checked:<16}{r['state']}"
+            f"{money(r['remaining_usd']):>10}  {reset:<12}{checked:<16}{r['state']}{plan}"
         )
     print(
         "\nzostało = odczyt z Console minus wydatki zgłoszone później (bez odczytu: przyznane minus wydatki w cyklu)."
@@ -694,22 +723,38 @@ def cmd_remove(args):
 def cmd_balance(args):
     remaining = flag(args, "--remaining-usd")
     expires = flag(args, "--expires-at")
+    plan_end = flag(args, "--plan-ends-at")
     email = email_of(args)
     no_leftovers(args)
-    value = usd(remaining, "--remaining-usd")
+    # sam koniec planu nie wymaga odczytu; bez niego kwota jest obowiązkowa, jak dotąd
+    value = usd(remaining, "--remaining-usd") if remaining is not None or plan_end is None else None
     if expires:
         parse_when(expires)
+    if plan_end and plan_end != "none":
+        parse_when(plan_end)
     with Locked():
         registry = load_registry()
         spec = registry["accounts"].get(email)
         if not spec or spec.get("state") == "pending":
             raise CreditsError(f"{email} nie jest połączone: claude-acc credits add {email} --scope own|KLIENT")
-        spec["balance"] = {"at": time.time(), "remaining_usd": value}
+        if value is not None:
+            spec["balance"] = {"at": time.time(), "remaining_usd": value}
         if expires:
             spec["resets_at"] = expires
+        if plan_end == "none":
+            spec.pop("plan_ends_at", None)
+        elif plan_end:
+            spec["plan_ends_at"] = plan_end
         save_registry(registry)
-    log(f"balance: {email} {money(value)}")
-    print(f"odczyt zapisany: {email} ma {money(value)}")
+    if value is not None:
+        log(f"balance: {email} {money(value)}")
+        print(f"odczyt zapisany: {email} ma {money(value)}")
+    if plan_end == "none":
+        log(f"plan: {email} bez końca")
+        print(f"koniec planu zdjęty: {email} znowu dostaje przydział co cykl")
+    elif plan_end:
+        log(f"plan: {email} kończy się {plan_end}")
+        print(f"koniec planu zapisany: {email} od {parse_when(plan_end):%d.%m.%Y} bez nowego przydziału (0 do odczytu z Console)")
     return 0
 
 
@@ -895,11 +940,24 @@ def cmd_exec(args):
 
 
 def cmd_helper(args):
-    """apiKeyHelper dla Claude Code i Agent SDK: klucz na stdout, tylko dla procesu, który go woła."""
+    """apiKeyHelper dla Claude Code i Agent SDK: klucz na stdout, tylko dla procesu, który go woła.
+
+    `--run ID` (komenda w ustawieniach biegu runenv) wskazuje bieg sam, bez zmiennej
+    CLAUDE_ACC_CREDITS_RUN, którą dziecko mogło zgubić; znacznik biegu dostaje wtedy linię z
+    organizacją, która oddała klucz (sprawdzenie płatnika po biegu). Bieg skończony albo bez
+    żywego właściciela nie dostaje klucza (kod 75)."""
+    run_flag = flag(args, "--run")
+    if run_flag is not None and not re.fullmatch(r"[0-9a-f]{16}", run_flag):
+        raise UsageError("--run: identyfikator biegu (16 znaków 0-9a-f)")
     purpose, scope, org, minimum = pick_options(args)
     no_leftovers(args)
     if sys.stdout.isatty():
         raise UsageError("helper oddaje klucz tylko jako apiKeyHelper (Claude Code, Agent SDK), nie do terminala")
+    if run_flag is not None and not runenv().run_alive(run_flag):
+        # proces, który przeżył zabitego właściciela biegu, nie dostaje już klucza: nikt go nie liczy
+        log(f"helper {purpose}: odmowa, bieg {run_flag} skończony albo bez żywego właściciela")
+        print(f"bieg {run_flag} już się skończył albo jego właściciel nie żyje: klucza nie wydaję", file=sys.stderr)
+        return NO_CREDIT
     pinned = org or os.environ.get("CLAUDE_ACC_CREDITS_ORG")
     if minimum is None:
         # przypięta organizacja: Claude Code woła helper także w trakcie biegu (po TTL i po 401),
@@ -911,10 +969,13 @@ def cmd_helper(args):
         if not key:
             mark_error(row["email"], "brak klucza w Pęku kluczy: claude-acc credits add <email> --scope ... --new-key")
             continue
-        run_id = os.environ.get("CLAUDE_ACC_CREDITS_RUN") or ""
+        run_id = run_flag or os.environ.get("CLAUDE_ACC_CREDITS_RUN") or ""
         if re.fullmatch(r"[0-9a-f]{16}", run_id):
             os.makedirs(runs_dir(), mode=0o700, exist_ok=True)
-            os.close(os.open(os.path.join(runs_dir(), run_id), os.O_CREAT | os.O_WRONLY, 0o600))
+            fd = os.open(os.path.join(runs_dir(), run_id), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a") as marker:
+                paid = {"at": time.time(), "org_id": row["org_id"], "email": row["email"], "purpose": purpose}
+                marker.write(json.dumps(paid) + "\n")
         log(f"helper {purpose}: {row['email']} ({row['org_id']})")
         sys.stdout.write(key)
         sys.stdout.flush()
@@ -949,9 +1010,27 @@ def cmd_key(args):
     return no_credit(data, scope, org, minimum)
 
 
+def runenv():
+    """Moduł środowiska biegu; uruchomiony jako skrypt credits.py podstawia się pod `credits`, żeby
+    runenv dzielił z nim stan i klasy błędów (main łapie jego UsageError i CreditsError)."""
+    sys.modules.setdefault("credits", sys.modules[__name__])
+    import runenv as module
+
+    return module
+
+
+def cmd_run(args):
+    return runenv().cmd_run(args)
+
+
+def cmd_canary(args):
+    return runenv().cmd_canary(args)
+
+
 COMMANDS = {
     "status": cmd_status, "add": cmd_add, "pending": cmd_pending, "remove": cmd_remove, "balance": cmd_balance,
-    "record": cmd_record, "exec": cmd_exec, "helper": cmd_helper, "key": cmd_key,
+    "record": cmd_record, "exec": cmd_exec, "helper": cmd_helper, "key": cmd_key, "run": cmd_run,
+    "canary": cmd_canary,
 }  # fmt: skip
 USAGE = "\n".join(line for line in __doc__.splitlines() if line.startswith("    claude-acc credits"))
 

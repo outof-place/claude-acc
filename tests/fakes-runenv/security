@@ -1,0 +1,64 @@
+#!/usr/bin/python3
+"""Atrapa `security` dla środowiska biegu: ten sam magazyn co tests/fakes/security ($HOME/fake/
+keychain.json), plus to, czego używa runenv: zapis z danymi szesnastkowo (-X) i dziennik stdin
+`security -i` (security-stdin.log) obok dziennika argumentów (security-argv.log).
+FAKE_SECURITY_READ_FAIL=<kod>: odczyt sekretu (-w) kończy się tym kodem, jak przy zablokowanym
+Pęku kluczy."""
+import os
+import shlex
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fakes"))
+import _store  # noqa: E402
+
+os.makedirs(_store.ROOT, exist_ok=True)
+with open(os.path.join(_store.ROOT, "security-argv.log"), "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+
+
+def run(args):
+    cmd = args[0]
+
+    def opt(flag):
+        return args[args.index(flag) + 1] if flag in args else None
+
+    key = f"{opt('-s')}|{opt('-a')}"
+    with open(os.path.join(_store.ROOT, "security.log"), "a") as log:
+        log.write(f"{cmd} {key}\n")
+    kc = _store.load("keychain.json", {})
+    if cmd == "find-generic-password":
+        fail = os.environ.get("FAKE_SECURITY_READ_FAIL")
+        if fail and "-w" in args:
+            print("security: SecKeychainSearchCopyNext: User interaction is not allowed.", file=sys.stderr)
+            return int(fail)
+        if key in kc:
+            print(kc[key] if "-w" in args else f'keychain: "fake"\n    "svce"<blob>="{opt("-s")}"')
+            return 0
+        print("security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.", file=sys.stderr)
+        return 44
+    if cmd == "add-generic-password":
+        secret = opt("-w") if "-w" in args else bytes.fromhex(opt("-X")).decode()
+        kc[key] = secret
+        _store.save("keychain.json", kc)
+        return 0
+    if cmd == "delete-generic-password":
+        existed = kc.pop(key, None) is not None
+        _store.save("keychain.json", kc)
+        return 0 if existed else 44
+    if cmd == "dump-keychain":
+        for k in kc:
+            print(f'    "svce"<blob>="{k.split("|")[0]}"')
+        return 0
+    return 1
+
+
+if sys.argv[1] == "-i":
+    data = sys.stdin.read()
+    with open(os.path.join(_store.ROOT, "security-stdin.log"), "a") as log:
+        log.write(data)
+    code = 0
+    for line in data.splitlines():
+        if line.strip():
+            code = run(shlex.split(line)) or code
+    sys.exit(code)
+sys.exit(run(sys.argv[1:]))

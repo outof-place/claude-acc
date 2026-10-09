@@ -1,0 +1,267 @@
+#!/usr/bin/python3
+"""Atrapa Claude Code dla środowiska biegu (testy instalują ją jako ~/.local/share/claude/versions/<v>
+i ~/.local/bin/claude). Robi to, co zmierzyło A0 (FACTS-A0.md):
+
+- ustawienia użytkownika to $CLAUDE_CONFIG_DIR/settings.json (bez zmiennej ~/.claude/settings.json);
+  `--restricted` i `--setting-sources` bez `user` je pomijają; `--settings PLIK|JSON` dokłada swoje;
+  `env` z ustawień trafia do procesu (OTEL działa tylko stamtąd albo ze środowiska procesu);
+- logowanie w kolejności Claude Code: ANTHROPIC_AUTH_TOKEN i ANTHROPIC_API_KEY, apiKeyHelper (przez
+  /bin/sh, klucz ze stdout), CLAUDE_CODE_OAUTH_TOKEN, wpis Pęku kluczy katalogu (hash
+  CLAUDE_SECURESTORAGE_CONFIG_DIR albo CLAUDE_CONFIG_DIR; bez obu wpis bazowy); bez logowania
+  "Not logged in" i kod 1. `auth status --json` nie woła helpera;
+- `-p`: każde "zapytanie" trafia do $HOME/fake/api-calls.jsonl z tym, kto naprawdę zapłacił
+  (klucz organizacji z credits-api.json albo konto tokenu z server.json), i do OTLP jako
+  claude_code.api_request (koszt, sesja, request_id, job.run z OTEL_RESOURCE_ATTRIBUTES,
+  user.email i organization.id tylko przy subskrypcji);
+- narzędzie Bash (FAKE_CLAUDE_BASH, tylko sesja najwyższego poziomu): najpierw hooki PreToolUse
+  z ustawień (deny blokuje), potem /bin/sh -c bez OTEL_* i CLAUDE_CODE_OAUTH_TOKEN. "@helper"
+  to komenda apiKeyHelper z ustawień, "@login" odczyt wpisu Pęku kluczy tego katalogu.
+
+Wstrzykiwane: FAKE_CLAUDE_REQUESTS (1), FAKE_CLAUDE_COST (0.001), FAKE_CLAUDE_ERROR=billing|401|429,
+FAKE_CLAUDE_NO_COST=1, FAKE_CLAUDE_NO_OTEL=1, FAKE_CLAUDE_SLEEP=s (po zapytaniach),
+FAKE_CLAUDE_FORCE_EMAIL / FAKE_CLAUDE_FORCE_ORG (zły płatnik w OTEL), FAKE_CLAUDE_ENV_DUMP=plik,
+FAKE_CLAUDE_COPY_SETTINGS=plik, FAKE_CLAUDE_TOOL=Monitor (narzędzie FAKE_CLAUDE_BASH to Monitor:
+lista permissions.deny, potem hooki z pasującym matcherem), FAKE_CLAUDE_AUTH_ORG=<orgId> i
+FAKE_CLAUDE_AUTH_LOGGED_OUT=1 (co pokaże `auth status`). Sesja z -p zapisuje transkrypt z
+"entrypoint" jak prawdziwy: CLAUDE_CODE_ENTRYPOINT albo "sdk-cli".
+"""
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+import uuid
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "fakes"))
+import _store  # noqa: E402
+
+BLAZITY_ORG = "bb6c7f81-65b7-4ea3-90bc-3d0ae91eb837"
+args = sys.argv[1:]
+me = os.path.basename(__file__)
+VERSION = me if me.count(".") == 2 else "9.9.9"
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+
+def opt(flag):
+    return args[args.index(flag) + 1] if flag in args and args.index(flag) + 1 < len(args) else None
+
+
+def config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.environ["HOME"], ".claude")
+
+
+def settings():
+    merged = {}
+    sources = opt("--setting-sources")
+    if "--restricted" not in args and (sources is None or "user" in sources.split(",")):
+        merged = read(os.path.join(config_dir(), "settings.json"))
+    flag = opt("--settings")
+    if flag:
+        extra = json.loads(flag) if flag.lstrip().startswith("{") else read(flag)
+        env = dict(merged.get("env") or {}, **(extra.get("env") or {}))
+        merged = dict(merged, **extra)
+        merged["env"] = env
+    return merged
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def service():
+    secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    base = secure if secure is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    if not base:
+        return "Claude Code-credentials"
+    return "Claude Code-credentials-" + hashlib.sha256(base.encode()).hexdigest()[:8]
+
+
+def login(conf, run_helper):
+    """(rodzaj, kto) albo None: kto zapłaci za zapytania tego procesu."""
+    keys = _store.load("credits-api.json", {}).get("keys", {})
+    for name in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        if os.environ.get(name):
+            return "key", keys.get(os.environ[name], "unknown-key")
+    if conf.get("apiKeyHelper"):
+        if not run_helper:
+            return "helper", None
+        out = subprocess.run(["/bin/sh", "-c", conf["apiKeyHelper"]], capture_output=True, text=True)
+        if out.returncode != 0 or not out.stdout.strip():
+            print(f"apiKeyHelper failed: exited {out.returncode}", file=sys.stderr)
+            return "helper-failed", None
+        return "key", keys.get(out.stdout.strip(), "unknown-key")
+    access = _store.load("server.json", {}).get("access", {})
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return "oauth", access.get(os.environ["CLAUDE_CODE_OAUTH_TOKEN"], "unknown@example.com")
+    blob = _store.load("keychain.json", {}).get(f"{service()}|{os.environ.get('USER', 'tester')}")
+    if blob:
+        oauth = json.loads(blob).get("claudeAiOauth") or {}
+        if oauth.get("accessToken") and (oauth.get("expiresAt") or 0) > time.time() * 1000:
+            return "oauth", access.get(oauth["accessToken"], "unknown@example.com")
+    return None
+
+
+def org_of(email):
+    return BLAZITY_ORG if email == "filip.maszota@blazity.com" else f"org-of-{email}"
+
+
+def post(env, records):
+    endpoint = env.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not env.get("CLAUDE_CODE_ENABLE_TELEMETRY") or env.get("OTEL_LOGS_EXPORTER") != "otlp" or not endpoint:
+        return
+    resource = dict(x.split("=", 1) for x in (env.get("OTEL_RESOURCE_ATTRIBUTES") or "").split(",") if "=" in x)
+
+    def kv(k, v):
+        if isinstance(v, bool) or v is None:
+            return None
+        if isinstance(v, int):
+            return {"key": k, "value": {"intValue": str(v)}}
+        if isinstance(v, float):
+            return {"key": k, "value": {"doubleValue": v}}
+        return {"key": k, "value": {"stringValue": str(v)}}
+
+    logs = []
+    for name, attrs in records:
+        attrs = dict(resource, **attrs, **{"event.name": name})
+        logs.append({"timeUnixNano": str(time.time_ns()), "body": {"stringValue": f"claude_code.{name}"},
+                     "attributes": [x for x in (kv(k, v) for k, v in attrs.items()) if x]})
+    body = {"resourceLogs": [{"resource": {"attributes": [kv(k, v) for k, v in resource.items()]},
+                              "scopeLogs": [{"scope": {"name": "com.anthropic.claude_code.events"}, "logRecords": logs}]}]}
+    req = urllib.request.Request(endpoint.rstrip("/") + "/v1/logs", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=5).read()
+
+
+def bash_tool(conf, command, env):
+    """Narzędzie Bash (albo Monitor): lista deny, hooki PreToolUse z ustawień, potem komenda bez
+    OTEL_* i tokenu OAuth."""
+    tool = os.environ.get("FAKE_CLAUDE_TOOL") or "Bash"
+    if tool in ((conf.get("permissions") or {}).get("deny") or []):
+        return f"denied: {tool} w permissions.deny"
+    if command == "@helper":
+        command = conf.get("apiKeyHelper") or "true"
+    elif command == "@login":
+        command = f'security find-generic-password -s "{service()}" -a {os.environ.get("USER", "tester")} -w'
+    event = json.dumps({"hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": {"command": command},
+                        "cwd": os.getcwd()})
+    for entry in (conf.get("hooks") or {}).get("PreToolUse") or []:
+        matcher = entry.get("matcher") or "*"
+        if matcher != "*" and tool not in [m.strip() for m in matcher.split("|")]:
+            continue
+        for hook in entry.get("hooks") or []:
+            out = subprocess.run(["/bin/sh", "-c", hook["command"]], input=event, capture_output=True, text=True, env=env)
+            decision = ((json.loads(out.stdout) if out.stdout.strip() else {}).get("hookSpecificOutput") or {})
+            if out.returncode == 2 or decision.get("permissionDecision") == "deny":
+                return f"denied: {decision.get('permissionDecisionReason') or out.stderr.strip()}"
+    child = {k: v for k, v in env.items() if not k.startswith("OTEL_") and k != "CLAUDE_CODE_OAUTH_TOKEN"}
+    child.update(CLAUDECODE="1", CLAUDE_CODE_CHILD_SESSION="1", FAKE_CLAUDE_DEPTH=str(int(env.get("FAKE_CLAUDE_DEPTH", "0")) + 1))
+    for name in ("FAKE_CLAUDE_BASH",):
+        child.pop(name, None)
+    out = subprocess.run(["/bin/sh", "-c", command], capture_output=True, text=True, env=child)
+    return f"exit={out.returncode}\n{out.stdout}{out.stderr}"
+
+
+def main():
+    if args[:1] == ["--version"]:
+        print(f"{VERSION} (Claude Code)")
+        return 0
+    conf = settings()
+    env = dict(os.environ, **{k: str(v) for k, v in (conf.get("env") or {}).items()})
+    if os.environ.get("FAKE_CLAUDE_COPY_SETTINGS") and env.get("FAKE_CLAUDE_DEPTH", "0") == "0":
+        with open(os.environ["FAKE_CLAUDE_COPY_SETTINGS"], "w") as f:
+            json.dump(conf, f)
+    if os.environ.get("FAKE_CLAUDE_ENV_DUMP"):
+        with open(os.environ["FAKE_CLAUDE_ENV_DUMP"], "a") as f:
+            f.write(json.dumps({k: os.environ.get(k) for k in (
+                "CLAUDE_CONFIG_DIR", "CLAUDE_ACC_CREDITS_ORG", "CLAUDE_ACC_CREDITS_RUN", "CLAUDE_ACC_RUN",
+                "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR")}) + "\n")
+    if args[:2] == ["auth", "status"]:
+        who = login(conf, run_helper=False)
+        if who and who[0] == "helper":
+            status = {"loggedIn": True, "authMethod": "api_key_helper", "apiKeySource": "apiKeyHelper"}
+        elif who and who[0] == "key":
+            status = {"loggedIn": True, "authMethod": "api_key", "apiKeySource": "ANTHROPIC_API_KEY"}
+        elif who and who[0] == "oauth":
+            status = {"loggedIn": True, "authMethod": "claude.ai", "apiKeySource": None}
+        else:
+            status = {"loggedIn": False, "authMethod": "none", "apiKeySource": None}
+        if who and who[0] == "oauth":
+            status.update(email=who[1], orgId=os.environ.get("FAKE_CLAUDE_AUTH_ORG") or org_of(who[1]))
+        if os.environ.get("FAKE_CLAUDE_AUTH_LOGGED_OUT"):
+            status.update(loggedIn=False, authMethod="none")
+        status["configDirectory"] = config_dir()
+        print(json.dumps(status))
+        return 0
+    if "-p" not in args and "--print" not in args:
+        print("atrapa Claude Code: tylko -p, auth status i --version", file=sys.stderr)
+        return 2
+    who = login(conf, run_helper=True)
+    if not who or who[1] is None:
+        print(json.dumps({"type": "result", "is_error": True, "result": "Not logged in · Please run /login",
+                          "total_cost_usd": 0}))
+        return 1
+    kind, payer = who
+    session = str(uuid.uuid4())
+    if "--no-session-persistence" not in args:
+        slug = "".join(c if c.isalnum() else "-" for c in os.getcwd())
+        folder = os.path.join(config_dir(), "projects", slug)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, f"{session}.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "queue-operation", "sessionId": session}) + "\n")
+            f.write(json.dumps({"type": "user", "sessionId": session, "cwd": os.getcwd(),
+                                "entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "sdk-cli"}) + "\n")
+    email = payer if kind == "oauth" else None
+    identity = {}
+    if email or os.environ.get("FAKE_CLAUDE_FORCE_EMAIL"):
+        identity["user.email"] = os.environ.get("FAKE_CLAUDE_FORCE_EMAIL") or email
+        identity["organization.id"] = os.environ.get("FAKE_CLAUDE_FORCE_ORG") or org_of(identity["user.email"])
+    elif os.environ.get("FAKE_CLAUDE_FORCE_ORG"):
+        identity["organization.id"] = os.environ["FAKE_CLAUDE_FORCE_ORG"]
+    depth = int(env.get("FAKE_CLAUDE_DEPTH", "0"))
+    total, records = 0.0, []
+    error = os.environ.get("FAKE_CLAUDE_ERROR") if depth == 0 else None
+    for n in range(int(os.environ.get("FAKE_CLAUDE_REQUESTS", "1"))):
+        cost = float(os.environ.get("FAKE_CLAUDE_COST", "0.001"))
+        attrs = dict(identity, **{"session.id": session, "model": "claude-haiku-5-5", "request_id": f"req_{uuid.uuid4().hex}",
+                                  "event.sequence": n + 1})
+        if not os.environ.get("FAKE_CLAUDE_NO_COST"):
+            attrs["cost_usd"] = cost
+        records.append(("api_request", attrs))
+        total += cost
+        with open(os.path.join(_store.ROOT, "api-calls.jsonl"), "a") as f:
+            f.write(json.dumps({"pid": os.getpid(), "session": session, "payer": f"{kind}:{payer}", "depth": depth,
+                                "config_dir": os.environ.get("CLAUDE_CONFIG_DIR"), "argv0": sys.argv[0]}) + "\n")
+    if error:
+        status, message = {"billing": (400, "Your credit balance is too low to access the Anthropic API."),
+                           "401": (401, "authentication_error: invalid x-api-key"),
+                           "429": (429, "rate_limit_error: Number of request tokens has exceeded your limit")}[error]
+        records.append(("api_error", dict(identity, **{"session.id": session, "model": "claude-haiku-5-5", "status_code": status,
+                                                         "error": message, "attempt": 1, "request_id": f"req_{uuid.uuid4().hex}"})))
+    if not os.environ.get("FAKE_CLAUDE_NO_OTEL"):
+        post(env, records)
+    bash = os.environ.get("FAKE_CLAUDE_BASH") if depth == 0 else None
+    if bash:
+        result = bash_tool(conf, bash, env)
+        with open(os.path.join(_store.ROOT, "bash-tool.log"), "a") as f:
+            f.write(result + "\n---\n")
+    time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0")))
+    if error == "billing":
+        print("Credit balance is too low")
+        return 1
+    if error:
+        print(json.dumps({"type": "result", "is_error": True, "result": f"API Error: {error}", "total_cost_usd": total}))
+        return 1
+    print(json.dumps({"type": "result", "is_error": False, "result": "OK", "session_id": session, "total_cost_usd": total}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
