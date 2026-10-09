@@ -153,7 +153,7 @@ class Guard:
         stopped = self.stop_fsmonitors()
         if stopped:
             self.log(f"   zatrzymane demony git fsmonitor: {len(stopped)} (wstaną przy następnym git)")
-        notify(f"fseventsd zjadł {mb(size)} pamięci, zrestartowany. Edytory i serwery języka mogą nie widzieć zmian plików do restartu.")
+        notify(f"fseventsd zjadł {mb(size)} pamięci, zrestartowany. Edytory i serwery języka mogą nie widzieć zmian plików do restartu.", self.log)
 
     def stop_fsmonitors(self):
         out = subprocess.run(["/bin/ps", "-axo", "pid=,args="], capture_output=True, text=True).stdout
@@ -199,15 +199,20 @@ def stop(pid, grace=10):
         pass
 
 
-def notify(text):
+def notify(text, log=None):
     """Powiadomienie w sesji osoby przy konsoli; strażnik działa jako root poza nią."""
     try:
         uid = os.stat("/dev/console").st_uid
         if os.geteuid() != 0 or uid == 0:
             return
-        script = f'display notification "{text}" with title "Strażnik fseventsd"'
-        subprocess.run(["/bin/launchctl", "asuser", str(uid), "/usr/bin/osascript", "-e", script],
-                       capture_output=True, timeout=10)
+        # tekst idzie jako argument skryptu, nie w jego treści: cudzysłów albo \ w nim psuły skrypt
+        out = subprocess.run(["/bin/launchctl", "asuser", str(uid), "/usr/bin/osascript",
+                              "-e", "on run argv",
+                              "-e", "display notification (item 1 of argv) with title \"Strażnik fseventsd\"",
+                              "-e", "end run", "--", text],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode != 0 and log:
+            log(f"   osascript nie pokazał powiadomienia ({out.returncode}): {out.stderr.strip()}")
     except (OSError, subprocess.SubprocessError):
         pass
 
