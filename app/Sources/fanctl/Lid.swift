@@ -1,6 +1,7 @@
 import Foundation
 import IOKit
 import IOKit.ps
+import Security
 
 /// Stay Awake with the lid closed. A power assertion only stops idle sleep: closing the lid of a
 /// MacBook on battery still sleeps it (`Clamshell Sleep` in `pmset -g log`). The one switch that
@@ -9,8 +10,8 @@ import IOKit.ps
 ///
 /// Rules:
 /// - the app asks through `awake.json` next to `fans.json`: `{"lid": true, "until": <epoch>,
-///   "pid": <its pid>}`. The request holds only while `until` is ahead and that pid is still a
-///   running ClaudeAcc, so a quit or crashed app can't leave the Mac unable to sleep;
+///   "pid": <its pid>}`. The request holds only while `until` is ahead and that pid is still the
+///   running app (`Requester`), so a quit or crashed app can't leave the Mac unable to sleep;
 /// - on battery at 10% or less it lets go, so a closed Mac in a bag sleeps before it dies;
 /// - at a serious thermal state or worse it lets go and stays off for `thermalPause`, so a hot
 ///   Mac in a bag sleeps instead of cooking;
@@ -22,6 +23,8 @@ import IOKit.ps
 /// - on SIGTERM/SIGINT it lets go before exiting.
 final class Lid {
     private let requestPath: String
+    /// Signing teams the app comes with (`daemon --team`, read from the app at install).
+    private let teams: Set<String>
     /// `SleepDisabled` is on because this daemon turned it on.
     private(set) var held: Bool
     /// The longest a single request keeps the lid from sleeping the Mac, counted from its write.
@@ -30,8 +33,9 @@ final class Lid {
     static let thermalPause: TimeInterval = 15 * 60
     private var cooledUntil: Date = .distantPast
 
-    init(requestPath: String, heldBefore: Bool) {
+    init(requestPath: String, heldBefore: Bool, teams: Set<String> = []) {
         self.requestPath = requestPath
+        self.teams = teams
         held = heldBefore
     }
 
@@ -61,9 +65,7 @@ final class Lid {
               let written = (try? FileManager.default.attributesOfItem(atPath: requestPath))?[.modificationDate] as? Date,
               Date.now.timeIntervalSince(written) < Self.maxHold
         else { return false }
-        var name = [CChar](repeating: 0, count: 64)
-        guard proc_name(pid, &name, UInt32(name.count)) > 0 else { return false }
-        return String(cString: name) == "ClaudeAcc"
+        return Requester.trusted(pid: pid, teams: teams)
     }
 
     /// Running on battery with 10% or less left.
@@ -107,5 +109,79 @@ final class Lid {
         guard (try? process.run()) != nil else { return false }
         process.waitUntilExit()
         return process.terminationStatus == 0
+    }
+}
+
+/// Who may hold the lid: the menu bar app, known by its code signature rather than its process
+/// name, so it still counts once it ships under another name (Pod Menu.app in Pod).
+///
+/// - signed by a team: the team must be one the daemon was started with (`fanctl daemon --team`:
+///   install-fans.sh reads it from the installed app, so no team id lives in the source), and the
+///   running code must satisfy `anchor apple generic and certificate leaf[subject.OU] = <team>`: a
+///   self-made certificate can claim any team id, Apple's chain can't be faked;
+/// - signed without a team (ad hoc: `swift build`, an install without a certificate) or not at all,
+///   or a daemon started without `--team` (installed before this check): the process name,
+///   `ClaudeAcc`, as before;
+/// - a signature that doesn't hold (the binary changed under the process) or a pid that's gone: no.
+///
+/// A pid from a file can be reused; the app writes its request again while it runs, and `until`
+/// and `Lid.maxHold` bound a stale one, as they did with the name check.
+enum Requester {
+    static let name = "ClaudeAcc"
+
+    enum Signer: Equatable, CustomStringConvertible {
+        /// Valid signature from Apple's chain with this team.
+        case team(String)
+        /// Valid ad hoc signature, or none at all.
+        case noTeam
+        /// No such process, or its signature doesn't hold.
+        case invalid(OSStatus)
+
+        var description: String {
+            switch self {
+            case .team(let id): "team \(id)"
+            case .noTeam: "no team (ad hoc or unsigned)"
+            case .invalid(let status): "invalid (OSStatus \(status))"
+            }
+        }
+    }
+
+    static func trusted(pid: pid_t, teams: Set<String>) -> Bool {
+        switch signer(pid: pid) {
+        case .team(let id): teams.isEmpty ? processName(pid) == name : teams.contains(id)
+        case .noTeam: processName(pid) == name
+        case .invalid: false
+        }
+    }
+
+    static func signer(pid: pid_t) -> Signer {
+        var found: SecCode?
+        let attributes = [kSecGuestAttributePid: NSNumber(value: pid)] as CFDictionary
+        var status = SecCodeCopyGuestWithAttributes(nil, attributes, [], &found)
+        guard status == errSecSuccess, let code = found else { return .invalid(status) }
+        status = SecCodeCheckValidity(code, [], nil)
+        if status == errSecCSUnsigned { return .noTeam }
+        guard status == errSecSuccess else { return .invalid(status) }
+        var staticCode: SecStaticCode?
+        var info: CFDictionary?
+        status = SecCodeCopyStaticCode(code, [], &staticCode)
+        guard status == errSecSuccess, let staticCode else { return .invalid(status) }
+        status = SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info)
+        guard status == errSecSuccess else { return .invalid(status) }
+        guard let id = (info as? [String: Any])?[kSecCodeInfoTeamIdentifier as String] as? String, !id.isEmpty,
+              id.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) })
+        else { return .noTeam }
+        var requirement: SecRequirement?
+        let text = "anchor apple generic and certificate leaf[subject.OU] = \"\(id)\"" as CFString
+        status = SecRequirementCreateWithString(text, [], &requirement)
+        guard status == errSecSuccess, let requirement else { return .invalid(status) }
+        status = SecCodeCheckValidity(code, [], requirement)
+        return status == errSecSuccess ? .team(id) : .invalid(status)
+    }
+
+    static func processName(_ pid: pid_t) -> String? {
+        var name = [CChar](repeating: 0, count: 64)
+        guard proc_name(pid, &name, UInt32(name.count)) > 0 else { return nil }
+        return String(decoding: name.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 }

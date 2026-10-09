@@ -1197,7 +1197,7 @@ sudo ./perf-root.sh vnodes trial [--value 786432] [--keep]   # cache vnode: pomi
 sudo ./perf-root.sh vnodes apply|undo
 sudo ./perf-root.sh trial [--rate 27Mbps] [--keep]           # ogranicznik: pomiar przed i po
 sudo ./perf-root.sh shaper apply|undo                        # ./perf-root.sh shaper status bez sudo
-./perf-root.sh devtools add|undo|status [--app /Applications/Orca.app]   # bez sudo, w Terminalu; "+" w Ustawieniach
+./perf-root.sh devtools add|undo|status [--app <ścieżka do .app>; domyślnie host z orcahost.py]   # bez sudo, w Terminalu; "+" w Ustawieniach
 ```
 
 Stan dla panelu jest w `~/.local/share/claude-acc/perf-state.json`:

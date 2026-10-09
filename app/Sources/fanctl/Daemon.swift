@@ -40,14 +40,14 @@ final class Daemon {
     /// Seconds between chart samples; with the 2 s tick a sample lands every 6 s.
     private static let sample: Double = 5
 
-    init(fans: Fans, config: String, state: String) {
+    init(fans: Fans, config: String, state: String, teams: Set<String> = []) {
         self.fans = fans
         configPath = config
         statePath = state
         // `SleepDisabled` outlives a restart: the last state file says whether it was ours
         let previous = FileManager.default.contents(atPath: state).flatMap { try? JSONDecoder().decode(Reading.self, from: $0) }
         let folder = (config as NSString).deletingLastPathComponent
-        lid = Lid(requestPath: folder + "/awake.json", heldBefore: previous?.lidHeld == true)
+        lid = Lid(requestPath: folder + "/awake.json", heldBefore: previous?.lidHeld == true, teams: teams)
     }
 
     func run() -> Never {

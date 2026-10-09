@@ -29,10 +29,19 @@ else
   BUILT="$(cd app && swift build -c release --show-bin-path)/fanctl"
 fi
 mkdir -p "$HOME/.local/share/claude-acc"
+# Zamknięta pokrywa (Lid) słucha aplikacji po podpisie: zespół z podpisu zainstalowanej aplikacji
+# (sign-app.sh: certyfikat z Pęku kluczy) idzie do demona jako --team; aplikacja ad hoc, bez zespołu,
+# zostaje przy nazwie procesu
+TEAM="$(codesign -dv "$HOME/Applications/Claude Acc.app" 2>&1 | sed -n 's/^TeamIdentifier=\([A-Z0-9]*\)$/\1/p' || true)"
+TEAM_ARGS=""
+if [ -n "$TEAM" ]; then
+  TEAM_ARGS="<string>--team</string><string>$TEAM</string>"
+fi
 
 sudo install -d -o root -g wheel -m 755 /usr/local/libexec
 sudo install -o root -g wheel -m 755 "$BUILT" "$BIN"
-sed "s|__HOME__|$HOME|g" launchd/com.filip.claude-acc.fans.plist.template | sudo tee "$PLIST" >/dev/null
+sed -e "s|__HOME__|$HOME|g" -e "s|__TEAM__|$TEAM_ARGS|" launchd/com.filip.claude-acc.fans.plist.template \
+  | sudo tee "$PLIST" >/dev/null
 sudo chown root:wheel "$PLIST"
 sudo chmod 644 "$PLIST"
 sudo launchctl bootout system "$PLIST" 2>/dev/null || true

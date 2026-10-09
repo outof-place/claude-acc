@@ -15,6 +15,11 @@ import subprocess
 import tempfile
 import unittest
 
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -85,6 +90,99 @@ class SpotlightAppsOnlyTest(unittest.TestCase):
         _, got = self.run_exclusions(cfg, saved, home, apps)
 
         self.assertEqual(got, ["/a", "/b"])
+
+
+FAKE_ID = """#!/bin/sh
+case "$1" in
+  -u) echo "$FAKE_UID" ;;
+  -un) echo "$FAKE_USER" ;;
+  *) exec /usr/bin/id "$@" ;;
+esac
+"""
+FAKE_STAT = """#!/bin/sh
+[ "$*" = "-f %Su /dev/console" ] && { echo "$FAKE_CONSOLE"; exit 0; }
+exec /usr/bin/stat "$@"
+"""
+FAKE_SUDO = """#!/bin/sh
+echo "sudo $*"
+"""
+
+
+class SudoUserTest(unittest.TestCase):
+    """Czyj stan zmienia perf-root.sh: SUDO_USER, a bez niego (albo z root od sudo wołanego przez roota)
+    właściciel konsoli; root to odmowa, bo /var/root nie ma claude-acc. Atrapy id, stat i sudo w PATH."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.fakes = os.path.join(self.tmp, "bin")
+        os.makedirs(self.fakes)
+        for name, body in (("id", FAKE_ID), ("stat", FAKE_STAT), ("sudo", FAKE_SUDO)):
+            path = os.path.join(self.fakes, name)
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0o755)
+
+    def env(self, uid, user="tester", console="tester", sudo_user=None):
+        env = {"PATH": f"{self.fakes}:/usr/bin:/bin", "HOME": self.tmp, "FAKE_UID": str(uid),
+               "FAKE_USER": user, "FAKE_CONSOLE": console}
+        if sudo_user is not None:
+            env["SUDO_USER"] = sudo_user
+        return env
+
+    def user(self, **kw):
+        return subprocess.run(["/bin/bash", os.path.join(ROOT, "perf-root.sh"), "user"], env=self.env(**kw),
+                              capture_output=True, text=True)
+
+    def test_sudo_user_wins(self):
+        done = self.user(uid=0, sudo_user="tester", console="other")
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "tester"))
+
+    def test_root_without_a_real_sudo_user_takes_the_console_user(self):
+        for sudo_user in (None, "", "root"):
+            with self.subTest(sudo_user=sudo_user):
+                done = self.user(uid=0, sudo_user=sudo_user, console="tester")
+                self.assertEqual((done.returncode, done.stdout.strip()), (0, "tester"), done.stderr)
+
+    def test_refuses_root_as_the_owner(self):
+        for sudo_user in (None, "root"):
+            with self.subTest(sudo_user=sudo_user):
+                done = self.user(uid=0, sudo_user=sudo_user, console="root")
+                self.assertEqual(done.returncode, 1)
+                self.assertEqual(done.stdout, "")
+                self.assertIn("czyj jest stan claude-acc", done.stderr)
+
+    def test_plain_user_is_itself(self):
+        done = self.user(uid=501, user="tester", console="other")
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "tester"))
+
+    def wrapper(self):
+        """Komenda claude-acc z setup.sh, z katalogiem źródeł, w którym perf-root.sh tylko się przedstawia."""
+        src = open(os.path.join(ROOT, "setup.sh"), encoding="utf-8").read()
+        start = src.index("<<'EOF'\n", src.index('cat > "$HOME/.local/bin/claude-acc"')) + len("<<'EOF'\n")
+        path = os.path.join(self.tmp, "claude-acc")
+        with open(path, "w") as f:
+            f.write(src[start:src.index("\nEOF\n", start) + 1])
+        libexec = os.path.join(self.tmp, "libexec")
+        state = os.path.join(self.tmp, ".local", "share", "claude-acc")
+        os.makedirs(libexec)
+        os.makedirs(state)
+        with open(os.path.join(state, "source"), "w") as f:
+            f.write(libexec + "\n")
+        fake = os.path.join(libexec, "perf-root.sh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\necho "perf-root SUDO_USER=${SUDO_USER:-} $*"\n')
+        os.chmod(fake, 0o755)
+        return path, fake
+
+    def test_wrapper_under_sudo_keeps_sudo_user(self):
+        path, fake = self.wrapper()
+        under_sudo = subprocess.run(["/bin/sh", path, "perf-root", "spotlight", "apps-only"],
+                                    env=self.env(uid=0, sudo_user="tester"), capture_output=True, text=True)
+        self.assertEqual(under_sudo.stdout.strip(), "perf-root SUDO_USER=tester spotlight apps-only", under_sudo.stderr)
+        plain = subprocess.run(["/bin/sh", path, "perf-root", "spotlight", "apps-only"],
+                               env=self.env(uid=501), capture_output=True, text=True)
+        self.assertEqual(plain.stdout.strip(), f"sudo {fake} spotlight apps-only", plain.stderr)
 
 
 if __name__ == "__main__":

@@ -25,8 +25,8 @@ struct PanelView: View {
                 if let email = store.snapshot?.orcaSelected {
                     Banner(
                         symbol: "exclamationmark.triangle.fill", tint: .orange,
-                        title: "Orca has \(email) selected",
-                        text: "Orca reverts switches and refreshes tokens itself, and two refreshers sign accounts out. Auto-switch and switching are paused until you pick System default in Orca's Claude account menu.")
+                        title: "\(HostApp.current.name) has \(email) selected",
+                        text: "\(HostApp.current.name) reverts switches and refreshes tokens itself, and two refreshers sign accounts out. Auto-switch and switching are paused until you pick System default in \(HostApp.current.name)'s Claude account menu.")
                 }
                 HStack(alignment: .top, spacing: 12) {
                     Column(width: 350) {
@@ -169,7 +169,7 @@ private struct FooterBar: View {
                         Text("Usage API rate-limited until \(Format.moment(until, now: now))")
                             .foregroundStyle(.orange)
                     } else if snapshot.orcaSelected != nil {
-                        Text("Auto-switch paused by Orca")
+                        Text("Auto-switch paused by \(HostApp.current.name)")
                     } else if snapshot.lastTick == nil {
                         Text("Auto-switch hasn't run yet")
                     } else if healthy {

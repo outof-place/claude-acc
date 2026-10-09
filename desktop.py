@@ -37,6 +37,7 @@ import threading
 import time
 
 import mcpbase
+import orcahost
 
 VERSION = "1.0.0"
 HOME = os.path.expanduser("~")
@@ -858,7 +859,7 @@ def cmd_mode(args):
 
 def cli_owner(env=None):
     env = os.environ if env is None else env
-    for var, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), ("ORCA_TERMINAL_HANDLE", "orca"), ("TERM_SESSION_ID", "term")):
+    for var, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), (orcahost.TERMINAL_ENV, "orca"), ("TERM_SESSION_ID", "term")):
         if env.get(var):
             return f"cli:{prefix}:{env[var]}"
     return "cli"

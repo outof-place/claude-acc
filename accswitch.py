@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zarządzanie limitami kont Claude Code trzymanych przez Orca.
+"""Zarządzanie limitami kont Claude Code trzymanych przez Orca (albo Pod: który, mówi orcahost.py).
 
 Konto Claude Code to po prostu zawartość wpisu w Pęku kluczy. Orca trzyma
 kopię każdego konta pod usługą "Orca Claude Code Managed Credentials"
@@ -55,8 +55,13 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import orcahost
+
 HOME = os.path.expanduser("~")
-ORCA_DIR = os.path.join(HOME, "Library/Application Support/orca")
+# aplikacja, która trzyma konta: Orca albo Pod (orcahost.py), z jej katalogiem danych, usługą Pęku
+# kluczy i nazwą w komunikatach
+HOST = orcahost.resolve()
+ORCA_DIR = HOST.user_data
 ACCOUNTS_DIR = os.path.join(ORCA_DIR, "claude-accounts")
 STATE_DIR = os.path.join(HOME, ".local/share/claude-acc")
 CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
@@ -79,7 +84,7 @@ IDLE_REFRESH_AFTER = 15 * 60
 # kolejne przerwy po 429 z endpointu limitów, osobno dla każdego konta; sukces zeruje licznik
 BACKOFF_STEPS = [120, 240, 480, 900]
 
-MANAGED_SERVICE = "Orca Claude Code Managed Credentials"
+MANAGED_SERVICE = HOST.keychain_service
 ACTIVE_SERVICE = "Claude Code-credentials"
 KEYCHAIN_USER = os.environ.get("USER", "user")
 
@@ -161,9 +166,14 @@ def log(line):
 
 
 def notify(title, text):
-    subprocess.run(["osascript", "-e",
-                    f"display notification {json.dumps(text)} with title {json.dumps(title)}"],
-                   capture_output=True)
+    # tekst i tytuł idą jako argumenty skryptu, nie w jego treści: json.dumps zamieniłby "ą" na \u0105,
+    # którego AppleScript nie rozumie
+    out = subprocess.run(["osascript", "-e", "on run argv",
+                          "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+                          "-e", "end run", "--", text, title],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        log(f"osascript nie pokazał powiadomienia ({out.returncode}): {out.stderr.strip()}")
 
 
 def parse_ts(value):
@@ -352,8 +362,8 @@ def orca_selected_id():
     go brak, activeClaudeManagedAccountId; "System default" zapisuje tam null.
     Orca trzyma ustawienia per profil, więc czytamy najświeższy orca-data.json.
     """
-    paths = glob.glob(os.path.join(ORCA_DIR, "profiles", "*", "orca-data.json"))
-    paths += [p for p in [os.path.join(ORCA_DIR, "orca-data.json")] if os.path.exists(p)]
+    paths = glob.glob(os.path.join(ORCA_DIR, "profiles", "*", HOST.data_file))
+    paths += [p for p in [os.path.join(ORCA_DIR, HOST.data_file)] if os.path.exists(p)]
     if not paths:
         return None
     try:
@@ -997,7 +1007,7 @@ def adopt_runtime(accounts, cfg):
     if account:
         kc_write(MANAGED_SERVICE, account.id, with_oauth(account.creds_json, oauth_of(raw)))
         clear_needs_login(account)
-        log(f"żywy token {account.email} z runtime zapisany do jego kopii w Orca")
+        log(f"żywy token {account.email} z runtime zapisany do jego kopii w {HOST.name}")
 
 
 def switch_to(account, cfg, reason=""):
@@ -1103,7 +1113,7 @@ def cmd_heal(cfg, args):
         if not match and len(broken) == 1 and len(orphans) == 1:
             match = orphans[0]  # jedno chore konto, jeden bezpański token
         if not match:
-            print(f"  {account.email}: nie znalazłem żywego tokenu, zaloguj konto w Orca")
+            print(f"  {account.email}: nie znalazłem żywego tokenu, zaloguj konto w {HOST.name}")
             continue
         kc_write(MANAGED_SERVICE, account.id, with_oauth(account.creds_json, oauth_of(match[1])))
         orphans.remove(match)
@@ -1398,6 +1408,8 @@ def snapshot(cfg, accounts=None):
         "last_tick": state.get("last_tick"),
         "switched_at": state.get("switched_at"),
         "orca_selected": orca,
+        # aplikacja kont (Orca albo Pod): nazwa w panelu, identyfikator dla dyktowania do jej terminali
+        "host": {"name": HOST.name, "bundle_id": HOST.bundle_id},
         "pause": load_json(PAUSE_PATH, None),
         "limit_pause": bool(cfg["limit_pause"]),
         "drain": bool(cfg["drain"]),
@@ -1520,8 +1532,8 @@ def who_once(cfg):
                 read_all = True
             owner = next((a for a in accounts if same_login(a.seen_oauth, oauth)), None)
         if owner is None:
-            return nobody("unknown_token", f"the token in {service} matches no Orca account: a login outside "
-                                           "Orca, or a session refreshed it after the last sync (claude-acc "
+            return nobody("unknown_token", f"the token in {service} matches no {HOST.name} account: a login outside "
+                                           f"{HOST.name}, or a session refreshed it after the last sync (claude-acc "
                                            "tick syncs it every 2 minutes)")
         owners[service] = owner
     if len({a.id for a in owners.values()}) > 1:
@@ -1556,7 +1568,7 @@ def cmd_who(cfg, args):
     accounts = load_accounts()
     active = find_active(accounts, cfg)
     if not active:
-        print(f"we wpisie {scoped_service(cfg['config_dir'])} leżą dane spoza Orca, nie ruszam ich")
+        print(f"we wpisie {scoped_service(cfg['config_dir'])} leżą dane spoza {HOST.name}, nie ruszam ich")
         return 1
     data, note = cached_usage(active, cfg)
     if not data:
@@ -1582,11 +1594,11 @@ def cmd_switch(cfg, args):
         return 1
     accounts = load_accounts()
     if not accounts:
-        print("brak kont zarządzanych przez Orca")
+        print(f"brak kont zarządzanych przez {HOST.name}")
         return 1
     orca = orca_selected(accounts)
     if orca:
-        print(f"Orca ma wybrane konto {orca} i cofnie każde przełączenie. W Orca wybierz System default")
+        print(f"{HOST.name} ma wybrane konto {orca} i cofnie każde przełączenie. W {HOST.name} wybierz System default")
         return 1
     active = find_active(accounts, cfg)
     if active:
@@ -1939,10 +1951,10 @@ def tick(cfg, accounts):
         # Orca sama pilnuje wybranego konta i odświeża jego token: drugi gracz
         # w tym samym miejscu to wyścig o refresh token i wylogowane konta.
         # Pauzy, której automat już nie zdejmie, nie trzymamy.
-        end_pause(f"Orca ma wybrane konto {orca}, automat stoi")
+        end_pause(f"{HOST.name} ma wybrane konto {orca}, automat stoi")
         if load_state().get("orca_notified") != orca:
-            log(f"tick: Orca ma wybrane konto {orca}, automat stoi, dopóki w Orca nie będzie System default")
-            notify("Claude: automat wstrzymany", f"W Orca wybrane jest {orca}. Wybierz System default.")
+            log(f"tick: {HOST.name} ma wybrane konto {orca}, automat stoi, dopóki w {HOST.name} nie będzie System default")
+            notify("Claude: automat wstrzymany", f"W {HOST.name} wybrane jest {orca}. Wybierz System default.")
             update_state(orca_notified=orca)
         return 0
     if load_state().get("orca_notified"):
@@ -1952,10 +1964,10 @@ def tick(cfg, accounts):
 
     if not active:
         # ktoś zalogował się ręcznie albo trwa /login: ręce precz, tylko jedno ostrzeżenie
-        end_pause("runtime ma konto spoza Orca")
+        end_pause(f"runtime ma konto spoza {HOST.name}")
         if not state.get("hands_off_notified"):
-            log("tick: wpis runtime zawiera dane spoza Orca, nie przełączam")
-            notify("Claude: nieznane konto", "Runtime ma dane spoza Orca. Automat nic nie zmienia.")
+            log(f"tick: wpis runtime zawiera dane spoza {HOST.name}, nie przełączam")
+            notify("Claude: nieznane konto", f"Runtime ma dane spoza {HOST.name}. Automat nic nie zmienia.")
             update_state(hands_off_notified=True)
         return 0
     if state.get("hands_off_notified"):

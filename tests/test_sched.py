@@ -25,6 +25,11 @@ import time
 import unittest
 from unittest import mock
 
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "sched.py")
@@ -2508,6 +2513,39 @@ class RunTest(unittest.TestCase):
         )
         self.assertNotIn("_internal", data)
         self.assertEqual(data["recent"][0]["label"], "go test ./internal/moneyfmt/")
+
+
+class HostTest(Paths):
+    """Orca i Pod: CLI hosta po pełnej ścieżce to dalej to samo CLI, a panel agenta idzie z env."""
+
+    def test_host_cli_by_full_path_is_not_a_project_script(self):
+        import orcahost
+
+        for app, cli in ((orcahost.orca().app, "orca"), ("/Applications/Pod.app", "podx")):
+            for command in (f"{app}/Contents/Resources/bin/{cli} terminal list --json", f"{cli} worktree ps"):
+                with self.subTest(command=command):
+                    self.assertIsNone(S.classify(command, self.repo))
+
+    def test_standalone_fallback_matches_orcahost(self):
+        """sched.py wczytany bez __file__ i bez sąsiadów ma te same nazwy, co orcahost."""
+        import orcahost
+
+        self.assertEqual((S.HOST_CLIS, S.PANE_ENV), (orcahost.CLI_NAMES, orcahost.PANE_ENV))
+        code = (
+            "import sys\n"
+            "from importlib.machinery import SourceFileLoader\n"
+            "m = type(sys)('acc_sched')\n"
+            f"SourceFileLoader('acc_sched', {SCRIPT!r}).exec_module(m)\n"
+            "print('orcahost' in sys.modules, m.HOST_CLIS, m.PANE_ENV)\n"
+        )
+        out = subprocess.run([sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.strip(), f"False {orcahost.CLI_NAMES} {orcahost.PANE_ENV}")
+
+    def test_agent_pane_comes_from_the_host_env(self):
+        with mock.patch.dict(os.environ, {"ORCA_PANE_KEY": "tab-1:pane-2"}):
+            self.assertEqual(S.agent_info("abcdef123456", "worker")["pane"], "tab-1:pane-2")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(S.agent_info(None, None)["pane"])
 
 
 if __name__ == "__main__":

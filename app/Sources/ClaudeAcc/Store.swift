@@ -116,6 +116,7 @@ final class Store {
         isPreview = true
         snapshot = preview
         latestSnapshot = preview
+        HostApp.current = preview.host ?? .orca
         readLocal()
         if let guardState { self.guardState = guardState }
         if let janitor { self.janitor = janitor }
@@ -182,6 +183,7 @@ final class Store {
 
     private func show(_ fresh: Snapshot) {
         latestSnapshot = fresh
+        HostApp.current = fresh.host ?? .orca
         // with the panel closed only the menu bar label reads it; the panel takes it when it opens
         if panelOpen || isPreview || snapshot == nil { snapshot = fresh }
         if problem != nil { problem = nil }

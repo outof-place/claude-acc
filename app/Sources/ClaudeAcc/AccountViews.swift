@@ -14,7 +14,7 @@ struct ActiveAccountCard: View {
                 if let active = snapshot.active {
                     ActiveAccount(store: store, snapshot: snapshot, account: active)
                 } else {
-                    Text("Claude Code is signed in to an account outside Orca. Auto-switch leaves it alone until you switch to one from the list.")
+                    Text("Claude Code is signed in to an account outside \(HostApp.current.name). Auto-switch leaves it alone until you switch to one from the list.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -63,7 +63,7 @@ private struct ActiveAccount: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         if account.mislabeled, let real = account.realEmail {
-                            Label("This Orca entry holds \(real)", systemImage: "exclamationmark.triangle.fill")
+                            Label("This \(HostApp.current.name) entry holds \(real)", systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                         }
