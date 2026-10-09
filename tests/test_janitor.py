@@ -485,6 +485,49 @@ class DerivedDataTest(unittest.TestCase):
         self.assertEqual([path for _, path, _ in self.sw.items], [os.path.join(self.derived, "Old-abc")])
 
 
+class TmpLeftoversTest(unittest.TestCase):
+    """Przerwane narzędzia zostawiają w $TMPDIR katalogi i ślady po kilkaset MB: idą po 6 h bez zmian.
+    2026-10-09 leżało tam 2,1 GB śladów xctrace sprzed doby i 0,6 GB katalogu linkera Go."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="tmp-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patched = {"user_tmpdir": lambda: self.tmp, "log": lambda line, path=None: None}
+        for name, value in patched.items():
+            self.addCleanup(setattr, janitor, name, getattr(janitor, name))
+            setattr(janitor, name, value)
+        self.sw = janitor.Sweep(dict(janitor.DEFAULT_CONFIG), dry_run=False)
+
+    def leftover(self, name, hours_old, is_dir=True):
+        path = os.path.join(self.tmp, name)
+        target = os.path.join(path, "a.out") if is_dir else path
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w") as f:
+            f.write("x" * 4096)
+        stamp = time.time() - hours_old * 3600
+        os.utime(target, (stamp, stamp))
+        if is_dir:
+            os.utime(path, (stamp, stamp))
+
+    def test_stale_leftovers_go_fresh_and_foreign_stay(self):
+        self.leftover("go-build123", 7)
+        self.leftover("go-link-456", 7)
+        self.leftover("instrumentsAbc.ktrace", 7, is_dir=False)
+        self.leftover("go-link-789", 1)
+        self.leftover("instrumentsXyz.ktrace", 1, is_dir=False)
+        self.leftover("instruments-notes.txt", 7, is_dir=False)
+        self.leftover("com.example.ShipIt.x", 7)
+        self.janitor.task_tmp(self.sw, None)
+        self.assertEqual(
+            sorted(os.listdir(self.tmp)),
+            ["com.example.ShipIt.x", "go-link-789", "instruments-notes.txt", "instrumentsXyz.ktrace"],
+        )
+
+
 def compressed(path):
     return bool(os.stat(path).st_flags & stat.UF_COMPRESSED)
 
