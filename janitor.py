@@ -73,6 +73,10 @@ DEFAULT_CONFIG = {
     "go_cache_keep_percent": 60,
     # Xcode DerivedData bez zmian od tylu dni
     "derived_data_idle_days": 14,
+    # symulatory agentów (pula portivo-mobile) i ich dzierżawy; te same wartości co w devguard.json.
+    # Nigdy nie kasujemy ich jako "niedostępnych": runtime potrafi zniknąć na chwilę przy zmianie Xcode
+    "simulator_pool_prefix": "Portivo-",
+    "simulator_leases": "~/.cache/portivo-mobile/leases",
     # logi aplikacji starsze niż tyle dni
     "log_days": 30,
     # na baterii poniżej tylu procent porządki czekają na ładowarkę
@@ -816,7 +820,36 @@ def task_xcode(sw, _scan):
         and not sw.dry_run
         and os.path.isdir(os.path.join(HOME, "Library/Developer/CoreSimulator"))
     ):
-        run([xcrun, "simctl", "delete", "unavailable"], timeout=300)
+        delete_unavailable_simulators(sw, xcrun)
+
+
+def delete_unavailable_simulators(sw, xcrun):
+    """Kasuje symulatory, które simctl uznaje za niedostępne, ale ostrożnie: 2026-10-09 po zmianie
+    Xcode runtime iOS 26.0 zniknął na chwilę i `simctl delete unavailable` skasował symulatory
+    agentów razem z zainstalowanymi klientami deweloperskimi (natywny build to 10-20 min).
+    Dlatego kasujemy pojedynczo, dopiero gdy urządzenie było niedostępne już w poprzednim
+    przebiegu, i nigdy tych z puli agentów (prefiks) ani z żywą dzierżawą portivo-mobile."""
+    out = run([xcrun, "simctl", "list", "devices", "unavailable", "-j"], timeout=60)
+    try:
+        groups = json.loads(out or "")["devices"].values()
+        found = {d["udid"]: d.get("name", "") for group in groups for d in group}
+    except (ValueError, KeyError, TypeError):
+        return  # bez czytelnej listy nie kasujemy niczego i nie ruszamy zapamiętanych
+    seen = load_json(SIMULATORS_STATE_PATH, [])
+    write_json(SIMULATORS_STATE_PATH, sorted(found))
+    prefix = sw.cfg["simulator_pool_prefix"]
+    leases = expand(sw.cfg["simulator_leases"])
+    for udid, name in sorted(found.items()):
+        label = f"{name} {udid}"
+        if udid not in seen:
+            sw.skip("xcode", label, "niedostępny pierwszy raz, czekamy na kolejny przebieg")
+        elif (prefix and name.startswith(prefix)) or os.path.exists(
+            os.path.join(leases, udid + ".json")
+        ):
+            sw.skip("xcode", label, "symulator agentów")
+        else:
+            run([xcrun, "simctl", "delete", udid], timeout=300)
+            log(f"xcode: skasowano niedostępny symulator {label}")
 
 
 def task_brew(sw, _scan):
@@ -890,6 +923,7 @@ def task_caps(sw, _scan):
 
 
 # granica czasu dla każdego katalogu: pliki zmienione wcześniej już przeszły kompresję
+SIMULATORS_STATE_PATH = os.path.join(STATE_DIR, "janitor-simulators.json")
 COMPRESS_STATE_PATH = os.path.join(STATE_DIR, "janitor-compress.json")
 UID = os.getuid()
 # afsctool dostaje pliki paczkami, żeby lista argumentów nie przekroczyła ARG_MAX
