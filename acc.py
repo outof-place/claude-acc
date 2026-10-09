@@ -14,7 +14,7 @@ import os
 import sys
 from importlib.machinery import SourceFileLoader
 
-SCRIPTS = ("accswitch", "browser", "credits", "desktop", "devguard", "hint", "hook", "hotspot", "janitor",
+SCRIPTS = ("accswitch", "browser", "credits", "desktop", "devguard", "hint", "hook", "hotspot", "janitor", "jobs",
            "mail", "mailhint", "mcpshare", "perf", "sched", "updates")
 # dawna nazwa skryptu, która może jeszcze stać we wpisie hooka w settings.json
 ALIASES = {"mailhint": "hint"}

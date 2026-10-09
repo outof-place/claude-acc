@@ -157,6 +157,8 @@ case "$1" in
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
+  # biegi blogów bez człowieka: płatnik z puli, licznik, limity czuwania, zapis biegu (jobs.py)
+  jobs) shift; exec "$PY" "$RUN" jobs "$@" ;;
   # wspólne serwery MCP: jeden proces stdio dla wszystkich sesji Claude Code
   mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)

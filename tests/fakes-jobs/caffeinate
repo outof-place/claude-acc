@@ -1,0 +1,12 @@
+#!/bin/sh
+# Atrapa caffeinate dla tests/test_jobs.py: zapisuje argumenty i swój pid, a z -w PID czeka,
+# aż tamten proces zniknie (jak prawdziwy), żeby test sprawdził, że runner trzymał i puścił asercję.
+mkdir -p "$HOME/fake"
+echo "$$ $*" >> "$HOME/fake/caffeinate.log"
+pid=""
+while [ $# -gt 0 ]; do
+  [ "$1" = "-w" ] && pid="$2"
+  shift
+done
+[ -n "$pid" ] || exit 0
+while kill -0 "$pid" 2>/dev/null; do sleep 0.2; done
