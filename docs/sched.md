@@ -41,6 +41,12 @@ własnych biegów (`predicted_from: history:N`) i nie opóźni startu głowy:
   Opóźni ją najwyżej o swój czas; gdy to wyprzedzający trzymają jej pamięć, nikt więcej nie wchodzi
   i głowa startuje, gdy się skończą.
 
+Lekki job (`small_gb`), który skończy się przed głową albo wchodzi jako krótki, wystarczy, że zmieści
+się w pamięci dostępnej teraz, jak mały job szybką ścieżką, także po `2 × starve_s`: rezerwy na
+wzrost długich jobów i natywnego buildu spoza schedulera potrafią zepchnąć `free_for_admission_gb`
+poniżej zera przy kilkunastu GB dostępnych (2026-10-09 18:20, 1.25.1: ruff i pytest po 0,1 GB stały
+wtedy za `next build`). Miejsce obok głowy liczy się zawsze w pamięci po rezerwach.
+
 Natywne buildy i symulatory nie wchodzą przez backfill, a za natywną głową wstrzymaną przez strażnika
 backfillu nie ma. 2026-10-09 głowa `next build` (11,7 GB przy 5,9 wolnych) trzymała tak po
 `2 × starve_s` 25 krótkich jobów (ruff, `go vet` jednego pakietu, skrypty Pythona) do 25 minut.
