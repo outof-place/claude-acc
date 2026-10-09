@@ -1,0 +1,6 @@
+#!/bin/sh
+# Atrapa osascript na początku PATH w każdym teście: prawdziwy pokazywałby Filipowi prawdziwe banery
+# (każdy przebieg testów w nowym $HOME to nowa deduplikacja). Wywołania ida do pliku z
+# CLAUDE_ACC_TEST_OSASCRIPT_LOG, a bez niego do pliku w $TMPDIR.
+log="${CLAUDE_ACC_TEST_OSASCRIPT_LOG:-${TMPDIR:-/tmp}/claude-acc-tests-osascript.log}"
+printf '%s\n' "$*" >> "$log"

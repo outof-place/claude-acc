@@ -16,6 +16,12 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "janitor.py")
@@ -126,6 +132,23 @@ class GoCacheTrimTest(unittest.TestCase):
         # dry run counts without deleting
         self.assertEqual(janitor.trim_oldest(root, keep_bytes=0, dry_run=True), 4 * block)
         self.assertEqual(len([a for a, p in paths if os.path.exists(p)]), 4)
+
+
+class NoRealBannerTest(unittest.TestCase):
+    """Przebieg z mało miejsca woła atrapę osascript, nigdy prawdziwego: inaczej każdy przebieg
+    testów (nowy $HOME, więc nowa deduplikacja) pokazywałby Filipowi prawdziwy baner."""
+
+    def test_low_disk_sweep_reaches_the_fake_osascript(self):
+        env = Env()
+        self.addCleanup(env.cleanup)
+        env.config(low_disk_gb=10**6)  # każdy dysk ma mniej
+        log = os.path.join(env.home, "osascript.log")
+        with mock.patch.dict(os.environ, {"CLAUDE_ACC_TEST_OSASCRIPT_LOG": log}):
+            self.assertEqual(os.path.dirname(shutil.which("osascript")), os.path.join(HERE, "fakes-osascript"))
+            env.sweep()
+
+        with open(log) as f:
+            self.assertIn("Mało miejsca na dysku", f.read())
 
 
 class JanitorTest(unittest.TestCase):
@@ -695,7 +718,6 @@ class OptimizeTest(unittest.TestCase):
             ("NSGlobalDomain", "KeyRepeat"): "2",
         }
         self.calls = []
-        from unittest import mock
 
         def run(cmd, timeout=600):
             if cmd[:2] == ["defaults", "read"]:

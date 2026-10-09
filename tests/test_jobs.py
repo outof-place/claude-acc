@@ -25,6 +25,11 @@ import threading
 import time
 import unittest
 
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
+
 try:
     from tests.test_credits import FAKES, FAKES_CREDITS, KEY_A, PY, ROOT, read, write_json
     from tests.test_runenv import FAKES_RUNENV, VERSION, accounts
