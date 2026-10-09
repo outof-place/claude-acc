@@ -23,6 +23,11 @@ import unittest
 from datetime import datetime, timedelta
 from unittest import mock
 
+# prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
+os.environ["PATH"] = os.pathsep.join(
+    [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakes-osascript"), os.environ.get("PATH", "")]
+)
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "credits.py")
