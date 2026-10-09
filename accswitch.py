@@ -14,6 +14,8 @@ zarządzanym Orca wymusza swoje konto przy starcie terminala i co 15 minut.
 Komendy:
   status [--json]   limity wszystkich kont, kolejka do palenia (--json dla aplikacji w pasku menu)
   who               konto aktywne w zarządzanym katalogu i prognoza
+  who --json        czyj token leży teraz we wpisach Claude Code: e-mail i id konta, bez sieci
+                    i blokady (~50 ms; przed wywołaniem modelu, np. Polid)
   plan              kolejność, w jakiej warto palić konta, z uzasadnieniem
   heal [--deep]     odzyskaj konta z martwym tokenem (--deep skanuje cały Pęk kluczy)
   switch <email>    przełącz na konkretne konto
@@ -35,6 +37,10 @@ Komendy:
 
 Kredyty API z planów (pula kluczy organizacji Console) to osobny skrypt: claude-acc credits --help.
 """
+
+# PEP 810: od Pythona 3.15 te moduły ładują się dopiero przy pierwszym użyciu, a starsze
+# wersje tę listę ignorują. Żaden nie jest potrzebny przy samym imporcie skryptu.
+__lazy_modules__ = ["glob", "hashlib", "json", "re", "shutil", "signal", "subprocess"]
 
 import fcntl
 import glob
@@ -60,6 +66,9 @@ LOG_PATH = os.path.join(STATE_DIR, "switch.log")
 LOCK_PATH = os.path.join(STATE_DIR, "lock")
 LOGIN_LOCK_PATH = os.path.join(STATE_DIR, "login.lock")
 USAGE_CACHE_PATH = os.path.join(STATE_DIR, "usage-cache.json")
+# to samo co `status --json`, zapisywane po każdym ticku: aplikacja w pasku menu czyta je
+# przy zamkniętym panelu, zamiast co minutę uruchamiać skrypt
+STATUS_PATH = os.path.join(STATE_DIR, "status.json")
 # istnieje tylko w trakcie pauzy limitów; hook w sesjach Claude Code (hook.py) tylko go czyta
 PAUSE_PATH = os.path.join(STATE_DIR, "pause.json")
 # znaczniki hooka z bieżącego epizodu pauzy; kasowane razem z nią
@@ -67,7 +76,7 @@ PAUSE_MARKS_DIR = os.path.join(STATE_DIR, "pause-marks")
 # ile token aktywnego konta musi być przeterminowany, zanim automat sam go odświeży:
 # wcześniej robią to sesje Claude Code i drugi odświeżający zabija konto
 IDLE_REFRESH_AFTER = 15 * 60
-# kolejne przerwy po 429 z endpointu limitów; sukces zeruje licznik
+# kolejne przerwy po 429 z endpointu limitów, osobno dla każdego konta; sukces zeruje licznik
 BACKOFF_STEPS = [120, 240, 480, 900]
 
 MANAGED_SERVICE = "Orca Claude Code Managed Credentials"
@@ -118,6 +127,22 @@ DEFAULT_CONFIG = {
 
 # tryb dobijania: tyle procent w obu oknach wystarczy, żeby konto jeszcze się przydało
 DRAIN_FLOOR = 1
+
+# Ile wolno ufać ostatniemu odczytowi limitów, zanim zapytamy API znowu.
+# Konto, którego nikt nie używa, ma te same liczby co przy odczycie (reset okna liczymy
+# lokalnie, settled): zmienić je może tylko praca gdzie indziej (Depot, `token`, claude.ai)
+IDLE_MAX_AGE = 1800
+# przed przełączeniem kandydata z pamięci czytamy jeszcze raz, czy naprawdę ma zapas
+CONFIRM_MAX_AGE = 90
+# pełne okno zostaje pełne do resetu (full_until), ale Anthropic potrafi odnowić limity
+# przed czasem: tyle (plus do godziny rozrzutu na konto, żeby nie pytać o wszystkie naraz)
+FULL_RECHECK = 3 * 3600
+# Najszybsze spalanie w historii (48 h, 15-25 sesji naraz, 10.2026): ~5% sesji 5h i ~1%
+# tygodnia na minutę. Zapas aktywnego konta ponad próg przełączenia podzielony przez to tempo
+# to czas, w którym konto na pewno progu nie przekroczy (active_max_age)
+PEAK_BURN = {"five_hour": 5.0, "seven_day": 1.0}
+# odczyt aktywnego konta: najczęściej co przebieg automatu (launchd co 120 s), najrzadziej co kwadrans
+ACTIVE_MAX_AGE = (100, 900)
 
 DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
 DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
@@ -543,15 +568,16 @@ def ensure_fresh(account, cfg, force=False):
     return new_json, "token odświeżony"
 
 
-def fetch_usage(access_token):
-    """Odpytanie API o limity, z hamulcem na 429.
+def fetch_usage(access_token, who):
+    """Odpytanie API o limity, z hamulcem na 429 osobno dla każdego konta (who).
 
-    Endpoint limitów jest liczony na adres IP, a osiem kont razy kilka procesów
-    potrafi go zdławić. Po 429 wstrzymujemy zapytania na kwadrans, zamiast
-    dobijać się dalej i przedłużać blokadę.
+    Endpoint limitów dławi pojedyncze konto, a nie cały adres: 8.10 aktywne konto
+    dostawało 429 przez półtorej godziny, a odczyty innych kont w tym czasie przechodziły.
+    Wspólny hamulec oślepiał więc automat na wszystkie konta, a sukces dowolnego z nich
+    zerował licznik, więc zdławione konto i tak dostawało zapytanie co dwie minuty.
     """
-    until = load_state().get("api_backoff_until", 0)
-    if time.time() < until:
+    backoff = load_state().get("api_backoff", {}).get(who) or {}
+    if time.time() < backoff.get("until", 0):
         return 429, None
     status, data = http(USAGE_URL, headers={
         "Authorization": f"Bearer {access_token}",
@@ -560,16 +586,26 @@ def fetch_usage(access_token):
     })
     if status == 429:
         # narastające przerwy: stałe 15 minut oślepiało automat, a API wracało po paru
-        step = min(load_state().get("api_backoff_step", 0), len(BACKOFF_STEPS) - 1)
-        update_state(api_backoff_until=time.time() + BACKOFF_STEPS[step], api_backoff_step=step + 1)
-        log(f"API limitów zwróciło 429, wstrzymuję odpytywanie na {BACKOFF_STEPS[step] // 60} min")
+        step = min(backoff.get("step", 0), len(BACKOFF_STEPS) - 1)
+        state = load_state()
+        state.setdefault("api_backoff", {})[who] = {"until": time.time() + BACKOFF_STEPS[step], "step": step + 1}
+        save_state(state)
+        log(f"API limitów zwróciło 429 dla {who}, wstrzymuję jego odczyty na {BACKOFF_STEPS[step] // 60} min")
     elif status == 200:
         state = load_state()
-        if "api_backoff_until" in state or "api_backoff_step" in state:
+        # api_backoff_until i api_backoff_step to wspólny hamulec ze starszej wersji
+        if who in state.get("api_backoff", {}) or "api_backoff_until" in state or "api_backoff_step" in state:
+            state.get("api_backoff", {}).pop(who, None)
             state.pop("api_backoff_until", None)
             state.pop("api_backoff_step", None)
             save_state(state)
     return status, data
+
+
+def backoff_until(who):
+    """Do kiedy odczyty limitów konta stoją po 429, albo None."""
+    until = (load_state().get("api_backoff", {}).get(who) or {}).get("until")
+    return until if until and until > time.time() else None
 
 
 def settled(data):
@@ -583,20 +619,47 @@ def settled(data):
     return out
 
 
+def full_until(data):
+    """Do kiedy liczby konta są znane bez pytania API, albo None.
+
+    Zużycie w oknie limitu tylko rośnie, aż okno się odnowi. Okno pełne (zapas poniżej
+    DRAIN_FLOOR) zostaje więc pełne do swojego resetu, a z nim całe konto: ani kolejka,
+    ani dobijanie go nie wezmą, cokolwiek odpowiedziałoby API. Dane po settled, więc
+    okno po resecie nie jest już pełne.
+    """
+    full = [w for w in (data.get("five_hour") or {}, data.get("seven_day") or {})
+            if 100 - (w.get("utilization") or 0) < DRAIN_FLOOR]
+    resets = [parse_ts(w.get("resets_at")) for w in full]
+    if not full or None in resets:
+        return None
+    return max(r.timestamp() for r in resets)
+
+
 def cached_usage(account, cfg, max_age=90, refresh=True, stale_ok=None):
-    """Limity z krótką pamięcią podręczną: kilka komend pod rząd nie mnoży zapytań.
+    """Limity z pamięci podręcznej, a z API tylko wtedy, gdy mogły się zmienić.
+
+    max_age mówi, jak długo odczyt wystarcza. Konto z pełnym oknem (full_until) ma do
+    resetu tego okna te same liczby, więc o nie nie pytamy, poza rzadkim sprawdzeniem
+    (FULL_RECHECK). Każdy prawdziwy odczyt trafia do historii: na niej stoi tempo spalania.
 
     Bez odświeżania (panel w pasku menu) przy nieudanym odczycie oddajemy
     ostatnie znane liczby: lepsze stare dane z wiekiem niż pusty wiersz.
     """
     hit = load_json(USAGE_CACHE_PATH, {}).get(account.email)
-    if hit and time.time() - hit["ts"] <= max_age:
-        return settled(hit["data"]), "z pamięci podręcznej"
+    if hit:
+        known, age = settled(hit["data"]), time.time() - hit["ts"]
+        if age <= max_age:
+            return known, "z pamięci podręcznej"
+        until = full_until(known)
+        recheck = FULL_RECHECK + int(hashlib.sha256(account.email.encode()).hexdigest()[:8], 16) % 3600
+        if until and age <= recheck:
+            return known, f"z pamięci podręcznej, pełne okno do {clock(until)}"
     data, note = usage(account, cfg, refresh)
     if data:
         cache = load_json(USAGE_CACHE_PATH, {})
         cache[account.email] = {"ts": time.time(), "data": data}
         write_json(USAGE_CACHE_PATH, cache)
+        record_history(account.email, data)
         return data, note
     if hit and (not refresh if stale_ok is None else stale_ok):
         return settled(hit["data"]), f"dane z pamięci ({note})"
@@ -623,12 +686,12 @@ def usage(account, cfg, refresh=True):
         oauth = oauth_of(creds_json)
         if not oauth.get("accessToken") or oauth.get("expiresAt", 0) <= time.time() * 1000:
             return None, "token wygasł, odświeży się przy przełączeniu"
-    status, data = fetch_usage(oauth_of(creds_json)["accessToken"])
+    status, data = fetch_usage(oauth_of(creds_json)["accessToken"], account.email)
     if status == 401 and refresh:
         creds_json, note = ensure_fresh(account, cfg, force=True)
         if not creds_json:
             return None, note
-        status, data = fetch_usage(oauth_of(creds_json)["accessToken"])
+        status, data = fetch_usage(oauth_of(creds_json)["accessToken"], account.email)
     if status != 200 or not data:
         return None, f"odczyt limitów nieudany (HTTP {status})"
     clear_needs_login(account)  # token odpowiedział, więc stary znacznik martwego tokenu kłamie
@@ -638,6 +701,33 @@ def usage(account, cfg, refresh=True):
 def headroom(data):
     """Ile zostało: (sesja 5h, tydzień), w procentach."""
     return 100 - data["five_hour"]["utilization"], 100 - data["seven_day"]["utilization"]
+
+
+def left_note(data):
+    session_left, weekly_left = headroom(data)
+    return f"zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji"
+
+
+def has_room(data, cfg):
+    """Zapas, z jakim automat bierze konto (i z jakim zdejmuje pauzę)."""
+    session_left, weekly_left = headroom(data)
+    return weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]
+
+
+def active_max_age(account, cfg):
+    """Jak długo ostatni odczyt aktywnego konta wystarcza automatowi i panelowi.
+
+    Zapas ponad próg przełączenia przy najszybszym znanym spalaniu (PEAK_BURN) daje czas,
+    w którym konto na pewno progu nie przekroczy. Daleko od progu (noc, świeże okno) to
+    kwadrans, blisko progu każdy przebieg automatu, jak dotąd.
+    """
+    hit = load_json(USAGE_CACHE_PATH, {}).get(account.email)
+    if not hit:
+        return ACTIVE_MAX_AGE[0]
+    session_left, weekly_left = headroom(settled(hit["data"]))
+    minutes = min((session_left - cfg["hard_session_left"]) / PEAK_BURN["five_hour"],
+                  (weekly_left - cfg["hard_weekly_left"]) / PEAK_BURN["seven_day"])
+    return int(min(max(minutes * 60, ACTIVE_MAX_AGE[0]), ACTIVE_MAX_AGE[1]))
 
 
 def profile_request(access_token):
@@ -813,12 +903,17 @@ def find_active(accounts, cfg):
         if not live.get("accessToken"):
             continue
         for a in accounts:
-            stored = a.seen_oauth
-            if stored.get("refreshToken") == live.get("refreshToken") or stored.get("accessToken") == live.get("accessToken"):
+            if same_login(a.seen_oauth, live):
                 return a
     # sesja odświeżyła token po ostatniej kopii: tokeny nie pasują do żadnej kopii,
     # więc właściciela mówi API profilu
     return owner_of(freshest_runtime(cfg), accounts)
+
+
+def same_login(stored, live):
+    """Czy kopia konta i wpis runtime to ta sama para tokenów (wystarczy jeden z nich). Pusty
+    token nie pasuje do pustego: kopia bez refresh tokenu nie może przejąć cudzego wpisu."""
+    return any(stored.get(k) and stored.get(k) == live.get(k) for k in ("refreshToken", "accessToken"))
 
 
 def owner_of(creds_json, accounts):
@@ -993,7 +1088,7 @@ def cmd_heal(cfg, args):
     for service, raw in pool.items():
         if not raw:
             continue
-        status, data = fetch_usage(oauth_of(raw)["accessToken"])
+        status, data = fetch_usage(oauth_of(raw)["accessToken"], service)
         if status != 200 or not data:
             continue
         mark = fingerprint(data)
@@ -1045,13 +1140,10 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
         if not data:
             rows.append({"account": a, "data": None, "why": note, "usable": False, "error": True})
             continue
-        session_left, weekly_left = headroom(data)
-        usable = weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]
-        why = f"zostało {weekly_left:.0f}% tygodnia, {session_left:.0f}% sesji"
         remember_fingerprint(a.email, data)
         rows.append({
-            "account": a, "data": data, "usable": usable, "error": False,
-            "why": why, "rank": rank(a, data, cfg),
+            "account": a, "data": data, "usable": has_room(data, cfg), "error": False,
+            "why": left_note(data), "rank": rank(a, data, cfg),
         })
     return rows
 
@@ -1078,6 +1170,18 @@ def drain_queue(rows):
     return sorted(scraps, key=lambda r: (r["rank"][0], -min(headroom(r["data"]))))
 
 
+def confirmed(rows, cfg, fits):
+    """Pierwszy z kolejki, którego świeży odczyt nadal spełnia fits(data), albo None.
+
+    Kolejka automatu stoi na odczytach z pamięci (do IDLE_MAX_AGE), więc zanim na
+    kogoś przełączymy, czytamy tylko to jedno konto jeszcze raz, zamiast wszystkich
+    co dwie minuty. Gdy API milczy (429, sieć), decyduje ostatni znany odczyt.
+    """
+    for row in rows:
+        data, _ = cached_usage(row["account"], cfg, max_age=CONFIRM_MAX_AGE, stale_ok=True)
+        if data and fits(data):
+            return dict(row, data=data, why=left_note(data))
+    return None
 
 
 # ---------- Depot: token sandboxów `depot claude` ----------
@@ -1124,10 +1228,8 @@ def depot_sync(accounts, cfg, active, force=False):
     if current and not force and (not active or current.id != active.id) \
             and state.get("depot_expires_at", 0) - now > min_valid:
         data, _ = cached_usage(current, cfg, max_age=600, refresh=False)
-        if data:
-            session_left, weekly_left = headroom(data)
-            if weekly_left >= cfg["min_weekly_left"] and session_left >= cfg["min_session_left"]:
-                return current.email  # konto sandboxów niesie, token ważny: nic do roboty
+        if data and has_room(data, cfg):
+            return current.email  # konto sandboxów niesie, token ważny: nic do roboty
 
     rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
     for row in rows:
@@ -1216,28 +1318,33 @@ def credits_summary():
         return None
 
 
-def snapshot(cfg):
-    """Stan wszystkich kont w jednym słowniku. To czyta aplikacja w pasku menu."""
-    accounts = load_accounts()
+def snapshot(cfg, accounts=None):
+    """Stan wszystkich kont w jednym słowniku. To czyta aplikacja w pasku menu.
+
+    Tick podaje konta wczytane w tym samym przebiegu, w którym zsynchronizował już
+    aktywne: druga runda odczytów Pęku kluczy sekundę później niczego by nie zmieniła.
+    """
+    synced = accounts is not None
+    accounts = load_accounts() if accounts is None else accounts
     active = find_active(accounts, cfg)
     # aplikacja pyta co minutę, więc nie odświeża żadnych tokenów (to robią sesje
-    # i automat), a świeże limity bierze tylko dla aktywnego konta; reszta z
-    # pamięci do 10 minut, bo endpoint limitów dławi 429 i blokuje wtedy automat
+    # i automat), a świeże limity bierze tylko dla aktywnego konta, tak często jak
+    # automat (active_max_age); reszta z pamięci do pół godziny, pełne konta do resetu
     orca = orca_selected(accounts)
-    if active and not orca:  # przy koncie wybranym w Orca niczego nie zapisujemy
+    if active and not orca and not synced:  # przy koncie wybranym w Orca niczego nie zapisujemy
         sync_back(active, cfg)
     if active:
-        cached_usage(active, cfg, max_age=120, refresh=False)
+        cached_usage(active, cfg, max_age=active_max_age(active, cfg), refresh=False)
     # Tokeny, które może trzymać jakaś sesja, zostają nietknięte. Konto, którego
     # token leży tylko w kopii Orca, odświeżamy: nikt inny go nie używa, a bez
     # tego panel pokazywał dane sprzed kilkunastu godzin.
     held = {oauth_of(kc_read(s, KEYCHAIN_USER)).get("refreshToken") for s in runtime_services(cfg)}
     idle = lambda a: not orca and a.seen_oauth.get("refreshToken") not in held
-    rows = survey(accounts, cfg, max_age=1800, refresh=idle)
+    rows = survey(accounts, cfg, max_age=IDLE_MAX_AGE, refresh=idle)
     if active and all(r["account"].id != active.id for r in rows):
         # konto z listy "never" też bywa aktywne (np. wybrane ręcznie): pokazujemy je,
         # tylko automat nigdy na nie nie przełącza
-        rows += survey([active], dict(cfg, never=[]), max_age=120, refresh=False)
+        rows += survey([active], dict(cfg, never=[]), max_age=active_max_age(active, cfg), refresh=False)
         rows[-1]["usable"] = False
     cache = load_json(USAGE_CACHE_PATH, {})
     order = {r["account"].id: i for i, r in enumerate(queue(rows), 1)}
@@ -1266,6 +1373,8 @@ def snapshot(cfg):
             "session": window_view(data.get("five_hour")) if data else None,
             "weekly": window_view(data.get("seven_day")) if data else None,
             "data_age": int(now - hit["ts"]) if hit and data else None,
+            # pełne okno: liczby są aktualne bez odczytu aż do tego resetu, więc ich wiek nie jest wadą
+            "full_until": full_until(data) if data else None,
             # API podaje tylko start subskrypcji, więc to miesięczna rocznica, nie data z rachunku
             "renews_at": renewal.timestamp() if renewal else None,
             "subscription_status": who.get("status"),
@@ -1284,7 +1393,8 @@ def snapshot(cfg):
         "thresholds": {"session_left": cfg["hard_session_left"], "weekly_left": cfg["hard_weekly_left"]},
         "forecast": forecast(active_row["data"], read_history(active.email, 60, cfg["history_keep_hours"]), cfg)
         if active_row else None,
-        "api_backoff_until": state.get("api_backoff_until"),
+        # hamulec 429 aktywnego konta: to on wstrzymuje automat
+        "api_backoff_until": backoff_until(active.email) if active else None,
         "last_tick": state.get("last_tick"),
         "switched_at": state.get("switched_at"),
         "orca_selected": orca,
@@ -1361,7 +1471,84 @@ def cmd_plan(cfg, _args):
     return 0
 
 
-def cmd_who(cfg, _args):
+WHO_SETTLE_S = 2.0  # przełączenie pisze dwa wpisy po kolei (~35 ms każdy); dłużej to nie przełączenie
+
+
+def who_now(cfg):
+    """Konto, którego token leży teraz we wpisach runtime Claude Code (`who --json`), dla procesów,
+    które przed każdym wywołaniem modelu sprawdzają, na czyim koncie pracują (Polid).
+
+    Bez sieci, bez blokady przebiegu i bez pamięci, która po przełączeniu kłamie: liczą się tylko
+    tokeny we wpisach i w kopiach kont Orca. Stan (`active_email` z ostatniego przełączenia) mówi
+    tylko, którą kopię sprawdzić najpierw; gdy nie pasuje, sprawdzamy wszystkie. Przełączenie pisze wpisy runtime po kolei, więc
+    przez chwilę każdy trzyma inne konto: wtedy czytamy jeszcze raz, najwyżej WHO_SETTLE_S.
+
+    {"email", "real_email", "id", "source": "keychain"} albo z "email": None i "reason":
+    no_login (pusty wpis), unknown_token (token spoza kopii Orca: logowanie spoza Orca albo sesja
+    odświeżyła go po ostatniej synchronizacji, którą tick robi co 2 min), switching."""
+    deadline = time.time() + WHO_SETTLE_S
+    while True:
+        out = who_once(cfg)
+        if out.get("reason") != "switching" or time.time() >= deadline:
+            return out
+        _KC_SEEN.clear()
+        time.sleep(0.1)
+
+
+def who_once(cfg):
+    services = live_services(cfg)
+    state = load_state()
+    accounts = orca_accounts()
+    hint = next((a for a in accounts if a.email == state.get("active_email")), None)
+    # wpisy runtime i kopia konta z podpowiedzi naraz: jeden odczyt Pęku kluczy trwa ~35 ms
+    kc_read_many([(s, KEYCHAIN_USER) for s in services] + ([(MANAGED_SERVICE, hint.id)] if hint else []))
+    live = {s: oauth_of(_KC_SEEN.get((s, KEYCHAIN_USER))) for s in services}
+    live = {s: o for s, o in live.items() if o.get("accessToken")}
+
+    def nobody(reason, detail):
+        return {"email": None, "real_email": None, "id": None, "source": "keychain", "reason": reason,
+                "detail": detail}
+
+    if not live:
+        return nobody("no_login", "no Claude Code login in the keychain")
+    owners, read_all = {}, False
+    for service, oauth in live.items():
+        owner = hint if hint and same_login(hint.seen_oauth, oauth) else None
+        if owner is None:
+            if not read_all:
+                kc_read_many((MANAGED_SERVICE, a.id) for a in accounts if (MANAGED_SERVICE, a.id) not in _KC_SEEN)
+                read_all = True
+            owner = next((a for a in accounts if same_login(a.seen_oauth, oauth)), None)
+        if owner is None:
+            return nobody("unknown_token", f"the token in {service} matches no Orca account: a login outside "
+                                           "Orca, or a session refreshed it after the last sync (claude-acc "
+                                           "tick syncs it every 2 minutes)")
+        owners[service] = owner
+    if len({a.id for a in owners.values()}) > 1:
+        return nobody("switching", "the Claude Code entries hold different accounts: "
+                                   + ", ".join(f"{a.email} in {s}" for s, a in owners.items()))
+    account = next(iter(owners.values()))
+    real = ((state.get("identity") or {}).get(account.id) or {}).get("email")
+    return {"email": account.email, "real_email": real, "id": account.id, "source": "keychain"}
+
+
+def orca_accounts():
+    """Konta Orca z ich plików, bez odczytu Pęku kluczy (ten robi load_accounts dla wszystkich)."""
+    found = []
+    for acct_id in sorted(os.listdir(ACCOUNTS_DIR)) if os.path.isdir(ACCOUNTS_DIR) else []:
+        try:
+            with open(os.path.join(ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json")) as f:
+                found.append(Account(acct_id, json.load(f).get("emailAddress")))
+        except (OSError, ValueError):
+            pass
+    return found
+
+
+def cmd_who(cfg, args):
+    if args and args[0] == "--json":
+        out = who_now(cfg)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out["email"] else 1
     lock = take_lock(wait=25)
     if not lock:
         print("inny przebieg trwa zbyt długo, spróbuj za chwilę")
@@ -1536,12 +1723,14 @@ def active_usage(account, cfg):
     oauth = account.oauth
     expired_for = time.time() - oauth.get("expiresAt", 0) / 1000
     if expired_for > IDLE_REFRESH_AFTER:
-        return cached_usage(account, cfg, max_age=60)
+        return cached_usage(account, cfg, max_age=active_max_age(account, cfg))
     if expired_for > 0:
         return None, "token właśnie wygasł, czekam, aż odświeży go sesja"
-    # stare liczby z pamięci nie mogą decydować o przełączeniu, więc stale_ok=False
-    data, note = cached_usage(account, cfg, max_age=60, refresh=False, stale_ok=False)
-    if data or check(account.creds_json) != 401:
+    # stare liczby z pamięci nie mogą decydować o przełączeniu, więc stale_ok=False;
+    # odczyt w pamięci starczy, póki konto nie mogło dojść do progu (active_max_age)
+    data, note = cached_usage(account, cfg, max_age=active_max_age(account, cfg), refresh=False, stale_ok=False)
+    # w trakcie hamulca 429 nikt nie pytał API o limity, więc nie ma czego sprawdzać w profilu
+    if data or backoff_until(account.email) or check(account.creds_json) != 401:
         return data, note
     sync_back(account, cfg)  # sesja mogła odświeżyć token między odczytami
     if check(account.creds_json) == 401:
@@ -1727,6 +1916,22 @@ def cmd_tick(cfg, _args):
         # pauza wyłączona w config.json w trakcie epizodu: sesje budzą się, gdy plik znika
         log("pauza limitów wyłączona w konfiguracji, sesje wznawiają pracę")
     accounts = load_accounts()
+    try:
+        return tick(cfg, accounts)
+    finally:
+        save_status(cfg, accounts)
+
+
+def save_status(cfg, accounts):
+    """Migawka dla aplikacji w pasku menu, jeszcze pod blokadą ticku. Jej błąd nie może
+    przesłonić wyniku ticku: aplikacja przy starym pliku sama uruchomi `status --json`."""
+    try:
+        write_json(STATUS_PATH, snapshot(cfg, accounts))
+    except Exception as err:
+        log(f"tick: zapis migawki nieudany: {err}")
+
+
+def tick(cfg, accounts):
     if not accounts:
         return 1
     orca = orca_selected(accounts)
@@ -1774,21 +1979,24 @@ def cmd_tick(cfg, _args):
         reason = f"{active.email}: token nie działa"
         carries = roomy = False
     else:
-        record_history(active.email, data)
         session_left, weekly_left = headroom(data)
         reason = f"{active.email}: tydzień {weekly_left:.0f}%, sesja {session_left:.0f}%"
         carries = session_left > cfg["hard_session_left"] and weekly_left > cfg["hard_weekly_left"]
         # pauzę zdejmujemy dopiero przy zapasie, z jakim automat bierze konto, a nie
         # tuż nad progiem porzucenia: inaczej sesje budziłyby się na minutę
-        roomy = session_left >= cfg["min_session_left"] and weekly_left >= cfg["min_weekly_left"]
+        roomy = has_room(data, cfg)
     if roomy:
         end_pause(f"{active.email} ma znowu zapas")
         return 0
     paused = os.path.exists(PAUSE_PATH)
     if carries and not paused:
         return 0  # konto jeszcze niesie, nie ruszamy go
-    rows = survey(accounts, cfg, exclude_id=active.id)
-    candidates = queue(rows)
+    # Kolejka z pamięci, a świeży odczyt tylko dla konta, na które naprawdę przechodzimy:
+    # w pauzie i przy dobijaniu automat czytał wszystkie konta co dwie minuty, a zapas
+    # nieużywanego konta wraca dopiero z resetem okna, który settled liczy lokalnie
+    rows = survey(accounts, cfg, exclude_id=active.id, max_age=IDLE_MAX_AGE)
+    pick = confirmed(queue(rows), cfg, lambda d: has_room(d, cfg))
+    candidates = [pick] if pick else []
     if candidates and carries:
         # trwa pauza, a inne konto odżyło: aktywne jeszcze niesie, więc zostaje,
         # sesje wracają do pracy, a przełączenie przyjdzie przy progu jak zwykle
@@ -1798,10 +2006,10 @@ def cmd_tick(cfg, _args):
         if not dead and min(headroom(data)) >= DRAIN_FLOOR:
             keep_draining(reason)  # aktywne konto pracuje do ostatniego procenta
             return 0
-        scraps = drain_queue(rows)
-        if scraps:
-            target = scraps[0]["account"]
-            switch_to(target, cfg, f"{reason}; dobijanie, {scraps[0]['why']}")
+        scrap = confirmed(drain_queue(rows), cfg, lambda d: min(headroom(d)) >= DRAIN_FLOOR)
+        if scrap:
+            target = scrap["account"]
+            switch_to(target, cfg, f"{reason}; dobijanie, {scrap['why']}")
             keep_draining(reason)  # Depot bierze tylko konta z zapasem, więc resztek nie dotyka
             return 0
     if not candidates:

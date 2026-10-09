@@ -24,6 +24,8 @@ FAKES = os.path.join(HERE, "fakes")
 USER = "tester"
 MANAGED = "Orca Claude Code Managed Credentials"
 BASE = "Claude Code-credentials"
+# dłużej niż pół godziny, przez które automat i panel ufają odczytom kont bez pracy
+PAST_IDLE = 31 * 60
 
 
 def scoped(config_dir):
@@ -156,6 +158,22 @@ class Env:
         path = os.path.join(self.state_dir, "usage-cache.json")
         if os.path.exists(path):
             os.remove(path)
+
+    def age_usage_cache(self, seconds, **windows):
+        """Mija czas: odczyty w pamięci są o tyle starsze. windows (email -> {okno: pola})
+        zmienia zapamiętane okna, np. reset, który już minął."""
+        path = os.path.join(self.state_dir, "usage-cache.json")
+        cache = json.load(open(path))
+        for email, hit in cache.items():
+            hit["ts"] -= seconds
+            for key, fields in windows.get(email.replace("@", "_"), {}).items():
+                hit["data"][key].update(fields)
+        json.dump(cache, open(path, "w"))
+
+    def history(self, email):
+        path = os.path.join(self.state_dir, "history.jsonl")
+        rows = [json.loads(line) for line in open(path)] if os.path.exists(path) else []
+        return [r for r in rows if r["email"] == email]
 
     # --- odczyt ---
 
@@ -338,6 +356,29 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(sorted(emails), ["a@x", "b@x"])
         self.assertEqual(w.calls("/v1/oauth/token"), [])
 
+    def test_tick_leaves_the_app_what_status_json_prints(self):
+        # przy zamkniętym panelu aplikacja czyta migawkę z ticku, zamiast co minutę
+        # uruchamiać `status --json`, więc obie muszą mówić to samo, także po przełączeniu
+        w = Env()
+        a = w.account("a@x", session_used=99)
+        w.account("b@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+
+        self.assertEqual(w.run("tick").returncode, 0)
+        saved = json.load(open(os.path.join(w.state_dir, "status.json")))
+        r = w.run("status", "--json")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        printed = json.loads(r.stdout)
+        self.assertEqual(saved["active_email"], "b@x")
+        self.assertEqual(saved["last_tick"], w.saved_state()["last_tick"])
+        for snap in (saved, printed):  # zegar i wiek danych płyną między przebiegami
+            snap.pop("generated_at")
+            for row in snap["accounts"]:
+                row.pop("data_age")
+        self.assertEqual(saved, printed)
+
 
 class PanelFreshnessTest(unittest.TestCase):
     def test_status_json_refreshes_idle_account_only_orca_holds(self):
@@ -365,21 +406,47 @@ class PanelFreshnessTest(unittest.TestCase):
         w.server["rate_limited"] = True
         w.write()
 
+        def lift_until():
+            # mija czas hamulca, licznik kroków zostaje
+            state = w.saved_state()
+            state["api_backoff"]["a@x"]["until"] = 0
+            w.state(api_backoff=state["api_backoff"])
+
+        snap = json.loads(w.run("status", "--json").stdout)
+        first = w.saved_state()["api_backoff"]["a@x"]["until"] - time.time()
+        lift_until()
         w.run("status", "--json")
-        first = w.saved_state()["api_backoff_until"] - time.time()
-        w.state(api_backoff_until=0)
-        w.run("status", "--json")
-        second = w.saved_state()["api_backoff_until"] - time.time()
-        server = json.load(open(os.path.join(w.fake, "server.json")))
-        server["rate_limited"] = False
-        json.dump(server, open(os.path.join(w.fake, "server.json"), "w"))
-        w.state(api_backoff_until=0)
+        second = w.saved_state()["api_backoff"]["a@x"]["until"] - time.time()
+        w.set_usage("a@x", rate_limited=False)
+        lift_until()
         w.run("status", "--json")
 
         self.assertAlmostEqual(first, 120, delta=15)
+        self.assertAlmostEqual(snap["api_backoff_until"] - time.time(), 120, delta=15)
         self.assertAlmostEqual(second, 240, delta=15)
-        self.assertNotIn("api_backoff_until", w.saved_state())
-        self.assertNotIn("api_backoff_step", w.saved_state())
+        self.assertNotIn("a@x", w.saved_state()["api_backoff"])
+
+    def test_rate_limited_account_does_not_blind_the_others(self):
+        # 8.10 aktywne konto dostawało 429 przez półtorej godziny, a inne konta odpowiadały:
+        # wspólny hamulec zostawiał panel i automat bez liczb wszystkich kont, a sukces
+        # innego konta zerował go, więc zdławione dostawało zapytanie co dwie minuty
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=42)
+        w.runtime(a)
+        w.server["rate_limited_accounts"] = ["a@x"]
+        w.write()
+
+        snap = json.loads(w.run("status", "--json").stdout)
+        w.age_usage_cache(PAST_IDLE)
+        w.run("status", "--json")
+
+        b = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(b["weekly"]["used"], 42)
+        self.assertEqual(b["status"], "ok")
+        self.assertIn("a@x", w.saved_state()["api_backoff"])  # sukces b@x nie zdjął hamulca a@x
+        # a@x raz, b@x dwa razy: drugi odczyt a@x stoi za hamulcem
+        self.assertEqual(len(w.calls("/api/oauth/usage")), 3)
 
     def test_status_json_stops_polling_usage_of_canceled_subscription(self):
         # API limitów odpowiada anulowanemu kontu 403, a panel pytał o nie co minutę,
@@ -419,6 +486,153 @@ class PanelFreshnessTest(unittest.TestCase):
         self.assertTrue(row["usable"])
         self.assertIsNotNone(row["queue"])
         self.assertEqual(row["weekly"]["used"], 20)
+
+
+class UsageTrafficTest(unittest.TestCase):
+    """Ile zapytań idzie do API limitów. Liczby, które da się policzyć lokalnie (pełne okno
+    do resetu, konto bez pracy, aktywne konto daleko od progu), nie idą do sieci."""
+
+    def usage_calls(self, w):
+        return len(w.calls("/api/oauth/usage"))
+
+    def active(self, w):
+        token = w.entry(BASE)["claudeAiOauth"]["accessToken"]
+        return next(e for e in w.ids if w.managed(e)["claudeAiOauth"]["accessToken"] == token)
+
+    def test_full_account_is_not_read_again_until_its_window_resets(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=100)
+        w.runtime(a)
+        w.write()
+        w.run("status", "--json")
+        before = self.usage_calls(w)
+
+        w.age_usage_cache(2 * 3600)
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        # dwie godziny później pyta tylko o a@x: tydzień b@x jest pełny do resetu za 3 dni
+        self.assertEqual(self.usage_calls(w) - before, 1)
+        b = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(b["weekly"]["used"], 100)
+        self.assertAlmostEqual(b["full_until"], time.time() + 3 * 86400, delta=120)
+        self.assertGreater(b["data_age"], 2 * 3600 - 60)
+        self.assertIsNone(next(x for x in snap["accounts"] if x["email"] == "a@x")["full_until"])
+
+    def test_full_account_is_still_checked_every_few_hours(self):
+        # Anthropic potrafi odnowić limity przed czasem: pełne konto nie może zniknąć na tydzień
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=100)
+        w.runtime(a)
+        w.write()
+        w.run("status", "--json")
+        w.set_usage("b@x", weekly_used=0)
+        before = self.usage_calls(w)
+
+        w.age_usage_cache(5 * 3600)
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(self.usage_calls(w) - before, 2)
+        self.assertEqual(next(x for x in snap["accounts"] if x["email"] == "b@x")["weekly"]["used"], 0)
+
+    def test_pause_reads_only_the_active_account_until_a_full_one_resets(self):
+        w = configure(Env(), limit_pause=True)
+        a = w.account("a@x", session_used=97, weekly_used=40)
+        w.account("b@x", weekly_used=100)
+        w.runtime(a)
+        w.write()
+        w.run("tick")
+        self.assertIsNotNone(w.pause())
+
+        # dwie godziny pauzy: b@x pełne do resetu tygodnia, więc pytamy tylko o a@x
+        before = self.usage_calls(w)
+        w.age_usage_cache(2 * 3600)
+        w.run("tick")
+        self.assertEqual(self.usage_calls(w) - before, 1)
+        self.assertIsNotNone(w.pause())
+
+        # tydzień b@x się odnawia: kolejka liczy to z resetu w pamięci, odczyt potwierdza
+        w.set_usage("b@x", weekly_used=0)
+        past = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() - 60))
+        w.age_usage_cache(200, b_x={"seven_day": {"resets_at": past}})
+        w.run("tick")
+
+        self.assertIsNone(w.pause())
+        self.assertEqual(self.active(w), "b@x")
+
+    def test_tick_reads_only_the_account_it_switches_to(self):
+        w = Env()
+        a = w.account("a@x", session_used=50)
+        for email, used in (("b@x", 20), ("c@x", 30), ("d@x", 40)):
+            w.account(email, weekly_used=used)
+        w.runtime(a)
+        w.write()
+        w.run("status", "--json")
+        w.set_usage("a@x", session_used=97)
+        before = self.usage_calls(w)
+
+        w.age_usage_cache(600)
+        w.run("tick")
+
+        self.assertEqual(self.active(w), "b@x")
+        self.assertEqual(self.usage_calls(w) - before, 2)  # a@x i b@x, bez c@x i d@x
+
+    def test_switch_skips_a_candidate_burned_since_its_last_read(self):
+        # w pamięci b@x ma najwięcej zapasu, ale od odczytu spaliły je sandboxy Depot
+        w = Env()
+        a = w.account("a@x", session_used=50)
+        w.account("b@x", weekly_used=20)
+        w.account("c@x", weekly_used=30)
+        w.runtime(a)
+        w.write()
+        w.run("status", "--json")
+        w.set_usage("a@x", session_used=97)
+        w.set_usage("b@x", weekly_used=100)
+
+        w.age_usage_cache(600)
+        w.run("tick")
+
+        self.assertEqual(self.active(w), "c@x")
+
+    def test_active_account_far_from_threshold_is_read_less_often(self):
+        # 90% sesji zapasu: nawet najszybsze spalanie (5%/min) nie dojdzie do progu w 5 minut
+        w = Env()
+        a = w.account("a@x", session_used=10)
+        w.runtime(a)
+        w.write()
+        w.run("tick")
+
+        w.age_usage_cache(300)
+        w.run("tick")
+        w.run("status", "--json")
+
+        self.assertEqual(self.usage_calls(w), 1)
+
+    def test_active_account_near_threshold_is_read_every_tick(self):
+        # 12% sesji przy progu 5%: przy najszybszym spalaniu to półtorej minuty
+        w = Env()
+        a = w.account("a@x", session_used=88)
+        w.runtime(a)
+        w.write()
+        w.run("tick")
+
+        w.age_usage_cache(120)
+        w.run("tick")
+
+        self.assertEqual(self.usage_calls(w), 2)
+
+    def test_history_holds_only_real_reads(self):
+        # odczyt z pamięci zapisany jako nowa próbka spłaszczał tempo spalania w prognozie
+        w = Env()
+        a = w.account("a@x", session_used=10)
+        w.runtime(a)
+        w.write()
+
+        w.run("tick")
+        w.run("tick")
+
+        self.assertEqual(len(w.history("a@x")), 1)
 
 
 class TickTest(unittest.TestCase):
@@ -635,6 +849,103 @@ class DepotTest(unittest.TestCase):
 
 
 TOKEN_FALLBACK = "Claude Acc token fallback"
+
+
+class WhoJsonTest(unittest.TestCase):
+    """`who --json`: e-mail konta, którego token leży teraz we wpisach Claude Code. Polid pyta o to
+    przed i po każdym wywołaniu modelu (sprawy prywatne tylko na koncie Filipa), więc odpowiedź ma
+    być szybka, bez sieci, bez czekania na blokadę przebiegu i bez pamięci, która po przełączeniu
+    kłamie (`status --json` trwał 0,4-4,2 s, `who` czekał na blokadę do 25 s)."""
+
+    def who(self, w, **extra):
+        r = w.run("who", "--json", **extra)
+        return r.returncode, json.loads(r.stdout)
+
+    def test_names_the_account_in_the_entry_without_network_lock_or_stale_state(self):
+        import fcntl
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.state(active_email="b@x")  # stan sprzed przełączenia w Orca: tylko podpowiedź
+        w.write()
+        # inny przebieg (tick, status) trzyma blokadę: who --json na nią nie czeka
+        lock = open(os.path.join(w.state_dir, "lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+
+        start = time.time()
+        code, got = self.who(w)
+
+        self.assertLess(time.time() - start, 5)
+        self.assertEqual((code, got), (0, {"email": "a@x", "id": w.ids["a@x"], "real_email": None,
+                                           "source": "keychain"}))
+        self.assertEqual(json.load(open(os.path.join(w.fake, "server.json")))["log"], [])  # bez sieci
+        self.assertEqual({c for c, _ in w.keychain_calls()}, {"find-generic-password"})  # tylko odczyt
+
+    def test_follows_a_switch_and_reports_the_real_email(self):
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x")
+        w.runtime(a)
+        w.write()
+        self.assertEqual(w.run("switch", "b@x").returncode, 0)
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()), "email": "real-b@x"}})
+        w.forget_keychain_calls()
+
+        code, got = self.who(w)
+
+        self.assertEqual((code, got["email"], got["real_email"]), (0, "b@x", "real-b@x"))
+        # oba wpisy runtime i kopia konta z ostatniego przełączenia; kopii pozostałych kont nie czyta
+        self.assertEqual(sorted(k for _, k in w.keychain_calls()),
+                         sorted([f"{BASE}|{USER}", f"{scoped(w.config_dir)}|{USER}", f"{MANAGED}|{w.ids['b@x']}"]))
+
+    def test_unknown_token_or_no_login_gives_no_email(self):
+        w = Env()
+        w.account("a@x")
+        w.runtime({"claudeAiOauth": {"accessToken": "at-foreign", "refreshToken": "rt-foreign",
+                                     "expiresAt": int((time.time() + 3600) * 1000)}})
+        w.write()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "unknown_token"))
+
+        w = Env()
+        w.account("a@x")
+        w.write()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "no_login"))
+
+        # kopia i obcy wpis bez refresh tokenu: brak tokenu po obu stronach to nie ta sama para
+        w = Env()
+        w.account("a@x")
+        copy = json.loads(w.keychain[f"{MANAGED}|{w.ids['a@x']}"])
+        del copy["claudeAiOauth"]["refreshToken"]
+        w.keychain[f"{MANAGED}|{w.ids['a@x']}"] = json.dumps(copy)
+        w.runtime({"claudeAiOauth": {"accessToken": "at-foreign", "expiresAt": int((time.time() + 3600) * 1000)}})
+        w.write()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "unknown_token"))
+
+    def test_entries_holding_different_accounts_are_never_reported_as_one(self):
+        # przełączenie pisze wpisy po kolei: przez chwilę każdy trzyma inne konto
+        w = Env()
+        a = w.account("a@x")
+        b = w.account("b@x")
+        w.runtime(a, services=[BASE])
+        w.runtime(b, services=[scoped(w.config_dir)])
+        w.write()
+        start = time.time()
+        code, got = self.who(w)
+        self.assertEqual((code, got["email"], got["reason"]), (1, None, "switching"))
+        self.assertLess(time.time() - start, 5)  # czeka chwilę, aż przełączenie się skończy, nie dłużej
+        # przełączenie kończy się w trakcie czekania: odpowiedź to konto po przełączeniu
+        p = w.spawn("who", "--json")
+        time.sleep(0.5)
+        keychain = json.load(open(os.path.join(w.fake, "keychain.json")))
+        keychain[f"{BASE}|{USER}"] = json.dumps(b)
+        json.dump(keychain, open(os.path.join(w.fake, "keychain.json"), "w"))
+        out, _ = p.communicate(timeout=30)
+        self.assertEqual((p.returncode, json.loads(out)["email"]), (0, "b@x"))
 
 
 class TokenTest(unittest.TestCase):

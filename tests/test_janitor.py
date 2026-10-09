@@ -162,6 +162,48 @@ class JanitorTest(unittest.TestCase):
         self.assertTrue(self.env.exists("fresh/.next"))
         self.assertTrue(self.env.exists("idle/package.json"))
 
+    def turbopack_app(self, name, cache_days, dev_cache_days, build_days=2):
+        """Build Next 16 z trwałym cache Turbopacka w .next/cache i .next/dev/cache."""
+        self.env.file(f"{name}/package.json", OLD, "{}")
+        for rel in ("BUILD_ID", "server/app/page.js", "static/chunks/a.js", "dev/server/page.js", "dev/lock"):
+            self.env.file(f"{name}/.next/{rel}", build_days)
+        self.env.file(f"{name}/.next/cache/turbopack/v1/00001.sst", cache_days)
+        self.env.file(f"{name}/.next/cache/fetch-cache/f.json", cache_days)
+        self.env.file(f"{name}/.next/dev/cache/turbopack/v1/00001.sst", dev_cache_days)
+
+    def test_idle_next_keeps_recent_turbopack_cache(self):
+        """2026-10-09: Turbopack trzyma cache buildu w .next/cache, a nowe worktree się z niego
+        rozgrzewają. Build po 24 godzinach idzie, cache zostaje do cache_idle_days."""
+        self.turbopack_app("web", cache_days=2, dev_cache_days=2)
+        self.env.sweep()
+        for rel in ("BUILD_ID", "server", "static", "dev/server", "dev/lock"):
+            self.assertFalse(self.env.exists(f"web/.next/{rel}"), rel)
+        self.assertTrue(self.env.exists("web/.next/cache/turbopack/v1/00001.sst"))
+        self.assertTrue(self.env.exists("web/.next/cache/fetch-cache/f.json"))
+        self.assertTrue(self.env.exists("web/.next/dev/cache/turbopack/v1/00001.sst"))
+        self.assertIn("next", self.env.state()["task_runs"])
+        self.assertGreater(self.env.state()["last_sweep"]["freed"], 0)
+        self.env.sweep()  # zostały same cache: kolejny przebieg ich nie rusza
+        self.assertTrue(self.env.exists("web/.next/cache/turbopack/v1/00001.sst"))
+        self.assertTrue(self.env.exists("web/.next/dev/cache/turbopack/v1/00001.sst"))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.env.work, "web/.next/dev"))), ["cache"])
+
+    def test_turbopack_cache_goes_once_idle_for_cache_days(self):
+        self.turbopack_app("stale", cache_days=10, dev_cache_days=10)
+        self.turbopack_app("mixed", cache_days=10, dev_cache_days=2)
+        self.env.sweep()
+        self.assertFalse(self.env.exists("stale/.next"))
+        self.assertFalse(self.env.exists("mixed/.next/cache"))
+        self.assertFalse(self.env.exists("mixed/.next/server"))
+        self.assertFalse(self.env.exists("mixed/.next/dev/server"))
+        self.assertTrue(self.env.exists("mixed/.next/dev/cache/turbopack/v1/00001.sst"))
+
+    def test_fresh_next_keeps_its_build(self):
+        self.turbopack_app("live", cache_days=10, dev_cache_days=10, build_days=0)
+        self.env.sweep()
+        self.assertTrue(self.env.exists("live/.next/server/app/page.js"))
+        self.assertTrue(self.env.exists("live/.next/cache/turbopack/v1/00001.sst"))
+
     def test_next_with_open_file_stays(self):
         chunk = self.app("served")
         with open(chunk):
@@ -301,6 +343,112 @@ class JanitorTest(unittest.TestCase):
         self.assertTrue(self.env.exists("idle2/.next"))
 
 
+class UnavailableSimulatorsTest(unittest.TestCase):
+    """2026-10-09: runtime iOS zniknął na chwilę po zmianie Xcode, a `simctl delete unavailable`
+    skasował symulatory agentów. Fałszywy simctl zapisuje wywołania i podaje listę niedostępnych."""
+
+    POOL = "AAAAAAAA-0000-0000-0000-000000000001"
+    LEASED = "BBBBBBBB-0000-0000-0000-000000000002"
+    MINE = "CCCCCCCC-0000-0000-0000-000000000003"
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="sims-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.leases = os.path.join(self.root, "leases")
+        os.makedirs(self.leases)
+        self.calls = []
+        names = {self.POOL: "Portivo-E2E-iPhone", self.LEASED: "Scratch", self.MINE: "My iPhone"}
+        listing = json.dumps(
+            {"devices": {"iOS-26-0": [{"udid": u, "name": n} for u, n in names.items()]}}
+        )
+
+        def fake_run(cmd, timeout=600):
+            self.calls.append(cmd[1:])
+            return listing if cmd[2:4] == ["list", "devices"] else ""
+
+        os.makedirs(os.path.join(self.root, "Library/Developer/CoreSimulator"))
+        patched = {
+            "HOME": self.root,
+            "which": lambda name: "xcrun",
+            "run": fake_run,
+            "log": lambda line, path=None: None,
+            "SIMULATORS_STATE_PATH": os.path.join(self.root, "janitor-simulators.json"),
+        }
+        for name, value in patched.items():
+            self.addCleanup(setattr, janitor, name, getattr(janitor, name))
+            setattr(janitor, name, value)
+        cfg = dict(janitor.DEFAULT_CONFIG, simulator_leases=self.leases)
+        self.sw = janitor.Sweep(cfg, dry_run=False)
+
+    def deleted(self):
+        return [c[2] for c in self.calls if c[:2] == ["simctl", "delete"]]
+
+    def sweep(self):
+        self.janitor.task_xcode(self.sw, None)
+
+    def test_never_runs_the_blanket_delete(self):
+        self.sweep()
+        self.sweep()
+        self.assertNotIn(["simctl", "delete", "unavailable"], self.calls)
+
+    def test_first_sighting_deletes_nothing(self):
+        self.sweep()
+        self.assertEqual(self.deleted(), [])
+
+    def test_second_sighting_deletes_only_foreign_unleased(self):
+        open(os.path.join(self.leases, self.LEASED + ".json"), "w").write("{}")
+        self.sweep()
+        self.sweep()
+        self.assertEqual(self.deleted(), [self.MINE])
+
+    def test_device_that_came_back_starts_over(self):
+        self.sweep()
+        self.janitor.write_json(self.janitor.SIMULATORS_STATE_PATH, [])  # w międzyczasie wrócił
+        self.sweep()
+        self.assertEqual(self.deleted(), [])
+
+
+class DerivedDataTest(unittest.TestCase):
+    """DerivedData projektów idzie po derived_data_idle_days, wspólne cache Xcode zostają:
+    CAS kompilacji (CompilationCache.noindex) odtwarza się zimnym buildem ~2,7 GB."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="derived-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.derived = os.path.join(self.root, "Library/Developer/Xcode/DerivedData")
+        patched = {"HOME": self.root, "which": lambda name: None, "log": lambda line, path=None: None}
+        for name, value in patched.items():
+            self.addCleanup(setattr, janitor, name, getattr(janitor, name))
+            setattr(janitor, name, value)
+        self.sw = janitor.Sweep(dict(janitor.DEFAULT_CONFIG), dry_run=False)
+
+    def entry(self, rel, days_old):
+        path = os.path.join(self.derived, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("x" * 4096)
+        stamp = time.time() - days_old * 86400
+        os.utime(path, (stamp, stamp))
+
+    def test_shared_caches_stay_idle_projects_go(self):
+        self.entry("Old-abc/Build/Intermediates.noindex/o.o", OLD)
+        self.entry("New-def/Build/Intermediates.noindex/o.o", 1)
+        self.entry("ModuleCache.noindex/Foundation.pcm", OLD)
+        self.entry("CompilationCache.noindex/plugin/v1/data", OLD)
+        self.janitor.task_xcode(self.sw, None)
+        left = sorted(os.listdir(self.derived))
+        self.assertEqual(left, ["CompilationCache.noindex", "ModuleCache.noindex", "New-def"])
+        self.assertEqual([path for _, path, _ in self.sw.items], [os.path.join(self.derived, "Old-abc")])
+
+
 def compressed(path):
     return bool(os.stat(path).st_flags & stat.UF_COMPRESSED)
 
@@ -425,6 +573,51 @@ class CompressSweepTest(unittest.TestCase):
         self.env.sweep()
         self.assertFalse(compressed(log))
 
+    def compress_state(self):
+        with open(os.path.join(self.env.state_dir, "janitor-compress.json")) as f:
+            return json.load(f)
+
+    def write_compress_state(self, state):
+        with open(os.path.join(self.env.state_dir, "janitor-compress.json"), "w") as f:
+            json.dump(state, f)
+
+    def dry_run_count(self):
+        out = self.env.sweep("--dry-run")
+        line = next(l for l in out.splitlines() if l.startswith("kompresja APFS"))
+        return int(line.split(": ")[2].split()[0])
+
+    def write_random(self, rel):
+        path = os.path.join(self.logs, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(os.urandom(64 * 1024))
+        return path
+
+    def test_incompressible_file_is_not_retried_until_it_changes(self):
+        noise = self.write_random("media/noise.bin")
+        self.env.sweep()
+        self.assertFalse(compressed(noise))
+        root = os.path.realpath(self.logs)
+        state = self.compress_state()
+        self.assertIn(noise, state["incompressible"])
+        # granica od zera (jak po resecie stanu): nieściśliwy plik i tak nie wraca
+        state[root] = 0
+        self.write_compress_state(state)
+        self.assertEqual(self.dry_run_count(), 0)
+        with open(noise, "ab") as f:
+            f.write(os.urandom(1024))
+        self.assertEqual(self.dry_run_count(), 1)
+
+    def test_state_from_1_20_0_loads(self):
+        root = os.path.realpath(self.logs)
+        log = self.write("session.jsonl")
+        self.write_compress_state({root: time.time() - 3600})
+        self.env.sweep()
+        self.assertTrue(compressed(log))
+        state = self.compress_state()
+        self.assertIsInstance(state[root], float)
+        self.assertEqual(state["pending_bundles"], {})
+
     def test_dry_run_compresses_nothing(self):
         log = self.write("session.jsonl")
         out = self.env.sweep("--dry-run")
@@ -432,8 +625,8 @@ class CompressSweepTest(unittest.TestCase):
         self.assertFalse(compressed(log))
         self.assertFalse(os.path.exists(os.path.join(self.env.state_dir, "janitor-compress.json")))
 
-    @unittest.skipUnless(shutil.which("cc"), "brak kompilatora C")
-    def test_running_app_stays_whole(self):
+    def start_live_app(self):
+        """Live.app z działającym procesem i Idle.app obok; [proces, plik Live.app, plik Idle.app]"""
         apps = os.path.join(self.env.work, "logs/Apps")
         live = os.path.join(apps, "Live.app/Contents")
         os.makedirs(os.path.join(live, "MacOS"))
@@ -448,9 +641,104 @@ class CompressSweepTest(unittest.TestCase):
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         time.sleep(0.3)
+        return proc, resource, idle
+
+    @unittest.skipUnless(shutil.which("cc"), "brak kompilatora C")
+    def test_running_app_stays_whole(self):
+        _, resource, idle = self.start_live_app()
         self.env.sweep()
         self.assertFalse(compressed(resource))
         self.assertTrue(compressed(idle))
+
+    @unittest.skipUnless(shutil.which("cc"), "brak kompilatora C")
+    def test_running_app_is_compressed_after_it_quits(self):
+        proc, resource, _ = self.start_live_app()
+        self.env.sweep()
+        self.assertFalse(compressed(resource))
+        state = self.compress_state()
+        bundle = os.path.join(os.path.realpath(self.logs), "Apps/Live.app")
+        self.assertEqual(state["pending_bundles"], {os.path.realpath(self.logs): [bundle]})
+        proc.kill()
+        proc.wait()
+        time.sleep(1.1)  # granica katalogu jest już za plikami aplikacji
+        self.env.sweep()
+        self.assertTrue(compressed(resource))
+        self.assertEqual(self.compress_state()["pending_bundles"], {})
+
+
+class OptimizeTest(unittest.TestCase):
+    """`mac optimize` na atrapie `defaults`: co zapisuje, co pamięta i co przywraca."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.dir = tempfile.mkdtemp(prefix="optimize-test-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.prefs = {
+            ("com.apple.dock", "autohide"): "1",
+            ("com.apple.dock", "expose-animation-duration"): "0.15",
+            ("NSGlobalDomain", "KeyRepeat"): "2",
+        }
+        self.calls = []
+        from unittest import mock
+
+        def run(cmd, timeout=600):
+            if cmd[:2] == ["defaults", "read"]:
+                return self.prefs.get((cmd[2], cmd[3]))
+            if cmd[:2] == ["defaults", "write"]:
+                self.prefs[(cmd[2], cmd[3])] = cmd[5]
+                return ""
+            if cmd[:2] == ["defaults", "delete"]:
+                self.prefs.pop((cmd[2], cmd[3]), None)
+                return ""
+            return None
+
+        self.killed = []
+        patches = [
+            mock.patch.object(janitor, "run", side_effect=run),
+            mock.patch.object(janitor, "BACKUP_PATH", os.path.join(self.dir, "optimize.json")),
+            mock.patch.object(janitor, "broken_launch_items", return_value=[]),
+            mock.patch.object(janitor, "log"),
+            mock.patch.object(
+                janitor.subprocess, "run", side_effect=lambda cmd, **kw: self.killed.append(cmd)
+            ),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def optimize(self, *args):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.janitor.cmd_optimize({}, list(args))
+
+    def test_writes_snappy_values_and_undo_restores(self):
+        before = dict(self.prefs)
+        self.assertEqual(self.optimize(), 0)
+        self.assertEqual(self.prefs[("NSGlobalDomain", "KeyRepeat")], "1")
+        self.assertEqual(self.prefs[("NSGlobalDomain", "QLPanelAnimationDuration")], "0")
+        self.assertEqual(self.prefs[("com.apple.dock", "expose-animation-duration")], "0.1")
+        self.assertEqual(self.prefs[("com.apple.dock", "autohide-time-modifier")], "0.1")
+        self.assertIn(["killall", "Dock"], self.killed)
+        self.assertEqual(self.optimize(), 0)  # drugi raz nic nie zmienia
+        self.assertEqual(self.optimize("--undo"), 0)
+        self.assertEqual(self.prefs, before)
+
+    def test_autohide_speed_only_with_autohide(self):
+        self.prefs[("com.apple.dock", "autohide")] = "0"
+        self.optimize()
+        self.assertNotIn(("com.apple.dock", "autohide-time-modifier"), self.prefs)
+
+    def test_dock_not_restarted_without_dock_changes(self):
+        for domain, key, kind, value, _ in self.janitor.TWEAKS:
+            if domain == "com.apple.dock":
+                self.prefs[(domain, key)] = value
+        self.optimize()
+        self.assertNotIn(["killall", "Dock"], self.killed)
 
 
 if __name__ == "__main__":

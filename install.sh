@@ -7,12 +7,12 @@ cd "$(dirname "$0")"
 (cd app && swift build -c release)
 BIN="$(cd app && swift build -c release --show-bin-path)"
 
-# pakiet aplikacji: binarka, Info.plist i podpis ad hoc
+# pakiet aplikacji: binarka, Info.plist i podpis, który trzyma zgody macOS przez przebudowy
 BUNDLE="$(mktemp -d)/Claude Acc.app"
 mkdir -p "$BUNDLE/Contents/MacOS"
 cp "$BIN/ClaudeAcc" "$BUNDLE/Contents/MacOS/ClaudeAcc"
 cp app/Info.plist "$BUNDLE/Contents/Info.plist"
-codesign --force --sign - "$BUNDLE"
+./sign-app.sh "$BUNDLE"
 
 # pomocnik bramy pulpitu: podpis ad hoc, ale ze STABILNYM designated requirement po identyfikatorze,
 # żeby zgoda TCC (Dostępność, Nagrywanie ekranu) przetrwała przebudowy mimo zmiany cdhash

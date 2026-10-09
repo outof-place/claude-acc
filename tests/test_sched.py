@@ -719,6 +719,192 @@ class PlanTest(Paths):
         )  # przy presji nic ponad dostępną pamięć, nawet po długim czekaniu
 
 
+class BackfillTest(Paths):
+    """Za głową, która się nie mieści, startuje to, co nie opóźni jej startu (backfill w stylu
+    EASY). Pomyłka, którą ten test łapie: 2026-10-09 16:40 głowa `next build` (11,7 GB przy 5,9
+    wolnych) czekała po 2 × starve_s na twardej rezerwacji pamięci, której i tak nie mogła użyć, a za
+    nią 25 krótkich jobów (ruff, go vet jednego pakietu, skrypt Pythona) czekało do 25 minut."""
+
+    def queued(self, jid, gb, wall, ago=0, src="history:20", now=None, **extra):
+        now = time.time() if now is None else now
+        return dict({"id": jid, "label": jid, "mem_predicted_gb": gb, "predicted_wall_s": wall,
+                     "predicted_from": src, "small": gb <= 4.5 and wall <= 120,
+                     "enqueued_at": now - ago, "route": {"choice": "local"}}, **extra)
+
+    def running(self, jid, gb, wall, elapsed, src="history:20", now=None, **extra):
+        # zajmuje już całą prognozę: bez rezerwy na wzrost wolna pamięć to dostępna - 8 GB
+        now = time.time() if now is None else now
+        return dict({"id": jid, "label": jid, "where": "local", "mem_predicted_gb": gb, "mem_now_gb": gb,
+                     "predicted_wall_s": wall, "predicted_from": src, "started_at": now - elapsed}, **extra)
+
+    def blocked(self, level, running, queue):
+        self.set_memory(level)
+        st = self.state()
+        st["running"] = running
+        S.refresh_memory(st, self.cfg)
+        st["queue"] = queue
+        return st
+
+    def test_jobs_that_end_before_the_head_starts_or_fit_beside_it_start(self):
+        # 14,4 GB dostępne, wolne 6,4; skrypt (10 GB) skończy się za 20 min, wtedy wolne 16,4:
+        # build się zmieści i zostanie obok niego 4,7 GB
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600)], [
+            self.queued("build", 11.7, 154, ago=1500),
+            self.queued("ruff", 0.39, 0.3, ago=600),
+            self.queued("sql", 0.13, 27.1, ago=500),
+            self.queued("unittest", 0.15, 243, ago=400),  # nie mały (243 s), skończy się przed buildem
+            self.queued("vet", 4.0, 60, ago=300, src="prior"),  # bez historii: czas i pamięć zgadnięte
+            self.queued("merge", 0.65, 1823, ago=200),  # dłuższy niż czekanie buildu, ale zmieści się obok
+            self.queued("e2e", 5.76, 69, ago=100),  # nie mieści się teraz
+            self.queued("long", 5.0, 3000, ago=50),  # mieści się teraz, ale nie obok buildu
+        ])
+        self.assertEqual(
+            S.plan(st, self.cfg, time.time()),
+            {jid: ("overtake", "build") for jid in ("ruff", "sql", "unittest", "merge")},
+        )
+        # miejsce obok głowy (4,7 GB) dzielą wszyscy: drugi długi job już się w nim nie zmieści
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600)], [
+            self.queued("build", 11.7, 154, ago=1500),
+            self.queued("long1", 3.0, 3000, ago=20), self.queued("long2", 3.0, 3000, ago=10)])
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"long1": ("overtake", "build")})
+
+    def test_job_that_would_delay_the_head_waits(self):
+        # skrypt skończy się za 100 s; obok buildu (16,2 GB) zostanie wtedy 0,2 GB
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=1700)], [
+            self.queued("build", 16.2, 154, ago=1500),
+            self.queued("j60", 1.0, 60, ago=20),  # 2 × 60 + 10 s > 100 s
+            self.queued("j40", 1.0, 40, ago=10),  # 2 × 40 + 10 s ≤ 100 s
+        ])
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"j40": ("overtake", "build")})
+        S.update_queue_view(st, self.cfg)
+        self.assertIn("build goes first", st["queue"][1]["reason"]["text"])  # j60
+        # głowa zaraz startuje: nawet ruff (0,3 s) nie wchodzi przed nią, a obok niej brak miejsca
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=1798)], [
+            self.queued("build", 16.2, 154, ago=1500), self.queued("ruff", 0.39, 0.3)])
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        # ...a gdy obok niej zostanie miejsce, ruff startuje
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=1798)], [
+            self.queued("build", 11.7, 154, ago=1500), self.queued("ruff", 0.39, 0.3)])
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"ruff": ("overtake", "build")})
+
+    def test_unknown_forecasts_are_conservative(self):
+        behind = [self.queued("ruff", 0.39, 0.3), self.queued("unittest", 0.15, 243),
+                  self.queued("merge", 0.65, 1823), self.queued("tiny", 0.1, 1, src="prior"),
+                  self.queued("e2e", 5.3, 20)]  # krótki, ale ciężki: gdy się przeciągnie, trzyma 5 GB
+        for why, blocker in (
+            ("prognoza skryptu zgadnięta", self.running("script", 10.0, 1800, elapsed=600, src="prior")),
+            ("skrypt biegnie dłużej, niż miał", self.running("script", 10.0, 1800, elapsed=2000)),
+        ):
+            # start głowy nie do przewidzenia: przechodzą tylko krótkie joby ze zmierzoną prognozą,
+            # bo opóźnią ją najwyżej o swój czas
+            st = self.blocked(30, [blocker], [self.queued("build", 11.7, 154, ago=1500)] + behind)
+            self.assertEqual(S.plan(st, self.cfg, time.time()), {"ruff": ("overtake", "build")}, why)
+        # głowa zmieściłaby się bez jobów, które ją już wyprzedziły: nikt więcej, aż się skończą
+        # (p1 biegnie dłużej, niż miał, więc i z nim start głowy nie do przewidzenia)
+        passer = self.running("p1", 5.5, 20, elapsed=25, passed="build")
+        st = self.blocked(40, [self.running("script", 10.0, 1800, elapsed=600, src="prior"), passer],
+                          [self.queued("build", 11.7, 154, ago=1500), self.queued("ruff", 0.39, 0.3)])
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        passer["passed"] = None  # ten sam job, ale nie wyprzedził buildu: build i tak by się nie zmieścił
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"ruff": ("overtake", "build")})
+
+    def test_light_jobs_start_in_memory_free_now_when_reserves_push_free_below_zero(self):
+        """2026-10-09 18:20 (1.25.1 przy starve_s 120): xcodebuild spoza schedulera (rezerwa na
+        wzrost do szczytu buildu) i świeży skrypt bez zajętej jeszcze pamięci zepchnęły wolną pamięć
+        po rezerwach poniżej zera przy ~14 GB dostępnych teraz. Po 2 × starve_s szybka ścieżka była
+        zamknięta, a backfill chciał miejsca po rezerwach, więc ruff i pytest (0,1-0,5 GB, sekundy)
+        stały za next build (11,6 GB), choć skończyłyby się, zanim ten mógł ruszyć."""
+        queue = [self.queued("build", 11.6, 154, ago=460), self.queued("ruff", 0.46, 1.3),
+                 self.queued("pytest", 0.08, 2.3), self.queued("e2e", 5.76, 47)]  # e2e: ciężki
+        for why, level, running in (
+            # start głowy nie do przewidzenia: skrypt przekroczył prognozę (krótki job, bramka)
+            ("skrypt po prognozie", 37, [self.running("up", 5.9, 4, elapsed=300, mem_now_gb=0.0)]),
+            # przewidywalny: skrypt skończy się za 20 min (job kończy się przed głową)
+            ("skrypt z prognozą", 30, [self.running("script", 10.0, 1800, elapsed=600)]),
+        ):
+            self.set_memory(level, native={"gb": 2.5, "active": True})
+            st = self.state()
+            st["running"] = running
+            S.refresh_memory(st, self.cfg)
+            self.assertLess(st["memory"]["free_for_admission_gb"], 0, why)
+            st["queue"] = [dict(j) for j in queue]
+            self.assertEqual(S.plan(st, self.cfg, time.time()),
+                             {"ruff": ("overtake", "build"), "pytest": ("overtake", "build")}, why)
+
+    def test_native_jobs_and_a_held_native_head_keep_their_rules(self):
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600)], [
+            self.queued("build", 11.7, 154, ago=1500),
+            self.queued("boot", 2.5, 20, lang="native", native_tool="simulator")])
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600)], [
+            self.queued("ios", 10.0, 600, ago=1500, lang="native"), self.queued("ruff", 0.39, 0.3)])
+        st["memory"]["guard_level"] = 2  # strażnik: krytyczna presja, natywna głowa wstrzymana
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {})
+
+    def simulate(self, blocker_wall, blocker_real, job_gb, cap_gb=24.0, ticks=600):
+        """Głowa (11,7 GB, czeka od 25 min) za skryptem (10 GB), a co 3 s przychodzi krótki job
+        (prognoza 10 s, naprawdę 15 s). Pamięć dostępna to cap_gb minus to, co biegnie.
+        (sekunda startu głowy, ile jobów ją wyprzedziło, ile wyprzedzających biegło przy jej starcie)."""
+        now0 = time.time()
+        running = [self.running("script", 10.0, blocker_wall, elapsed=0, now=now0)]
+        ends = {"script": now0 + blocker_real}
+        queue = [self.queued("build", 11.7, 154, ago=1500, now=now0)]
+        passed = 0
+        for t in range(ticks):
+            now = now0 + t
+            running = [r for r in running if ends[r["id"]] > now]
+            if t % 3 == 0:
+                queue.append(self.queued(f"s{t}", job_gb, 10, now=now))
+                ends[f"s{t}"] = now + 15
+            st = self.blocked((cap_gb - sum(r["mem_now_gb"] for r in running)) / 48 * 100, running, queue)
+            for jid, (why, by) in S.plan(st, self.cfg, now).items():
+                job = next(j for j in queue if j["id"] == jid)
+                queue.remove(job)
+                if jid == "build":
+                    return t, passed, sum(1 for r in running if r.get("passed") == "build")
+                running.append(dict(job, where="local", started_at=now, mem_now_gb=job["mem_predicted_gb"],
+                                    passed=by))
+                passed += why == "overtake"
+        self.fail("głowa nie wystartowała")
+
+    def test_stream_of_short_jobs_still_lets_the_head_start(self):
+        for why, wall, real, gb in (
+            ("prognoza skryptu trafna", 300, 300, 1.5),
+            ("prognoza skryptu trafna, małe joby", 300, 300, 0.4),
+            ("skrypt biegnie 3 × dłużej, niż miał", 100, 300, 1.5),
+        ):
+            start, passed, beside = self.simulate(wall, real, gb)
+            # głowa startuje, gdy skończy się skrypt, najwyżej po jednym krótkim jobie (15 s)
+            self.assertLessEqual(start, 300 + 15, why)
+            self.assertGreater(passed, 50, why)  # a przez 5 minut krótkie joby nie stały w kolejce
+
+
+class OldLockTest(Paths):
+    """Bilans „stary zamek” liczy czekanie przy dawnym `plock go`: jeden job Go naraz, w kolejności
+    przyjścia. Pomyłka, którą ten test łapie: 2026-10-09 `sched status` pokazał 38278h, bo przez
+    wirtualny zamek szły wszystkie lokalne joby (JS, skrypty, natywne, ~13 naraz), w kolejności
+    końca, więc zamek uciekł o 40 h w przyszłość, a każdy job doliczał całą tę kolejkę."""
+
+    def run_entry(self, jid, enq, lang=None):
+        return {"id": jid, "label": jid, "where": "local", "lang": lang, "class": jid, "module": "m",
+                "repo": "r", "enqueued_at": enq, "started_at": enq, "waited_s": 0.0,
+                "mem_predicted_gb": 1.0, "predicted_wall_s": 10,
+                "route": {"choice": "local", "why": "fits", "text": "local, fits"}}
+
+    def test_only_go_jobs_in_arrival_order(self):
+        t = time.time() - 1000
+        st = self.state()
+        st["running"] = [self.run_entry("long", t), self.run_entry("a", t + 1),
+                         self.run_entry("b", t + 2), self.run_entry("js", t + 3, lang="node")]
+        S.save_state(st)
+        # krótkie skończyły się pierwsze, ale przy zamku czekałyby na długi, który przyszedł wcześniej
+        for jid, wall in (("a", 1), ("b", 1), ("js", 500), ("long", 100)):
+            S.finish(jid, self.cfg, 0, wall, 0.5, 1.0)
+        today = S.load_state(self.cfg)["today"]
+        self.assertAlmostEqual(today["old_lock_wait_s"], 99 + 99, delta=0.5)
+        self.assertAlmostEqual(today["wait_saved_s"], 99 + 99, delta=0.5)
+
+
 class Count1Test(Paths):
     def test_drop_regex(self):
         self.assertEqual(S.drop_count1("go test -count=1 ./x"), "go test ./x")
@@ -1912,6 +2098,9 @@ class RunTest(unittest.TestCase):
             SHELL="/bin/zsh",
         )
         self.env.pop("GOFLAGS", None)
+        # testy puszczone przez hook schedulera biegną w jego jobie: sched.py run w środku
+        # wykonałby komendę od razu, bez kolejki i historii
+        self.env.pop("CLAUDE_ACC_SCHED_JOB", None)
         self.procs = []
         self.addCleanup(self.kill_all)
 

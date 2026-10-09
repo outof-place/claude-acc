@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Atrapa `claude mcp remove/add-json -s user`: edytuje plik z $CLAUDE_ACC_CLAUDE_JSON."""
+import json
+import os
+import sys
+
+path = os.environ["CLAUDE_ACC_CLAUDE_JSON"]
+args = sys.argv[1:]
+cfg = json.load(open(path))
+servers = cfg.setdefault("mcpServers", {})
+if args[:2] == ["mcp", "remove"]:
+    if servers.pop(args[-1], None) is None:
+        print(f"No MCP server found with name: {args[-1]}", file=sys.stderr)
+        sys.exit(1)
+elif args[:2] == ["mcp", "add-json"]:
+    name, entry = args[-2], json.loads(args[-1])
+    entry.setdefault("type", "stdio")  # prawdziwe CLI też dopisuje type
+    servers[name] = entry
+else:
+    sys.exit(2)
+json.dump(cfg, open(path, "w"), indent=2)

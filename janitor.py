@@ -21,6 +21,9 @@ Komendy:
   spotlight                     projekty, których node_modules indeksuje Spotlight,
                                 i otwarcie ustawień, w których się je wyklucza
   optimize [--dry-run|--undo]   jednorazowe strojenie systemu, odwracalne
+  compress-apps [--dry-run] [--apps A,B] [--threads N]
+                                kompresja APFS aplikacji roota (Office, Adobe, .pkg) przez sudo,
+                                ze sprawdzeniem podpisu przed i po (compressapps.py)
 """
 
 import fcntl
@@ -60,9 +63,10 @@ DEFAULT_CONFIG = {
     "protect": [],
     # przebieg z launchd nie powtarza porządków sprzed chwili (np. po ponownym logowaniu)
     "min_hours_between_sweeps": 2,
-    # cache buildów Next.js (.next, .next-*) bez zmian od tylu godzin
+    # cache buildów Next.js (.next, .next-*) bez zmian od tylu godzin; ich .next/cache
+    # i .next/dev/cache (trwały cache Turbopacka) mają próg z cache_idle_days
     "next_idle_hours": 24,
-    # .turbo, node_modules/.cache i node_modules/.vite bez zmian od tylu dni
+    # .turbo, node_modules/.cache, node_modules/.vite i cache Turbopacka w .next bez zmian od tylu dni
     "cache_idle_days": 7,
     # node_modules projektów, w których nic się nie zmieniło od tylu dni; 0 wyłącza
     "node_modules_idle_days": 30,
@@ -71,8 +75,12 @@ DEFAULT_CONFIG = {
     # cache kompilacji Go czyszczony dopiero powyżej tylu GB
     "go_cache_max_gb": 20,
     "go_cache_keep_percent": 60,
-    # Xcode DerivedData bez zmian od tylu dni
+    # Xcode DerivedData bez zmian od tylu dni; wspólne cache (XCODE_SHARED_CACHES) zostają
     "derived_data_idle_days": 14,
+    # symulatory agentów (pula portivo-mobile) i ich dzierżawy; te same wartości co w devguard.json.
+    # Nigdy nie kasujemy ich jako "niedostępnych": runtime potrafi zniknąć na chwilę przy zmianie Xcode
+    "simulator_pool_prefix": "Portivo-",
+    "simulator_leases": "~/.cache/portivo-mobile/leases",
     # logi aplikacji starsze niż tyle dni
     "log_days": 30,
     # na baterii poniżej tylu procent porządki czekają na ładowarkę
@@ -590,8 +598,15 @@ def task_trash(sw, scan):
         sw.remove("trash", path, lambda n: n.startswith(TRASH_PREFIX))
 
 
+# trwały cache Turbopacka (turbopackFileSystemCacheForBuild, dev server), z którego nowe
+# worktree portivo dostają twardymi linkami rozgrzany build: zostaje po skasowaniu reszty .next
+# i idzie dopiero po cache_idle_days bez zmian, jak .turbo
+NEXT_CACHES = ("cache", "dev/cache")
+
+
 def task_next(sw, scan):
     since = time.time() - sw.cfg["next_idle_hours"] * HOUR
+    cache_since = time.time() - sw.cfg["cache_idle_days"] * DAY
     for path in scan().next_dirs:
         app = os.path.dirname(path)
         if sw.usage.holds(path) or sw.usage.works_in(app) or not sw.usage.ok:
@@ -599,7 +614,27 @@ def task_next(sw, scan):
         elif recently_changed(path, since):
             sw.skip("next", path, "świeży")
         else:
-            sw.remove("next", path, lambda n: n == ".next" or n.startswith(".next-"))
+            keep = {c for c in NEXT_CACHES if recently_changed(os.path.join(path, c), cache_since)}
+            if keep:
+                remove_next_output(sw, path, keep)
+            else:
+                sw.remove("next", path, lambda n: n == ".next" or n.startswith(".next-"))
+
+
+def remove_next_output(sw, path, keep, prefix=""):
+    """Kasuje z .next wszystko poza `keep` (ścieżki względem .next) i katalogami nad nimi."""
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return
+    for entry in entries:
+        rel = prefix + entry.name
+        if rel in keep:
+            continue
+        if any(k.startswith(rel + "/") for k in keep) and entry.is_dir(follow_symlinks=False):
+            remove_next_output(sw, entry.path, keep, rel + "/")
+        else:
+            sw.remove("next", entry.path, lambda n, want=entry.name: n == want)
 
 
 def task_project_caches(sw, scan):
@@ -801,11 +836,16 @@ def task_docker(sw, _scan):
     )
 
 
+# wspólne dla wszystkich projektów w DerivedData: moduły Clang i CAS kompilacji Xcode 27
+# (compilation caching); bez CAS pierwszy build każdego projektu kompiluje ~2,7 GB od zera
+XCODE_SHARED_CACHES = ("ModuleCache.noindex", "CompilationCache.noindex")
+
+
 def task_xcode(sw, _scan):
     derived = os.path.join(HOME, "Library/Developer/Xcode/DerivedData")
     since = time.time() - sw.cfg["derived_data_idle_days"] * DAY
     for path in glob.glob(os.path.join(derived, "*")):
-        if not os.path.isdir(path) or path.endswith("ModuleCache.noindex"):
+        if not os.path.isdir(path) or os.path.basename(path) in XCODE_SHARED_CACHES:
             continue
         if sw.usage.busy(path) or recently_changed(path, since):
             continue
@@ -816,7 +856,36 @@ def task_xcode(sw, _scan):
         and not sw.dry_run
         and os.path.isdir(os.path.join(HOME, "Library/Developer/CoreSimulator"))
     ):
-        run([xcrun, "simctl", "delete", "unavailable"], timeout=300)
+        delete_unavailable_simulators(sw, xcrun)
+
+
+def delete_unavailable_simulators(sw, xcrun):
+    """Kasuje symulatory, które simctl uznaje za niedostępne, ale ostrożnie: 2026-10-09 po zmianie
+    Xcode runtime iOS 26.0 zniknął na chwilę i `simctl delete unavailable` skasował symulatory
+    agentów razem z zainstalowanymi klientami deweloperskimi (natywny build to 10-20 min).
+    Dlatego kasujemy pojedynczo, dopiero gdy urządzenie było niedostępne już w poprzednim
+    przebiegu, i nigdy tych z puli agentów (prefiks) ani z żywą dzierżawą portivo-mobile."""
+    out = run([xcrun, "simctl", "list", "devices", "unavailable", "-j"], timeout=60)
+    try:
+        groups = json.loads(out or "")["devices"].values()
+        found = {d["udid"]: d.get("name", "") for group in groups for d in group}
+    except (ValueError, KeyError, TypeError):
+        return  # bez czytelnej listy nie kasujemy niczego i nie ruszamy zapamiętanych
+    seen = load_json(SIMULATORS_STATE_PATH, [])
+    write_json(SIMULATORS_STATE_PATH, sorted(found))
+    prefix = sw.cfg["simulator_pool_prefix"]
+    leases = expand(sw.cfg["simulator_leases"])
+    for udid, name in sorted(found.items()):
+        label = f"{name} {udid}"
+        if udid not in seen:
+            sw.skip("xcode", label, "niedostępny pierwszy raz, czekamy na kolejny przebieg")
+        elif (prefix and name.startswith(prefix)) or os.path.exists(
+            os.path.join(leases, udid + ".json")
+        ):
+            sw.skip("xcode", label, "symulator agentów")
+        else:
+            run([xcrun, "simctl", "delete", udid], timeout=300)
+            log(f"xcode: skasowano niedostępny symulator {label}")
 
 
 def task_brew(sw, _scan):
@@ -890,10 +959,13 @@ def task_caps(sw, _scan):
 
 
 # granica czasu dla każdego katalogu: pliki zmienione wcześniej już przeszły kompresję
+SIMULATORS_STATE_PATH = os.path.join(STATE_DIR, "janitor-simulators.json")
 COMPRESS_STATE_PATH = os.path.join(STATE_DIR, "janitor-compress.json")
 UID = os.getuid()
 # afsctool dostaje pliki paczkami, żeby lista argumentów nie przekroczyła ARG_MAX
 COMPRESS_CHUNK = 200
+# ile plików stan pamięta między przebiegami (otwarte na katalog, nieściśliwe razem)
+COMPRESS_MEMORY = 50000
 
 
 def bundle_of(path):
@@ -905,13 +977,33 @@ def bundle_of(path):
     return None
 
 
-def compress_candidates(root, since, until, max_bytes, skip_bundles=()):
-    """Pliki do kompresji APFS: zwykłe, niepuste, jeszcze nieskompresowane, zapisywalne,
-    zmienione po `since` i nie później niż `until`. [(ścieżka, bajty na dysku, zmiana)]
+def compress_change(path, st, since, until, max_bytes):
+    """Chwila zmiany pliku, jeśli nadaje się do kompresji APFS, inaczej None.
 
-    Plik już skompresowany ma flagę UF_COMPRESSED, więc spacer nie czyta treści. Zmiana to
-    max(mtime, ctime): rozpakowana aktualizacja aplikacji ma stare mtime z archiwum, ale
-    świeży ctime. Twarde dowiązania (store pnpm) liczą się raz, po i-węźle.
+    Zwykły, niepusty, jeszcze nieskompresowany, zapisywalny, zmieniony po `since` i nie
+    później niż `until`. Zmiana to max(mtime, ctime): rozpakowana aktualizacja aplikacji
+    ma stare mtime z archiwum, ale świeży ctime.
+    """
+    when = max(st.st_mtime, st.st_ctime)
+    if (
+        st.st_flags & stat.UF_COMPRESSED
+        or st.st_size == 0
+        or st.st_size > max_bytes
+        or not since < when <= until
+        # właściciel kompresuje też plik tylko do odczytu (obiekty gita, moduły Go)
+        or not (st.st_uid == UID or os.access(path, os.W_OK))
+    ):
+        return None
+    return when
+
+
+def compress_candidates(root, since, until, max_bytes, skip_bundles=(), skipped=None):
+    """Pliki do kompresji APFS w drzewie `root`. [(ścieżka, bajty na dysku, zmiana)]
+
+    Warunki w compress_change. Plik już skompresowany ma flagę UF_COMPRESSED, więc spacer
+    nie czyta treści. Twarde dowiązania (store pnpm) liczą się raz, po i-węźle. Aplikacje
+    z `skip_bundles` (działające) spacer omija w całości i dopisuje do listy `skipped`,
+    żeby zadanie wróciło do nich, kiedy się zamkną.
     """
     found, inodes = [], set()
     stack = [root]
@@ -927,6 +1019,8 @@ def compress_candidates(root, since, until, max_bytes, skip_bundles=()):
                         if entry.name.startswith(TRASH_PREFIX):
                             continue
                         if entry.name.endswith(".app") and entry.path in skip_bundles:
+                            if skipped is not None:
+                                skipped.append(entry.path)
                             continue
                         stack.append(entry.path)
                         continue
@@ -935,16 +1029,8 @@ def compress_candidates(root, since, until, max_bytes, skip_bundles=()):
                     st = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
-                when = max(st.st_mtime, st.st_ctime)
-                if (
-                    st.st_flags & stat.UF_COMPRESSED
-                    or st.st_size == 0
-                    or st.st_size > max_bytes
-                    or not since < when <= until
-                    or (st.st_dev, st.st_ino) in inodes
-                    # właściciel kompresuje też plik tylko do odczytu (obiekty gita, moduły Go)
-                    or not (st.st_uid == UID or os.access(entry.path, os.W_OK))
-                ):
+                when = compress_change(entry.path, st, since, until, max_bytes)
+                if when is None or (st.st_dev, st.st_ino) in inodes:
                     continue
                 inodes.add((st.st_dev, st.st_ino))
                 found.append((entry.path, st.st_blocks * 512, when))
@@ -973,6 +1059,12 @@ def task_compress(sw, _scan):
 
     Oszczędność to różnica bloków na dysku przed i po. Klony APFS (pnpm na APFS kopiuje
     klonami) dzielą bloki, a po kompresji każdy ma własne, więc dla nich zysk bywa ujemny.
+
+    Granica czasu katalogu idzie zawsze do `until`; to, co przebieg pominął, czeka w stanie.
+    Działająca aplikacja trafia do `pending_bundles` i po zamknięciu przechodzi cała, od
+    zera. Otwarty plik trafia do `pending_files`. Plik, którego afsctool nie ścisnął (media,
+    już skompresowane binaria), trafia do `incompressible` i nie wraca, dopóki się nie zmieni.
+    Stan z 1.20.0 (same granice {katalog: czas}) czyta się bez zmian.
     """
     conf = dict(COMPRESS_DEFAULTS, **(sw.cfg.get("compress") or {}))
     roots = [p for pattern in conf["paths"] for p in sorted(glob.glob(os.path.expanduser(pattern)))]
@@ -983,6 +1075,10 @@ def task_compress(sw, _scan):
         log("compress: brak afsctool (brew install afsctool), pomijam")
         sw.warnings.append("Kompresja APFS wymaga afsctool: brew install afsctool")
         return
+    if not sw.usage.ok:
+        # bez lsof nie wiadomo, co jest otwarte, a kompresja podmienia plik w miejscu
+        log("compress: lsof nie odpowiedział, pomijam ten przebieg")
+        return
     running = set()
     if conf["exclude_running_apps"]:
         for command in sw.usage.commands:
@@ -990,6 +1086,11 @@ def task_compress(sw, _scan):
             if bundle:
                 running.add(bundle)
     state = load_json(COMPRESS_STATE_PATH, {})
+    if not isinstance(state, dict):
+        state = {}
+    pending_bundles = dict(state.get("pending_bundles") or {})
+    pending_files = dict(state.get("pending_files") or {})
+    incompressible = dict(state.get("incompressible") or {})
     until = time.time() - conf["min_age_minutes"] * 60
     max_bytes = conf["max_file_mb"] * 1024**2
     for root in roots:
@@ -997,12 +1098,41 @@ def task_compress(sw, _scan):
         if not os.path.isdir(real) or sw.protected(real, real=True):
             continue
         since = state.get(real, 0)
-        files = compress_candidates(real, since, until, max_bytes, skip_bundles=running)
-        ready, busy = [], []
+        if not isinstance(since, (int, float)):
+            since = 0
+        skipped = []
+        files = compress_candidates(real, since, until, max_bytes, skip_bundles=running, skipped=skipped)
+        seen = {path for path, _, _ in files}
+        # aplikacje, które poprzednio działały: po zamknięciu całe, niezależnie od granicy
+        for bundle in pending_bundles.get(real) or []:
+            if bundle in running:
+                skipped.append(bundle)
+            elif os.path.isdir(bundle):
+                for item in compress_candidates(bundle, 0, until, max_bytes):
+                    if item[0] not in seen:
+                        seen.add(item[0])
+                        files.append(item)
+        # pliki, które poprzednio były otwarte
+        for path in pending_files.get(real) or {}:
+            if path in seen:
+                continue
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            when = compress_change(path, st, 0, until, max_bytes) if stat.S_ISREG(st.st_mode) else None
+            if when is not None:
+                seen.add(path)
+                files.append((path, st.st_blocks * 512, when))
+        ready, held, bundles = [], {}, set(skipped)
         for path, size, when in files:
             bundle = bundle_of(path)
-            if (bundle and bundle in running) or sw.protected(path, real=True) or sw.usage.holds(path):
-                busy.append(when)
+            if bundle and bundle in running:
+                bundles.add(bundle)
+            elif sw.protected(path, real=True) or incompressible.get(path) == when:
+                continue
+            elif sw.usage.holds(path):
+                held[path] = when
             else:
                 ready.append((path, size))
         before = sum(size for _, size in ready)
@@ -1019,9 +1149,28 @@ def task_compress(sw, _scan):
         sw.record("compress", f"kompresja APFS {short(root)}", saved)
         if paths:
             log(f"compress: {short(root)}: {len(paths)} plików, {human(before)} -> {human(before - saved)}")
-        # pliki pominięte jako zajęte wrócą w następnym przebiegu
-        state[real] = min([until] + [when - 1 for when in busy])
+        # nieścisnięte nie wracają, dopóki się nie zmienią; zmianę liczymy po próbie afsctool
+        for path in paths:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                incompressible.pop(path, None)
+                continue
+            if st.st_flags & stat.UF_COMPRESSED:
+                incompressible.pop(path, None)
+            else:
+                incompressible[path] = max(st.st_mtime, st.st_ctime)
+        state[real] = until
+        pending_bundles[real] = sorted(bundles)
+        pending_files[real] = dict(sorted(held.items(), key=lambda kv: kv[1])[-COMPRESS_MEMORY:])
     if not sw.dry_run:
+        incompressible = {path: when for path, when in incompressible.items() if os.path.lexists(path)}
+        if len(incompressible) > COMPRESS_MEMORY:
+            newest = sorted(incompressible.items(), key=lambda kv: kv[1])[-COMPRESS_MEMORY:]
+            incompressible = dict(newest)
+        state["pending_bundles"] = {root: items for root, items in pending_bundles.items() if items}
+        state["pending_files"] = {root: items for root, items in pending_files.items() if items}
+        state["incompressible"] = incompressible
         write_json(COMPRESS_STATE_PATH, state, indent=1)
 
 
@@ -1477,14 +1626,14 @@ TWEAKS = [
         "com.apple.dock",
         "autohide-time-modifier",
         "float",
-        "0.15",
+        "0.1",
         "szybka animacja Docka",
     ),
     (
         "com.apple.dock",
         "expose-animation-duration",
         "float",
-        "0.15",
+        "0.1",
         "szybkie Mission Control",
     ),
     (
@@ -1507,6 +1656,20 @@ TWEAKS = [
         "float",
         "0.001",
         "arkusze i zmiana rozmiaru bez animacji",
+    ),
+    (
+        "NSGlobalDomain",
+        "QLPanelAnimationDuration",
+        "float",
+        "0",
+        "Quick Look otwiera się bez animacji",
+    ),
+    (
+        "NSGlobalDomain",
+        "KeyRepeat",
+        "int",
+        "1",
+        "szybsze powtarzanie klawiszy (15 ms, szybciej niż suwak w Ustawieniach; od następnego logowania)",
     ),
     (
         "com.apple.finder",
@@ -1539,6 +1702,12 @@ TWEAKS = [
 ]
 
 
+# strojenie, które ma sens tylko przy innym ustawieniu: (domena, klucz) -> (domena, klucz, wartość)
+TWEAK_ONLY_IF = {
+    ("com.apple.dock", "autohide-time-modifier"): ("com.apple.dock", "autohide", "true"),
+}
+
+
 def defaults_read(domain, key):
     out = run(["defaults", "read", domain, key])
     return None if out is None else out.strip()
@@ -1567,11 +1736,16 @@ def cmd_optimize(cfg, args):
     dry_run = "--dry-run" in args
     backup = load_json(BACKUP_PATH, {"defaults": {}, "agents": []})
     changed = []
+    dock = False
     for domain, key, kind, value, why in TWEAKS:
+        need = TWEAK_ONLY_IF.get((domain, key))
+        if need and not same_value(defaults_read(need[0], need[1]), "bool", need[2]):
+            continue
         current = defaults_read(domain, key)
         if same_value(current, kind, value):
             continue
         changed.append(why)
+        dock = dock or domain == "com.apple.dock"
         if dry_run:
             continue
         backup["defaults"].setdefault(
@@ -1604,7 +1778,8 @@ def cmd_optimize(cfg, args):
         print(f"  {why}")
     if not dry_run:
         write_json(BACKUP_PATH, backup, indent=1)
-        subprocess.run(["killall", "Dock"], capture_output=True)
+        if dock:
+            subprocess.run(["killall", "Dock"], capture_output=True)
         log(f"optimize: {len(changed)} zmian")
         print("Cofnięcie: claude-acc mac optimize --undo")
     return 0
@@ -1615,6 +1790,7 @@ def optimize_undo():
     if not backup:
         print("Nie ma czego cofać")
         return 0
+    dock = any(e["domain"] == "com.apple.dock" for e in backup.get("defaults", {}).values())
     for entry in backup.get("defaults", {}).values():
         if entry["value"] is None:
             run(["defaults", "delete", entry["domain"], entry["key"]])
@@ -1637,10 +1813,48 @@ def optimize_undo():
                 capture_output=True,
             )
     os.remove(BACKUP_PATH)
-    subprocess.run(["killall", "Dock"], capture_output=True)
+    if dock:
+        subprocess.run(["killall", "Dock"], capture_output=True)
     log("optimize: cofnięte")
     print("Cofnięte")
     return 0
+
+
+def cmd_compress_apps(cfg, args):
+    """Aplikacje roota, których zadanie `compress` nie zapisze: lista bez sudo, kompresja przez sudo.
+
+    compressapps.py leży obok tego pliku i sam nic nie importuje, więc pod sudo idzie z -I
+    (bez PYTHONPATH i katalogu skryptu w sys.path). Pełna ścieżka do afsctool idzie w
+    argumencie, bo secure_path sudo nie zna /opt/homebrew/bin.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, "compressapps.py")
+    sys.path.insert(0, here)
+    import compressapps
+
+    opts = compressapps.parse_args(["plan"] + list(args))
+    tool = compressapps.find_afsctool()
+    if not tool:
+        print("brak afsctool: brew install afsctool")
+        return 1
+    passthrough = ["--afsctool", tool, "--threads", str(opts.threads), "--done-ratio", str(opts.done_ratio)]
+    if opts.apps:
+        passthrough += ["--apps", opts.apps]
+    if opts.dry_run:
+        return compressapps.main(["plan"] + passthrough)
+    out = os.path.join(user_tmpdir(), f"compress-apps-{os.getpid()}.json")
+    rc = subprocess.run(["sudo", "/usr/bin/python3", "-I", script, "run", "--json-out", out] + passthrough).returncode
+    try:
+        with open(out) as f:
+            results = json.load(f)
+        os.unlink(out)
+    except (OSError, ValueError):
+        results = []
+    if results:
+        freed = sum(r.get("freed", 0) for r in results)
+        back = sum(1 for r in results if r.get("rolled_back"))
+        log(f"compress-apps: {len(results)} aplikacji, zwolniono {human(freed)}" + (f", cofnięte: {back}" if back else ""))
+    return rc
 
 
 COMMANDS = {
@@ -1649,6 +1863,7 @@ COMMANDS = {
     "report": cmd_report,
     "spotlight": cmd_spotlight,
     "optimize": cmd_optimize,
+    "compress-apps": cmd_compress_apps,
 }
 
 

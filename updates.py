@@ -36,6 +36,10 @@ Komendy:
   status [--json]
 """
 
+# Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę:
+# pomoc i status nie płacą za moduły potrzebne tylko przebiegowi
+__lazy_modules__ = ["concurrent.futures", "datetime", "json", "shutil", "subprocess", "tempfile"]
+
 import fcntl
 import json
 import os
@@ -54,10 +58,14 @@ CONFIG_PATH = os.path.join(STATE_DIR, "updates.json")
 STATE_PATH = os.path.join(STATE_DIR, "updates-state.json")
 LOG_PATH = os.path.join(STATE_DIR, "updates.log")
 LOCK_PATH = os.path.join(STATE_DIR, "updates.lock")
+# perf.py keep zapisuje tu pod "link", czy Mac wychodzi do sieci przez telefon (tethering)
+PERF_STATE_PATH = os.path.join(STATE_DIR, "perf-state.json")
 LOG_MAX_BYTES = 1024 * 1024
 
 HOUR = 3600
 DAY = 24 * HOUR
+# wpis "link" starszy niż to nic już nie mówi: perf.py keep odświeża go dużo częściej
+TETHER_FRESH = 15 * 60
 # godzina z launchd/com.filip.claude-acc.updates.plist.template; stąd panel zna termin następnego
 RUN_AT = (4, 30)
 
@@ -939,6 +947,25 @@ def next_due(cfg, state):
     return last["at"] + wait
 
 
+def tethered():
+    """Wpis "link" z perf-state.json, gdy Mac jest teraz na tetheringu, a inaczej None.
+
+    Przebieg ściąga setki megabajtów (brew, npm, pip), które na tetheringu idą z pakietu danych
+    telefonu. Wpis stary, bez daty albo popsuty to brak wiedzy, a nie tethering: przebieg rusza.
+    """
+    link = load_json(PERF_STATE_PATH, {})
+    link = link.get("link") if isinstance(link, dict) else None
+    if not isinstance(link, dict) or link.get("tethered") is not True:
+        return None
+    at = link.get("at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return None
+    # minuta zapasu na zegar, który cofnął się po zapisie
+    if not -60 <= time.time() - at <= TETHER_FRESH:
+        return None
+    return link
+
+
 def next_run(cfg, state):
     """Pierwsza 4:30, kiedy przebieg będzie już należny: tak go uruchomi launchd."""
     when = datetime.fromtimestamp(max(next_due(cfg, state), time.time()))
@@ -975,7 +1002,16 @@ def cmd_run(cfg, args):
         print("aktualizacja już trwa")
         return 0
     state = load_json(STATE_PATH, {})
-    if not (force or dry or only) and time.time() < next_due(cfg, state):
+    scheduled = not (force or dry or only)
+    if scheduled and time.time() < next_due(cfg, state):
+        return 0
+    link = tethered() if scheduled else None
+    if link:
+        # bez last_run: przebieg zostaje należny i następne uruchomienie z launchd próbuje znowu;
+        # `claude-acc update` (--force) rusza i na tetheringu, bo kliknął człowiek
+        via = ", ".join(str(link[k]) for k in ("port", "iface") if link.get(k))
+        log(f"=== aktualizacja odłożona: Mac na tetheringu{f' ({via})' if via else ''}")
+        print("aktualizacja odłożona: Mac na tetheringu")
         return 0
 
     started = time.time()

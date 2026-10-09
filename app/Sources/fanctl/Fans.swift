@@ -28,6 +28,8 @@ struct Reading: Codable {
     /// Another app (Mole, Macs Fan Control…) set the fans after we did; we don't fight it.
     var conflict: Bool?
     var error: String?
+    /// The daemon turned `SleepDisabled` on for Stay Awake with the lid closed.
+    var lidHeld: Bool?
 }
 
 /// Fans on Apple Silicon: `FNum` fans, each with `F<n>Ac` (actual rpm), `F<n>Mn`/`F<n>Mx`

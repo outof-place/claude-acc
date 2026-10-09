@@ -5,7 +5,7 @@ struct ClaudeAccApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 
     init() {
-        // `ClaudeAcc --render panel.png [--snapshot accounts.json]`: the panel as a picture,
+        // `ClaudeAcc --render panel.png [--snapshot accounts.json] [--live]`: the panel as a picture,
         // to look at without clicking. With --snapshot it uses that file instead of live data,
         // and demo-guard.json / demo-janitor.json / demo-updates.json next to it, if they exist (README screenshots).
         let args = CommandLine.arguments
@@ -13,8 +13,17 @@ struct ClaudeAccApp: App {
             let data = args.firstIndex(of: "--snapshot").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
             let open = args.firstIndex(of: "--open").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
             let hover = args.firstIndex(of: "--hover").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
-            exit(Self.render(to: args[i + 1], from: data, open: open, hover: hover) ? 0 : 1)
+            // --live keeps the panel's fixed height, so a column that overflows shows up as it does on
+            // screen (lists that scroll inside their cards render empty: ImageRenderer skips ScrollView)
+            let live = args.contains("--live")
+            exit(Self.render(to: args[i + 1], from: data, open: open, hover: hover, live: live) ? 0 : 1)
         }
+        // `ClaudeAcc --dictate-file test.wav`: one recording through dictation's whole path
+        // (Keychain, AI Gateway, correction) without the microphone, as JSON; works while the app runs
+        if let i = args.firstIndex(of: "--dictate-file"), i + 1 < args.count {
+            DictateFile.run(args[i + 1])
+        }
+        if args.contains("--widget-demo") { WidgetDemo.run() }
         // a second copy would put a second ring in the menu bar
         let mine = Bundle.main.bundleIdentifier ?? ""
         if NSRunningApplication.runningApplications(withBundleIdentifier: mine).count > 1 {
@@ -27,7 +36,7 @@ struct ClaudeAccApp: App {
         Settings { EmptyView() }
     }
 
-    private static func render(to path: String, from snapshotFile: String?, open: String?, hover: String?) -> Bool {
+    private static func render(to path: String, from snapshotFile: String?, open: String?, hover: String?, live: Bool) -> Bool {
         let output: CLIResult
         var guardState: GuardState?
         var janitor: JanitorState?
@@ -83,7 +92,7 @@ struct ClaudeAccApp: App {
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
         let panel = PanelView(store: store, frozenNow: frozen)
             .fixedSize()
-            .environment(\.renderingToFile, true)
+            .environment(\.renderingToFile, !live)
             .background(Color(nsColor: .windowBackgroundColor))
             .environment(\.colorScheme, .dark)
         let renderer = ImageRenderer(content: panel)
@@ -98,8 +107,35 @@ struct ClaudeAccApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBar: MenuBarController?
+    private var widget: DictationWidget?
+    private var store: Store?
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // `claude-acc dictate` opens claude-acc://dictate/<toggle|start|stop|cancel> in the background
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(openURL(_:reply:)),
+            forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        menuBar = MenuBarController(store: Store())
+        let store = Store()
+        self.store = store
+        menuBar = MenuBarController(store: store)
+        widget = DictationWidget(dictation: store.dictation)
+        store.dictation.activate()
+    }
+
+    @objc private func openURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        guard let text = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue,
+              let url = URL(string: text), url.scheme == "claude-acc", url.host() == "dictate",
+              let dictation = store?.dictation
+        else { return }
+        dictationLog.notice("command: \(url.absoluteString, privacy: .public)")
+        switch url.lastPathComponent {
+        case "start": dictation.start(handsFree: true, fromCommand: true)
+        case "stop": dictation.stop()
+        case "cancel": dictation.cancel()
+        default: dictation.toggle()
+        }
     }
 }

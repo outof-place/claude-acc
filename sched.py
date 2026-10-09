@@ -67,6 +67,9 @@ DEFAULTS = {
     "small_gb": 4.5,
     "small_wall_s": 120,
     "starve_s": 120,
+    # głowa, której startu nie da się przewidzieć, przepuszcza tylko job, którego prognoza
+    # × 2 + 10 s mieści się w tylu sekundach: o tyle najwyżej ją opóźni
+    "head_delay_s": 60,
     "drop_count1": True,
     "pause_swap_gb": 0.5,
     "ldflags_w_for_build": True,
@@ -2259,7 +2262,8 @@ def new_today():
         "jobs_local": 0,
         "jobs_depot": 0,
         "wait_s": 0.0,
-        "old_lock_wait_s": 0.0,
+        "old_lock_wait_s": 0.0,  # czekanie jobów Go przy dawnym `plock go` (old_lock)
+        "go_wait_s": 0.0,  # prawdziwe czekanie tych samych jobów
         "wait_saved_s": 0.0,
         "depot_units": 0.0,
         "depot_cost_usd": 0.0,
@@ -2288,8 +2292,12 @@ def empty_state(cfg):
         "overtakes": [],
         "recent": [],
         "today": new_today(),
-        "_internal": {"swap": [], "avail": [], "vlock_free_at": 0.0},
+        "_internal": {"swap": [], "avail": [], "old_lock": new_old_lock()},
     }
+
+
+def new_old_lock():
+    return {"wait_s": 0.0, "free_at": 0.0, "pending": []}
 
 
 def load_state(cfg):
@@ -2300,10 +2308,15 @@ def load_state(cfg):
             raise ValueError
     except (OSError, ValueError):
         state = empty_state(cfg)
-    state.setdefault("_internal", {"swap": [], "avail": [], "vlock_free_at": 0.0})
+    internal = state.setdefault("_internal", {"swap": [], "avail": []})
     if state.get("today", {}).get("date") != time.strftime("%Y-%m-%d"):
         state["today"] = new_today()
-        state["_internal"]["vlock_free_at"] = 0.0
+        internal["old_lock"] = new_old_lock()
+    if "old_lock" not in internal:
+        # stan z zamkiem liczonym ze wszystkich jobów w kolejności końca (38278h): bilans od nowa
+        internal.pop("vlock_free_at", None)
+        internal["old_lock"] = new_old_lock()
+        state["today"].update(old_lock_wait_s=0.0, go_wait_s=0.0, wait_saved_s=0.0)
     state["config"] = {k: cfg[k] for k in PUBLIC_CONFIG}
     return state
 
@@ -2541,8 +2554,8 @@ def plan(state, cfg, now):
     """Kto z kolejki startuje teraz: {id: ("fits"|"overtake", id wyprzedzonego)}.
 
     FIFO; głowa startuje, gdy się mieści, a gdy lokalnie nic nie biegnie: bez rezerwy na dev
-    serwer, po 30 s czekania w ogóle. Za zablokowaną głową startują tylko małe joby, a gdy głowa
-    czeka dłużej niż starve_s, jej pamięć jest zarezerwowana i nikt jej nie wyprzedza.
+    serwer, po 30 s czekania w ogóle. Za zablokowaną głową startują małe joby, które się mieszczą,
+    a gdy głowa czeka dłużej niż starve_s, tylko te, które zostawiają jej miejsce (rezerwacja).
 
     Mały job (krótki i lekki: testy JS, jeden pakiet Go) wystarczy, że zmieści się w pamięci
     dostępnej teraz: rezerwy długich jobów na wzrost, którego jeszcze nie ma, go nie blokują.
@@ -2550,10 +2563,16 @@ def plan(state, cfg, now):
     Głowa czekająca dłużej niż starve_s zostawia sobie miejsce i w pamięci dostępnej teraz, a po
     2 × starve_s rezerwacja jest twarda: strumień krótkich jobów nie zagłodzi dużego.
 
+    Rezerwacja nie trzyma jednak pamięci, której głowa jeszcze nie użyje: każdy job za nią (także
+    nie mały) startuje, jeśli nie opóźni jej startu (`backfill`); potrzebuje do tego prognozy z
+    własnych biegów. 2026-10-09 głowa `next build` (11,7 GB przy 5,9 wolnych) trzymała tak 25
+    krótkich jobów do 25 minut, choć wszystkie skończyłyby się, zanim zwolniła się dla niej pamięć.
+
     Natywny build i start symulatora startują tylko w pamięci wolnej po rezerwach (sam na Macu:
     w dostępnej minus zapas), nigdy ponad nią i nigdy, gdy strażnik dev serwerów mówi o presji
     krytycznej. Jego pamięć leży częściowo poza drzewem procesów (symulator, demon Gradle), więc
-    SIGSTOP nic by tu nie uratował, a rosnący swap jądro zgłasza jako „normal” do samego końca."""
+    SIGSTOP nic by tu nie uratował, a rosnący swap jądro zgłasza jako „normal” do samego końca.
+    Nie wchodzi też przed głowę przez backfill, a za wstrzymaną nim głową backfillu nie ma."""
     mem = state["memory"]
     free = mem["free_for_admission_gb"]
     now_free = mem["available_gb"] - cfg["headroom_gb"] - sum(
@@ -2564,7 +2583,10 @@ def plan(state, cfg, now):
     guard_critical = mem.get("guard_level") == 2
     brake = mem.get("brake", "normal")
     admitted = {}
+    ahead = []  # wpuszczone przed głową w tym przebiegu: ich końce też zwolnią jej pamięć
     blocked = None
+    shade = None  # kiedy głowa się zmieści i ile miejsca zostanie obok niej (shadow)
+    stuck = False  # głowa nie wystartowałaby nawet bez jobów, które ją wyprzedziły
     reserve = 0.0
     strict = False
     # jeden natywny build naraz: trzyma go job w fazie buildu albo build spoza schedulera
@@ -2594,6 +2616,7 @@ def plan(state, cfg, now):
             overcommit = pressure != "warn" and not native and now - job["enqueued_at"] >= 30
             if not held and (need <= free or quick or (alone and (need <= spare or overcommit))):
                 admitted[job["id"]] = ("fits", None)
+                ahead.append((job["id"], need, job.get("predicted_wall_s"), measured(job)))
                 free -= need
                 now_free -= need
                 any_local = True
@@ -2603,35 +2626,129 @@ def plan(state, cfg, now):
             if now - job["enqueued_at"] > cfg["starve_s"]:
                 reserve = need
                 strict = now - job["enqueued_at"] > 2 * cfg["starve_s"]
+            if not held:
+                lone = (spare, overcommit) if brake != "brake" else None
+                shade = shadow(state, need, free, now, ahead, lone)
+                stuck = not head_fits_without_passers(state, job, free, now, ahead, lone)
             continue
-        if job.get("small") and not held and (need <= free - reserve or quick):
+        how = None
+        if shade is not None and not native:
+            how = backfill(job, free, now_free, shade, stuck, cfg)
+        if how or (job.get("small") and not held and (need <= free - reserve or quick)):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
             now_free -= need
             slot = slot or bool(job.get("exclusive"))
+            if shade is not None and how != "ends" and shade["spare_gb"] is not None:
+                shade["spare_gb"] -= need  # będzie biec obok głowy
     return admitted
+
+
+# backfill: prognoza czasu to mediana historii, a czasy mają długi ogon (2026-10-09, 3000 biegów:
+# 9-21% trwało ponad 2 × prognoza + 10 s, zależnie od długości), więc job wchodzi przed głowę
+# z takim zapasem, a nie z samą prognozą
+BACKFILL_SLACK = (2.0, 10.0)
+
+
+def measured(job):
+    """Czy prognoza joba pochodzi z jego własnych biegów (a nie z tabeli albo rodziny)."""
+    return str(job.get("predicted_from") or "").startswith("history")
+
+
+def backfill(job, free, now_free, shade, stuck, cfg):
+    """Jak job wejdzie przed zablokowaną głowę, nie opóźniając jej startu, albo None.
+
+    Gdy start głowy da się przewidzieć (shade["sure"]): "ends", jeśli job skończy się przed nim
+    (z zapasem BACKFILL_SLACK), albo "beside", jeśli w tej chwili zmieści się obok niej. Gdy nie
+    (czeka na job bez zmierzonej prognozy albo taki, który biegnie dłużej, niż miał): "short", jeśli
+    job jest lekki (small_gb), jego prognoza z zapasem mieści się w head_delay_s, a głowa nie
+    wystartowałaby nawet bez jobów, które ją już wyprzedziły (`stuck`). Opóźni ją wtedy najwyżej o
+    swój czas, a gdy to wyprzedzający trzymają jej pamięć, nikt więcej nie wchodzi, więc strumień
+    krótkich jobów jej nie zagłodzi. Ciężki krótki job (e2e na 5 GB) tu nie wchodzi: w replayu
+    2026-10-09 to on, gdy przeciągnął się 27 razy, trzymał głowie najwięcej pamięci najdłużej.
+    Zawsze z prognozą z własnej historii i w pamięci wolnej po rezerwach. Lekki job, który przed
+    startem głowy się skończy ("ends", "short"), może wejść też w pamięci dostępnej teraz, jak mały
+    job szybką ścieżką, także po 2 × starve_s: rezerwy na wzrost długich jobów i natywnego buildu
+    spoza schedulera potrafią zepchnąć wolną pamięć poniżej zera przy kilkunastu GB dostępnych
+    (2026-10-09 18:20: ruff i pytest po 0,1 GB stały wtedy za next build)."""
+    need = job["mem_predicted_gb"]
+    if not measured(job):
+        return None
+    light = need <= cfg["small_gb"]
+    fits = need <= free
+    fits_now = fits or (light and need <= now_free)
+    slack = BACKFILL_SLACK[0] * (job.get("predicted_wall_s") or 0) + BACKFILL_SLACK[1]
+    if shade["sure"]:
+        if fits_now and slack <= shade["wait_s"]:
+            return "ends"
+        if fits and shade["spare_gb"] is not None and need <= shade["spare_gb"]:
+            return "beside"
+        return None
+    if stuck and light and fits_now and slack <= cfg["head_delay_s"]:
+        return "short"
+    return None
+
+
+def shadow(state, need, free, now, ahead=(), lone=None):
+    """Kiedy job, który się nie mieści, zmieści się według prognoz lokalnych jobów, i ile miejsca
+    zostanie wtedy obok niego. Biegnące joby kończą się w kolejności prognoz (najwcześniej za 5 s)
+    i każdy zwalnia to, co trzyma, i swoją rezerwę na wzrost; `ahead` to joby wpuszczone w tym
+    przebiegu planu, których nie ma jeszcze w `running`: (id, GB, s, zmierzona prognoza). `lone`:
+    (dostępne minus zapas, wolno ponad pamięć) dla głowy, która może wystartować sama na Macu:
+    gdy nie zmieści się nawet po końcu wszystkich, startuje po końcu ostatniego i nic obok niej.
+
+    {"wait_s": sekundy albo None, gdy końce jobów jej nie wpuszczą, "spare_gb": miejsce obok
+    (None: żadne), "after": id jobów, na których koniec czeka, "sure": start da się przewidzieć,
+    bo każdy z tych jobów ma prognozę z własnej historii i jeszcze jej nie przekroczył}."""
+    ends = []
+    for i, r in enumerate(state["running"]):
+        if r["where"] != "local":
+            continue
+        wall = r.get("predicted_wall_s") or 60
+        left = wall - (now - r.get("started_at", now))
+        held = r.get("mem_now_gb") or 0.0
+        ends.append((max(5.0, left), i, r["id"], held + growth_left(r, now), held, measured(r) and left >= 0))
+    for k, (jid, gb, wall, sure) in enumerate(ahead):
+        ends.append((max(5.0, wall or 60), len(state["running"]) + k, jid, gb, 0.0, sure and bool(wall)))
+    ends.sort(key=lambda e: (e[0], e[1]))
+    out = {"wait_s": 0.0, "spare_gb": free - need, "after": [], "sure": True}
+    if need <= free:
+        return out
+    released = 0.0
+    for left, _i, jid, gb, held, sure in ends:
+        free += gb
+        released += held
+        out["after"].append(jid)
+        out["sure"] = out["sure"] and sure
+        if need <= free:
+            out.update(wait_s=left, spare_gb=free - need)
+            return out
+    if lone is not None and ends and (lone[1] or need <= lone[0] + released):
+        out.update(wait_s=ends[-1][0], spare_gb=None)
+        return out
+    out.update(wait_s=None, spare_gb=None, sure=False)
+    return out
+
+
+def head_fits_without_passers(state, head, free, now, ahead, lone):
+    """Czy głowa wystartowałaby teraz, gdyby nie joby, które ją wyprzedziły (`passed`): wtedy to one
+    ją opóźniają i nikt więcej nie powinien wchodzić. Sama na Macu tylko wtedy, gdy poza nimi
+    lokalnie nic nie biegnie i nic nie weszło w tym przebiegu."""
+    need = head["mem_predicted_gb"]
+    local = [r for r in state["running"] if r["where"] == "local"]
+    passers = [r for r in local if r.get("passed") == head["id"]]
+    gb = sum((r.get("mem_now_gb") or 0.0) + growth_left(r, now) for r in passers)
+    if need <= free + gb:
+        return True
+    others = bool(ahead) or len(passers) < len(local)
+    held = sum(r.get("mem_now_gb") or 0.0 for r in passers)
+    return lone is not None and not others and (lone[1] or need <= lone[0] + held)
 
 
 def blockers_eta(state, job):
     """(sekundy do chwili, gdy job się zmieści, id jobów, na których koniec czeka)."""
-    need = job["mem_predicted_gb"]
-    free = state["memory"]["free_for_admission_gb"]
-    if need <= free:
-        return 0.0, []
-    now = time.time()
-    finishing = []
-    for i, r in enumerate(state["running"]):
-        if r["where"] == "local":
-            left = (r.get("predicted_wall_s") or 60) - (now - r.get("started_at", now))
-            finishing.append((max(5.0, left), i, r))
-    finishing.sort(key=lambda x: (x[0], x[1]))
-    after = []
-    for left, _i, r in finishing:
-        free += r.get("mem_predicted_gb") or 0
-        after.append(r["id"])
-        if need <= free:
-            return left, after
-    return 3600.0, after
+    s = shadow(state, job["mem_predicted_gb"], state["memory"]["free_for_admission_gb"], time.time())
+    return (3600.0 if s["wait_s"] is None else s["wait_s"]), s["after"]
 
 
 def decide_route(state, job, gb, wall, cfg, cache):
@@ -2768,10 +2885,15 @@ def update_queue_view(state, cfg):
         elif (
             head_blocked is not None
             and now - head_blocked["enqueued_at"] > cfg["starve_s"]
+            and job["mem_predicted_gb"] <= free
         ):
+            # mieści się, ale plan go nie wpuścił: mógłby opóźnić start głowy (backfill)
+            eta = head_blocked.get("eta_start_s")
             code, text = (
                 "head",
-                f"waiting: memory is reserved for {head_blocked['label']}",
+                f"waiting: {head_blocked['label']} goes first"
+                + (f" (starts in about {human_s(eta)})" if eta else "")
+                + ", starting now could delay it",
             )
         else:
             code = "memory"
@@ -2942,7 +3064,6 @@ def new_entry(job, command, argv, opts):
     return {
         "id": new_id(),
         "class": job["class"],
-        "lang": job.get("lang", "go"),
         "kind": job["kind"],
         "label": job["label"],
         "module": job["module"],
@@ -3137,6 +3258,7 @@ def start_local(state, entry, why):
         entry.pop(key, None)
     state["running"].append(entry)
     if reason == "overtake":
+        entry["passed"] = passed  # plan: gdy to wyprzedzający trzymają pamięć głowy, nikt więcej
         passed_job = next((j for j in state["queue"] if j["id"] == passed), {})
         state["overtakes"] = (
             state["overtakes"]
@@ -3295,6 +3417,29 @@ def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None):
         return bool(me.get("native_done"))
 
 
+def old_lock(state, me, wall, waited):
+    """Bilans dnia: ile czekałyby joby Go przy dawnym `plock go` (jeden job Go naraz, w kolejności
+    przyjścia, z prawdziwymi czasami biegów) i ile czekały naprawdę. Skończony job, przed którym
+    nie ma już w kolejce ani w biegu starszego joba Go, wchodzi do sumy na stałe; młodsze czekają w
+    `pending`, bo starszy, gdy się skończy, stanie w zamku przed nimi."""
+    today, lock = state["today"], state["_internal"]["old_lock"]
+    today["go_wait_s"] = round(today.get("go_wait_s", 0.0) + waited, 1)
+    pending = sorted(lock["pending"] + [[round(me["enqueued_at"], 1), round(wall, 1)]])
+    horizon = min(
+        (j["enqueued_at"] for j in state["running"] + state["queue"] if not j.get("lang") and j.get("where") != "depot"),
+        default=float("inf"),
+    )
+    wait, free_at, done = lock["wait_s"], lock["free_at"], 0
+    for enq, w in pending:
+        start = max(enq, free_at)
+        wait, free_at = wait + start - enq, start + w
+        if enq < horizon:
+            lock.update(wait_s=round(wait, 1), free_at=free_at)
+            done += 1
+    lock["pending"] = pending[done:]
+    today["old_lock_wait_s"] = round(wait, 1)
+
+
 def old_hook_depot(entry):
     """Czy stary hak depot-heavy-go.sh wysłałby tę klasę na Depot (job i koszt)."""
     comp = "filtered" if entry.get("filtered") else entry.get("compile_only", False)
@@ -3324,12 +3469,8 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
         units = cost = None
         if where == "local":
             today["jobs_local"] += 1
-            # wirtualny stary zamek: start = max(przyjście, zwolnienie poprzedniego)
-            start_v = max(me["enqueued_at"], internal.get("vlock_free_at", 0.0))
-            today["old_lock_wait_s"] = round(
-                today["old_lock_wait_s"] + start_v - me["enqueued_at"], 1
-            )
-            internal["vlock_free_at"] = start_v + wall
+            if not me.get("lang"):  # Go: tylko te szły kiedyś przez `plock go`
+                old_lock(state, me, wall, waited)
             ci = old_hook_depot(me)
             if ci:
                 _, cores, eta = ci
@@ -3341,7 +3482,7 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
             cost = round(units * cfg["unit_usd"], 3)
             today["depot_units"] = round(today["depot_units"] + units, 1)
             today["depot_cost_usd"] = round(today["depot_cost_usd"] + cost, 2)
-        today["wait_saved_s"] = round(today["old_lock_wait_s"] - today["wait_s"], 1)
+        today["wait_saved_s"] = round(today["old_lock_wait_s"] - today.get("go_wait_s", 0.0), 1)
         for o in state["overtakes"]:
             if o["id"] == jid:
                 o["wall_s"] = round(wall, 1)
@@ -3995,7 +4136,8 @@ def cmd_status(args):
     t = state["today"]
     print(
         f"Dziś: {t['jobs_local']} lokalnie, {t['jobs_depot']} na Depot; czekanie {human_s(t['wait_s'])} "
-        f"(stary zamek: {human_s(t['old_lock_wait_s'])}); Depot ${t['depot_cost_usd']:.2f}, "
+        f"(Go {human_s(t.get('go_wait_s', 0))}, przy starym zamku na Go {human_s(t['old_lock_wait_s'])}); "
+        f"Depot ${t['depot_cost_usd']:.2f}, "
         f"zostało lokalnie ${t['local_kept_usd']:.2f}"
     )
     return 0

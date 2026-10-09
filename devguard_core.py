@@ -4,6 +4,10 @@ Wejściem jest devguard.py (komendy, opis i szybka ścieżka hooka `admit`); ten
 importuje, więc jego bajtkod idzie z __pycache__, a nie z kompilacji przy każdym starcie.
 """
 
+# Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę.
+# ctypes zostaje: libc i struktury niżej powstają przy imporcie; json i subprocess ładuje janitor.
+__lazy_modules__ = ["shlex", "socket", "urllib.parse", "uuid"]
+
 import ctypes
 import ctypes.util
 import fcntl
