@@ -51,6 +51,30 @@ Natywne buildy i symulatory nie wchodzą przez backfill, a za natywną głową w
 backfillu nie ma. 2026-10-09 głowa `next build` (11,7 GB przy 5,9 wolnych) trzymała tak po
 `2 × starve_s` 25 krótkich jobów (ruff, `go vet` jednego pakietu, skrypty Pythona) do 25 minut.
 
+Korek z 2026-10-09 wieczorem (~28 min, 14 jobów) zmienił cztery rzeczy:
+
+- **Prognoza bez własnych biegów ma sufit `small_gb`.** Dotyczy tabeli, rodziny i czasownika, poza
+  pomiarami z tabeli (moduły Go z `PRIORS`, natywne buildy) i dolnymi granicami (Docker). Od pierwszego
+  biegu liczy się zmierzony szczyt.
+  - Rodzina uczy najpierw z tego samego czasownika: `tc`, `tc:*`, `tsc` i `typecheck` to typecheck,
+    więc `tc:cli` uczy się z `tc`, a nie z e2e w tej samej rodzinie pnpm. Bierze p75 × 1,25, a nie
+    p90 × 1,5.
+  - `ensure:*`, esbuild i `--help`/`--version` to praca lekka (0,5 GB, 30 s).
+  - `go test ./...` w module spoza tabeli rośnie z liczbą pakietów (1 GB + 0,15 GB na pakiet).
+  - Biegi komend złożonych (`multi`) nie uczą klasy pojedynczej komendy.
+- **Rezerwa po rozgrzewce idzie za pomiarem.** Rozgrzewka trwa `max(60 s, połowa prognozy czasu)`,
+  najwyżej 300 s. Po niej rezerwa to `min(prognoza, szczyt × 1,5 + 1 GB)`, nadmiar wraca do puli. Wyjątek
+  to natywne i Docker, bo ich pamięć leży poza drzewem procesów.
+- **Prognoza końca uwzględnia przeciągnięcie.** Job po swojej prognozie ma przed sobą połowę tego, co
+  już biegnie, a nie „about 5s”. Z taką granicą lekki job startuje przed głową, jeśli skończy się przed
+  jej realnym startem, także gdy start niepewny przez przeciągnięcie. Nie wtedy, gdy przez zgadniętą
+  prognozę.
+  - Po `aging_s` job, który się mieści, startuje mimo rezerwy głowy, której nic nie wpuszcza.
+- **Stojący job.** Job bez CPU, bez nowych procesów i bez wyjścia przez `stall_s` dostaje w stanie
+  `stalled_s`, a `status` i panel mówią dlaczego. Jego rezerwa wraca do puli, powiadomienie idzie raz,
+  a powód czekania w kolejce go wymienia. Nic go nie zabija, chyba że jego klasa ma limit w
+  `class_timeout_s`.
+
 Pliki w `~/.local/share/claude-acc/sched/`:
 
 | plik | kto pisze | po co |
@@ -275,6 +299,9 @@ small_wall_s         120    ...i tyle sekund lub mniej; mały może wyprzedzać
 starve_s             120    po tylu sekundach czekania job rezerwuje pamięć; wyprzedza go już tylko backfill
 head_delay_s         60     gdy startu głowy nie da się przewidzieć, wyprzedza ją tylko lekki job,
                             którego 2 × prognoza + 10 s mieści się w tylu sekundach
+aging_s              300    job, który się mieści, czeka za głową najwyżej tyle sekund
+stall_s              600    tyle sekund bez CPU i wyjścia: job stoi (stalled), rezerwa wraca do puli
+class_timeout_s      {}     twardy limit biegu {"prefiks klasy": sekundy}: SIGTERM, po 10 s SIGKILL
 drop_count1          true   zdejmuj -count=1 w iteracji agenta dla pakietów bez bazy
 pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ciężki job dostaje SIGSTOP
 depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)

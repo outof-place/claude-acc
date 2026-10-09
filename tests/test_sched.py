@@ -730,6 +730,10 @@ class BackfillTest(Paths):
     wolnych) czekała po 2 × starve_s na twardej rezerwacji pamięci, której i tak nie mogła użyć, a za
     nią 25 krótkich jobów (ruff, go vet jednego pakietu, skrypt Pythona) czekało do 25 minut."""
 
+    def setUp(self):
+        super().setUp()
+        self.cfg["aging_s"] = 10**9  # aging ma własne testy (JamTest); tu tylko backfill
+
     def queued(self, jid, gb, wall, ago=0, src="history:20", now=None, **extra):
         now = time.time() if now is None else now
         return dict({"id": jid, "label": jid, "mem_predicted_gb": gb, "predicted_wall_s": wall,
@@ -796,14 +800,18 @@ class BackfillTest(Paths):
         behind = [self.queued("ruff", 0.39, 0.3), self.queued("unittest", 0.15, 243),
                   self.queued("merge", 0.65, 1823), self.queued("tiny", 0.1, 1, src="prior"),
                   self.queued("e2e", 5.3, 20)]  # krótki, ale ciężki: gdy się przeciągnie, trzyma 5 GB
-        for why, blocker in (
-            ("prognoza skryptu zgadnięta", self.running("script", 10.0, 1800, elapsed=600, src="prior")),
-            ("skrypt biegnie dłużej, niż miał", self.running("script", 10.0, 1800, elapsed=2000)),
-        ):
-            # start głowy nie do przewidzenia: przechodzą tylko krótkie joby ze zmierzoną prognozą,
-            # bo opóźnią ją najwyżej o swój czas
-            st = self.blocked(30, [blocker], [self.queued("build", 11.7, 154, ago=1500)] + behind)
-            self.assertEqual(S.plan(st, self.cfg, time.time()), {"ruff": ("overtake", "build")}, why)
+        # start głowy nie do przewidzenia, bo prognoza skryptu jest zgadnięta: przechodzą tylko krótkie
+        # joby ze zmierzoną prognozą, bo opóźnią ją najwyżej o swój czas
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=600, src="prior")],
+                          [self.queued("build", 11.7, 154, ago=1500)] + behind)
+        self.assertEqual(S.plan(st, self.cfg, time.time()), {"ruff": ("overtake", "build")})
+        # skrypt ze zmierzoną prognozą przeciągnął (2000 s z 1800): według time_left pobiegnie jeszcze
+        # ~1000 s, więc lekki unittest (2 × 243 + 10 s) skończy się przed głową (EASY); ciężkie e2e i
+        # merge (dłuższy niż to czekanie) nie wchodzą. 2026-10-09 kolejka pisała wtedy „about 5s”
+        st = self.blocked(30, [self.running("script", 10.0, 1800, elapsed=2000)],
+                          [self.queued("build", 11.7, 154, ago=1500)] + behind)
+        self.assertEqual(S.plan(st, self.cfg, time.time()),
+                         {"ruff": ("overtake", "build"), "unittest": ("overtake", "build")})
         # głowa zmieściłaby się bez jobów, które ją już wyprzedziły: nikt więcej, aż się skończą
         # (p1 biegnie dłużej, niż miał, więc i z nim start głowy nie do przewidzenia)
         passer = self.running("p1", 5.5, 20, elapsed=25, passed="build")
@@ -823,7 +831,8 @@ class BackfillTest(Paths):
                  self.queued("pytest", 0.08, 2.3), self.queued("e2e", 5.76, 47)]  # e2e: ciężki
         for why, level, running in (
             # start głowy nie do przewidzenia: skrypt przekroczył prognozę (krótki job, bramka)
-            ("skrypt po prognozie", 37, [self.running("up", 5.9, 4, elapsed=300, mem_now_gb=0.0)]),
+            # (w rozgrzewce: po niej rezerwa schodzi do zmierzonego szczytu, reserve_target)
+            ("skrypt po prognozie", 37, [self.running("up", 5.9, 4, elapsed=30, mem_now_gb=0.0)]),
             # przewidywalny: skrypt skończy się za 20 min (job kończy się przed głową)
             ("skrypt z prognozą", 30, [self.running("script", 10.0, 1800, elapsed=600)]),
         ):
@@ -2548,6 +2557,235 @@ class HostTest(Paths):
             self.assertIsNone(S.agent_info(None, None)["pane"])
 
 
+class JamTest(Paths):
+    """2026-10-09 kolejka stała ~28 min z 14 jobami. Prognozy z rodziny (`pnpm run tc:cli` 30,3 GB po
+    `pnpm tc` z e2e w tej samej rodzinie pnpm, `ensure:electron-runtime` 30,3 GB, esbuild 11,9 GB,
+    `tsc --help` 9,8 GB, go test w małym module 10 GB), rezerwy po prognozie zamiast po pomiarze (e2e
+    14,8 GB przy 2,4 użytych), ETA „about 5s” przez 20 minut za jobami, które przeciągnęły, i trzy
+    vitesty stojące bez CPU z rezerwą po 4 GB. Liczby z history.jsonl i state.json tego dnia."""
+
+    def setUp(self):
+        super().setUp()
+        self.ide = os.path.join(self.dir, "ide")
+        os.makedirs(os.path.join(self.ide, ".git"))
+        write(os.path.join(self.ide, "package.json"), json.dumps({"scripts": {
+            "tc": "pnpm run tc:node && pnpm run tc:web", "tc:cli": "tsc -p cli", "tc:web": "tsc -p web",
+            "ensure:electron-runtime": "node scripts/ensure.mjs", "e2e": "playwright test"}}))
+        for name in ("node_modules/.bin/esbuild", "node_modules/typescript/bin/tsc", "scripts/ensure.mjs"):
+            write(os.path.join(self.ide, name), "#!/bin/sh\n", 0o755)
+        self.small = self.cfg["small_gb"]
+
+    def rows(self):
+        """Rodzina pnpm repo `ide` tego dnia: `pnpm tc` dwumodalne (5,7-6,5 i 15-20 GB, z komendami
+        złożonymi w środku) i ciężkie skrypty e2e obok."""
+        rows = []
+        for i, peak in enumerate([5.9, 20.4, 6.2, 18.1, 5.8, 9.1, 20.2, 6.5, 15.8, 5.9] * 2):
+            rows.append({"where": "local", "lang": "generic", "class": "ide:script:pnpm-script:tc",
+                         "peak_gb": peak, "wall_s": 10.0 + i})
+        for peak in (11.5, 8.7, 9.3):
+            rows.append({"where": "local", "lang": "generic", "class": "ide:script:pnpm-script:tc:node",
+                         "peak_gb": peak, "wall_s": 30.0})
+        for peak in (19.0, 22.0, 18.5, 21.0, 20.0):
+            rows.append({"where": "local", "lang": "generic", "class": "ide:script:pnpm-script:e2e",
+                         "peak_gb": peak, "wall_s": 300.0})
+        return rows
+
+    def predict(self, command, rows=None):
+        job = S.classify(command, self.ide)
+        self.assertIsNotNone(job, command)
+        return S.predict(job, 4, self.rows() if rows is None else rows, self.small)
+
+    def test_fallbacks_without_own_history_are_capped_and_per_verb(self):
+        gb, _s, src = self.predict("pnpm run tc:cli")
+        self.assertEqual(src, "family:typecheck:23")  # tc, tc:node: ten sam czasownik, bez e2e
+        self.assertLessEqual(gb, self.small)  # było 30,32 GB
+        self.assertEqual(self.predict("pnpm run ensure:electron-runtime")[:3:2], (0.5, "light"))  # było 30,32
+        self.assertEqual(self.predict("node_modules/.bin/esbuild src/main.ts --bundle")[2], "light")  # było 11,92
+        self.assertEqual(self.predict("node node_modules/typescript/bin/tsc --help --all")[2], "light")  # 9,85
+        # nowy skrypt bez nikogo z tym samym czasownikiem: cała rodzina, odpornie i z sufitem
+        self.assertLessEqual(self.predict("pnpm run e2e")[0], self.small)
+
+    def test_one_run_teaches_the_class(self):
+        """Po pierwszym biegu liczy się zmierzony szczyt, nie zgadywanie z rodziny."""
+        rows = self.rows() + [{"where": "local", "lang": "generic", "class": "ide:script:pnpm-script:tc:cli",
+                               "peak_gb": 2.92, "wall_s": 7.1}]
+        gb, s, src = self.predict("pnpm run tc:cli", rows)
+        self.assertEqual(src, "history:1")
+        self.assertAlmostEqual(gb, max(2.92 * 1.15, self.small * 0.8), places=2)
+        self.assertEqual(s, 7.1)
+
+    def test_compound_runs_do_not_teach_a_single_command(self):
+        """Szczyt komendy złożonej (oxlint; pnpm test; pnpm tc) to szczyt całości: nie uczy `pnpm tc`."""
+        tc = "ide:script:pnpm-script:tc"
+        single = [{"where": "local", "lang": "generic", "class": tc, "peak_gb": 6.0, "wall_s": 10.0}] * 5
+        compound = [{"where": "local", "lang": "generic", "class": tc, "peak_gb": 20.0, "wall_s": 60.0,
+                     "multi": True}] * 5
+        self.assertAlmostEqual(self.predict("pnpm tc", single + compound)[0], 6.9)
+        job = S.classify("pnpm test; pnpm tc", self.ide)
+        self.assertTrue(job["multi"])
+        self.assertTrue(S.new_entry(job, "pnpm test; pnpm tc", None, {})["multi"])
+        # złożona bez własnych biegów: najcięższa część, czasy po kolei (ensure lekkie, e2e nie)
+        cmd = "pnpm run ensure:electron-runtime > /dev/null 2>&1; npx playwright test tests/e2e/a.spec.ts"
+        job = S.classify(cmd, self.ide)
+        self.assertEqual([p["kind"] for p in job["parts"]], ["e2e"])
+        part_gb, part_s, _ = S.predict(dict(job["parts"][0], multi=False), 4, [], self.small)
+        gb, s, _src = S.predict(job, 4, [], self.small)
+        self.assertEqual((gb, s), (max(0.5, part_gb), S.LIGHT_PRIOR[1] + part_s))
+
+    def test_go_tree_in_a_small_module_scales_with_its_packages(self):
+        mod = os.path.join(self.dir, "tinymod")
+        write(os.path.join(mod, "go.mod"), "module tinymod\n\ngo 1.22\n")
+        for pkg in ("a", "b", "c", "d", "e"):
+            write(os.path.join(mod, pkg, "x.go"), f"package {pkg}\n")
+        job = S.classify("go test -tags permguard ./...", mod)
+        gb, s, src = S.predict(job, 4, [], self.small)
+        self.assertEqual(src, "prior")
+        self.assertAlmostEqual(gb, 1.0 + 0.15 * 5)  # było 10 GB przy szczycie 0,29
+        self.assertLessEqual(s, 30 + 4 * 5)
+        # moduł z pomiarów w tabeli zostaje przy swojej prognozie
+        charter = S.classify("go test ./...", self.charter)
+        self.assertGreater(S.predict(charter, 4, [], self.small)[0], self.small)
+
+    def jam(self, ensure_elapsed=120.0):
+        """Stan z 2026-10-09 ~22:27: biegnie ensure z prognozą 30,32 GB przy 3,1 GB użytych, w kolejce
+        `pnpm tc` (21,1 GB) jako głowa i joby po 4 GB za nim."""
+        self.set_memory(57)  # 27,4 GB dostępne z 48
+        st = self.state()
+        now = time.time()
+        st["running"] = [{"id": "ensure", "label": "pnpm run ensure:electron-runtime", "where": "local",
+                          "mem_predicted_gb": 30.32, "mem_now_gb": 3.1, "mem_peak_gb": 3.1,
+                          "predicted_wall_s": 34.0, "predicted_from": "family:61",
+                          "started_at": now - ensure_elapsed}]
+        S.refresh_memory(st, self.cfg)
+        st["queue"] = [
+            {"id": "tc", "label": "pnpm tc", "mem_predicted_gb": 21.1, "predicted_wall_s": 21.0,
+             "predicted_from": "history:20", "small": False, "enqueued_at": now - 900, "route": {"choice": "local"}},
+            {"id": "perm", "label": "./perm-guard", "mem_predicted_gb": 4.0, "predicted_wall_s": 60.0,
+             "predicted_from": "prior", "small": True, "enqueued_at": now - 78, "route": {"choice": "local"}},
+            {"id": "test", "label": "pnpm test", "mem_predicted_gb": 19.0, "predicted_wall_s": 90.0,
+             "predicted_from": "history:20", "small": False, "enqueued_at": now - 44, "route": {"choice": "local"}},
+        ]
+        return st, now
+
+    def test_reservation_follows_what_a_job_uses_after_warm_up(self):
+        st, now = self.jam(ensure_elapsed=20.0)  # w rozgrzewce: cała prognoza
+        self.assertAlmostEqual(st["memory"]["reserved_gb"], 30.32 - 3.1, places=1)
+        self.assertLess(st["memory"]["free_for_admission_gb"], 0)
+        st, now = self.jam(ensure_elapsed=120.0)  # po rozgrzewce: szczyt × 1,5 + 1 GB
+        self.assertAlmostEqual(st["memory"]["reserved_gb"], 3.1 * 1.5 + 1.0 - 3.1, places=1)
+        self.assertGreater(st["memory"]["free_for_admission_gb"], 15)
+        # e2e z prognozą 14,8 GB, które bierze 2,4 GB, rezerwuje 2,2, a nie 12,4
+        e2e = {"where": "local", "mem_predicted_gb": 14.81, "mem_now_gb": 2.4, "mem_peak_gb": 2.4,
+               "predicted_wall_s": 93.0, "started_at": now - 100}
+        self.assertAlmostEqual(S.growth_left(e2e, now), 2.2, places=2)
+        # natywny build trzyma pamięć poza drzewem: rezerwa zostaje przy prognozie
+        self.assertAlmostEqual(S.growth_left(dict(e2e, lang="native"), now), 14.81 - 2.4, places=2)
+
+    def test_jobs_behind_an_unstartable_head_start_after_aging(self):
+        st, now = self.jam()
+        free = st["memory"]["free_for_admission_gb"]
+        self.assertTrue(4.0 <= free < 21.1, free)
+        # głowa twardo rezerwuje (czeka > 2 × starve_s): perm-guard (4 GB) jeszcze nie wchodzi...
+        self.assertEqual(S.plan(st, self.cfg, now), {})
+        # ...a po aging_s czekania wchodzi, choć głowa dalej się nie mieści
+        st["queue"][1]["enqueued_at"] = now - self.cfg["aging_s"] - 1
+        self.assertEqual(S.plan(st, self.cfg, now), {"perm": ("overtake", "tc")})
+        # job, który się nie mieści (19 GB obok 4 GB perm-guard), dalej czeka
+        st["queue"][2]["enqueued_at"] = now - self.cfg["aging_s"] - 1
+        self.assertNotIn("test", S.plan(st, self.cfg, now))
+
+    def test_eta_behind_an_overrun_job_is_not_five_seconds(self):
+        now = time.time()
+        late = {"id": "rerun", "label": "rerun-failed.sh", "where": "local", "mem_predicted_gb": 6.0,
+                "mem_now_gb": 6.0, "predicted_wall_s": 300.0, "predicted_from": "history:20",
+                "started_at": now - 1500}
+        self.assertAlmostEqual(S.time_left(late, now), 750, delta=1)  # połowa tego, co już biegnie
+        self.assertAlmostEqual(S.time_left(dict(late, started_at=now - 200), now), 100, delta=1)
+        self.set_memory(30)
+        st = self.state()
+        st["running"] = [late]
+        S.refresh_memory(st, self.cfg)
+        st["queue"] = [{"id": "big", "label": "big", "mem_predicted_gb": 12.0, "predicted_wall_s": 60.0,
+                        "predicted_from": "history:20", "small": False, "enqueued_at": now - 30,
+                        "route": {"choice": "local"}}]
+        S.update_queue_view(st, self.cfg)
+        text = st["queue"][0]["reason"]["text"]
+        self.assertIn("rerun-failed.sh", text)
+        self.assertNotIn("about 5s", text)
+        self.assertIn("about 12m", text)
+
+    def test_stalled_job_releases_its_reservation_and_says_why(self):
+        st, now = self.jam(ensure_elapsed=20.0)
+        st["running"][0]["stalled_s"] = 1080
+        S.refresh_memory(st, self.cfg)
+        self.assertEqual(st["memory"]["reserved_gb"], 0.0)
+        S.update_queue_view(st, self.cfg)
+        reasons = [j["reason"]["text"] for j in st["queue"]]
+        self.assertTrue(any("ensure:electron-runtime stalled 18m (no CPU, no output)" in r for r in reasons), reasons)
+
+    def test_stall_watch(self):
+        cfg = dict(self.cfg, stall_s=600)
+        watch = S.StallWatch(cfg, {"class": "ide:test:vitest", "label": "vitest"}, "j-1")
+        with mock.patch.object(S, "notify") as notify, mock.patch.object(S.StallWatch, "output_size", return_value=0):
+            t = 1000.0
+            self.assertIsNone(watch.sample(t, 5.0, {10, 11}))
+            self.assertIsNone(watch.sample(t + 300, 5.2, {10, 11}))  # 0,2 s CPU: to jeszcze nie życie
+            self.assertEqual(watch.sample(t + 600, 5.3, {10, 11}), 600)
+            self.assertEqual(watch.sample(t + 700, 5.3, {10, 11}), 700)
+            self.assertEqual(notify.call_count, 1)  # raz, nie co sekundę
+            self.assertIsNone(watch.sample(t + 701, 6.0, {10, 11}))  # CPU wraca: pracuje
+            self.assertIsNone(watch.sample(t + 1400, 6.0, {10, 11, 12}))  # nowy proces to też życie
+        # wyjście do pliku też liczy się jako życie
+        watch = S.StallWatch(cfg, {"class": "x", "label": "x"}, "j-2")
+        sizes = iter([0, 10, 20])
+        with mock.patch.object(S, "notify"), mock.patch.object(S.StallWatch, "output_size", side_effect=lambda: next(sizes)):
+            watch.sample(0.0, 1.0, {1})
+            self.assertIsNone(watch.sample(700.0, 1.0, {1}))
+            self.assertIsNone(watch.sample(1400.0, 1.0, {1}))
+
+    def test_class_timeout_is_off_by_default_and_terminates_when_set(self):
+        import signal
+
+        job = {"class": "ide:test:vitest", "label": "vitest"}
+        with mock.patch.object(S.os, "killpg") as killpg:
+            S.StallWatch(dict(self.cfg), job, "j").enforce(10**6, 4242)
+            killpg.assert_not_called()
+            watch = S.StallWatch(dict(self.cfg, class_timeout_s={"ide:test": 1800}), job, "j")
+            watch.enforce(1799, 4242)
+            killpg.assert_not_called()
+            watch.enforce(1800, 4242)
+            self.assertEqual(killpg.call_args_list[-1], mock.call(4242, signal.SIGTERM))
+            watch.enforce(1805, 4242)
+            self.assertEqual(killpg.call_args_list[-1], mock.call(4242, signal.SIGTERM))
+            watch.enforce(1811, 4242)
+            self.assertEqual(killpg.call_args_list[-1], mock.call(4242, signal.SIGKILL))
+
+
+class StallRunTest(unittest.TestCase):
+    """Prawdziwy `sched.py run` z jobem, który śpi: stoi, mówi o tym w stanie i historii, nie ginie."""
+
+    setUp, kill_all, set_memory, done = RunTest.setUp, RunTest.kill_all, RunTest.set_memory, RunTest.done
+
+    def test_sleeping_job_is_marked_stalled_and_finishes_untouched(self):
+        os.makedirs(self.sched_dir, exist_ok=True)
+        with open(os.path.join(self.sched_dir, "config.json"), "w") as f:
+            json.dump({"stall_s": 1}, f)
+        calls = os.path.join(self.dir, "osascript.log")
+        write(os.path.join(self.bin, "osascript"), f"#!/bin/sh\necho \"$@\" >> {calls}\n", 0o755)
+        shop = os.path.join(self.dir, "shop")
+        make_generic_repo(shop)
+        write(os.path.join(shop, "scripts/e2e.sh"), "#!/bin/sh\nsleep 4\necho done\n", 0o755)
+        p = subprocess.Popen(["/usr/bin/python3", SCRIPT, "run", "--via", "hook", "--shell", "./scripts/e2e.sh"],
+                             cwd=shop, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        rc, out, err = self.done(p)
+        self.assertEqual((rc, out.strip()), (0, "done"), err)
+        self.assertIn("stoi od", err)
+        rows = [json.loads(l) for l in open(os.path.join(self.sched_dir, "history.jsonl"))]
+        self.assertGreaterEqual(rows[-1]["stalled_s"] or 0, 1)
+        self.assertIn("job stoi", open(calls).read())
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -2649,7 +2887,7 @@ class GenericTest(Paths):
         job = S.classify("python3 scripts/capture.py", self.shop)
         gb, _s, src = S.predict(job, 4, rows)
         self.assertEqual(src, "family:5")
-        self.assertAlmostEqual(gb, 1.0)  # p90 × 1,5, najmniej 1 GB
+        self.assertAlmostEqual(gb, 0.5)  # p75 × 1,25, najmniej 0,5 GB
         # rodzina to repo, rodzaj i narzędzie: skrypty node się nie liczą
         node = S.classify("node plugins/cli/main.ts capture", self.shop)
         self.assertEqual(S.predict(node, 4, rows)[2], "prior")
@@ -2678,10 +2916,11 @@ class GenericTest(Paths):
         # trzyma rezerwy na wzrost, który nie przyjdzie
         now = time.time()
         job = {"where": "local", "mem_predicted_gb": 4.0, "mem_now_gb": 1.0, "predicted_wall_s": 120,
-               "started_at": now - 60}
-        self.assertEqual(S.growth_left(job, now), 3.0)
+               "started_at": now - 30}
+        self.assertEqual(S.growth_left(job, now), 3.0)  # w rozgrzewce: cała prognoza
         self.assertEqual(S.growth_left(dict(job, started_at=now - 700), now), 0.0)
         self.assertEqual(S.growth_left(dict(job, paused=True), now), 0.0)
+        self.assertEqual(S.growth_left(dict(job, stalled_s=700), now), 0.0)
 
 
 class GitGrepTest(unittest.TestCase):
