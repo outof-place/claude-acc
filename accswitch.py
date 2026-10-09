@@ -14,6 +14,8 @@ zarządzanym Orca wymusza swoje konto przy starcie terminala i co 15 minut.
 Komendy:
   status [--json]   limity wszystkich kont, kolejka do palenia (--json dla aplikacji w pasku menu)
   who               konto aktywne w zarządzanym katalogu i prognoza
+  who --json        czyj token leży teraz we wpisach Claude Code: e-mail i id konta, bez sieci
+                    i blokady (~50 ms; przed wywołaniem modelu, np. Polid)
   plan              kolejność, w jakiej warto palić konta, z uzasadnieniem
   heal [--deep]     odzyskaj konta z martwym tokenem (--deep skanuje cały Pęk kluczy)
   switch <email>    przełącz na konkretne konto
@@ -901,12 +903,17 @@ def find_active(accounts, cfg):
         if not live.get("accessToken"):
             continue
         for a in accounts:
-            stored = a.seen_oauth
-            if stored.get("refreshToken") == live.get("refreshToken") or stored.get("accessToken") == live.get("accessToken"):
+            if same_login(a.seen_oauth, live):
                 return a
     # sesja odświeżyła token po ostatniej kopii: tokeny nie pasują do żadnej kopii,
     # więc właściciela mówi API profilu
     return owner_of(freshest_runtime(cfg), accounts)
+
+
+def same_login(stored, live):
+    """Czy kopia konta i wpis runtime to ta sama para tokenów (wystarczy jeden z nich). Pusty
+    token nie pasuje do pustego: kopia bez refresh tokenu nie może przejąć cudzego wpisu."""
+    return any(stored.get(k) and stored.get(k) == live.get(k) for k in ("refreshToken", "accessToken"))
 
 
 def owner_of(creds_json, accounts):
@@ -1464,7 +1471,84 @@ def cmd_plan(cfg, _args):
     return 0
 
 
-def cmd_who(cfg, _args):
+WHO_SETTLE_S = 2.0  # przełączenie pisze dwa wpisy po kolei (~35 ms każdy); dłużej to nie przełączenie
+
+
+def who_now(cfg):
+    """Konto, którego token leży teraz we wpisach runtime Claude Code (`who --json`), dla procesów,
+    które przed każdym wywołaniem modelu sprawdzają, na czyim koncie pracują (Polid).
+
+    Bez sieci, bez blokady przebiegu i bez pamięci, która po przełączeniu kłamie: liczą się tylko
+    tokeny we wpisach i w kopiach kont Orca. Stan (`active_email` z ostatniego przełączenia) mówi
+    tylko, którą kopię sprawdzić najpierw; gdy nie pasuje, sprawdzamy wszystkie. Przełączenie pisze wpisy runtime po kolei, więc
+    przez chwilę każdy trzyma inne konto: wtedy czytamy jeszcze raz, najwyżej WHO_SETTLE_S.
+
+    {"email", "real_email", "id", "source": "keychain"} albo z "email": None i "reason":
+    no_login (pusty wpis), unknown_token (token spoza kopii Orca: logowanie spoza Orca albo sesja
+    odświeżyła go po ostatniej synchronizacji, którą tick robi co 2 min), switching."""
+    deadline = time.time() + WHO_SETTLE_S
+    while True:
+        out = who_once(cfg)
+        if out.get("reason") != "switching" or time.time() >= deadline:
+            return out
+        _KC_SEEN.clear()
+        time.sleep(0.1)
+
+
+def who_once(cfg):
+    services = live_services(cfg)
+    state = load_state()
+    accounts = orca_accounts()
+    hint = next((a for a in accounts if a.email == state.get("active_email")), None)
+    # wpisy runtime i kopia konta z podpowiedzi naraz: jeden odczyt Pęku kluczy trwa ~35 ms
+    kc_read_many([(s, KEYCHAIN_USER) for s in services] + ([(MANAGED_SERVICE, hint.id)] if hint else []))
+    live = {s: oauth_of(_KC_SEEN.get((s, KEYCHAIN_USER))) for s in services}
+    live = {s: o for s, o in live.items() if o.get("accessToken")}
+
+    def nobody(reason, detail):
+        return {"email": None, "real_email": None, "id": None, "source": "keychain", "reason": reason,
+                "detail": detail}
+
+    if not live:
+        return nobody("no_login", "no Claude Code login in the keychain")
+    owners, read_all = {}, False
+    for service, oauth in live.items():
+        owner = hint if hint and same_login(hint.seen_oauth, oauth) else None
+        if owner is None:
+            if not read_all:
+                kc_read_many((MANAGED_SERVICE, a.id) for a in accounts if (MANAGED_SERVICE, a.id) not in _KC_SEEN)
+                read_all = True
+            owner = next((a for a in accounts if same_login(a.seen_oauth, oauth)), None)
+        if owner is None:
+            return nobody("unknown_token", f"the token in {service} matches no Orca account: a login outside "
+                                           "Orca, or a session refreshed it after the last sync (claude-acc "
+                                           "tick syncs it every 2 minutes)")
+        owners[service] = owner
+    if len({a.id for a in owners.values()}) > 1:
+        return nobody("switching", "the Claude Code entries hold different accounts: "
+                                   + ", ".join(f"{a.email} in {s}" for s, a in owners.items()))
+    account = next(iter(owners.values()))
+    real = ((state.get("identity") or {}).get(account.id) or {}).get("email")
+    return {"email": account.email, "real_email": real, "id": account.id, "source": "keychain"}
+
+
+def orca_accounts():
+    """Konta Orca z ich plików, bez odczytu Pęku kluczy (ten robi load_accounts dla wszystkich)."""
+    found = []
+    for acct_id in sorted(os.listdir(ACCOUNTS_DIR)) if os.path.isdir(ACCOUNTS_DIR) else []:
+        try:
+            with open(os.path.join(ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json")) as f:
+                found.append(Account(acct_id, json.load(f).get("emailAddress")))
+        except (OSError, ValueError):
+            pass
+    return found
+
+
+def cmd_who(cfg, args):
+    if args and args[0] == "--json":
+        out = who_now(cfg)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out["email"] else 1
     lock = take_lock(wait=25)
     if not lock:
         print("inny przebieg trwa zbyt długo, spróbuj za chwilę")
