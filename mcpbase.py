@@ -7,6 +7,10 @@ dla nieznanej wersji). Klasa pochodna podaje nazwę, narzędzia i `call_tool`; t
 do puli wątków, więc długie wywołanie (czekanie na zgodę, ładowanie strony) nie blokuje odczytu.
 """
 
+# Python 3.15 (PEP 810) ładuje go dopiero przy pierwszym serwerze, a starsze pomijają tę nazwę:
+# `--help` i status bramek nie płacą za pulę wątków
+__lazy_modules__ = ["concurrent.futures"]
+
 import json
 import sys
 import threading

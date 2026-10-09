@@ -307,6 +307,9 @@ def main(argv=None):
         return 1
     tools = Tools(afsctool, args.threads)
     rows = plan(app_bundles(), tools, args.wanted, args.done_ratio)
+    if not rows and args.wanted:
+        print(f"żadna aplikacja w /Applications nie pasuje do --apps {args.apps}")
+        return 0
     if args.mode == "plan" or args.dry_run:
         print_plan(rows)
         return 0
@@ -320,6 +323,9 @@ def main(argv=None):
         print(f"kompresuję {os.path.basename(bundle)}...", flush=True)
         results.append(process(bundle, tools, st))
     print_results(results)
+    skipped = [(bundle, reason) for bundle, _, reason in rows if reason]
+    if skipped:
+        print("pominięte: " + ", ".join(f"{os.path.basename(b)} ({r})" for b, r in skipped))
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump(results, f, ensure_ascii=False)

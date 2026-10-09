@@ -32,6 +32,8 @@ enum CLI {
     static let guardState = directory + "/devguard-state.json"
     static let guardConfig = directory + "/devguard.json"
     static let fanConfig = directory + "/fans.json"
+    /// Stay Awake asks the fan daemon (root) to keep a closed lid from sleeping the Mac.
+    static let awakeRequest = directory + "/awake.json"
     static let fanState = directory + "/fans-state.json"
     static let perfState = directory + "/perf-state.json"
     static let schedState = directory + "/sched/state.json"

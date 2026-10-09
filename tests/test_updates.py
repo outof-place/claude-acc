@@ -147,6 +147,11 @@ class Env:
         with open(os.path.join(self.state_dir, "updates-state.json"), "w") as f:
             json.dump(state, f)
 
+    def set_link(self, link):
+        # wpis, który perf.py keep zostawia w perf-state.json
+        with open(os.path.join(self.state_dir, "perf-state.json"), "w") as f:
+            json.dump({"ultra": {}, "link": link}, f)
+
     def calls(self):
         return self.lines("fake/calls.log")
 
@@ -276,6 +281,47 @@ class UpdatesTest(unittest.TestCase):
         upcoming = datetime.fromtimestamp(env.state()["next_run"])
         self.assertEqual((upcoming.hour, upcoming.minute), (4, 30))
         self.assertTrue(3 * DAY - 3600 <= upcoming.timestamp() - run["at"] < 4 * DAY)
+
+    def test_a_scheduled_run_waits_while_the_mac_is_tethered(self):
+        env = Env(self)
+        tether = {"tethered": True, "port": "iPhone USB", "iface": "en8", "gateway": "172.20.10.1"}
+        env.set_link(dict(tether, at=time.time() - 60))
+        done = env.run("run")
+        self.assertEqual(done.stdout.strip(), "aktualizacja odłożona: Mac na tetheringu")
+        self.assertEqual(env.calls(), [])
+        log = "\n".join(env.lines(".local/share/claude-acc/updates.log"))
+        self.assertIn("=== aktualizacja odłożona: Mac na tetheringu (iPhone USB, en8)", log)
+        # bez last_run przebieg zostaje należny: następne uruchomienie z launchd próbuje znowu
+        self.assertIsNone(env.state())
+
+        env.set_link(dict(tether, tethered=False, at=time.time()))
+        env.run("run")
+        self.assertIn("brew update --quiet", env.calls())
+        self.assertEqual(env.state()["last_run"]["trigger"], "auto")
+
+    def test_a_stale_or_broken_tether_entry_does_not_hold_the_run(self):
+        env = Env(self)
+        stale = {"tethered": True, "port": "iPhone USB", "iface": "en8", "at": time.time() - 16 * 60}
+        cases = {
+            "stale": json.dumps({"link": stale}),
+            "no time": json.dumps({"link": dict(stale, at="teraz")}),
+            "garbled": '{"link": {"tethered": tr',
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                env.write(".local/share/claude-acc/perf-state.json", text)
+                env.set_state({})
+                before = len(env.calls())
+                env.run("run")
+                self.assertGreater(len(env.calls()), before)
+                self.assertIn("last_run", env.state())
+
+    def test_update_by_hand_runs_while_tethered(self):
+        env = Env(self)
+        env.set_link({"tethered": True, "port": "iPhone USB", "iface": "en8", "at": time.time()})
+        env.run("run", "--force")
+        self.assertIn("brew update --quiet", env.calls())
+        self.assertEqual(env.state()["last_run"]["trigger"], "manual")
 
     def test_python_packages_are_upgraded_together_from_wheels(self):
         env = Env(self, pip={

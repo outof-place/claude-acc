@@ -338,6 +338,29 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(sorted(emails), ["a@x", "b@x"])
         self.assertEqual(w.calls("/v1/oauth/token"), [])
 
+    def test_tick_leaves_the_app_what_status_json_prints(self):
+        # przy zamkniętym panelu aplikacja czyta migawkę z ticku, zamiast co minutę
+        # uruchamiać `status --json`, więc obie muszą mówić to samo, także po przełączeniu
+        w = Env()
+        a = w.account("a@x", session_used=99)
+        w.account("b@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+
+        self.assertEqual(w.run("tick").returncode, 0)
+        saved = json.load(open(os.path.join(w.state_dir, "status.json")))
+        r = w.run("status", "--json")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        printed = json.loads(r.stdout)
+        self.assertEqual(saved["active_email"], "b@x")
+        self.assertEqual(saved["last_tick"], w.saved_state()["last_tick"])
+        for snap in (saved, printed):  # zegar i wiek danych płyną między przebiegami
+            snap.pop("generated_at")
+            for row in snap["accounts"]:
+                row.pop("data_age")
+        self.assertEqual(saved, printed)
+
 
 class PanelFreshnessTest(unittest.TestCase):
     def test_status_json_refreshes_idle_account_only_orca_holds(self):

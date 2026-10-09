@@ -141,7 +141,7 @@ final class Store {
         launchAtLogin = SMAppService.mainApp.status == .enabled
         poller = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.refresh()
+                await self?.poll()
                 // a baseline, so the panel opens with the last minute's load instead of a dash
                 self?.sampleLoad()
                 try? await Task.sleep(for: .seconds(60))
@@ -154,6 +154,40 @@ final class Store {
     }
 
     // MARK: Reading
+
+    /// What `status --json` prints, written by every tick (launchd runs one every 2 minutes).
+    private static let tickSnapshot = CLI.directory + "/status.json"
+    /// A tick snapshot older than this means the ticks stopped: the script runs itself again.
+    private static let tickSnapshotMaxAge: TimeInterval = 180
+
+    /// The minute's reading. With the panel closed the tick's file stands in for the script,
+    /// whose every run spawns ~20 Keychain reads; open, the panel asks the script as before.
+    private func poll() async {
+        if !panelOpen, readTickSnapshot() {
+            readLocal()
+            return
+        }
+        await refresh()
+    }
+
+    /// Takes the tick's snapshot when it's newer than the one shown. False when the script
+    /// should run: no file, unreadable, or what's shown is older than `tickSnapshotMaxAge`.
+    private func readTickSnapshot() -> Bool {
+        if let data = changedFile(Self.tickSnapshot), let fresh = Self.decode(Snapshot.self, from: data),
+           fresh.generatedAt > (latestSnapshot?.generatedAt ?? 0) {
+            show(fresh)
+        }
+        return Date.now.timeIntervalSince1970 - (latestSnapshot?.generatedAt ?? 0) <= Self.tickSnapshotMaxAge
+    }
+
+    private func show(_ fresh: Snapshot) {
+        latestSnapshot = fresh
+        // with the panel closed only the menu bar label reads it; the panel takes it when it opens
+        if panelOpen || isPreview || snapshot == nil { snapshot = fresh }
+        if problem != nil { problem = nil }
+        updateLabel()
+        for (setting, pick) in settingPicks where pick == value(of: setting) { settingPicks[setting] = nil }
+    }
 
     func refresh() async {
         if refreshing {
@@ -172,11 +206,7 @@ final class Store {
                 continue
             }
             do {
-                latestSnapshot = try Self.decoder.decode(Snapshot.self, from: Data(result.stdout.utf8))
-                if panelOpen || isPreview || snapshot == nil { snapshot = latestSnapshot }
-                if problem != nil { problem = nil }
-                updateLabel()
-                for (setting, pick) in settingPicks where pick == value(of: setting) { settingPicks[setting] = nil }
+                show(try Self.decoder.decode(Snapshot.self, from: Data(result.stdout.utf8)))
             } catch {
                 problem = "The script returned unreadable data: \(error.localizedDescription)"
                 updateLabel()
@@ -319,6 +349,7 @@ final class Store {
         fanState = latestFan
         guardState = latestGuard
         refreshDisk(force: true)
+        _ = readTickSnapshot()  // a tick that just ran saves the script run
         let age = Date.now.timeIntervalSince1970 - (snapshot?.generatedAt ?? 0)
         if age > 30 { Task { await refresh() } }
         live?.cancel()

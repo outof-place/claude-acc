@@ -8,6 +8,8 @@ tymczasowym.
 Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 """
 
+import contextlib
+import io
 import os
 import plistlib
 import shutil
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -165,6 +168,26 @@ class MainTest(unittest.TestCase):
     @unittest.skipIf(os.geteuid() == 0, "test sprawdza odmowę bez roota")
     def test_run_without_root_refuses(self):
         self.assertEqual(compressapps.main(["run", "--afsctool", "/bin/sh"]), 1)
+        self.assertEqual(self.tools.modifying(), [])
+
+
+    def run_as_root(self, *args):
+        out = io.StringIO()
+        with mock.patch.object(compressapps.os, "geteuid", return_value=0), contextlib.redirect_stdout(out):
+            rc = compressapps.main(["run", "--afsctool", "/bin/sh", *args])
+        return rc, out.getvalue()
+
+    def test_no_match_says_so(self):
+        rc, out = self.run_as_root("--apps", "Nope")
+        self.assertEqual(rc, 0)
+        self.assertIn("nie pasuje do --apps Nope", out)
+        self.assertEqual(self.tools.modifying(), [])
+
+    def test_real_run_lists_skipped_apps(self):
+        self.tools.running_set = {"/Applications/Word.app"}
+        rc, out = self.run_as_root()
+        self.assertEqual(rc, 0)
+        self.assertIn("pominięte: Word.app (działa)", out)
         self.assertEqual(self.tools.modifying(), [])
 
 
