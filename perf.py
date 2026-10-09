@@ -3624,7 +3624,7 @@ def describe_agents(r):
         lines.append(f"czekanie na hooki (p50/p90): {parts}")
     slow = r.get("slow_hooks") or []
     if slow:
-        lines.append("hooki, które kosztują najwięcej (ms p50 / p90, liczba):")
+        lines.append("hooki, które kosztują najwięcej (tylko te, które coś wypisały; ms p50 / p90, liczba):")
         for h in slow:
             lines.append(f"  {h['hook']} ({h['event']}): {fmt(h['p50'])} / {fmt(h['p90'])} ({h['n']})")
     lines.append(
