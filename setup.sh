@@ -229,6 +229,8 @@ open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
 echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
-if [ -d "/Applications/Orca.app" ] || [ -d "$HOME/Applications/Orca.app" ]; then
-  echo "Orca: wtyczka claude-acc (pasek statusu, panel, komendy Cmd-J): claude-acc orca install"
+# host agentów (Orca albo Pod) według orcahost.py
+HOST_APP="$("$STATE/python" "$STATE/orcahost.py" app 2>/dev/null || true)"
+if [ -n "$HOST_APP" ] && { [ -d "$HOST_APP" ] || [ -d "$HOME/Applications/$(basename "$HOST_APP")" ]; }; then
+  echo "$(basename "$HOST_APP" .app): wtyczka claude-acc (pasek statusu, panel, komendy Cmd-J): claude-acc orca install"
 fi

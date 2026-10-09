@@ -269,10 +269,6 @@ def host(ttl=30.0):
     return _cache[1]
 
 
-def reset():
-    _cache[:] = [0.0, None]
-
-
 def known(env=None, home=None):
     """Every host that may be on this Mac: the resolved one first, then Orca and an installed Pod.
     What protects (processes never killed, hooks, Keychain entries agents may not read) covers all."""

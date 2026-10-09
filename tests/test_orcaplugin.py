@@ -1,7 +1,7 @@
 """Testy orcaplugin.py (instalacja wtyczki w katalogu wtyczek Orki) i testy samej wtyczki (node).
 
 Wszystko w katalogu testu: --user-data wskazuje tymczasowy userData, a podrobiona Orca.app to
-katalog z app.asar. Prawdziwego ~/Library/Application Support/orca nic nie dotyka.
+katalog z app.asar. Prawdziwego katalogu danych Orki nic nie dotyka.
 """
 
 import importlib.util
