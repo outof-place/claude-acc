@@ -26,7 +26,7 @@ def reply(code, obj):
 
 email = server.get("access", {}).get(headers.get("Authorization", "").replace("Bearer ", ""))
 if url.endswith("/api/oauth/usage"):
-    if server.get("rate_limited"):
+    if server.get("rate_limited") or (email and email in server.get("rate_limited_accounts", [])):
         reply(429, {"error": "rate_limited"})
     if not email:
         reply(401, {"error": "invalid token"})
