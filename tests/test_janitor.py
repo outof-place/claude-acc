@@ -162,6 +162,48 @@ class JanitorTest(unittest.TestCase):
         self.assertTrue(self.env.exists("fresh/.next"))
         self.assertTrue(self.env.exists("idle/package.json"))
 
+    def turbopack_app(self, name, cache_days, dev_cache_days, build_days=2):
+        """Build Next 16 z trwałym cache Turbopacka w .next/cache i .next/dev/cache."""
+        self.env.file(f"{name}/package.json", OLD, "{}")
+        for rel in ("BUILD_ID", "server/app/page.js", "static/chunks/a.js", "dev/server/page.js", "dev/lock"):
+            self.env.file(f"{name}/.next/{rel}", build_days)
+        self.env.file(f"{name}/.next/cache/turbopack/v1/00001.sst", cache_days)
+        self.env.file(f"{name}/.next/cache/fetch-cache/f.json", cache_days)
+        self.env.file(f"{name}/.next/dev/cache/turbopack/v1/00001.sst", dev_cache_days)
+
+    def test_idle_next_keeps_recent_turbopack_cache(self):
+        """2026-10-09: Turbopack trzyma cache buildu w .next/cache, a nowe worktree się z niego
+        rozgrzewają. Build po 24 godzinach idzie, cache zostaje do cache_idle_days."""
+        self.turbopack_app("web", cache_days=2, dev_cache_days=2)
+        self.env.sweep()
+        for rel in ("BUILD_ID", "server", "static", "dev/server", "dev/lock"):
+            self.assertFalse(self.env.exists(f"web/.next/{rel}"), rel)
+        self.assertTrue(self.env.exists("web/.next/cache/turbopack/v1/00001.sst"))
+        self.assertTrue(self.env.exists("web/.next/cache/fetch-cache/f.json"))
+        self.assertTrue(self.env.exists("web/.next/dev/cache/turbopack/v1/00001.sst"))
+        self.assertIn("next", self.env.state()["task_runs"])
+        self.assertGreater(self.env.state()["last_sweep"]["freed"], 0)
+        self.env.sweep()  # zostały same cache: kolejny przebieg ich nie rusza
+        self.assertTrue(self.env.exists("web/.next/cache/turbopack/v1/00001.sst"))
+        self.assertTrue(self.env.exists("web/.next/dev/cache/turbopack/v1/00001.sst"))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.env.work, "web/.next/dev"))), ["cache"])
+
+    def test_turbopack_cache_goes_once_idle_for_cache_days(self):
+        self.turbopack_app("stale", cache_days=10, dev_cache_days=10)
+        self.turbopack_app("mixed", cache_days=10, dev_cache_days=2)
+        self.env.sweep()
+        self.assertFalse(self.env.exists("stale/.next"))
+        self.assertFalse(self.env.exists("mixed/.next/cache"))
+        self.assertFalse(self.env.exists("mixed/.next/server"))
+        self.assertFalse(self.env.exists("mixed/.next/dev/server"))
+        self.assertTrue(self.env.exists("mixed/.next/dev/cache/turbopack/v1/00001.sst"))
+
+    def test_fresh_next_keeps_its_build(self):
+        self.turbopack_app("live", cache_days=10, dev_cache_days=10, build_days=0)
+        self.env.sweep()
+        self.assertTrue(self.env.exists("live/.next/server/app/page.js"))
+        self.assertTrue(self.env.exists("live/.next/cache/turbopack/v1/00001.sst"))
+
     def test_next_with_open_file_stays(self):
         chunk = self.app("served")
         with open(chunk):
@@ -368,6 +410,43 @@ class UnavailableSimulatorsTest(unittest.TestCase):
         self.janitor.write_json(self.janitor.SIMULATORS_STATE_PATH, [])  # w międzyczasie wrócił
         self.sweep()
         self.assertEqual(self.deleted(), [])
+
+
+class DerivedDataTest(unittest.TestCase):
+    """DerivedData projektów idzie po derived_data_idle_days, wspólne cache Xcode zostają:
+    CAS kompilacji (CompilationCache.noindex) odtwarza się zimnym buildem ~2,7 GB."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="derived-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.derived = os.path.join(self.root, "Library/Developer/Xcode/DerivedData")
+        patched = {"HOME": self.root, "which": lambda name: None, "log": lambda line, path=None: None}
+        for name, value in patched.items():
+            self.addCleanup(setattr, janitor, name, getattr(janitor, name))
+            setattr(janitor, name, value)
+        self.sw = janitor.Sweep(dict(janitor.DEFAULT_CONFIG), dry_run=False)
+
+    def entry(self, rel, days_old):
+        path = os.path.join(self.derived, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("x" * 4096)
+        stamp = time.time() - days_old * 86400
+        os.utime(path, (stamp, stamp))
+
+    def test_shared_caches_stay_idle_projects_go(self):
+        self.entry("Old-abc/Build/Intermediates.noindex/o.o", OLD)
+        self.entry("New-def/Build/Intermediates.noindex/o.o", 1)
+        self.entry("ModuleCache.noindex/Foundation.pcm", OLD)
+        self.entry("CompilationCache.noindex/plugin/v1/data", OLD)
+        self.janitor.task_xcode(self.sw, None)
+        left = sorted(os.listdir(self.derived))
+        self.assertEqual(left, ["CompilationCache.noindex", "ModuleCache.noindex", "New-def"])
+        self.assertEqual([path for _, path, _ in self.sw.items], [os.path.join(self.derived, "Old-abc")])
 
 
 def compressed(path):

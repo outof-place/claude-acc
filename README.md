@@ -300,7 +300,7 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 
 | Task | What goes | When |
 | --- | --- | --- |
-| `next` | `.next` and `.next-*` next to a `package.json`, unchanged for 24 hours | every run |
+| `next` | `.next` and `.next-*` next to a `package.json`, unchanged for 24 hours; Turbopack's persistent cache in `.next/cache` and `.next/dev/cache` (what new worktrees seed from) stays until it is unchanged for 7 days | every run |
 | `caches` | `.turbo`, `node_modules/.cache`, `node_modules/.vite`, unchanged for 7 days | daily |
 | `node_modules` | every `node_modules` of a project where no file changed and git didn't move for 30 days | daily |
 | `tmp` | `go-build*` in `$TMPDIR` older than 6 hours | every run |
@@ -309,7 +309,7 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `npm` | `npm cache verify`, npx packages unused for 30 days (not the ones a running process uses, like MCP servers), npm logs older than a week | daily |
 | `pnpm` | `pnpm store prune`, and after every run that removed a `node_modules` | weekly |
 | `docker` | dangling images and build cache older than a week, only when the engine is already running | daily |
-| `xcode` | DerivedData unchanged for 14 days, unavailable simulators | daily |
+| `xcode` | DerivedData unchanged for 14 days except the shared `ModuleCache.noindex` and `CompilationCache.noindex`, unavailable simulators | daily |
 | `brew` | `brew cleanup --prune=14` | weekly |
 | `uv` | `uv cache prune` | weekly |
 | `logs` | files in `~/Library/Logs` older than 30 days | daily |
@@ -337,8 +337,8 @@ Configuration lives in `~/.local/share/claude-acc/janitor.json`. Every key is op
 | --- | --- | --- |
 | `roots` | `~/Documents`, `~/Developer`, `~/Projects`, `~/code`, `~/src` | Where projects live |
 | `protect` | `[]` | Paths the janitor never touches (footage, experiment results) |
-| `next_idle_hours` | `24` | Age of a `.next` cache before it goes |
-| `cache_idle_days` | `7` | Age of `.turbo` and `node_modules/.cache` |
+| `next_idle_hours` | `24` | Age of a `.next` build before it goes |
+| `cache_idle_days` | `7` | Age of `.turbo`, `node_modules/.cache` and Turbopack's cache in `.next` |
 | `node_modules_idle_days` | `30` | Project inactivity before its `node_modules` goes, `0` turns it off |
 | `npx_idle_days` | `30` | Age of an npx package |
 | `go_cache_max_gb` / `go_cache_keep_percent` | `20` / `60` | Go build cache size that triggers a trim, and how much of it the trim keeps (the most recently used entries) |
