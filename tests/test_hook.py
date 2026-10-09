@@ -21,6 +21,7 @@ from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK = os.path.join(os.path.dirname(HERE), "hook.py")
+ACC = os.path.join(os.path.dirname(HERE), "acc.py")
 
 spec = importlib.util.spec_from_file_location("hook", HOOK)
 hook = importlib.util.module_from_spec(spec)
@@ -47,18 +48,23 @@ class Guarded(unittest.TestCase):
     # hooki w powłoce (False) albo bez niej przez natywny program: "swift" to claude-acc-hook
     # pause, "c" to claude-acc-pause (oba programy na miejscu, jak po instalacji)
     native = False
+    # z acc.py i zarządzanym interpreterem ($STATE/python) w katalogu stanu, jak po setup.sh
+    launcher = False
 
     def setUp(self):
         self.real_settings = stamp(REAL_SETTINGS)
         World.native = self.native
+        World.launcher = self.launcher
 
     def tearDown(self):
         World.native = False
+        World.launcher = False
         self.assertEqual(stamp(REAL_SETTINGS), self.real_settings, "test zmienił prawdziwy ~/.claude/settings.json")
 
 
 class World:
     native = False
+    launcher = False
 
     def __init__(self):
         self.home = tempfile.mkdtemp(prefix="claude-acc-hook-")
@@ -71,6 +77,22 @@ class World:
             shutil.copy(BUILT_PAUSE, os.path.join(self.dir, "claude-acc-pause"))
         self.transcript = os.path.join(self.home, "transcript.jsonl")
         open(self.transcript, "w").write('{"type":"assistant","message":"robię"}\n')
+        if self.launcher:
+            shutil.copy(ACC, os.path.join(self.dir, "acc.py"))
+            self.link_python()
+
+    def link_python(self):
+        """$STATE/python, który linkuje setup.sh: zapisuje swoje argumenty i uruchamia systemowy."""
+        python = os.path.join(self.dir, "python")
+        with open(python, "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{self.home}/python-runs"\nexec /usr/bin/python3 "$@"\n')
+        os.chmod(python, 0o755)
+
+    def python_runs(self):
+        try:
+            return open(os.path.join(self.home, "python-runs")).read().splitlines()
+        except FileNotFoundError:
+            return []
 
     def pause(self, episode="100", resume_at=None):
         json.dump({"episode": episode, "since": 100, "account": "a@x", "reason": "test",
@@ -335,6 +357,103 @@ class CPauseCheckpointTest(CheckpointTest):
 @needs_pause
 class CPauseWakeTest(WakeTest):
     native = "c"
+
+
+@needs_native
+@needs_pause
+class LauncherOutsidePauseTest(OutsidePauseTest):
+    native = "c"
+    launcher = True
+
+
+@needs_native
+@needs_pause
+class LauncherCheckpointTest(CheckpointTest):
+    native = "c"
+    launcher = True
+
+
+@needs_native
+@needs_pause
+class LauncherWakeTest(WakeTest):
+    native = "c"
+    launcher = True
+
+
+@needs_native
+@needs_pause
+class LauncherTest(Guarded):
+    """W pauzie oba natywne fronty uruchamiają hook.py przez acc.py na zarządzanym
+    interpreterze (20 ms na wywołanie zamiast 30), a bez nich przez /usr/bin/python3."""
+
+    FRONTS = ("swift", "c")
+
+    def world(self, native):
+        World.native = native
+        w = World()
+        w.pause()
+        return w
+
+    def test_pause_runs_hook_through_acc_py_on_the_managed_interpreter(self):
+        for native in self.FRONTS:
+            with self.subTest(native=native):
+                w = self.world(native)
+                shutil.copy(ACC, os.path.join(w.dir, "acc.py"))
+                w.link_python()
+
+                self.assertIn("TASKS.md", w.context(w.fire("PostToolUse")))
+                self.assertEqual(w.python_runs(), [f"{w.dir}/acc.py hook post"])
+
+    def test_without_acc_py_hook_runs_on_the_system_interpreter(self):
+        for native in self.FRONTS:
+            with self.subTest(native=native):
+                w = self.world(native)
+                w.link_python()
+
+                self.assertIn("TASKS.md", w.context(w.fire("PostToolUse")))
+                self.assertEqual(w.python_runs(), [])
+
+    def test_interpreter_that_does_not_run_is_skipped(self):
+        for native in self.FRONTS:
+            with self.subTest(native=native):
+                w = self.world(native)
+                shutil.copy(ACC, os.path.join(w.dir, "acc.py"))
+                w.link_python()
+                os.chmod(os.path.join(w.dir, "python"), 0o644)
+
+                self.assertIn("TASKS.md", w.context(w.fire("PostToolUse")))
+                self.assertEqual(w.python_runs(), [])
+
+
+@needs_native
+class HandOverTest(Guarded):
+    """claude-acc-hook oddaje komendę `devguard.py admit` z tymi samymi bajtami na stdin:
+    przez acc.py, gdy leży w katalogu stanu, a bez niego wprost."""
+
+    native = "swift"
+
+    def hand_over(self, w):
+        # Python udaje skrypt: zapisuje argumenty i stdin; bez hook-words.json front oddaje wszystko
+        with open(os.path.join(w.dir, "python"), "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$*" > "{w.home}/argv"\ncat > "{w.home}/stdin"\n')
+        os.chmod(os.path.join(w.dir, "python"), 0o755)
+        event = json.dumps({"tool_name": "Bash", "tool_input": {"command": "npm run dev"}})
+        r = subprocess.run([os.path.join(w.dir, "claude-acc-hook")], input=event, env=w.env(),
+                           capture_output=True, text=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(open(os.path.join(w.home, "stdin")).read(), event)
+        return open(os.path.join(w.home, "argv")).read().strip()
+
+    def test_hand_over_goes_through_acc_py(self):
+        w = World()
+        shutil.copy(ACC, os.path.join(w.dir, "acc.py"))
+
+        self.assertEqual(self.hand_over(w), f"{w.dir}/acc.py devguard admit")
+
+    def test_hand_over_without_acc_py_runs_devguard_directly(self):
+        w = World()
+
+        self.assertEqual(self.hand_over(w), f"{w.dir}/devguard.py admit")
 
 
 ORIGINAL = {

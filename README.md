@@ -230,7 +230,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc perf-root spotlight apps-only\|undo` | Root: Spotlight indexes apps only; undo restores the previous privacy list |
 | `claude-acc perf-root iogpu set [MB]\|undo\|status` | Root: more memory for the GPU (`iogpu.wired_limit_mb`), so local models stay on Metal; kept across reboots, `status` without sudo |
 | `claude-acc perf-root devtools add\|undo\|status` | Opens Developer Tools in System Settings and waits until Orca is on the list, so fresh Go test binaries skip Gatekeeper |
-| `claude-acc perf bench agents` | Tool turnaround and hook waits from the last day of Claude Code transcripts, with the hooks that cost the most |
+| `claude-acc perf bench agents [--hours N]` | Where agents spend their time, from Claude Code transcripts (last day by default): model latency by context size, the floor of a Bash call, cache re-writes after idle gaps, tool turnaround and the hooks that cost the most |
 | `claude-acc perf bench gatekeeper` | How long the first run of a freshly built binary waits for Gatekeeper from this terminal |
 | `claude-acc mail add <address> gmail\|imap [read\|modify\|draft] [--send] [...]` | Add a mailbox; for IMAP the password goes into the Keychain, `--token-command` gives a Gmail mailbox without delegation |
 | `claude-acc mail google --service-account SA [--aws-audience A --aws-profile P]` | The Google service account and the identity that signs for it |
@@ -689,10 +689,15 @@ A Mac running a dozen agents spends a surprising amount of its time on work nobo
 | `devguard-budget`, `devguard-max-server` | The guard's `budget_percent` from 35 to 25 and `max_server_gb` from 5 to 4 |
 | `git-speed` | `core.untrackedCache`, `core.fsmonitor` and `git maintenance` (launchd: hourly prefetch, commit-graph and loose objects, daily incremental repack) in the repos listed in `git_repos` (empty by default), plus `git_global` in `~/.gitconfig`: parallel checkout (`checkout.workers=0`, `git worktree add` in an 18,000-file repo 2.0 s to 1.55 s) and `fetch.writeCommitGraph`. Set `git_maintenance` to `false` to leave maintenance out. A repo already in maintenance stays there after `ultra off` |
 | `claude-ui` | `prefersReducedMotion: true` and `spinnerTipsEnabled: false` in `~/.claude/settings.json` (keys from `claude_ui`): fewer spinner, shimmer and flash frames to repaint when many sessions share one terminal window |
+| `subagent-cache-1h` | `subagentPromptCacheTtl: "1h"` in `~/.claude/settings.json`. With the 5-minute default, 47% of subagent cache writes re-wrote a 300-900k context after a 5-60 minute pause |
+| `tether-profile` | While the default route goes through a phone (iPhone USB, Bluetooth PAN, Personal Hotspot), `tether_env` in the `env` of `~/.claude/settings.json`: no auto-updater download (~236 MB a release) and no background prompt suggestions or away summaries. Removed again on a cable or regular Wi-Fi; scheduled `updates` runs wait for a regular link too |
+| `rg-threads` | A `ripgreprc` with `--threads=4` and `RIPGREP_CONFIG_PATH` for Claude Code sessions: on macOS 16 threads fight over kernel locks walking a tree (428 → 179 ms in a 17.7k-file repo). An explicit `-j` still wins |
 
 Claude Code runs every hook of an event in parallel and waits for the slowest, and a shell script with `jq` pays 50-80 ms in process starts on every tool call of every session. `claude-acc perf bench agents` lists the hooks that cost the most (it sees the hooks that print something). For a hook of your own that shows up there, a small compiled program (Go, Swift) answers in about 5 ms, and `"async": true` removes the wait for a hook whose output nobody reads. `sh -c` itself costs 3-4 ms per hook on a loaded Mac; exec form (Claude Code 2.1.139 and later) skips it, and `claude-hooks-native` moves simple hooks there. Running sessions keep the hook commands they started with: the change shows in new and resumed sessions.
 
 Docker's VM is left out of Ultra because the cap applies only after a Docker restart: `claude-acc perf apply docker-vm` writes `MemoryMiB` 6144 while Docker is closed (the VM held 8 GB for 3.7 GB of containers), and every container with a restart policy comes back on its own.
+
+`claude-acc perf apply docker-idle` (also outside Ultra) stops a Docker project, a compose project or a lone container, when nothing on the Mac has connected to its published ports or run `docker exec` in it (healthchecks don't count) for `docker_idle_hours` (2 by default, `docker_idle_keep` lists projects it never touches). Docker's Resource Saver then pauses the VM once nothing runs. The idle clock starts when the tweak first sees a project, `docker compose up -d` or `docker start` brings it back, and `perf undo docker-idle` starts exactly what it stopped.
 
 Root tweaks sit next to Ultra in the panel, each with the command to copy:
 
