@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.filip.claude-acc.jobs</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/share/claude-acc/python</string>
+    <string>__HOME__/.local/share/claude-acc/acc.py</string>
+    <string>jobs</string>
+    <string>tick</string>
+  </array>
+  <!-- tik harmonogramu blogów co 2 minuty (jobs.py): start zaległego slotu do ok. 4 minut po pełnym
+       obudzeniu (pierwszy pełny tik tylko alarmuje), alarm 20:00 do 20:02. launchd odpala go także
+       w DarkWake; tik sam to rozpoznaje (pmset -g systemstate) i wtedy nic nie startuje. -->
+  <key>StartInterval</key><integer>120</integer>
+  <key>RunAtLoad</key><true/>
+  <!-- tik wypuszcza bieg bloga (build, Playwright) we własnej sesji, a bieg dziedziczy klasę joba:
+       Background i brak ProcessType dławią CPU i I/O (man launchd.plist), Interactive nie -->
+  <key>ProcessType</key><string>Interactive</string>
+  <!-- bootout przy aktualizacji claude-acc nie zabija biegu, który tik wypuścił -->
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/.local/share/claude-acc/jobs-launchd.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.local/share/claude-acc/jobs-launchd.log</string>
+</dict>
+</plist>

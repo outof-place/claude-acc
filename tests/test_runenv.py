@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -958,7 +959,9 @@ class Guard(unittest.TestCase):
         event = json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo hi"}})
         ok = subprocess.run(["/bin/sh", "-c", runenv.guard_command()], input=event, capture_output=True, text=True, timeout=30)
         self.assertEqual((ok.returncode, ok.stdout), (0, ""), ok.stderr)
-        with mock.patch.object(runenv, "HERE", tempfile.mkdtemp(prefix="guard-broken-")):
+        broken_dir = tempfile.mkdtemp(prefix="guard-broken-")
+        self.addCleanup(shutil.rmtree, broken_dir, True)
+        with mock.patch.object(runenv, "HERE", broken_dir):
             broken = runenv.guard_command()
         r = subprocess.run(["/bin/sh", "-c", broken], input=event, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 2, r.stderr)
@@ -1091,6 +1094,7 @@ class MeterUnit(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="meter-test-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, "events.jsonl")
 
     def body(self, run, *requests, error=None):

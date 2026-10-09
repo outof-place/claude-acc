@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+"""Atrapa osascript dla testów jobów, surowa jak AppleScript (osacompile, macOS 26).
+
+Skrypt z opcji -e: literał tekstowy z escape'em spoza \\" \\\\ \\n \\t \\r (np. \\u0105 z json.dumps) to
+błąd kompilacji -2741, kod 1 i nic nie wychodzi; taka próba trafia do $HOME/fake/notify-failed.log.
+Argumenty po skrypcie (po "--" albo po pierwszym nie-opcji) dostaje on run argv; argument z "-" na
+początku bez "--" to "illegal option", kod 2, jak w prawdziwym osascript.
+Baner, który by wyszedł, to linia JSON {"title", "text"} w $HOME/fake/notify.log:
+  display notification "..." with title "..."
+  on run argv / display notification (item 1 of argv) with title (item 2 of argv) / end run
+Inny skrypt: linia {"script", "args"} w notify.log i kod 0. Plik $HOME/fake/osascript-fail: każdy
+skrypt kończy się błędem wykonania (kod 1), jak osascript, któremu Centrum powiadomień nie odpowiada.
+"""
+import json
+import os
+import re
+import sys
+
+FAKE = os.path.join(os.environ["HOME"], "fake")
+LITERAL = re.compile(r'"((?:[^"\\]|\\.)*)"')
+ARGV_SCRIPT = "on run argv\ndisplay notification (item 1 of argv) with title (item 2 of argv)\nend run"
+
+
+def log(name, entry):
+    os.makedirs(FAKE, exist_ok=True)
+    with open(os.path.join(FAKE, name), "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def unescape(text):
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t", "r": "\r"}.get(m[1], m[1]), text)
+
+
+def main(args):
+    script, rest, i = [], [], 0
+    while i < len(args):
+        if args[i] == "-e" and i + 1 < len(args):
+            script.append(args[i + 1])
+            i += 2
+        elif args[i] == "--":
+            rest = args[i + 1:]
+            break
+        elif args[i].startswith("-"):
+            print(f"osascript: illegal option -- {args[i][1:2]}", file=sys.stderr)
+            return 2
+        else:
+            rest = args[i:]
+            break
+    src = "\n".join(script)
+    for m in LITERAL.finditer(src):
+        bad = re.search(r"\\[^\"\\ntr]", m[1])
+        if bad:
+            at = m.start() + 1 + bad.start()
+            print(f"{at}:{at + 2}: syntax error: Expected \u201c\"\u201d but found unknown token. (-2741)", file=sys.stderr)
+            log("notify-failed.log", {"script": src, "args": rest})
+            return 1
+    if os.path.exists(os.path.join(FAKE, "osascript-fail")):
+        print("execution error: atrapa: Centrum powiadomień nie odpowiada (-1712)", file=sys.stderr)
+        log("notify-failed.log", {"script": src, "args": rest})
+        return 1
+    if src == ARGV_SCRIPT:
+        if len(rest) < 2:
+            print("execution error: Can\u2019t get item 2 of {}. (-1728)", file=sys.stderr)
+            return 1
+        log("notify.log", {"title": rest[1], "text": rest[0]})
+        return 0
+    m = re.fullmatch(r'display notification "((?:[^"\\]|\\.)*)" with title "((?:[^"\\]|\\.)*)"', src)
+    if m:
+        log("notify.log", {"title": unescape(m[2]), "text": unescape(m[1])})
+        return 0
+    log("notify.log", {"script": src, "args": rest})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
