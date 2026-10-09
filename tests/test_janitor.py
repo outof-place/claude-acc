@@ -152,6 +152,19 @@ class JanitorTest(unittest.TestCase):
         time.sleep(0.3)
         return proc
 
+    def test_low_disk_alert_carries_its_limit_for_the_panel(self):
+        """Panel pokazuje alert z odczytem sprzed nawet 3 godzin; z progiem w alercie porównuje
+        go z bieżącym odczytem i chowa, gdy miejsca znów jest dość."""
+        self.env.config(protect=[], low_disk_gb=1_000_000)  # każdy dysk jest poniżej
+        # świeże powiadomienie: przebieg testowy nie wyśle prawdziwego do Centrum powiadomień
+        with open(os.path.join(self.env.state_dir, "janitor-state.json"), "w") as f:
+            json.dump({"low_disk_alert_at": time.time()}, f)
+        self.env.sweep()
+        low = [a for a in self.env.state()["alerts"] if a["kind"] == "low_disk"]
+        self.assertEqual(len(low), 1)
+        self.assertEqual(low[0]["limit"], 1_000_000 * 1024**3)
+        self.assertGreater(low[0]["free"], 0)
+
     def test_idle_next_goes_fresh_stays(self):
         self.app("idle")
         self.app("blog", next_dir=".next-blog")

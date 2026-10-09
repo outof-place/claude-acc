@@ -47,6 +47,7 @@ struct ClaudeAccApp: App {
         var depot: DepotRuns?
         var updates: UpdatesState?
         var desktop: DesktopPanel?
+        var link: TetherLink?
         if let snapshotFile {
             let text = (try? String(contentsOfFile: snapshotFile, encoding: .utf8)) ?? ""
             output = CLIResult(status: text.isEmpty ? 1 : 0, stdout: text, stderr: "no file \(snapshotFile)")
@@ -74,19 +75,24 @@ struct ClaudeAccApp: App {
                 updates = Store.decode(UpdatesState.self, from: data)
             }
             if let data = try? Data(contentsOf: folder.appending(path: "demo-perf.json")) {
-                ultra = Store.decode(PerfFile.self, from: data)?.ultra
+                let perf = Store.decode(PerfFile.self, from: data)
+                ultra = perf?.ultra
+                link = perf?.link
             }
             if let data = try? Data(contentsOf: folder.appending(path: "demo-desktop.json")) {
                 desktop = Store.decode(DesktopPanel.self, from: data)
             }
         } else {
             output = CLI.runBlocking(CLI.process(["status", "--json"]))
+            // Stay Awake's hotspot line: the route `perf keep` saw last (it runs every 5 minutes)
+            link = FileManager.default.contents(atPath: CLI.perfState)
+                .flatMap { Store.decode(PerfFile.self, from: $0) }?.link
         }
         guard output.status == 0, let snapshot = Store.decode(Snapshot.self, from: Data(output.stdout.utf8)) else {
             FileHandle.standardError.write(Data("no data: \(output.message)\n".utf8))
             return false
         }
-        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, depot: depot, updates: updates, desktop: desktop)
+        let store = Store(preview: snapshot, guardState: guardState, janitor: janitor, fans: fans, ultra: ultra, load: load, sched: sched, depot: depot, updates: updates, desktop: desktop, link: link)
         store.previewOpenAccount = open
         store.previewHoverAccount = hover
         let frozen = snapshotFile.map { _ in Date(timeIntervalSince1970: snapshot.generatedAt) }
