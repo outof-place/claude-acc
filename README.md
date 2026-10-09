@@ -191,6 +191,7 @@ To try the pause in one real session without pausing the others, start that sess
 | --- | --- |
 | `claude-acc status` | Usage of every account and the switching order |
 | `claude-acc who` | The active account, its burn rate and when it will hit the wall |
+| `claude-acc who --json` | Which account's token is in the Claude Code Keychain entries right now, as `{"email", "real_email", "id", "source"}` (or `"email": null` with a `reason`): no network, no lock, about 50 ms, for tools that check the account before every model call |
 | `claude-acc switch <email>` | Switch to that account |
 | `claude-acc switch --auto` | Switch to the next account in line |
 | `claude-acc login <email>` | Log the account in again in the browser |
