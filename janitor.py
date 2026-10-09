@@ -696,16 +696,26 @@ def task_node_modules(sw, scan):
                 sw.pnpm_prune = True
 
 
+def tmp_leftover(name):
+    """Co przerwany proces zostawia w $TMPDIR: katalogi robocze `go build`/`go test` i linkera Go
+    (po kilka GB) oraz ślady xctrace/Instruments (*.ktrace, po kilkaset MB)."""
+    return name.startswith(("go-build", "go-link-")) or (
+        name.startswith("instruments") and name.endswith(".ktrace")
+    )
+
+
 def task_tmp(sw, _scan):
-    """Katalogi go-build* po `go test`, które przerwany proces zostawia w $TMPDIR (po kilka GB)."""
+    """Śmieci w $TMPDIR (tmp_leftover) nieruszane od 6 godzin i bez procesu, który ich używa."""
     since = time.time() - 6 * HOUR
-    for path in glob.glob(os.path.join(user_tmpdir(), "go-build*")):
-        if not os.path.isdir(path) or mtime(path) > since:
+    root = user_tmpdir()
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not tmp_leftover(name) or mtime(path) > since:
             continue
         if sw.usage.busy(path) or recently_changed(path, since):
             sw.skip("tmp", path, "w użyciu")
         else:
-            sw.remove("tmp", path, lambda n: n.startswith("go-build"))
+            sw.remove("tmp", path, tmp_leftover)
 
 
 def trim_oldest(root, keep_bytes, dry_run=False):
