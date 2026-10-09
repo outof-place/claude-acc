@@ -254,6 +254,7 @@ To try the pause in one real session without pausing the others, start that sess
 | `claude-acc credits canary [--version X.Y.Z]` | Check a Claude Code version with one metered Haiku call and pin it for `run` |
 | `claude-acc credits record --org ID --usd N --purpose NAME` | Report what a call cost, so the balance stays current between Console readings |
 | `claude-acc credits key --purpose NAME --json` | Which Keychain entry to use, without the key |
+| `claude-acc jobs run NAME [--slot S] [--json]` | One unattended attempt of a blog job and its record ([Jobs](#jobs)); `jobs list`, `jobs log NAME`, `jobs add/set/remove`, `jobs hold/release` |
 | `claude-acc desktop install` / `uninstall` | Register the `desktop` MCP server, the `desktop` skill and the prompt hint for every Claude Code session |
 | `claude-acc desktop doctor [--open]` / `status [--json]` | Whether the helper has Accessibility and Screen Recording (and which binary to tick), the displays, the mode |
 | `claude-acc desktop mode full\|guarded` | Whether the agent acts freely (full) or is asked before `type`, `key` and `hold_key` (guarded) |
@@ -604,6 +605,25 @@ A run is also refused before the start when the project in its working directory
 **Pinned version.** `run` uses only the Claude Code version recorded in `runenv/pin.json` and refuses, naming it, when that version is gone. After an update, `claude-acc credits canary` runs one Haiku call (about half a cent) through a full run and pins the installed version only if the call was metered with its cost and the payer check passed.
 
 Programs use the same thing from Python: `runenv.prepare(purpose, budget_usd, ...)` returns the run (its `env`, payer, live `spent()`, `alarm()` and `alarms()`), `runenv.finish(run, exit_code)` returns the summary and `runenv.exit_code_for(summary, code)` the exit code; the docstring at the top of `runenv.py` has the details.
+
+## Jobs
+
+`claude-acc jobs` runs a blog pipeline (one repo command that follows the blog pipeline contract) unattended and leaves one record per attempt that says what happened, what it cost, who paid, the links and the log.
+
+```sh
+claude-acc jobs add outofplace --cwd ~/orca/workspaces/outofplace/blog-autopilot \
+  --precheck 'sh scripts/autopilot/precheck.sh' --entry 'pnpm autopilot' --budget-usd 25
+claude-acc jobs run outofplace     # one attempt; exits with the contract's code, 75 when it could not start
+claude-acc jobs list               # every job, its last outcome, a run in progress, a hold
+claude-acc jobs log outofplace     # the last attempts and the tail of the latest log
+claude-acc jobs set outofplace budget_usd=30 run_min=240
+claude-acc jobs set outofplace live_urls=https://example.com/blog   # checked after an unclean publish
+claude-acc jobs hold --hours 4 --reason 'iOS build'   # until `jobs release`
+```
+
+An attempt picks a payer through `credits run`'s run environment (credit from the pool, otherwise a subscription account, never the work account), runs the precheck and then the entry command in their own process groups with the pinned `claude` first on `PATH` (built like the updater's, so `pnpm`, `node`, `vercel` and `gh` resolve under launchd), and holds `caffeinate -i -s` for as long as the runner lives. Limits are in awake minutes and count from the moment a command starts: time the Mac sleeps, time spent waiting for memory and time a heavy step waits in the build scheduler's queue are not counted. Before the start the run waits for memory (no brake, no critical pressure, `footprint_gb` free); heavy steps inside the pipeline go through `$CLAUDE_ACC_JOB_HEAVY`, one at a time through the scheduler. One attempt per job at a time (a second one exits 73 without a record) and one heavy job at a time across jobs.
+
+The outcome follows the contract's exit code unless the runner saw something itself before the pipeline wrote its side-effect marker: a credit that ran out, a 401 or 429, a sleep, the memory brake, a signal, the time limit. Those make it BŁĄD, retryable, with a hint to pay differently next time where it fits. The brake kills first and logs its victim at the end of its pass, after the pipeline has already exited, so on a failing end the runner waits up to 12 seconds for the guard's state file to change before it decides. The side-effect phase starts with the marker, with a final result that says OPUBLIKOWANO, ZAPARKOWANO or PILNE, or with exit code 0, 2 or 5, and the runner writes the exit code to `current.json` the moment the pipeline ends. After that nothing is retried: any unclean end, a runner error included, is PILNE, and the runner opens the result's URLs itself, or the job's `live_urls` when the result has none (the marker carries no URLs). A stop at 1.5 × the budget, a payer mismatch or a leaked login is final and carries a banner. An attempt that could not start is POMINIĘTO with a `skip` cause (`heavy`, `hold`, `memory`, `payer`, `version`, `interrupt`) for the scheduler to time its retry. A runner killed outright leaves its attempt in `current.json`, and the next `jobs` command turns it into a record once the run environment has settled the run's bill. Records live in `~/.local/share/claude-acc/jobs/<job>/history.jsonl`, logs next to them in `logs/` (60 per job, skipped attempts' logs pruned first); the field list is in the docstring at the top of `jobs.py`.
 
 ## Desktop gateway
 
