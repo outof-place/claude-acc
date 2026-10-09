@@ -10,6 +10,7 @@ Uruchomienie: /usr/bin/python3 -m unittest tests.test_credits
 """
 
 import importlib.util
+import gc
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import time
 import unittest
+import weakref
 from datetime import datetime, timedelta
 from unittest import mock
 
@@ -65,6 +67,9 @@ class World:
 
     def __init__(self):
         self.home = tempfile.mkdtemp(prefix="credits-test-")
+        # $HOME znika razem ze światem (test go puszcza) albo najpóźniej z końcem procesu: bez tego
+        # każdy przebieg zostawiał w $TMPDIR setki katalogów (ok. 1,9 GB)
+        self.removal = weakref.finalize(self, shutil.rmtree, self.home, True)
         self.fake = os.path.join(self.home, "fake")
         self.state = os.path.join(self.home, ".local/share/claude-acc")
         self.credits = os.path.join(self.state, "credits")
@@ -151,6 +156,18 @@ print("base_url=" + ("set" if "ANTHROPIC_BASE_URL" in os.environ else "unset"))
 print("to stderr", file=sys.stderr)
 sys.exit(int(sys.argv[2]))
 """
+
+
+class Homes(unittest.TestCase):
+    """Światy testów sprzątają swój $HOME (credits-test-* w $TMPDIR)."""
+
+    def test_world_removes_its_home_once_the_test_lets_go_of_it(self):
+        w = World()
+        home = w.home
+        self.assertTrue(os.path.isdir(home))
+        del w
+        gc.collect()
+        self.assertFalse(os.path.exists(home))
 
 
 class AddingKeys(unittest.TestCase):

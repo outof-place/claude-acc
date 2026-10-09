@@ -85,7 +85,7 @@ Definicja joba (jobs add / jobs set; walidacja przy każdej zmianie):
   limits        {precheck_min, run_min, admit_min: minuty czuwania; grace_s: SIGTERM -> SIGKILL}
   live_urls     [] albo do 10 adresów http(s) (np. indeks bloga): runner sprawdza je przy PILNE, gdy
                 JSON wyniku nie ma urls (znacznik z kontraktu nie niesie adresów)
-  schedule      dowolny JSON, należy do harmonogramu (A2b); jobs.py go nie czyta
+  schedule      harmonogram tiku (niżej) albo null; walidacja przy add i set (check_schedule)
 
 Zapis próby (schemat v1, zamrożony; history.jsonl i current.json):
   v               1
@@ -141,15 +141,23 @@ Zapis próby (schemat v1, zamrożony; history.jsonl i current.json):
   slot            dowolny tekst z `--slot` (A2b); null przy biegu ręcznym
 
 Komendy:
+  jobs [--json]                         przegląd: każdy slot każdego joba z ostatnich 7 dni, następny
+                                        slot, tik, wstrzymanie i to, co czeka na Ciebie
+  jobs tick [--json]                    jeden obrót harmonogramu (launchd co 2 min; patrz niżej)
   jobs list [--json]                    joby, ostatni wynik, bieg w toku, wstrzymanie
-  jobs run NAZWA [--slot S] [--json]    jedna próba; --json wypisuje zapis na stdout
+  jobs run NAZWA [--slot S] [--mode M] [--json]
+                                        jedna próba; --mode jednorazowo zamiast mode joba (tik:
+                                        przełączenie płatności po switch_payment)
+  jobs enable NAZWA / jobs disable NAZWA
   jobs log NAZWA [-n 5] [--json]        ostatnie próby i ogon logu
   jobs add NAZWA --cwd KATALOG --entry 'KOMENDA' --budget-usd N [--precheck 'KOMENDA']
        [--run-min 180] [--precheck-min 10] [--admit-min 15] [--grace-s 15] [--footprint-gb 2]
        [--mode auto|credits|subscription] [--live-urls URL,URL] [--light] [--disabled]
   jobs set NAZWA POLE=WARTOŚĆ...        cwd, entry, precheck, budget_usd, mode, heavy, enabled,
                                         footprint_gb, precheck_min, run_min, admit_min, grace_s,
-                                        live_urls (po przecinku albo JSON), schedule (JSON)
+                                        live_urls (po przecinku albo JSON), schedule (JSON albo null)
+  jobs set NAZWA --every 2d [--from 2026-10-09] --at 05:30[,14:00]
+  jobs set NAZWA --days pn,cz --at 05:30     harmonogram (czas Europe/Warsaw); też w jobs add
   jobs remove NAZWA                     usuwa definicję (historia i logi zostają)
   jobs hold [--hours 4] [--reason TEKST] / jobs release
 
@@ -161,6 +169,74 @@ Zmienne dla potoku (poza CLAUDE_ACC_JOB_SETTINGS i CLAUDE_ACC_JOB_BUDGET_USD od 
 CLAUDE_ACC_JOB (nazwa), CLAUDE_ACC_JOB_RESULT, CLAUDE_ACC_JOB_HEAVY, CLAUDE_ACC_JOB_AWAKE_MINUTES
 (limit komendy wejścia). Testy: CLAUDE_ACC_JOBS_CLOCK (plik {"slept": s} dopisywany do zegara
 ściennego runnera), CLAUDE_ACC_TOOL_PATH (updates.tool_path), SCHED_FAKE_MEMORY (sched.py).
+
+Harmonogram (`jobs tick`, launchd com.filip.claude-acc.jobs co 120 s; etap A2b):
+  schedule      {"every_days": N, "anchor": "RRRR-MM-DD"} albo {"weekdays": [0..6], pn = 0}, plus
+                "at": ["GG:MM", ...] (najwcześniejszy start, czas Europe/Warsaw), "since" (epoch:
+                pierwszy harmonogram i każde włączenie joba) i "edited" (epoch: zmiana
+                harmonogramu). Slot sprzed max(since, edited) istnieje tylko, gdy ma zapisy prób:
+                edycja ani `jobs enable` nie odpalają slotu z przeszłości, a wyłączenie i włączenie
+                nie gubią otwartego slotu ani historii
+  slot          id "RRRR-MM-DD/n" (data w Warszawie i numer godziny tego dnia z "at", od 1; tik
+                podaje go w `jobs run --slot`, a --at zmienione w trakcie slotu zostawia mu id);
+                dni liczone w kalendarzu, nie co 48 h, więc zmiana czasu nie przesuwa godziny
+                startu. Ids porównywane jako (data, n). Zapis z innym tekstem w slot to bieg spoza
+                tiku, jak ręczny (slot null)
+
+Stan slotu wynika z zapisów prób (history.jsonl, pole slot), bieżącej próby (current.json) i
+zegara; tik pamięta tylko to, czego zapisy nie mają (tick-state.json: banery już pokazane, powód
+czekania, ostatni tik, próba właśnie wypuszczona). Od pierwszego pasującego:
+  zrobiony      jest zapis slotu z final (wynik z zapisu, nigdy nie ponawiany) albo bieg spoza tiku
+                (ręczny albo z obcym slot) z OPUBLIKOWANO, ZAPARKOWANO, BEZ WPISU albo PILNE, który
+                skończył się między startem slotu a startem następnego; BŁĄD ręcznego biegu (np.
+                Ctrl-C) slotu nie zamyka
+  biegnie       żywa próba tego slotu (current.json z blokadą joba albo próba wypuszczona przez tik)
+  limit prób    3 próby liczone bez wyniku ostatecznego: koniec, baner (BEZ WYNIKU)
+  zastąpiony    zaczął się nowszy slot tego joba (także taki, który przepadł, bo job był
+                wyłączony) albo nowszy slot ma już zapis: koniec; bez żadnej próby, która ruszyła,
+                to BRAK BIEGU, inaczej BEZ WYNIKU; baner przy pierwszym pełnym obudzeniu, w którym
+                tik to widzi (zaległe sloty po śnie łączą się w jeden bieg najnowszego slotu)
+  ponowienie    ostatnia próba do ponowienia, a backoff jeszcze trwa
+  należny       start nie wcześniej niż "at"; czeka, póki choć jedna bramka stoi:
+                  Mac nie w pełni obudzony (pmset -g systemstate bez Graphics: DarkWake; pmset nie
+                    odpowiada: też nie startujemy), świeżo po śnie (pierwszy pełny tik po śnie albo
+                    DarkWake tylko alarmuje, start od następnego), `jobs hold`, inna próba tego joba,
+                    current.json martwej próby jeszcze bez zapisu (recover czeka na rachunek runenv),
+                    inny ciężki bieg, odstęp 20 min od końca poprzedniego ciężkiego biegu;
+                kolejka: najstarszy slot pierwszy, potem nazwa joba; jeden start na tik
+Liczona próba: każdy zapis slotu poza POMINIĘTO z skip heavy, hold, memory (bramki tiku i pamięć
+nie zjadają prób; pamięć ponawia co 20 min). Backoff po liczonej próbie: 1 h, potem 3 h; po
+POMINIĘTO payer (nikt nie zapłaci) 2 h, potem 4 h (okna sesji subskrypcji wracają co 5 h).
+Płatność: job auto zostaje na auto, bo runenv sam omija złe źródło: kredyt z billing oznacza
+wyczerpany, 429 na subskrypcji trafia do avoid.json, a 401 na subskrypcji tik dopisuje tam sam
+(runenv.avoid na 5 h, przy starcie następnej próby). Wyjątek: próba, która płaciła kredytem i
+skończyła się 401 albo limitem (switch_payment, override auth albo limit), przełącza resztę slotu
+na --mode subscription: runenv nie ma listy omijanych organizacji i wybrałby tę samą znowu.
+Decyduje ostatni zapis slotu z płatnikiem kredytowym, nie ostatni zapis (POMINIĘTO bez płatnika
+nie gubi przełączenia). Job z mode credits albo subscription nie dostaje --mode.
+Banery (osascript; tekst jako argumenty skryptu, on run argv): zapis z BŁĄD ostatecznym,
+ZAPARKOWANO albo PILNE ze slotem (tiku albo obcym) i każde PILNE, także ręczne, najwyżej 8 dni po
+końcu zapisu; limit prób; slot zastąpiony bez wyniku (BRAK BIEGU, BEZ WYNIKU); o 20:00 (pierwszy
+pełny tik po 20:00) każdy niedomknięty slot, który już się zaczął, z powodem czekania jak w
+`jobs`, raz na wieczór; nic przy OPUBLIKOWANO ani BEZ WPISU. Tik w DarkWake pisze tylko heartbeat.
+Ten sam baner nie wraca (tick-state.json); baner, którego osascript nie przyjął (kod różny od 0),
+trafia do tick.log i nie jest oznaczony jako pokazany, więc wraca w następnym tiku; tik zabity w
+pół drogi może pokazać baner drugi raz, nigdy go nie zgubi. Tik zabity po wypuszczeniu próby:
+następny tik widzi próbę po blokadzie joba i current.json, a druga próba tego joba kończy się
+kodem 73 bez zapisu. Wpis jobs.json, który nie jest poprawną definicją (nie obiekt, limity nie
+liczbami, enabled albo heavy nie true/false), to ZŁA DEFINICJA tego joba, a zły harmonogram to ZŁY
+HARMONOGRAM; pozostałe joby i heartbeat działają dalej. Każdy tik pisze w tick.log stan zasilania
+(full, dark, unknown) i to, czy Mac właśnie się obudził.
+
+Pliki tiku (~/.local/share/claude-acc/jobs/): tick.lock (jeden tik naraz), tick-state.json,
+tick.log (tik i wyjście wypuszczonych prób), heartbeat.json ({wall, uptime, boot, power,
+interval_s, stale_after_s, attention}: `claude-acc status` i panel mówią, gdy tik stoi dłużej niż
+stale_after_s czuwania), held-accounts.json (konto subskrypcji, które trzyma żywy bieg, z "until":
+automat kont nie przełącza na nie Twoich sesji; pisze runner po wyborze płatnika, czyści runner i
+tik). Zegar czuwania między procesami to CLOCK_UPTIME_RAW (stoi w czasie snu; time.monotonic() w
+3.9 liczy od startu procesu). Testy: CLAUDE_ACC_JOBS_NOW (plik {wall, uptime, boot}),
+CLAUDE_ACC_JOBS_RUNNER (atrapa `jobs run`), CLAUDE_ACC_JOBS_TICK_DIE (punkt, w którym tik zabija się
+SIGKILL: after-spawn, after-banner).
 """
 
 import fcntl
@@ -169,13 +245,16 @@ import json
 import os
 import re
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from collections import namedtuple
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import credits
 import lastresort
@@ -228,6 +307,47 @@ PHASE_TEXT = {"precheck": "precheck", "run": "komenda wejścia", "side-effect": 
 BRAKE_LABELS = {code: label for code, label, *_rest in lastresort.CLASSES}
 # zegar ścienny w testach: plik {"slept": s} udaje sen tylu sekund
 CLOCK_SEAM = os.environ.get("CLAUDE_ACC_JOBS_CLOCK")
+
+# harmonogram (tik)
+TICK_LOCK = os.path.join(JOBS_DIR, "tick.lock")
+TICK_STATE = os.path.join(JOBS_DIR, "tick-state.json")
+TICK_LOG = os.path.join(JOBS_DIR, "tick.log")
+HEARTBEAT_PATH = os.path.join(JOBS_DIR, "heartbeat.json")
+HELD_PATH = os.path.join(JOBS_DIR, "held-accounts.json")
+STALE_ALARM_PATH = os.path.join(JOBS_DIR, "stale-alarm.json")
+WARSAW = ZoneInfo("Europe/Warsaw")
+DAY = 86400
+TICK_INTERVAL_S = 120  # launchd StartInterval (launchd/com.filip.claude-acc.jobs.plist.template)
+STALE_AFTER_S = 15 * 60  # tyle czuwania bez tiku to alarm (status, panel, baner z automatu kont)
+MAX_ATTEMPTS = 3
+BACKOFF_S = (3600, 3 * 3600)  # po 1. i 2. liczonej próbie: sieć albo API mają czas wrócić tego samego dnia
+PAYER_BACKOFF_S = (2 * 3600, 4 * 3600)  # nikt nie zapłaci: okna sesji subskrypcji wracają co 5 h
+MEMORY_RETRY_S = 20 * 60
+LAUNCH_RETRY_S = 20 * 60  # wypuszczona próba nie zostawiła zapisu (kod 64, 73, awaria przed zapisem)
+STAGGER_S = 20 * 60  # odstęp między ciężkimi biegami: jedno obudzenie nie wrzuca wszystkich blogów naraz
+EVENING_HOUR = 20
+# ściana uciekła czuwaniu o tyle między tikami: Mac spał. W czuwaniu oba zegary idą razem (dryf rzędu
+# 0,1 ms na minutę), a seria DarkWake 08.10 to 45 s czuwania i ok. 9 s snu (pmset -g log)
+SLEEP_GAP_TICK_S = 5
+HISTORY_DAYS = 7
+BANNER_DAYS = 8  # zapis próby woła banerem najwyżej tyle dni po końcu (klucze "sent" żyją 9 dni)
+NOT_COUNTED = ("heavy", "hold", "memory")  # POMINIĘTO, które nie zjada próby
+SLOT_RE = re.compile(r"(\d{4}-\d{2}-\d{2})/(\d+)")  # id slotu tiku; inne teksty z --slot to biegi spoza tiku
+CLOSES_BY_HAND = ("OPUBLIKOWANO", "ZAPARKOWANO", "BEZ WPISU", "PILNE")  # bieg spoza tiku, który zamyka slot
+SWITCH_FROM_CREDITS = ("auth", "limit")  # kredyt z 401 albo limitem: reszta slotu płaci subskrypcją
+# baner: tekst i tytuł idą jako argumenty skryptu, nie w jego treści (AppleScript nie zna \uXXXX z json.dumps)
+NOTIFY_SCRIPT = ("on run argv", "display notification (item 1 of argv) with title (item 2 of argv)", "end run")
+HINT_REFRESH_S = 15 * 60
+HINT_MARGIN_S = 30 * 60
+DAY_NAMES = ("pn", "wt", "śr", "cz", "pt", "so", "nd")
+DAY_TOKENS = {
+    "pn": 0, "pon": 0, "mon": 0, "wt": 1, "wto": 1, "tue": 1, "śr": 2, "sr": 2, "śro": 2, "sro": 2, "wed": 2,
+    "cz": 3, "czw": 3, "thu": 3, "pt": 4, "pią": 4, "pia": 4, "fri": 4, "so": 5, "sob": 5, "sat": 5,
+    "nd": 6, "nie": 6, "ndz": 6, "sun": 6,
+}  # fmt: skip
+SCHEDULE_HELP = ("harmonogram: --every 2d [--from RRRR-MM-DD] --at GG:MM[,GG:MM] albo --days pn,cz --at GG:MM "
+                 "(dni: pn wt śr cz pt so nd albo mon tue wed thu fri sat sun; czas Europe/Warsaw)")  # fmt: skip
+OUTCOME_BANNERS = ("ZAPARKOWANO", "PILNE")
 
 
 class Skip(Exception):
@@ -345,11 +465,14 @@ def prune(folder, keep, first=()):
             pass
 
 
-def held():
+def held(now=None):
     """Wstrzymanie (`jobs hold`) albo None, gdy go nie ma albo minęło."""
     hold = read_json(HOLD_PATH)
-    if isinstance(hold, dict) and float(hold.get("until") or 0) > time.time():
-        return hold
+    try:
+        if isinstance(hold, dict) and float(hold.get("until") or 0) > (wall_now() if now is None else now):
+            return hold
+    except (TypeError, ValueError):
+        pass
     return None
 
 
@@ -386,6 +509,26 @@ def clocks():
         seam = read_json(CLOCK_SEAM)
         wall += float((seam or {}).get("slept") or 0) if isinstance(seam, dict) else 0.0
     return awake, wall
+
+
+def tick_clock():
+    """(ściana, czuwanie, start systemu) dla tiku i heartbeatu, porównywalne między procesami.
+    Czuwanie to CLOCK_UPTIME_RAW (wspólny dla procesów, stoi w czasie snu; time.monotonic() w 3.9
+    liczy od pierwszego wywołania w procesie). Start systemu to ściana minus CLOCK_MONOTONIC (ten
+    biegnie także w czasie snu): stały w obrębie jednego uruchomienia, inny po restarcie.
+    Testy podają wszystkie trzy w pliku $CLAUDE_ACC_JOBS_NOW."""
+    wall = time.time()
+    uptime = time.clock_gettime(time.CLOCK_UPTIME_RAW)
+    boot = wall - time.clock_gettime(time.CLOCK_MONOTONIC)
+    seam = os.environ.get("CLAUDE_ACC_JOBS_NOW")
+    fake = read_json(seam) if seam else None
+    if isinstance(fake, dict):
+        wall, uptime, boot = (float(fake.get(k, v)) for k, v in (("wall", wall), ("uptime", uptime), ("boot", boot)))
+    return wall, uptime, boot
+
+
+def wall_now():
+    return tick_clock()[0]
 
 
 # ---------- pamięć, hamulec, kolejka schedulera ----------
@@ -703,6 +846,7 @@ class Attempt:
         self.side = False
         self.interrupted = None
         self.heavy_fd, self.caffeinate = None, None
+        self.hint = False
         self.saved_at = 0.0
         self.previous = {}
 
@@ -804,8 +948,6 @@ class Attempt:
     def keep_awake(self):
         """caffeinate z PATH biegu (tool_path): -i przed uśpieniem z bezczynności, -s przed każdym
         uśpieniem, ważne tylko na zasilaczu (man caffeinate); -w puszcza asercję ze śmiercią runnera."""
-        import shutil
-
         tool = shutil.which("caffeinate", path=updates.tool_path())
         if not tool:
             self.say("nie ma caffeinate: Mac może zasnąć w trakcie biegu")
@@ -826,6 +968,8 @@ class Attempt:
             except OSError:
                 pass
             os.close(self.heavy_fd)
+        if self.hint:
+            free_accounts(pid=os.getpid())
         for sig, handler in self.previous.items():
             signal.signal(sig, handler)
         os.close(self.log_fd)
@@ -847,6 +991,9 @@ class Attempt:
         self.run = self.prepare(limits)
         payer = dict({"mode": self.run.mode}, **self.run.payer, verdict=None)
         self.record.update(run_id=self.run.run_id, payer=payer, version=self.run.version)
+        if self.run.mode == "subscription":
+            # wskazówka dla automatu kont od chwili wyboru płatnika, a nie od następnego tiku
+            self.hint = hold_account(self.run.payer.get("email"), self.name, os.getpid(), hint_until(job, time.time()))
         self.say(f"płaci {runenv.describe(self.run.meta)}: {self.run.reason}; Claude Code {self.run.version}")
         if self.interrupted:
             raise Skip("interrupt", f"przerwane przed startem komendy ({signal_name(self.interrupted)})")
@@ -1253,6 +1400,847 @@ def recover_one(name, cur, swept, ended_at):
     return rec
 
 
+# ---------- wskazówka dla automatu kont: konto subskrypcji, które trzyma bieg ----------
+
+
+def hint_until(job, now):
+    """Najpóźniej tyle żyje wskazówka bez odświeżenia: najdłuższy bieg w minutach czuwania (pamięć,
+    precheck, komenda) plus zapas. Żywy bieg odświeża ją tik; sen dłuższy niż zapas skraca ją, ale
+    wtedy token subskrypcji biegu (ok. 8 h) i tak wygasa."""
+    lim = job["limits"]
+    return now + (float(lim["admit_min"]) + float(lim["precheck_min"]) + float(lim["run_min"])) * 60 + HINT_MARGIN_S
+
+
+def edit_hints(change):
+    """held-accounts.json pod blokadą definicji; change(lista wpisów) -> nowa lista. Zepsuty plik
+    zaczyna od zera. Błąd zapisu nie zatrzymuje ani biegu, ani tiku (False)."""
+    try:
+        with Edit():
+            data = read_json(HELD_PATH)
+            items = data.get("accounts") if isinstance(data, dict) else None
+            items = [e for e in items or [] if isinstance(e, dict) and isinstance(e.get("email"), str)]
+            new = change([dict(e) for e in items])  # kopie: zmiana w miejscu też jest zmianą
+            if new != items:
+                credits.write_json(HELD_PATH, {"v": 1, "accounts": new})
+        return True
+    except OSError:
+        return False
+
+
+def hold_account(email, name, pid, until):
+    """Bieg `name` (pid) płaci kontem subskrypcji email do until (epoch): automat kont nie
+    przełącza na nie Twoich sesji (accswitch.jobs_free w ticku)."""
+    if not email:
+        return False
+    entry = {"email": email.lower(), "job": name, "pid": pid, "since": time.time(), "until": until}
+    return edit_hints(lambda items: [e for e in items if e.get("pid") != pid] + [entry])
+
+
+def free_accounts(pid=None, keep=None):
+    """Zdejmuje wskazówki biegu pid albo (keep) wszystkie, dla których keep(wpis) jest fałszem."""
+    if keep is None:
+        keep = lambda e: e.get("pid") != pid  # noqa: E731
+    return edit_hints(lambda items: [e for e in items if keep(e)])
+
+
+def pid_alive(pid):
+    try:
+        return bool(pid) and runenv.pid_state(int(pid))[0]
+    except (TypeError, ValueError, OSError):
+        return False
+
+
+# ---------- harmonogram: sloty ----------
+
+Slot = namedtuple("Slot", "id start hhmm")
+
+
+def parse_hhmm(text):
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(text).strip())
+    if not m:
+        raise credits.UsageError(f"godzina {text!r}: GG:MM od 00:00 do 23:59, np. 05:30; {SCHEDULE_HELP}")
+    return f"{int(m[1]):02d}:{m[2]}"
+
+
+def parse_days(text):
+    tokens = [t.strip().lower() for t in re.split(r"[,\s]+", str(text)) if t.strip()]
+    bad = [t for t in tokens if t not in DAY_TOKENS]
+    if not tokens or bad:
+        raise credits.UsageError(f"dni {', '.join(bad) or '(puste)'}: nie znam; {SCHEDULE_HELP}")
+    return sorted({DAY_TOKENS[t] for t in tokens})
+
+
+def check_schedule(raw):
+    """Harmonogram po normalizacji albo None (job tylko ręczny); UsageError z tym, co poprawić."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise credits.UsageError(SCHEDULE_HELP)
+    unknown = set(raw) - {"every_days", "anchor", "weekdays", "at", "since", "edited"}
+    if unknown or ("every_days" in raw) == ("weekdays" in raw):
+        raise credits.UsageError(SCHEDULE_HELP)
+    out = {}
+    if "every_days" in raw:
+        n = raw["every_days"]
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 60:
+            raise credits.UsageError(f"--every: od 1 do 60 dni, np. --every 2d; {SCHEDULE_HELP}")
+        try:
+            anchor = date.fromisoformat(str(raw.get("anchor")))
+        except ValueError:
+            raise credits.UsageError(f"--from: data RRRR-MM-DD, np. 2026-10-10; {SCHEDULE_HELP}")
+        out.update(every_days=n, anchor=anchor.isoformat())
+    else:
+        days = raw["weekdays"]
+        if not isinstance(days, list) or not days or not all(isinstance(d, int) and not isinstance(d, bool) and 0 <= d <= 6 for d in days):
+            raise credits.UsageError(f"--days: co najmniej jeden dzień; {SCHEDULE_HELP}")
+        out["weekdays"] = sorted(set(days))
+    at = raw.get("at")
+    at = [at] if isinstance(at, str) else at
+    if not isinstance(at, list) or not 1 <= len(at) <= 6:
+        raise credits.UsageError(f"--at: od jednej do sześciu godzin GG:MM; {SCHEDULE_HELP}")
+    out["at"] = sorted({parse_hhmm(t) for t in at})
+    for key in ("since", "edited"):
+        value = raw.get(key)
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise credits.UsageError(f"schedule.{key}: chwila w sekundach epoch")
+            out[key] = float(value)
+    return out
+
+
+BAD_DEFINITION, BAD_SCHEDULE = "zła definicja", "zły harmonogram"
+
+
+def checked_job(raw):
+    """Wpis jobs.json dla tiku i przeglądu: (definicja z harmonogramem po check_schedule, None) albo
+    (None, (rodzaj, powód)), rodzaj BAD_DEFINITION albo BAD_SCHEDULE. Ręcznie zepsuty wpis (nie
+    obiekt, limity nie liczbami, enabled albo heavy nie true/false) psuje tylko swój job."""
+    try:
+        if not isinstance(raw, dict):
+            raise credits.UsageError(f"wpis to {type(raw).__name__}, nie obiekt JSON")
+        if not isinstance(raw.get("limits") or {}, dict):
+            raise credits.UsageError("limits to nie obiekt JSON")
+        job = normalized(raw)
+        for key in DEFAULT_LIMITS:
+            float(job["limits"][key])
+        for key in ("enabled", "heavy"):
+            if not isinstance(job[key], bool):
+                raise credits.UsageError(f"{key}: true albo false")
+    except credits.UsageError as exc:
+        return None, (BAD_DEFINITION, str(exc))
+    except (TypeError, ValueError) as exc:
+        return None, (BAD_DEFINITION, f"limity to liczby ({exc})")
+    try:
+        job["schedule"] = check_schedule(job.get("schedule"))
+    except credits.UsageError as exc:
+        return None, (BAD_SCHEDULE, str(exc))
+    return job, None
+
+
+def raw_enabled(raw):
+    """enabled z surowego wpisu (także złego): bez pola włączony."""
+    return raw.get("enabled", True) is not False if isinstance(raw, dict) else True
+
+
+def schedule_text(sched):
+    at = " i ".join(sched["at"])
+    if "every_days" in sched:
+        n = sched["every_days"]
+        when_ = "codziennie" if n == 1 else f"co {n} dni"
+        return f"{when_} od {date.fromisoformat(sched['anchor']):%d.%m.%Y}, o {at}"
+    return f"w {', '.join(DAY_NAMES[d] for d in sched['weekdays'])}, o {at}"
+
+
+def day_matches(sched, day):
+    if "every_days" in sched:
+        delta = (day - date.fromisoformat(sched["anchor"])).days
+        return delta >= 0 and delta % sched["every_days"] == 0
+    return day.weekday() in sched["weekdays"]
+
+
+def local_start(day, hhmm):
+    """Epoch najwcześniejszego startu: GG:MM tego dnia w Warszawie, liczone w kalendarzu. Godzina,
+    której nie ma (zmiana na czas letni), to pierwsza chwila po przeskoku (02:30 -> 03:00 CEST);
+    godzina podwójna (zmiana na zimowy) to jej pierwsze wystąpienie (fold 0)."""
+    h, m = (int(x) for x in hhmm.split(":"))
+    base = datetime(day.year, day.month, day.day, h, m)
+    for k in range(0, 121):
+        local = base + timedelta(minutes=k)
+        ts = local.replace(tzinfo=WARSAW).timestamp()
+        if datetime.fromtimestamp(ts, WARSAW).replace(tzinfo=None) == local:
+            return ts
+    return base.replace(tzinfo=WARSAW).timestamp()
+
+
+def slots_between(sched, lo, hi):
+    """Sloty z początkiem w [lo, hi], od najstarszego. Id slotu to data w Warszawie i numer
+    godziny dnia ("2026-10-12/1"): zmiana --at w trakcie slotu zostawia mu id, próby i wynik."""
+    day = datetime.fromtimestamp(lo, WARSAW).date() - timedelta(days=1)
+    last = datetime.fromtimestamp(hi, WARSAW).date() + timedelta(days=1)
+    out = []
+    while day <= last:
+        if day_matches(sched, day):
+            for i, hhmm in enumerate(sched["at"]):
+                start = local_start(day, hhmm)
+                if lo <= start <= hi:
+                    out.append(Slot(f"{day.isoformat()}/{i + 1}", start, hhmm))
+        day += timedelta(days=1)
+    return out
+
+
+def next_slot(sched, now):
+    since = max(sched.get("since") or 0, sched.get("edited") or 0, now)
+    found = slots_between(sched, since + 1, since + 62 * DAY)
+    return found[0] if found else None
+
+
+def warsaw(ts, fmt="%d.%m %H:%M"):
+    return datetime.fromtimestamp(ts, WARSAW).strftime(fmt) if ts else "?"
+
+
+def slot_label(slot_id, start=None):
+    """"pn 12.10 05:30" (z godziną z obecnego harmonogramu) albo sam dzień z id."""
+    try:
+        day = date.fromisoformat(slot_id.split("/")[0])
+    except ValueError:
+        return slot_id
+    text = f"{DAY_NAMES[day.weekday()]} {day:%d.%m}"
+    return f"{text} {warsaw(start, '%H:%M')}" if start else text
+
+
+def retry_at(last, counted, now):
+    """Najwcześniejsza następna próba po zapisie last (n = liczba liczonych prób). Koniec "z
+    przyszłości" (zegar cofnięty) liczy się jako teraz, żeby slot nie czekał na powrót zegara."""
+    if last is None:
+        return 0.0
+    ended = min(float(last.get("ended_at") or last.get("started_at") or 0), now)
+    skip = last.get("skip")
+    if skip in ("heavy", "hold"):
+        return ended  # bramki tiku same pilnują, kiedy można
+    if skip == "memory":
+        return ended + MEMORY_RETRY_S
+    curve = PAYER_BACKOFF_S if skip == "payer" else BACKOFF_S
+    return ended + curve[min(max(counted, 1), len(curve)) - 1]
+
+
+def slot_key(slot_id):
+    """(data, n) dla id slotu tiku ("2026-10-12/1") albo None dla innego tekstu z `--slot`."""
+    m = SLOT_RE.fullmatch(slot_id) if isinstance(slot_id, str) else None
+    return (m[1], int(m[2])) if m else None
+
+
+def next_mode(job, recs):
+    """--mode dla następnej próby slotu (recs: jego zapisy) albo None (mode joba). Job auto zostaje
+    na auto: runenv sam omija wyczerpany kredyt (billing) i konta z avoid.json (429 zapisuje runenv,
+    401 na subskrypcji dopisuje tik w spawn()). Wyjątek: ostatnia próba slotu, która płaciła kredytem,
+    skończyła się 401 albo limitem; runenv nie ma listy omijanych organizacji i w auto wybrałby tę
+    samą organizację znowu, więc reszta slotu płaci subskrypcją. Liczy się ostatni zapis z płatnikiem
+    kredytowym, nie ostatni zapis: POMINIĘTO bez płatnika (pamięć, inny ciężki bieg) i próba na
+    subskrypcji, która padła z innego powodu, nie gubią przełączenia."""
+    if job["mode"] != "auto":
+        return None
+    paid = next((r for r in reversed(recs) if (r.get("payer") or {}).get("mode") == "credits"), None)
+    if paid and paid.get("switch_payment") and paid.get("override") in SWITCH_FROM_CREDITS:
+        return "subscription"
+    return None
+
+
+def last_paid(recs):
+    """Ostatni zapis slotu z płatnikiem (POMINIĘTO przed wyborem płatnika go nie ma) albo None."""
+    return next((r for r in reversed(recs) if r.get("payer")), None)
+
+
+def slot_views(name, job, records, now, live=None, lo=None):
+    """Stan każdego slotu joba od lo (domyślnie 8 dni wstecz), od najstarszego. live: żywa próba
+    joba (zapis w toku albo wypuszczona przez tik) albo None. Nic tu nie pisze: przegląd i tik
+    liczą to samo."""
+    sched = job["schedule"]
+    since, edited = sched.get("since") or 0.0, sched.get("edited") or 0.0
+    by_slot, outside = {}, []
+    for rec in records:
+        if slot_key(rec.get("slot")):
+            by_slot.setdefault(rec["slot"], []).append(rec)
+        elif rec.get("state") == "done" and rec.get("outcome") in CLOSES_BY_HAND:
+            outside.append(rec)  # ręczny albo z obcym --slot: zamyka slot tylko efektem albo BEZ WPISU
+    lo = now - (HISTORY_DAYS + 1) * DAY if lo is None else lo
+    everything = slots_between(sched, lo, now + 2 * DAY)
+    # sprzed since i edited tylko sloty z zapisami: wyłączenie i włączenie nie gubi otwartego slotu
+    slots = [s for s in everything if s.id in by_slot or max(since, edited) <= s.start <= now]
+    kept = {s.id for s in slots}
+    views = []
+    for s in slots:
+        # nowszy slot, który się zaczął: istniejący albo taki, który przepadł, bo job był wyłączony
+        # (sprzed since); slot sprzed samej edycji (edited) nie zamyka starszego, ten biegnie dalej
+        newer = next((n for n in everything if n.start > s.start and n.start <= now and (n.id in kept or n.start < since)), None)
+        later_record = any(slot_key(other) > slot_key(s.id) for other in by_slot)  # zegar cofnięty: nowszy slot już biegł
+        recs = by_slot.get(s.id, [])
+        until = newer.start if newer else float("inf")
+        by_hand = next((r for r in reversed(outside) if s.start <= float(r.get("ended_at") or 0) < until), None)
+        views.append(slot_view(job, s, recs, now, newer, later_record, by_hand, live))
+    return views
+
+
+def slot_view(job, s, recs, now, newer, later_record, by_hand, live):
+    counted = [r for r in recs if r.get("skip") not in NOT_COUNTED]
+    last = recs[-1] if recs else None
+    v = {"slot": s.id, "start": s.start, "label": slot_label(s.id, s.start), "attempts": len(counted),
+         "records": recs, "last": last, "outcome": None, "reason": "", "next_at": None, "mode": None,
+         "closed_at": None}  # fmt: skip
+    final = next((r for r in reversed(recs) if r.get("final")), None)
+    if final:
+        return dict(v, state="done", outcome=final.get("outcome"), reason=final.get("reason") or "")
+    if by_hand:
+        who = f"bieg spoza tiku (--slot {by_hand['slot']})" if by_hand.get("slot") else "ręcznie"
+        return dict(v, state="done", outcome=by_hand.get("outcome"), manual=True,
+                    reason=f"{who} {warsaw(by_hand.get('started_at'))}: {by_hand.get('reason') or ''}")  # fmt: skip
+    if live and live.get("slot") == s.id:
+        return dict(v, state="running", reason=f"biegnie od {warsaw(live.get('started_at'), '%H:%M')}")
+    if len(counted) >= MAX_ATTEMPTS:
+        return dict(v, state="capped", outcome="BEZ WYNIKU", closed_at=float(last.get("ended_at") or now),
+                    reason=f"{len(counted)}/{MAX_ATTEMPTS} prób bez wyniku; ostatnia: {last.get('outcome')}: {last.get('reason')}")  # fmt: skip
+    if newer or later_record:
+        closed = newer.start if newer else now
+        ran = [r for r in recs if r.get("skip") is None]
+        if not ran:
+            why = f"{last.get('outcome')}: {last.get('reason')}" if last else "Mac spał albo tik nie biegł w czasie slotu"
+            return dict(v, state="missed", outcome="BRAK BIEGU", closed_at=closed, reason=why)
+        return dict(v, state="dropped", outcome="BEZ WYNIKU", closed_at=closed,
+                    reason=f"{len(counted)}/{MAX_ATTEMPTS} prób, potem nowszy slot; ostatnia: {last.get('outcome')}: {last.get('reason')}")  # fmt: skip
+    nxt = max(retry_at(last, len(counted), now), s.start)
+    mode = next_mode(job, recs)
+    if nxt > now:
+        tail = f"; ostatnia: {last.get('outcome')}: {last.get('reason')}" if last else ""
+        return dict(v, state="backoff", next_at=nxt, mode=mode,
+                    reason=f"{len(counted)}/{MAX_ATTEMPTS}, następna próba {warsaw(nxt, '%H:%M')}{tail}")  # fmt: skip
+    tail = f"{len(counted)}/{MAX_ATTEMPTS}; ostatnia: {last.get('outcome')}: {last.get('reason')}" if last else "jeszcze bez próby"
+    return dict(v, state="due", next_at=nxt, mode=mode, reason=tail)
+
+
+# ---------- harmonogram: stan systemu ----------
+
+
+def power_state():
+    """"full" (pełne obudzenie), "dark" (DarkWake) albo "unknown". `pmset -g systemstate` wypisuje
+    "Current System Capabilities are: CPU Graphics Audio Network"; w DarkWake bez Graphics i Audio
+    (pmset -g log: DarkWake [CDNP], Wake [CDNVA]). launchd odpala StartInterval także w DarkWake."""
+    tool = shutil.which("pmset") or "/usr/bin/pmset"
+    try:
+        out = subprocess.run([tool, "-g", "systemstate"], capture_output=True, text=True, timeout=10,
+                             stdin=subprocess.DEVNULL).stdout  # fmt: skip
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    line = next((ln for ln in out.splitlines() if "Capabilities" in ln and ":" in ln), None)
+    if line is None:
+        return "unknown"
+    return "full" if "Graphics" in line.split(":", 1)[1].split() else "dark"
+
+
+def slept_between(prev, wall, uptime, boot):
+    """Czy od poprzedniego tiku Mac spał albo się restartował (albo poprzedniego tiku nie ma)."""
+    try:
+        if abs(boot - float(prev["boot"])) > 300 or uptime < float(prev["uptime"]):
+            return True
+        return (wall - float(prev["wall"])) - (uptime - float(prev["uptime"])) > SLEEP_GAP_TICK_S
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def awake_age(beat, uptime, boot):
+    """Sekundy czuwania od zapisu beat ({uptime, boot}); po restarcie czuwanie od startu systemu."""
+    try:
+        if abs(boot - float(beat["boot"])) <= 300 and uptime >= float(beat["uptime"]):
+            return uptime - float(beat["uptime"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    return uptime
+
+
+def tick_log(line):
+    try:
+        os.makedirs(JOBS_DIR, mode=0o700, exist_ok=True)
+        if os.path.exists(TICK_LOG) and os.path.getsize(TICK_LOG) > 1024 * 1024:
+            with open(TICK_LOG, errors="replace") as f:
+                tail = f.readlines()[-6000:]  # linia stanu zasilania co tik: ok. 8 dni
+            with open(TICK_LOG, "w") as f:
+                f.writelines(tail)
+        with open(TICK_LOG, "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+    except OSError:
+        pass
+
+
+def notify_argv(title, text, tool="osascript"):
+    """Wywołanie osascript dla banera. Tekst i tytuł to argumenty skryptu (on run argv), nie jego
+    treść: AppleScript nie zna escape'ów \\uXXXX, które robi json.dumps z polskich liter, i nie
+    kompiluje takiego skryptu (-2741). "--" kończy opcje osascript, więc tekst z "-" na początku
+    też przechodzi."""
+    argv = [tool]
+    for line in NOTIFY_SCRIPT:
+        argv += ["-e", line]
+    return argv + ["--", text, title]
+
+
+def notify(title, text):
+    """Baner macOS (osascript z PATH; launchd ma /usr/bin). True, gdy osascript go przyjął; inaczej
+    linia w tick.log, a wołający nie oznacza banera jako pokazanego."""
+    tool = shutil.which("osascript") or "/usr/bin/osascript"
+    try:
+        r = subprocess.run(notify_argv(title, text, tool), capture_output=True, text=True, timeout=20,
+                           stdin=subprocess.DEVNULL)  # fmt: skip
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        tick_log(f"baner nie wyszedł ({exc.__class__.__name__}): {title}: {text}")
+        return False
+    if r.returncode != 0:
+        err = (r.stderr or "").strip().splitlines()
+        tick_log(f"baner nie wyszedł (osascript kod {r.returncode}: {err[-1] if err else 'bez komunikatu'}): {title}: {text}")
+        return False
+    tick_log(f"baner: {title}: {text}")
+    return True
+
+
+def die_at(point):
+    """Test: tik zabija się SIGKILL w tym miejscu ($CLAUDE_ACC_JOBS_TICK_DIE)."""
+    if os.environ.get("CLAUDE_ACC_JOBS_TICK_DIE") == point:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def live_attempt(name, launched):
+    """Żywa próba joba: current.json, którego blokadę ktoś trzyma (runner albo `jobs run` ręczny),
+    albo próba, którą tik wypuścił, a która jeszcze nie wzięła blokady. Liczy się blokada, nie pid
+    z current.json (pid może należeć już do innego procesu)."""
+    path = os.path.join(job_dir(name), "current.json")
+    if os.path.isfile(path):
+        fd = try_lock(os.path.join(job_dir(name), "lock"))
+        if fd is None:
+            cur = read_json(path)
+            return dict(cur, live="runner") if isinstance(cur, dict) else {"live": "runner"}
+        os.close(fd)
+    entry = (launched or {}).get(name)
+    if isinstance(entry, dict) and pid_alive(entry.get("pid")) and runenv.pid_state(int(entry["pid"]))[1] == entry.get("pid_start"):
+        return {"slot": entry.get("slot"), "started_at": entry.get("at"), "pid": entry.get("pid"), "live": "launched"}
+    return None
+
+
+def load_tick_state(wall):
+    state = read_json(TICK_STATE)
+    if not isinstance(state, dict) or not isinstance(state.get("sent"), dict):
+        # nowy albo zepsuty stan: banery tylko za to, co zamknie się od teraz
+        state = {"v": 1, "since": wall, "sent": {}, "launched": {}, "waiting": {}, "last": {}}
+    for key in ("launched", "waiting", "last"):
+        if not isinstance(state.get(key), dict):
+            state[key] = {}
+    return state
+
+
+def evening_of(wall):
+    """Ostatni wieczór (20:00 w Warszawie) nie później niż wall: (data, epoch)."""
+    local = datetime.fromtimestamp(wall, WARSAW)
+    day = local.date() if local.hour >= EVENING_HOUR else local.date() - timedelta(days=1)
+    return day.isoformat(), datetime(day.year, day.month, day.day, EVENING_HOUR, tzinfo=WARSAW).timestamp()
+
+
+def needs_banner(rec):
+    """Zapis próby, który sam w sobie woła Filipa: BŁĄD ostateczny, ZAPARKOWANO, PILNE (i banner)."""
+    outcome = rec.get("outcome")
+    return outcome in OUTCOME_BANNERS or (outcome == "BŁĄD" and rec.get("final")) or bool(rec.get("banner"))
+
+
+# ---------- harmonogram: tik ----------
+
+
+def hold_text(hold):
+    return f"wstrzymane do {warsaw(float(hold.get('until') or 0))}: {hold.get('reason') or 'bez powodu'}"
+
+
+def waiting_reason(name, v, waiting):
+    """Powód slotu jak w `jobs`: bramka, na której tik go trzyma (należny), i stan prób."""
+    w = (waiting or {}).get(name) or {}
+    if v["state"] == "due" and w.get("slot") == v["slot"] and w.get("reason"):
+        return f"{w['reason']}; {v['reason']}"
+    return v["reason"]
+
+
+def record_label(rec):
+    """Gdzie był zapis: slot tiku ("pn 12.10"), obcy --slot (sam tekst) albo bieg ręczny."""
+    return slot_label(rec["slot"]) if rec.get("slot") else f"ręcznie {warsaw(rec.get('started_at'))}"
+
+
+class Tick:
+    """Jeden obrót: zegar, stan systemu, sloty każdego joba, banery, co najwyżej jeden start."""
+
+    def __init__(self):
+        self.wall, self.uptime, self.boot = tick_clock()
+        self.state = load_tick_state(self.wall)
+        self.out = {"power": None, "started": [], "banners": [], "waiting": {}, "errors": {}}
+        self.notify_failed = False
+        self.raw = {}
+
+    def run(self):
+        st, wall = self.state, self.wall
+        prev = st.get("last") or {}
+        power = self.out["power"] = power_state()
+        fresh = slept_between(prev, wall, self.uptime, self.boot) or prev.get("power") != "full"
+        # co tik: R1 porównuje to przez noc z pmset -g log (DarkWake [CDNP], Wake [CDNVA])
+        tick_log(f"tik: zasilanie {power}" + (", świeżo po śnie" if fresh else ""))
+        # po długiej nieobecności alarm obejmuje wszystko od ostatniego tiku (najwyżej 31 dni)
+        lo = max(wall - 31 * DAY, min(wall - (HISTORY_DAYS + 1) * DAY, float(prev.get("wall") or wall) - DAY))
+        st["last"] = {"wall": wall, "uptime": self.uptime, "boot": self.boot, "power": power}
+        if power == "dark":
+            # DarkWake: Filip nic nie zobaczy, a Mac zaraz zaśnie; tylko znak życia
+            self.save()
+            self.heartbeat(power, (read_json(HEARTBEAT_PATH) or {}).get("attention") or [])
+            return self.out
+        try:
+            recover(runenv.sweep())
+        except Exception as exc:  # noqa: BLE001 - zapis zaległej próby nie może zatrzymać harmonogramu
+            tick_log(f"recover: {exc.__class__.__name__}: {exc}")
+        self.raw = load_jobs()
+        hold = held(wall)
+        jobs, views, live, bad = {}, {}, {}, {}
+        for name in sorted(self.raw):
+            try:  # jeden zły job (definicja, harmonogram, zapisy) nie wycisza pozostałych ani heartbeatu
+                live[name] = live_attempt(name, st["launched"])
+                job, problem = checked_job(self.raw[name])
+                if problem:
+                    bad[name] = problem
+                    continue
+                jobs[name] = job
+                if job["schedule"] is not None:
+                    views[name] = (job, slot_views(name, job, history(name), wall, live[name], lo))
+            except Exception as exc:  # noqa: BLE001
+                bad[name] = ("błąd tiku", f"{exc.__class__.__name__}: {exc}")
+        for name, (kind, err) in bad.items():
+            self.out["errors"][name] = f"{kind}: {err}"
+        self.reconcile_hints(jobs, live)
+        self.settle_launches(live)
+        self.banners(views)
+        if power == "full" and not fresh:
+            self.start(jobs, views, live, hold)
+        else:
+            reason = "Mac dopiero się obudził: start od następnego tiku" if power == "full" else \
+                "pmset nie mówi, czy Mac nie śpi: bez startu"  # fmt: skip
+            self.wait_all(views, reason)
+        self.evening(views, bad, hold)
+        # klucze starsze niż 9 dni nie mają już czego blokować (zapisy wołają najwyżej BANNER_DAYS)
+        for key, at in list(st["sent"].items()):
+            if not isinstance(at, (int, float)) or at < wall - 9 * DAY:
+                st["sent"].pop(key, None)
+        st["waiting"] = self.out["waiting"]
+        self.save()
+        self.heartbeat(power, attention(views, bad, hold, power, wall))
+        return self.out
+
+    def save(self):
+        try:
+            credits.write_json(TICK_STATE, self.state)
+        except OSError as exc:
+            tick_log(f"zapis stanu tiku: {exc}")
+
+    def heartbeat(self, power, attn):
+        try:
+            credits.write_json(HEARTBEAT_PATH, {
+                "v": 1, "wall": self.wall, "uptime": self.uptime, "boot": self.boot, "power": power,
+                "interval_s": TICK_INTERVAL_S, "stale_after_s": STALE_AFTER_S, "attention": attn,
+            })  # fmt: skip
+        except OSError as exc:
+            tick_log(f"heartbeat: {exc}")
+
+    def reconcile_hints(self, jobs, live):
+        """Wskazówka dla automatu kont z current.json żywych biegów na subskrypcji (runner pisze ją
+        sam, tik ją odświeża i zdejmuje po biegach, których już nie ma)."""
+        live_pids = {}
+        for name, cur in live.items():
+            payer = (cur or {}).get("payer") or {}
+            if cur and cur.get("live") == "runner" and payer.get("mode") == "subscription" and payer.get("email") and cur.get("pid"):
+                live_pids[int(cur["pid"])] = (name, payer["email"].lower())
+        now = time.time()
+
+        def change(items):
+            keep = [e for e in items if pid_alive(e.get("pid"))]
+            for e in keep:
+                if e.get("pid") in live_pids:
+                    e["until"] = max(float(e.get("until") or 0), now + HINT_REFRESH_S)
+            known = {e.get("pid") for e in keep}
+            for pid, (name, email) in live_pids.items():
+                if pid not in known:
+                    job = jobs.get(name) or normalized({})  # zły wpis jobs.json: domyślne limity
+                    keep.append({"email": email, "job": name, "pid": pid, "since": now, "until": hint_until(job, now)})
+            return keep
+
+        edit_hints(change)
+
+    def settle_launches(self, live):
+        """Wypuszczona próba: zniknęła z zapisem (gotowe) albo bez (kod 64, 73, awaria: następna
+        dopiero po LAUNCH_RETRY_S, żeby nie wołać runnera co tik)."""
+        launched = self.state["launched"]
+        for name, entry in list(launched.items()):
+            if not isinstance(entry, dict) or live.get(name):
+                continue
+            count = sum(1 for r in history(name) if r.get("slot") == entry.get("slot"))
+            if count > int(entry.get("records") or 0) or self.wall - float(entry.get("at") or 0) > LAUNCH_RETRY_S:
+                launched.pop(name, None)
+            else:
+                entry["failed"] = True
+
+    def show(self, keys, title, text):
+        """Baner raz na klucz (tick-state.json "sent"). osascript go nie przyjął: bez znaku, więc
+        następny tik spróbuje znowu, a reszta banerów tego tiku czeka (osascript może wisieć 20 s)."""
+        sent = self.state["sent"]
+        if all(k in sent for k in keys):
+            return True  # już pokazany (np. tik zabity po banerze, przed resztą zapisu stanu)
+        if self.notify_failed:
+            return False
+        if not notify(title, text):
+            self.notify_failed = True
+            return False
+        self.out["banners"].append({"key": keys[0] if len(keys) == 1 else "miss", "title": title, "text": text})
+        die_at("after-banner")
+        for k in keys:
+            sent[k] = self.wall
+        return True
+
+    def banners(self, views):
+        """Zapisy, które wołają Filipa, limit prób i sloty zastąpione bez wyniku."""
+        st, wall = self.state, self.wall
+        since = float(st.get("since") or wall)
+        # zapisy prób: BŁĄD ostateczny, ZAPARKOWANO, PILNE ze slotem (tiku albo obcym) i każde PILNE,
+        # także ręczne (np. agent, którego sesja zginęła po pushu); także zapisy, które oddał recover().
+        # Najwyżej BANNER_DAYS po końcu, czyli zawsze w zasięgu kluczy "sent" (9 dni): baner nie wraca
+        floor = max(since, wall - BANNER_DAYS * DAY)
+        for name in sorted(self.raw):
+            for rec in history(name)[-50:]:
+                if float(rec.get("ended_at") or 0) < floor or not needs_banner(rec):
+                    continue
+                if rec.get("slot") or rec.get("outcome") == "PILNE":
+                    extra = f" UWAGA: {rec['banner']}" if rec.get("banner") and rec["banner"] not in (rec.get("reason") or "") else ""
+                    links = " ".join(list(rec.get("urls") or []) + ([rec["pr"]] if rec.get("pr") else []))
+                    text = f"{record_label(rec)}: {rec.get('reason')}{extra}" + (f" {links}" if links else "")
+                    self.show([f"rec:{rec.get('id')}"], f"jobs: {name} {rec.get('outcome')}", text)
+        missed = []
+        for name, (job, vs) in sorted(views.items()):
+            if not job["enabled"]:
+                continue
+            for v in vs:
+                if v["state"] == "capped" and float(v["closed_at"] or 0) >= since:
+                    who = "nikt nie zapłacił" if (v["last"] or {}).get("skip") == "payer" else "bez wyniku"
+                    self.show([f"cap:{name}:{v['slot']}"], f"jobs: {name} {who} ({v['attempts']}/{MAX_ATTEMPTS})",
+                              f"{v['label']}: {v['reason']}")  # fmt: skip
+                elif v["state"] in ("missed", "dropped") and float(v["closed_at"] or 0) >= since and f"miss:{name}:{v['slot']}" not in st["sent"]:
+                    missed.append((name, v))
+        if missed:
+            text = "; ".join(f"{name} {v['label']} {v['outcome']}" for name, v in missed)
+            first = missed[0][1]["reason"]
+            self.show([f"miss:{name}:{v['slot']}" for name, v in missed], "jobs: sloty bez biegu",
+                      f"{text} ({first})" if len(missed) == 1 else text)  # fmt: skip
+
+    def evening(self, views, bad, hold):
+        """20:00: ostatni wieczór, którego tik jeszcze nie przerobił (Mac spał o 20:00: pierwszy pełny
+        tik). Woła po start(), więc linia mówi, czemu slot czeka, tak jak `jobs`."""
+        st, wall = self.state, self.wall
+        day, evening = evening_of(wall)
+        done = st.get("evening_done")
+        if done is None:
+            st["evening_done"] = day  # pierwszy tik w ogóle: bez alarmu za wieczór sprzed instalacji
+            return
+        if day <= done:
+            return
+        # wieczór przerabiany na czas mówi o każdym niedomkniętym slocie; przerabiany po śnie (rano)
+        # tylko o slotach, które już próbowały: te bez prób tik właśnie nadrabia
+        on_time = datetime.fromtimestamp(wall, WARSAW).date().isoformat() == day
+        started = {(s["job"], s["slot"]) for s in self.out["started"]}
+        lines = [f"{name}: {kind} ({err})" for name, (kind, err) in sorted(bad.items()) if raw_enabled(self.raw.get(name))]
+        for name, (job, vs) in sorted(views.items()):
+            if not job["enabled"]:
+                continue
+            for v in vs:
+                if v["state"] in ("due", "backoff") and v["start"] <= evening and (on_time or v["records"]) \
+                        and (name, v["slot"]) not in started:  # fmt: skip
+                    why = waiting_reason(name, v, self.out["waiting"])
+                    if hold and v["state"] == "due" and hold_text(hold) not in why:
+                        why += f"; {hold_text(hold)}"
+                    lines.append(f"{name} {v['label']}: {why}")
+        if lines and not self.show([f"eve:{day}"], f"jobs: bez wyniku ({warsaw(evening, '%d.%m')} 20:00)", "; ".join(lines)):
+            return  # osascript nie przyjął: następny tik próbuje znowu
+        st["evening_done"] = day
+
+    def wait_all(self, views, reason):
+        for name, (job, vs) in views.items():
+            if job["enabled"] and any(v["state"] == "due" for v in vs):
+                self.out["waiting"][name] = {"slot": next(v["slot"] for v in vs if v["state"] == "due"), "reason": reason}
+
+    def start(self, jobs, views, live, hold):
+        """Kolejka należnych slotów (najstarszy slot, potem nazwa joba) i co najwyżej jeden start."""
+        queue = sorted(((v["start"], name, v) for name, (job, vs) in views.items() if job["enabled"]
+                        for v in vs if v["state"] == "due"), key=lambda q: q[:2])  # fmt: skip
+        if not queue:
+            return
+        heavy = {n: (jobs[n]["heavy"] if n in jobs else True) for n in self.raw}  # zły wpis: jak ciężki
+        heavy_busy = next((n for n, cur in live.items() if cur and heavy.get(n, True)), None)
+        other = read_json(HEAVY_PATH)
+        if not heavy_busy and isinstance(other, dict) and pid_alive(other.get("pid")):
+            heavy_busy = other.get("job") or "?"
+        last_end, last_job = 0.0, None
+        for n in self.raw:
+            if not heavy[n]:
+                continue
+            for r in history(n)[-20:]:
+                if r.get("skip") is None and float(r.get("ended_at") or 0) > last_end:
+                    last_end, last_job = min(float(r["ended_at"]), self.wall), n  # zegar cofnięty: odstęp od teraz
+        chosen = None
+        for _start, name, v in queue:
+            job = views[name][0]
+            entry = self.state["launched"].get(name)
+            if live.get(name):
+                reason = f"biegnie próba {name} ({live[name].get('slot') or 'ręczna'})"
+            elif os.path.isfile(os.path.join(job_dir(name), "current.json")):
+                # runner zginął, a recover() jeszcze nie zapisał próby (run.json bez rachunku, sweep w
+                # innym procesie): nowa próba nadpisałaby current.json, a martwa przepadłaby bez zapisu
+                reason = "poprzednia próba zginęła i czeka na zapis (rachunek runenv); start po nim"
+            elif isinstance(entry, dict) and entry.get("failed"):
+                reason = f"próba wypuszczona {warsaw(entry.get('at'), '%H:%M')} nie zostawiła zapisu; ponownie po {warsaw(float(entry.get('at') or 0) + LAUNCH_RETRY_S, '%H:%M')}"
+            elif hold:
+                reason = hold_text(hold)
+            elif job["heavy"] and heavy_busy:
+                reason = f"biegnie inny ciężki job: {heavy_busy}"
+            elif job["heavy"] and self.wall < last_end + STAGGER_S:
+                reason = f"odstęp po {last_job} do {warsaw(last_end + STAGGER_S, '%H:%M')}"
+            elif chosen is None:
+                chosen = (name, v)
+                if job["heavy"]:
+                    heavy_busy = name
+                continue
+            else:
+                reason = "kolejka: jeden start na tik"
+            self.out["waiting"][name] = {"slot": v["slot"], "reason": reason}
+        if chosen:
+            self.spawn(*chosen)
+
+    def spawn(self, name, v):
+        runner = os.environ.get("CLAUDE_ACC_JOBS_RUNNER")
+        argv = [runner] if runner else [sys.executable, os.path.join(HERE, "acc.py"), "jobs"]
+        argv += ["run", name, "--slot", v["slot"]] + (["--mode", v["mode"]] if v["mode"] else [])
+        paid = last_paid(v["records"]) or {}
+        payer = paid.get("payer") or {}
+        if paid.get("switch_payment") and payer.get("mode") == "subscription" and payer.get("email"):
+            # 401 albo 429 na tym koncie (także gdy potem było POMINIĘTO bez płatnika): następna próba
+            # nie może wziąć go znowu; runenv omija konta z avoid.json, a sam zapisuje tam tylko 429
+            try:
+                runenv.avoid(payer["email"], time.time() + 5 * 3600, f"jobs: {paid.get('override')} w próbie {paid.get('id')}")
+            except (OSError, credits.CreditsError) as exc:
+                tick_log(f"avoid {payer['email']}: {exc}")
+        os.makedirs(JOBS_DIR, mode=0o700, exist_ok=True)
+        log_fd = os.open(TICK_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            # własna sesja: bootout tiku (launchd zabija grupę procesów joba) nie dotyka biegu
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=log_fd, cwd=HERE,
+                                    start_new_session=True)  # fmt: skip
+        except OSError as exc:
+            tick_log(f"start {name} {v['slot']}: {exc}")
+            return
+        finally:
+            os.close(log_fd)
+        die_at("after-spawn")
+        count = len(v["records"])
+        self.state["launched"][name] = {"slot": v["slot"], "pid": proc.pid, "pid_start": runenv.pid_state(proc.pid)[1],
+                                        "at": self.wall, "records": count}  # fmt: skip
+        tick_log(f"start {name} slot {v['slot']} próba {v['attempts'] + 1}" + (f" (--mode {v['mode']})" if v["mode"] else "") + f", pid {proc.pid}")
+        self.out["started"].append({"job": name, "slot": v["slot"], "pid": proc.pid, "mode": v["mode"]})
+
+
+def attention(views, bad, hold, power, wall):
+    """Linie dla Filipa (status, panel): to, co z ostatnich 48 h wymaga jego ruchu, i stan tiku."""
+    out = [f"{name}: {kind}" for name, (kind, _err) in sorted(bad.items())]
+    for name, (job, vs) in sorted(views.items()):
+        if not job["enabled"]:
+            continue
+        for v in vs:
+            if v["start"] < wall - 2 * DAY:
+                continue
+            if v["state"] in ("capped", "missed", "dropped") or (v["state"] == "done" and (v["outcome"] in OUTCOME_BANNERS or v["outcome"] == "BŁĄD")):
+                out.append(f"{name} {v['label']} {v['outcome']}")
+    if hold:
+        out.append(f"wstrzymane do {warsaw(float(hold.get('until') or 0))}")
+    if power == "unknown":
+        out.append("pmset nie mówi, czy Mac nie śpi: tik nie startuje biegów")
+    return out
+
+
+def heartbeat_view():
+    """(heartbeat albo None, sekundy czuwania od niego albo None, czy są włączone joby z harmonogramem)."""
+    jobs = load_jobs()
+    scheduled = any(isinstance(j, dict) and j.get("schedule") is not None and j.get("enabled", True) for j in jobs.values())
+    beat = read_json(HEARTBEAT_PATH)
+    if not isinstance(beat, dict):
+        return None, None, scheduled
+    _wall, uptime, boot = tick_clock()
+    return beat, awake_age(beat, uptime, boot), scheduled
+
+
+def heartbeat_text():
+    """Opis tiku dla `claude-acc status` i `jobs`, z flagą "stoi": (tekst, stoi) albo (None, False)."""
+    beat, age, scheduled = heartbeat_view()
+    if beat is None:
+        return ("tik jeszcze nie biegł (launchd com.filip.claude-acc.jobs)", True) if scheduled else (None, False)
+    limit = float(beat.get("stale_after_s") or STALE_AFTER_S)
+    at = warsaw(float(beat.get("wall") or 0), "%d.%m %H:%M")
+    if age > limit:
+        return f"tik stoi od {at} ({duration(age)} czuwania bez tiku; launchctl print gui/$UID/com.filip.claude-acc.jobs)", True
+    power = {"dark": ", DarkWake", "unknown": ", pmset nie odpowiada"}.get(beat.get("power"), "")
+    return f"tik {warsaw(float(beat.get('wall') or 0), '%H:%M')}{power}", False
+
+
+def status_line():
+    """Jedna linia jobów dla `claude-acc status`: świeżość tiku, konta trzymane przez biegi i to, co
+    czeka na Filipa. Same pliki: bez recover, sieci i blokad. None, gdy jobów z harmonogramem nie ma."""
+    text, stale = heartbeat_text()
+    beat = read_json(HEARTBEAT_PATH)
+    data = read_json(HELD_PATH)
+    now, holding = time.time(), []
+    for e in (data.get("accounts") if isinstance(data, dict) else None) or []:
+        try:
+            if float(e["until"]) > now and pid_alive(e.get("pid")):
+                holding.append(f"{e['email']} trzyma {e.get('job')}")
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    if text is None and not holding:
+        return None
+    parts = [("UWAGA, " if stale else "") + (text or "bez harmonogramu")] + holding
+    attn = (beat or {}).get("attention") if isinstance(beat, dict) else None
+    if attn:
+        parts.append("do sprawdzenia: " + ", ".join(attn[:3]) + (f" (+{len(attn) - 3})" if len(attn) > 3 else ""))
+    return "joby: " + "; ".join(parts) + " (claude-acc jobs)"
+
+
+def heartbeat_alarm():
+    """Baner, gdy tik jobów stoi (heartbeat bez świeżego zapisu przez stale_after_s czuwania), raz na
+    epizod. Woła go automat kont (accswitch cmd_tick, co 2 min): proces inny niż tik. Tylko w pełnym
+    obudzeniu: czuwanie rośnie też w nocnych DarkWake, a baner tam nikt nie zobaczy, więc epizod
+    zostaje nieoznaczony do pierwszego pełnego obudzenia; tak samo, gdy osascript banera nie przyjął.
+    Tylko pliki i pmset, bez sieci i recover; nigdy nie rzuca."""
+    try:
+        beat, age, scheduled = heartbeat_view()
+        if not scheduled:
+            return
+        if beat is not None and age <= float(beat.get("stale_after_s") or STALE_AFTER_S):
+            return
+        episode = str((beat or {}).get("wall") or "brak")
+        seen = read_json(STALE_ALARM_PATH)
+        if isinstance(seen, dict) and seen.get("episode") == episode:
+            return
+        if power_state() != "full":
+            return
+        # znak przed banerem: dwa automaty naraz nie pokażą go dwa razy; nieudany baner go cofa
+        credits.write_json(STALE_ALARM_PATH, {"episode": episode, "at": time.time()})
+        text, _stale = heartbeat_text()
+        if not notify("jobs: harmonogram stoi", f"{text}; blogi nie wystartują same"):
+            if isinstance(seen, dict):
+                credits.write_json(STALE_ALARM_PATH, seen)
+            else:
+                os.unlink(STALE_ALARM_PATH)
+    except Exception:  # noqa: BLE001 - alarm nie może zatrzymać automatu kont
+        pass
+
+
 # ---------- definicje ----------
 
 
@@ -1299,6 +2287,7 @@ def validate(name, job):
     if not good or not all(isinstance(u, str) and re.fullmatch(r"https?://\S+", u) for u in urls):
         raise credits.UsageError("live_urls (--live-urls): adresy http(s) po przecinku, najwyżej 10, np. indeks bloga")
     job["live_urls"] = urls
+    job["schedule"] = check_schedule(job["schedule"])
     total = limits["precheck_min"] + limits["run_min"]
     if job["mode"] == "subscription" and total > SUBSCRIPTION_MAX_MIN:
         raise credits.UsageError(
@@ -1364,12 +2353,17 @@ def running(name):
 def cmd_run(args):
     as_json = credits.switch(args, "--json")
     slot = credits.flag(args, "--slot")
+    mode = credits.flag(args, "--mode")
     if len(args) != 1:
-        raise credits.UsageError("usage: claude-acc jobs run NAZWA [--slot S] [--json]")
+        raise credits.UsageError("usage: claude-acc jobs run NAZWA [--slot S] [--mode auto|credits|subscription] [--json]")
     name = args[0]
     job = load_job(name)
     if not job["enabled"]:
-        raise credits.UsageError(f"job {name} jest wyłączony; włącz: claude-acc jobs set {name} enabled=true")
+        raise credits.UsageError(f"job {name} jest wyłączony; włącz: claude-acc jobs enable {name}")
+    if mode is not None:
+        if mode not in runenv.MODES:
+            raise credits.UsageError("--mode: auto, credits albo subscription")
+        job = dict(job, mode=mode)  # jednorazowo: tik przełącza źródło płatności po switch_payment
     swept = runenv.sweep()
     recover(swept)
     lock = try_lock(os.path.join(job_dir(name), "lock"))
@@ -1491,13 +2485,17 @@ def cmd_add(args):
     if not args or args[0].startswith("-"):
         raise credits.UsageError("usage: claude-acc jobs add NAZWA --cwd KATALOG --entry 'KOMENDA' --budget-usd N ...")
     name = args.pop(0)
+    sched = schedule_flags(args, None)
     job = parse_job_options(args)
     credits.no_leftovers(args)
     if "cwd" in job:
         job["cwd"] = os.path.abspath(os.path.expanduser(job["cwd"]))
+    if sched is not None:
+        job["schedule"] = dict(sched, since=wall_now(), edited=wall_now())
     job = validate(name, job)
     save_job(name, job, new=True)
     print(describe_job(name, job))
+    print_next_slot(job)
     total = job["limits"]["precheck_min"] + job["limits"]["run_min"]
     if job["mode"] == "auto" and total > SUBSCRIPTION_MAX_MIN:
         print(f"uwaga: {total:g} min to za długo dla subskrypcji: bez kredytu w puli bieg będzie POMINIĘTO", file=sys.stderr)
@@ -1535,7 +2533,11 @@ def cmd_set(args):
         jobs = load_jobs()
         if name not in jobs:
             raise credits.UsageError(f"nie ma joba {name!r}")
+        before = normalized(jobs[name])
         job = normalized(jobs[name])
+        sched = schedule_flags(args, job.get("schedule"))
+        if sched is not None:
+            job["schedule"] = sched
         for item in args:
             key, sep, text = item.partition("=")
             if not sep or (key not in FIELDS and key not in DEFAULT_LIMITS) or key == "limits":
@@ -1546,11 +2548,89 @@ def cmd_set(args):
                 job["limits"][key] = value
             else:
                 job[key] = os.path.abspath(os.path.expanduser(value)) if key == "cwd" else value
-        job = validate(name, job)
+        job = validate(name, stamped(before, job))
         jobs[name] = job
         credits.write_json(JOBS_PATH, {"jobs": jobs})
     print(describe_job(name, job))
+    print_next_slot(job)
     return 0
+
+
+def schedule_flags(args, old):
+    """Harmonogram z flag --every/--from/--days/--at (zdejmuje je z args) albo None bez nich.
+    --every bez --from zostawia dotychczasową kotwicę (parzystość dni blogów), --at sam zmienia
+    tylko godziny."""
+    every, start, days, at = (credits.flag(args, f) for f in ("--every", "--from", "--days", "--at"))
+    if every is None and start is None and days is None and at is None:
+        return None
+    if every is not None and days is not None:
+        raise credits.UsageError(f"--every albo --days, nie oba; {SCHEDULE_HELP}")
+    try:
+        base = dict(check_schedule(old)) if old is not None else {}
+    except credits.UsageError:
+        base = {}  # zły harmonogram sprzed etapu A2b: flagi budują go od nowa
+    if every is not None:
+        m = re.fullmatch(r"(\d{1,2})\s*d?", every.strip().lower())
+        if not m or not 1 <= int(m[1]) <= 60:
+            raise credits.UsageError(f"--every {every!r}: od 1 do 60 dni, np. --every 2d; {SCHEDULE_HELP}")
+        if "every_days" not in base:
+            base.pop("weekdays", None)
+            base["anchor"] = datetime.fromtimestamp(wall_now(), WARSAW).date().isoformat()
+        base["every_days"] = int(m[1])
+    elif days is not None:
+        base.pop("every_days", None)
+        base.pop("anchor", None)
+        base["weekdays"] = parse_days(days)
+    if start is not None:
+        if "every_days" not in base:
+            raise credits.UsageError(f"--from tylko z --every (kotwica co N dni); {SCHEDULE_HELP}")
+        try:
+            base["anchor"] = date.fromisoformat(start.strip()).isoformat()
+        except ValueError:
+            raise credits.UsageError(f"--from {start!r}: data RRRR-MM-DD; {SCHEDULE_HELP}")
+    if at is not None:
+        base["at"] = [parse_hhmm(t) for t in at.split(",") if t.strip()] or [parse_hhmm(at)]
+    if "at" not in base or ("every_days" not in base and "weekdays" not in base):
+        raise credits.UsageError(SCHEDULE_HELP)
+    return check_schedule(base)
+
+
+def stamped(before, job):
+    """Chwile harmonogramu: since (sloty sprzed niej nie istnieją) przy pierwszym harmonogramie i
+    przy włączeniu joba; edited (sloty sprzed niej żyją tylko, gdy mają już próby) przy zmianie
+    harmonogramu. Edycja ani `jobs enable` nie odpalają więc slotu z przeszłości."""
+    new = job.get("schedule")
+    if not isinstance(new, dict):
+        return job
+    old = before.get("schedule") if isinstance(before.get("schedule"), dict) else None
+    now = wall_now()
+    core = lambda s: {k: v for k, v in (s or {}).items() if k not in ("since", "edited")}  # noqa: E731
+    new = dict(new)
+    if old is None or (job.get("enabled", True) and not before.get("enabled", True)):
+        new.update(since=now, edited=now)
+    else:
+        new["since"] = old.get("since", now) if not isinstance(old.get("since"), bool) else now
+        new["edited"] = now if core(new) != core(old) else old.get("edited", new["since"])
+    return dict(job, schedule=new)
+
+
+def print_next_slot(job):
+    sched = job.get("schedule")
+    if not job.get("enabled") or not isinstance(sched, dict):
+        return
+    nxt = next_slot(sched, wall_now())
+    if nxt:
+        print(f"harmonogram: {schedule_text(sched)}; następny slot: {slot_label(nxt.id, nxt.start)}")
+
+
+def cmd_enable(args, enabled=True):
+    if len(args) != 1:
+        raise credits.UsageError(f"usage: claude-acc jobs {'enable' if enabled else 'disable'} NAZWA")
+    return cmd_set([args[0], f"enabled={'true' if enabled else 'false'}"])
+
+
+def cmd_disable(args):
+    return cmd_enable(args, enabled=False)
 
 
 def cmd_remove(args):
@@ -1572,9 +2652,10 @@ def cmd_hold(args):
     credits.no_leftovers(args)
     if not 0 < hours <= 72:
         raise credits.UsageError("--hours: od 0 do 72")
-    until = time.time() + hours * 3600
+    now = wall_now()
+    until = now + hours * 3600
     with Edit():
-        credits.write_json(HOLD_PATH, {"until": until, "reason": reason, "at": time.time()})
+        credits.write_json(HOLD_PATH, {"until": until, "reason": reason, "at": now})
     print(f"joby wstrzymane do {when(until)}: {reason}; zdjęcie: claude-acc jobs release")
     return 0
 
@@ -1590,12 +2671,125 @@ def cmd_release(args):
     return 0
 
 
+def cmd_tick(args):
+    as_json = credits.switch(args, "--json")
+    credits.no_leftovers(args)
+    fd = try_lock(TICK_LOCK)
+    if fd is None:
+        print("inny tik jobów właśnie trwa; ten kończy bez zmian", file=sys.stderr)
+        return 0
+    try:
+        out = Tick().run()
+    finally:
+        os.close(fd)
+    if as_json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0
+
+
+def overview(wall):
+    """Przegląd dla `jobs` (i --json): sloty 7 dni każdego joba liczone z harmonogramu i historii
+    (bez tiku, bez recover i sieci), ręczne biegi, tik, wstrzymanie, konta trzymane przez biegi."""
+    state = read_json(TICK_STATE)
+    launched = state.get("launched") if isinstance(state, dict) and isinstance(state.get("launched"), dict) else {}
+    waiting = state.get("waiting") if isinstance(state, dict) and isinstance(state.get("waiting"), dict) else {}
+    items = []
+    for name, raw in sorted(load_jobs().items()):
+        job, problem = checked_job(raw)
+        records = history(name)
+        live = live_attempt(name, launched)
+        shown = job or {"enabled": raw_enabled(raw), "heavy": None, "mode": None, "schedule": None}
+        item = {"name": name, "enabled": shown["enabled"], "heavy": shown["heavy"], "mode": shown["mode"], "schedule": None,
+                "error": problem[1] if problem else None, "error_kind": problem[0] if problem else None, "next": None,
+                "slots": [], "manual": [], "running": live}  # fmt: skip
+        sched = shown["schedule"]
+        if sched is not None:
+            item["schedule"] = schedule_text(sched)
+            nxt = next_slot(sched, wall)
+            item["next"] = {"slot": nxt.id, "start": nxt.start, "label": slot_label(nxt.id, nxt.start)} if nxt else None
+            if job["enabled"]:
+                for v in slot_views(name, job, records, wall, live):
+                    v["reason"] = waiting_reason(name, v, waiting)
+                    v["records"] = len(v["records"])
+                    item["slots"].append(v)
+        # biegi spoza tiku: ręczne (slot null) i z obcym tekstem w --slot
+        item["manual"] = [r for r in records if not slot_key(r.get("slot")) and float(r.get("started_at") or 0) >= wall - HISTORY_DAYS * DAY]
+        items.append(item)
+    text, stale = heartbeat_text()
+    if stale:
+        for item in items:
+            for v in item["slots"]:
+                if v["state"] in ("due", "backoff"):
+                    v["reason"] = f"tik stoi, sam nie wystartuje; {v['reason']}"
+    return {"tick": {"text": text, "stale": stale}, "hold": held(wall), "jobs": items}
+
+
+STATE_TEXT = {"done": None, "running": "W TOKU", "capped": "BEZ WYNIKU", "missed": "BRAK BIEGU", "dropped": "BEZ WYNIKU",
+              "backoff": "PONOWIENIE", "due": "CZEKA"}  # fmt: skip
+
+
+def cmd_overview(args):
+    as_json = credits.switch(args, "--json")
+    credits.no_leftovers(args)
+    wall = wall_now()
+    data = overview(wall)
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=1))
+        return 0
+    tick, hold = data["tick"], data["hold"]
+    head = f"Joby: {'UWAGA, ' if tick['stale'] else ''}{tick['text'] or 'tik jeszcze nie biegł'}"
+    if hold:
+        head += f"; {hold_text(hold)} (claude-acc jobs release)"
+    print(head)
+    if not data["jobs"]:
+        print("nie ma jobów; dodaj: claude-acc jobs add NAZWA --cwd KATALOG --entry 'KOMENDA' --budget-usd N --every 2d --at 05:30")
+    for item in data["jobs"]:
+        name = item["name"]
+        if item["error"]:
+            print(f"{name}: {item['error_kind'].upper()}: {item['error']}")
+        elif not item["enabled"]:
+            print(f"{name}: WYŁĄCZONY" + (f" ({item['schedule']}); włącz: claude-acc jobs enable {name}" if item["schedule"] else ""))
+        elif item["schedule"] is None:
+            print(f"{name}: bez harmonogramu (tylko ręcznie: claude-acc jobs run {name})")
+        else:
+            nxt = f"; następny slot: {item['next']['label']}" if item["next"] else ""
+            print(f"{name}: {item['schedule']}{nxt}")
+        for v in reversed(item["slots"]):
+            word = STATE_TEXT[v["state"]] or v["outcome"]
+            line = f"  {v['label']}  {word}"
+            last = v["last"] or {}
+            if v["state"] == "done" and not v.get("manual"):
+                title = f" {last.get('title')}" if last.get("title") else ""
+                links = " ".join(list(last.get("urls") or []) + ([last["pr"]] if last.get("pr") else []))
+                cost = f", {runenv.usd4(last['cost_usd'])}" if last.get("cost_usd") is not None else ""
+                line += f"{title}  {links}".rstrip() + f"  ({v['attempts']}/{MAX_ATTEMPTS}, {payer_text(last)}{cost})"
+                if last.get("outcome") in ("BEZ WPISU", "BŁĄD", "PILNE", "ZAPARKOWANO"):
+                    line += f": {last.get('reason')}"
+            else:
+                line += f": {v['reason']}"
+            print(line)
+        for rec in reversed(item["manual"]):
+            who = f"spoza tiku (--slot {rec['slot']})" if rec.get("slot") else "ręcznie"
+            print(f"  {warsaw(rec.get('started_at'))} {who}: {rec.get('outcome') or 'w toku'}: {rec.get('reason')}")
+        cur = item["running"]
+        if cur and not any(v["state"] == "running" for v in item["slots"]):
+            print(f"  W TOKU od {warsaw(cur.get('started_at'), '%H:%M')} ({cur.get('slot') or 'ręcznie'}, faza {cur.get('phase', 'start')})")
+    return 0
+
+
 COMMANDS = {"run": cmd_run, "list": cmd_list, "log": cmd_log, "add": cmd_add, "set": cmd_set,
-            "remove": cmd_remove, "hold": cmd_hold, "release": cmd_release}  # fmt: skip
+            "remove": cmd_remove, "hold": cmd_hold, "release": cmd_release, "tick": cmd_tick,
+            "enable": cmd_enable, "disable": cmd_disable}  # fmt: skip
 
 
 def main(argv):
-    if not argv or argv[0] not in COMMANDS:
+    if not argv or argv[0] in ("--json", "status"):
+        try:
+            return cmd_overview([a for a in argv if a != "status"])
+        except credits.UsageError as exc:
+            print(f"błąd: {exc}", file=sys.stderr)
+            return USAGE
+    if argv[0] not in COMMANDS:
         print(__doc__[__doc__.index("Komendy:"):__doc__.index("Kody `jobs run`")].rstrip(), file=sys.stderr)
         return USAGE
     try:
