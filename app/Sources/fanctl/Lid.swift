@@ -23,7 +23,7 @@ import Security
 /// - on SIGTERM/SIGINT it lets go before exiting.
 final class Lid {
     private let requestPath: String
-    /// Signing teams the app may come with, besides `Requester.team` (`daemon --team`).
+    /// Signing teams the app comes with (`daemon --team`, read from the app at install).
     private let teams: Set<String>
     /// `SleepDisabled` is on because this daemon turned it on.
     private(set) var held: Bool
@@ -115,19 +115,18 @@ final class Lid {
 /// Who may hold the lid: the menu bar app, known by its code signature rather than its process
 /// name, so it still counts once it ships under another name (Pod Menu.app in Pod).
 ///
-/// - signed by a team: the team must be `team` or one named at install (`fanctl daemon --team`, for
-///   a build signed with someone else's certificate), and the running code must satisfy
-///   `anchor apple generic and certificate leaf[subject.OU] = <team>`: a self-made certificate can
-///   claim any team id, Apple's chain can't be faked;
-/// - signed without a team (ad hoc: `swift build`, an install without a certificate) or not at all:
-///   the process name, `ClaudeAcc`, as before;
+/// - signed by a team: the team must be one the daemon was started with (`fanctl daemon --team`:
+///   install-fans.sh reads it from the installed app, so no team id lives in the source), and the
+///   running code must satisfy `anchor apple generic and certificate leaf[subject.OU] = <team>`: a
+///   self-made certificate can claim any team id, Apple's chain can't be faked;
+/// - signed without a team (ad hoc: `swift build`, an install without a certificate) or not at all,
+///   or a daemon started without `--team` (installed before this check): the process name,
+///   `ClaudeAcc`, as before;
 /// - a signature that doesn't hold (the binary changed under the process) or a pid that's gone: no.
 ///
 /// A pid from a file can be reused; the app writes its request again while it runs, and `until`
 /// and `Lid.maxHold` bound a stale one, as they did with the name check.
 enum Requester {
-    /// The team that signs Claude Acc and Pod.
-    static let team = "75Y2KR6P5W"
     static let name = "ClaudeAcc"
 
     enum Signer: Equatable, CustomStringConvertible {
@@ -149,7 +148,7 @@ enum Requester {
 
     static func trusted(pid: pid_t, teams: Set<String>) -> Bool {
         switch signer(pid: pid) {
-        case .team(let id): teams.union([team]).contains(id)
+        case .team(let id): teams.isEmpty ? processName(pid) == name : teams.contains(id)
         case .noTeam: processName(pid) == name
         case .invalid: false
         }

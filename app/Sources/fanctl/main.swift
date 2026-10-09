@@ -8,7 +8,7 @@ import Foundation
 //   fanctl daemon --config F --state F [--team ID]...
 //                                 root LaunchDaemon: follows the mode in F, writes readings to the
 //                                 state file, and never lets a chip run hot on a fixed setting;
-//                                 --team adds a signing team the app may come with (Lid, Requester)
+//                                 --team: the signing team of the app that may hold the lid (Lid)
 //   fanctl lid-check <pid> [--team ID]...
 //                                 whether that process may hold the lid, and its signer (diagnostics)
 
