@@ -1909,13 +1909,13 @@ class HostFixtureTest(unittest.TestCase):
         app = os.path.join(self.dir, "Pod.app")
         bin_dir = os.path.join(app, "Contents", "Resources", "bin")
         os.makedirs(bin_dir)
-        self.pod_cli = os.path.join(bin_dir, "pod")
+        self.pod_cli = os.path.join(bin_dir, "podx")
         with open(self.pod_cli, "w") as f:
             f.write("#!/bin/sh\n")
         os.chmod(self.pod_cli, 0o755)
         self.orca = orcahost.orca(self.dir)
         self.pod = self.orca._replace(kind="pod", name="Pod", app=app, executable="Pod", bundle_id="codes.pod.app",
-                                      user_data=os.path.join(self.dir, "Library", "Application Support", "pod"), cli="pod")
+                                      user_data=os.path.join(self.dir, "Library", "Application Support", "pod"), cli="podx")
         env = {k: v for k, v in os.environ.items() if k not in ("DEVGUARD_ORCA", orcahost.USER_DATA_ENV)}
         patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
