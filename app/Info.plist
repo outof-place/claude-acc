@@ -13,14 +13,27 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.20.0</string>
+	<string>1.21.0</string>
 	<key>CFBundleVersion</key>
-	<string>30</string>
+	<string>31</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.filip.claude-acc.dictate</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>claude-acc</string>
+			</array>
+		</dict>
+	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Dictation records your voice while you hold the right Command key and sends it to AI Gateway for a transcript.</string>
 </dict>
 </plist>

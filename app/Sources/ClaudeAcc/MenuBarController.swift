@@ -31,6 +31,9 @@ final class MenuBarController: NSObject {
         NotificationCenter.default.addObserver(
             self, selector: #selector(spaceChanged), name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil)
+        // dictation started from the panel: out of the way, the text goes to the app behind it
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(dictationStarted), name: Dictation.startedFromPanel, object: nil)
         // `--open-panel`: open once at launch, to check the panel without clicking the menu bar
         if CommandLine.arguments.contains("--open-panel") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.open() }
@@ -39,6 +42,10 @@ final class MenuBarController: NSObject {
 
     @objc private func toggle() {
         panel.isOpen ? close() : open()
+    }
+
+    @objc private func dictationStarted() {
+        close()
     }
 
     @objc private func spaceChanged() {
