@@ -154,6 +154,8 @@ case "$1" in
     shift
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
+    # stan limitu GPU to tylko odczyt sysctl i plisty demona
+    case "${1:-} ${2:-}" in "iogpu status" | "iogpu ") exec "$(cat "$STATE/source")/perf-root.sh" "$@" ;; esac
     exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
   fans)
     shift

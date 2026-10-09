@@ -587,5 +587,80 @@ class CompressSweepTest(unittest.TestCase):
         self.assertEqual(self.compress_state()["pending_bundles"], {})
 
 
+class OptimizeTest(unittest.TestCase):
+    """`mac optimize` na atrapie `defaults`: co zapisuje, co pamięta i co przywraca."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.janitor = janitor
+        self.dir = tempfile.mkdtemp(prefix="optimize-test-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.prefs = {
+            ("com.apple.dock", "autohide"): "1",
+            ("com.apple.dock", "expose-animation-duration"): "0.15",
+            ("NSGlobalDomain", "KeyRepeat"): "2",
+        }
+        self.calls = []
+        from unittest import mock
+
+        def run(cmd, timeout=600):
+            if cmd[:2] == ["defaults", "read"]:
+                return self.prefs.get((cmd[2], cmd[3]))
+            if cmd[:2] == ["defaults", "write"]:
+                self.prefs[(cmd[2], cmd[3])] = cmd[5]
+                return ""
+            if cmd[:2] == ["defaults", "delete"]:
+                self.prefs.pop((cmd[2], cmd[3]), None)
+                return ""
+            return None
+
+        self.killed = []
+        patches = [
+            mock.patch.object(janitor, "run", side_effect=run),
+            mock.patch.object(janitor, "BACKUP_PATH", os.path.join(self.dir, "optimize.json")),
+            mock.patch.object(janitor, "broken_launch_items", return_value=[]),
+            mock.patch.object(janitor, "log"),
+            mock.patch.object(
+                janitor.subprocess, "run", side_effect=lambda cmd, **kw: self.killed.append(cmd)
+            ),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def optimize(self, *args):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.janitor.cmd_optimize({}, list(args))
+
+    def test_writes_snappy_values_and_undo_restores(self):
+        before = dict(self.prefs)
+        self.assertEqual(self.optimize(), 0)
+        self.assertEqual(self.prefs[("NSGlobalDomain", "KeyRepeat")], "1")
+        self.assertEqual(self.prefs[("NSGlobalDomain", "QLPanelAnimationDuration")], "0")
+        self.assertEqual(self.prefs[("com.apple.dock", "expose-animation-duration")], "0.1")
+        self.assertEqual(self.prefs[("com.apple.dock", "autohide-time-modifier")], "0.1")
+        self.assertIn(["killall", "Dock"], self.killed)
+        self.assertEqual(self.optimize(), 0)  # drugi raz nic nie zmienia
+        self.assertEqual(self.optimize("--undo"), 0)
+        self.assertEqual(self.prefs, before)
+
+    def test_autohide_speed_only_with_autohide(self):
+        self.prefs[("com.apple.dock", "autohide")] = "0"
+        self.optimize()
+        self.assertNotIn(("com.apple.dock", "autohide-time-modifier"), self.prefs)
+
+    def test_dock_not_restarted_without_dock_changes(self):
+        for domain, key, kind, value, _ in self.janitor.TWEAKS:
+            if domain == "com.apple.dock":
+                self.prefs[(domain, key)] = value
+        self.optimize()
+        self.assertNotIn(["killall", "Dock"], self.killed)
+
+
 if __name__ == "__main__":
     unittest.main()

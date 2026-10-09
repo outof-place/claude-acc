@@ -53,6 +53,15 @@ class FakeSystem:
     def git(self, repo, *args):
         return None
 
+    def git_global(self, *args):
+        return None
+
+    def maintenance_scheduled(self):
+        return False
+
+    def maintenance_schedule(self, repo, on):
+        return None
+
     def docker_memory(self):
         return 8318709760 if self.docker else None
 
@@ -872,35 +881,166 @@ class JsonSettingTest(Isolated):
 
 
 class GitSpeedTest(Isolated):
-    def test_real_repo_config_restored(self):
-        repo = os.path.join(self.dir, "repo")
-        subprocess.run(["git", "init", "-q", repo], check=True)
-        subprocess.run(
-            ["git", "-C", repo, "config", "core.untrackedCache", "false"], check=True
-        )
+    """Prawdziwy git na repozytorium i globalnym configu w katalogu tymczasowym; harmonogram
+    `git maintenance` (launchd) zastępuje flaga, rejestracja idzie przez prawdziwe register."""
+
+    def setUp(self):
+        super().setUp()
+        self.gitconfig = os.path.join(self.dir, "gitconfig")
+        with open(self.gitconfig, "w") as f:
+            f.write("[checkout]\n\tworkers = 2\n")
+        patcher = mock.patch.dict(perf.janitor.ENV, {"GIT_CONFIG_GLOBAL": self.gitconfig})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.repo = os.path.realpath(os.path.join(self.dir, "repo"))
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "config", "core.untrackedCache", "false"], check=True)
+        test = self
 
         class GitSystem(FakeSystem):
+            scheduled = False
+
             def git(self, repo, *args):
                 return perf.System().git(repo, *args)
 
-        system = GitSystem({})
-        cfg = dict(self.cfg, git_repos=[repo])
-        record, changed = perf.tweak("git-speed").apply(cfg, system)
-        self.assertEqual(changed, [repo])
+            def git_global(self, *args):
+                return perf.System().git_global(*args)
 
-        def get(key):
-            return subprocess.run(
-                ["git", "-C", repo, "config", "--local", "--get", key],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout.strip()
+            def maintenance_scheduled(self):
+                return self.scheduled
 
-        self.assertEqual(get("core.untrackedCache"), "true")
-        self.assertEqual(get("core.fsmonitor"), "true")
-        perf.tweak("git-speed").undo(record, system)
-        self.assertEqual(get("core.untrackedCache"), "false")
-        self.assertEqual(get("core.fsmonitor"), "")
+            def maintenance_schedule(self, repo, on):
+                test.schedule_calls.append(on)
+                if on:
+                    self.scheduled = True
+                    return perf.System().git(repo, "maintenance", "register")
+                self.scheduled = False
+                return ""
+
+        self.schedule_calls = []
+        self.system = GitSystem({})
+        self.cfg = dict(self.cfg, git_repos=[self.repo])
+
+    def bytes(self, path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def get(self, *args):
+        return subprocess.run(
+            ["git", *args], capture_output=True, text=True, check=False,
+            env=dict(os.environ, GIT_CONFIG_GLOBAL=self.gitconfig),
+        ).stdout.strip()
+
+    def test_real_repo_config_restored(self):
+        local = os.path.join(self.repo, ".git/config")
+        before = self.bytes(local), self.bytes(self.gitconfig)
+        record, changed = perf.tweak("git-speed").apply(self.cfg, self.system)
+        self.assertEqual(
+            changed,
+            [self.repo, "checkout.workers=0", "fetch.writeCommitGraph=true",
+             f"git maintenance: {perf.short_path(self.repo)}"],
+        )
+        self.assertEqual(self.get("-C", self.repo, "config", "--local", "core.untrackedCache"), "true")
+        self.assertEqual(self.get("-C", self.repo, "config", "--local", "core.fsmonitor"), "true")
+        self.assertEqual(self.get("config", "--global", "checkout.workers"), "0")
+        self.assertEqual(self.get("config", "--global", "fetch.writeCommitGraph"), "true")
+        self.assertEqual(self.get("config", "--global", "--get-all", "maintenance.repo"), self.repo)
+        self.assertEqual(self.get("-C", self.repo, "config", "--local", "maintenance.auto"), "false")
+        self.assertTrue(record["scheduled"])
+        # drugi raz (keep) nic nie zmienia
+        again, changed = perf.tweak("git-speed").apply(self.cfg, self.system, record)
+        self.assertEqual(changed, [])
+        self.assertEqual(again, record)
+        perf.tweak("git-speed").undo(record, self.system)
+        self.assertEqual((self.bytes(local), self.bytes(self.gitconfig)), before)
+        self.assertEqual(self.schedule_calls, [True, False])
+
+    def test_maintenance_already_there_is_left_alone(self):
+        subprocess.run(
+            ["git", "-C", self.repo, "maintenance", "register"], check=True,
+            env=dict(os.environ, GIT_CONFIG_GLOBAL=self.gitconfig),
+        )
+        self.system.scheduled = True
+        record, changed = perf.tweak("git-speed").apply(self.cfg, self.system)
+        self.assertNotIn(f"git maintenance: {perf.short_path(self.repo)}", changed)
+        self.assertTrue(record["maintenance"][self.repo]["registered"])
+        self.assertNotIn("scheduled", record)
+        perf.tweak("git-speed").undo(record, self.system)
+        self.assertEqual(self.get("config", "--global", "--get-all", "maintenance.repo"), self.repo)
+        self.assertEqual(self.schedule_calls, [])
+        self.assertTrue(self.system.scheduled)
+
+    def test_global_value_changed_after_us_survives_undo(self):
+        record, _ = perf.tweak("git-speed").apply(self.cfg, self.system)
+        subprocess.run(
+            ["git", "config", "--global", "checkout.workers", "4"], check=True,
+            env=dict(os.environ, GIT_CONFIG_GLOBAL=self.gitconfig),
+        )
+        perf.tweak("git-speed").undo(record, self.system)
+        self.assertEqual(self.get("config", "--global", "checkout.workers"), "4")
+        self.assertEqual(self.get("config", "--global", "fetch.writeCommitGraph"), "")
+
+    def test_maintenance_can_be_turned_off(self):
+        cfg = dict(self.cfg, git_maintenance=False)
+        record, changed = perf.tweak("git-speed").apply(cfg, self.system)
+        self.assertEqual(record["maintenance"], {})
+        self.assertEqual(self.get("config", "--global", "--get-all", "maintenance.repo"), "")
+        self.assertEqual(self.schedule_calls, [])
+
+
+class ClaudeUiTest(Isolated):
+    def test_apply_and_undo_restore_bytes(self):
+        self.write(self.claude, claude_settings())
+        with open(self.claude, "a") as f:
+            f.write("\n")
+        original = self.text(self.claude)
+        item = perf.tweak("claude-ui")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(changed, ["prefersReducedMotion=true", "spinnerTipsEnabled=false"])
+        data = self.read(self.claude)
+        self.assertIs(data["prefersReducedMotion"], True)
+        self.assertIs(data["spinnerTipsEnabled"], False)
+        again, changed = item.apply(self.cfg, FakeSystem({}), record)
+        self.assertEqual(changed, [])
+        self.assertEqual(again, record)
+        item.undo(record, FakeSystem({}))
+        self.assertEqual(self.text(self.claude), original)
+
+    def test_existing_value_and_later_change_are_kept(self):
+        settings = dict(claude_settings(), spinnerTipsEnabled=False)
+        self.write(self.claude, settings)
+        item = perf.tweak("claude-ui")
+        record, changed = item.apply(self.cfg, FakeSystem({}))
+        self.assertEqual(changed, ["prefersReducedMotion=true"])
+        data = self.read(self.claude)
+        data["prefersReducedMotion"] = False  # użytkownik wyłączył w /config po nas
+        self.write(self.claude, data)
+        item.undo(record, FakeSystem({}))
+        data = self.read(self.claude)
+        self.assertIs(data["prefersReducedMotion"], False)
+        self.assertIs(data["spinnerTipsEnabled"], False)
+
+    def test_integer_is_not_taken_for_boolean(self):
+        self.write(self.claude, dict(claude_settings(), prefersReducedMotion=1))
+        record, changed = perf.tweak("claude-ui").apply(self.cfg, FakeSystem({}))
+        self.assertIn("prefersReducedMotion=true", changed)
+        self.assertEqual(record["keys"]["prefersReducedMotion"]["prev"], 1)
+
+
+class IogpuDefaultTest(unittest.TestCase):
+    def test_default_leaves_eight_gb_and_never_lowers(self):
+        gib = 1024**3
+        self.assertEqual(perf.iogpu_default_mb(48 * gib), 40960)  # zmierzone M4 Max 48 GB
+        self.assertEqual(perf.iogpu_default_mb(128 * gib), 128 * 1024 * 85 // 100)  # sufit 85%
+        for small in (8, 16, 24):
+            self.assertEqual(perf.iogpu_default_mb(small * gib), 0)  # mniej niż domyślne ~2/3
+        self.assertEqual(perf.iogpu_default_mb(32 * gib), 24576)
+
+    def test_iogpu_is_a_root_tweak_outside_ultra(self):
+        item = perf.tweak("iogpu")
+        self.assertTrue(item.root)
+        self.assertNotIn("iogpu", perf.ULTRA)
+        self.assertIn("iogpu", perf.ROOT_UNITS)
 
 
 def transcript_lines():
@@ -1594,7 +1734,8 @@ class UltraFakeHomeTest(unittest.TestCase):
             ["/usr/bin/python3", SCRIPT, *args],
             capture_output=True,
             text=True,
-            env=dict(os.environ, HOME=self.home),
+            # globalny config gita też pod tym HOME, nawet gdy środowisko wskazuje inny
+            env=dict(os.environ, HOME=self.home, GIT_CONFIG_GLOBAL=os.path.join(self.home, ".gitconfig")),
             timeout=120,
             check=False,
         )
