@@ -6,12 +6,29 @@
 #            [--orca-plugin]   wtyczka claude-acc w Orce (bez flagi tylko odświeża już zainstalowaną)
 #   setup.sh --uninstall   zdejmuje automaty, aplikację, komendę i hooki pauzy limitów;
 #                          stan i konfiguracja zostają
+#   --owner pod [--owner-app <Pod.app>]   instaluje aplikacja, która wozi claude-acc w sobie (paczka
+#                          z scripts/payload.sh); zapisuje $STATE/owner.json, po czym setup.sh bez
+#                          --owner pod (Homebrew, install.sh) odmawia z kodem 3 (owner.py)
 #
 # Woła go install.sh po zbudowaniu ze źródeł i `claude-acc-setup` z Homebrew, które podaje
 # swoją zbudowaną aplikację. Wiatraki (root) to osobny krok: install-fans.sh.
 # CLAUDE_ACC_NO_HOOKS=1 pomija hooki pauzy limitów w settings.json Claude Code.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
+
+# kto jest właścicielem instalacji: z owner.json w $STATE; obcy setup nie nadpisuje skryptów i hooków Pod
+OWNER=""
+OWNER_APP=""
+ARGS=("$@")
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+  case "${ARGS[i]}" in
+    --owner) OWNER="${ARGS[i + 1]:-}" ;;
+    --owner-app) OWNER_APP="${ARGS[i + 1]:-}" ;;
+  esac
+done
+if [ -f "$SRC/owner.py" ]; then
+  /usr/bin/python3 "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
+fi
 
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
@@ -30,6 +47,7 @@ while [ $# -gt 0 ]; do
     --hook) HOOK="$2"; shift 2 ;;
     --desktop) DESKTOP="$2"; shift 2 ;;
     --orca-plugin) ORCA_PLUGIN=1; shift ;;
+    --owner|--owner-app) shift 2 ;;
     --uninstall)
       for job in $JOBS; do
         launchctl bootout "gui/$(id -u)" "$AGENTS/$job.plist" 2>/dev/null || true
@@ -56,6 +74,8 @@ while [ $# -gt 0 ]; do
       [ -f "$STATE/mcpshare.py" ] && /usr/bin/python3 "$STATE/mcpshare.py" unshare --all >/dev/null 2>&1 || true
       # wtyczka w katalogu wtyczek Orki (zgoda i ustawienia Orki zostają)
       [ -f "$STATE/orcaplugin.py" ] && /usr/bin/python3 "$STATE/orcaplugin.py" uninstall || true
+      # właściciel zdejmuje też swoje oznaczenie
+      [ -n "$OWNER" ] && rm -f "$STATE/owner.json"
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -130,6 +150,11 @@ else
 fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
+# właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji
+if [ -n "$OWNER" ]; then
+  version="$(cat "$SRC/VERSION" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_SRC/Contents/Info.plist")"
+  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"}
+fi
 # bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
 # przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
 if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
