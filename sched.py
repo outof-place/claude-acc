@@ -1185,6 +1185,9 @@ GENERIC_TOOLS = {
     "storybook": ("build", {"build"}),
     "just": ("script", None), "task": ("script", None), "make": ("script", None),
 }  # fmt: skip
+# podkomendy, które uruchamiają program albo zadanie z nazwy (`deno run main.ts`, `nx run app:serve`):
+# w kolejce tylko wtedy, gdy nazwa mówi o pracy (heavy_sig), jak skrypty
+RUNNER_VERBS = {"deno": ("run", "task"), "nx": ("run", "run-many", "affected"), "lerna": ("run",)}
 # `python -m X`: tylko moduły, które są pracą (testy, typecheck, budowanie paczki)
 PYTHON_MODULES = {"pytest": "test", "unittest": "test", "mypy": "typecheck", "pyright": "typecheck",
                   "tox": "test", "nox": "test", "build": "build"}  # fmt: skip
@@ -1255,6 +1258,8 @@ def generic_tool(words, here):
             kind = "test"
         elif tool == "nx" and first in ("test", "e2e", "lint"):
             kind = {"lint": "typecheck"}.get(first, first)
+        if first in RUNNER_VERBS.get(tool, ()) and not heavy_sig(":".join([tool] + positional[1:])):
+            return None
         sig = f"{tool}:{first}"
     elif kind == "script":
         # just/task/make: przepis, uczony z historii; bez celu to cel domyślny
@@ -1547,6 +1552,8 @@ def classify(command, cwd, argv=None):
                 job = parse_node(words, here)
         if job is None and generic_on and prog not in ("go", "golangci-lint", "govulncheck"):
             job = parse_generic(words, here)
+            if job and job["kind"] == "script" and not heavy_sig(job["sig"]):
+                job = None  # skrypt, program projektu albo cel make bez czasownika pracy: od razu
             if job:
                 job["lang"] = "generic"
         if job:
@@ -1558,7 +1565,8 @@ def classify(command, cwd, argv=None):
     for raw in found:
         lang = raw.get("lang")
         done = finishers.get(lang, finish_job)(raw)
-        if done is None and lang is None and raw["kind"] == "make" and generic_on and not GENERIC_NEVER.search(raw["target"]):
+        if (done is None and lang is None and raw["kind"] == "make" and generic_on and not GENERIC_NEVER.search(raw["target"])
+                and heavy_sig(f"make:{raw['target']}")):
             # make poza modułem Go: przepis jak każdy inny skrypt
             done = finish_generic(dict(raw, lang="generic", kind="script", tool="make", sig=f"make:{raw['target']}"))
         if done:
@@ -1836,6 +1844,25 @@ TYPECHECK_VERBS = ("tc", "tsc", "typecheck", "type-check", "check-types", "types
 LIGHT_VERBS = ("ensure", "esbuild")
 LIGHT_PRIOR = (0.5, 30)
 HELP_FLAGS = ("--help", "-h", "--version", "-v", "-V", "help")
+
+
+# słowa w nazwie skryptu, celu make albo skryptu pnpm, które znaczą ciężką pracę; reszta (`./perm-guard`,
+# `commit-pliki.sh`, `make prepare-emails`, `pnpm run ensure:electron-runtime`) idzie od razu, bez
+# kolejki. 2026-10-09 binarka na 1 ms czekała 2m24s za `ensure:electron-runtime`
+HEAVY_WORDS = ("build", "test", "tests", "e2e", "spec", "typecheck", "tc", "tsc", "lint", "check", "verify",
+               "compile", "bundle", "bench", "benchmark", "coverage", "integration", "unit")  # fmt: skip
+
+
+def heavy_sig(sig):
+    """Czy podpis skryptu (pnpm, ścieżka, interpreter, make, just) nazywa ciężką pracę: build, test,
+    e2e, typecheck, lint, check... w którymkolwiek członie nazwy (`build:ghostty-terminal-macos`,
+    `scripts/run-tests.sh`, `stack.sh build`)."""
+    tool, _, rest = str(sig).partition(":")
+    for part in (rest or tool).split(":"):
+        head = os.path.splitext(os.path.basename(part))[0].lower()
+        if head in TYPECHECK_VERBS or any(w in HEAVY_WORDS for w in re.split(r"[^a-z0-9]+", head)):
+            return True
+    return False
 
 
 def sig_verb(sig):
