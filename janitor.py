@@ -1288,7 +1288,9 @@ def run_sweep(cfg, state, started, dry_run, force):
     alerts = [{"kind": "task_failed", "task": t, "error": e} for t, e in sw.failures]
     if free < cfg["low_disk_gb"] * GB:
         warnings.append(f"Na dysku zostało tylko {human(free)}")
-        alerts.append({"kind": "low_disk", "free": free})
+        # próg jedzie z alertem: panel czyta dysk co minutę i chowa alert, gdy znów jest ponad nim,
+        # zamiast pokazywać godzinami liczbę z tego przebiegu (2026-10-09: "9,3 GB" przy 44 GB)
+        alerts.append({"kind": "low_disk", "free": free, "limit": cfg["low_disk_gb"] * GB})
     if "scan" in cached:
         indexed = spotlight_indexed(cached["scan"])
         if indexed:

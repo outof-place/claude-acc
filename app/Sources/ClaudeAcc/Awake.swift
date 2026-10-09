@@ -9,9 +9,10 @@ import Observation
 final class Awake {
     /// Manual session: until a date, or `.distantFuture` for "until I turn it off".
     private(set) var manualUntil: Date?
-    /// macOS marks a path "expensive" for every hotspot: an iPhone over Wi-Fi or USB,
-    /// an Android with the metered hint, any network in Low Data Mode.
+    /// The default route goes through the phone, by the rule tether-profile acts on (`perf.py
+    /// link`). It used to be the path's "expensive" flag: a second rule, and the two disagreed.
     private(set) var onHotspot = false
+    /// The hardware port the hotspot comes through: "iPhone USB", "Wi-Fi", "Bluetooth PAN".
     private(set) var hotspotVia: String?
     @ObservationIgnored private(set) var lastKeepAlive: Date?
     private(set) var keepAliveFailing = false
@@ -36,6 +37,11 @@ final class Awake {
     @ObservationIgnored private let preview: Bool
     /// The `until` last sent to the daemon, 0 for no request; nil before the first write.
     @ObservationIgnored private var lidRequested: Double?
+    @ObservationIgnored private var linkChecking = false
+    /// The path changed again during a check: one more check follows it.
+    @ObservationIgnored private var linkChanged = false
+    /// The last check got no answer (perf.py missing or failing): the next tick asks again.
+    @ObservationIgnored private var linkUnknown = false
     /// The state file's last contents without its timestamp: rewritten only when they change.
     @ObservationIgnored private var publishedState: [String: AnyHashable]?
 
@@ -47,7 +53,8 @@ final class Awake {
         return URLSession(configuration: config)
     }()
 
-    init(preview: Bool = false) {
+    /// `link`: a panel render shows the route `perf keep` last saw, without acting on it.
+    init(preview: Bool = false, link: TetherLink? = nil) {
         autoOnHotspot = defaults.object(forKey: "awake.autoOnHotspot") as? Bool ?? true
         keepDisplayOn = defaults.bool(forKey: "awake.keepDisplayOn")
         keepHotspotAlive = defaults.object(forKey: "awake.keepHotspotAlive") as? Bool ?? true
@@ -55,19 +62,16 @@ final class Awake {
         self.preview = preview
         let until = defaults.double(forKey: "awake.until")
         manualUntil = until > 0 ? Date(timeIntervalSince1970: until) : nil
-        guard !preview else { return }
-        monitor.pathUpdateHandler = { [weak self] path in
-            let hotspot = path.status == .satisfied && path.isExpensive
-            let via: String? = if path.usesInterfaceType(.wifi) {
-                "Wi-Fi"
-            } else if path.usesInterfaceType(.wiredEthernet) {
-                "USB"
-            } else if path.usesInterfaceType(.cellular) {
-                "cellular"
-            } else {
-                nil
+        guard !preview else {
+            if let link, link.tethered {
+                onHotspot = true
+                hotspotVia = link.via
             }
-            Task { @MainActor in self?.pathChanged(hotspot: hotspot, via: via) }
+            return
+        }
+        // the monitor only says when the route may have changed; perf.py says where it goes
+        monitor.pathUpdateHandler = { [weak self] _ in
+            Task { @MainActor in self?.checkLink() }
         }
         monitor.start(queue: DispatchQueue(label: "claude-acc.awake.path"))
         ticker = Task { [weak self] in
@@ -108,6 +112,25 @@ final class Awake {
 
     // MARK: Internals
 
+    /// Asks perf.py where the default route goes (about 0.4 s, off the main actor); path changes
+    /// that come in the meantime fold into one more check.
+    private func checkLink() {
+        guard !linkChecking else {
+            linkChanged = true
+            return
+        }
+        linkChecking = true
+        linkChanged = false
+        Task {
+            let result = await CLI.run(["link", "--json"], script: CLI.perf)
+            let link = result.status == 0 ? Store.decode(TetherLink.self, from: Data(result.stdout.utf8)) : nil
+            linkChecking = false
+            linkUnknown = link == nil
+            if let link { pathChanged(hotspot: link.tethered, via: link.via) }
+            if linkChanged { checkLink() }
+        }
+    }
+
     private func pathChanged(hotspot: Bool, via: String?) {
         if !hotspot { hotspotDismissed = false }
         let joined = hotspot && !onHotspot
@@ -122,6 +145,7 @@ final class Awake {
             manualUntil = nil
             save()
         }
+        if linkUnknown { checkLink() }
         apply()
         if onHotspot && keepHotspotAlive && isOn {
             await keepAlive()
