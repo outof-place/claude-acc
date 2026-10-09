@@ -494,6 +494,51 @@ class CompressSweepTest(unittest.TestCase):
         self.env.sweep()
         self.assertFalse(compressed(log))
 
+    def compress_state(self):
+        with open(os.path.join(self.env.state_dir, "janitor-compress.json")) as f:
+            return json.load(f)
+
+    def write_compress_state(self, state):
+        with open(os.path.join(self.env.state_dir, "janitor-compress.json"), "w") as f:
+            json.dump(state, f)
+
+    def dry_run_count(self):
+        out = self.env.sweep("--dry-run")
+        line = next(l for l in out.splitlines() if l.startswith("kompresja APFS"))
+        return int(line.split(": ")[2].split()[0])
+
+    def write_random(self, rel):
+        path = os.path.join(self.logs, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(os.urandom(64 * 1024))
+        return path
+
+    def test_incompressible_file_is_not_retried_until_it_changes(self):
+        noise = self.write_random("media/noise.bin")
+        self.env.sweep()
+        self.assertFalse(compressed(noise))
+        root = os.path.realpath(self.logs)
+        state = self.compress_state()
+        self.assertIn(noise, state["incompressible"])
+        # granica od zera (jak po resecie stanu): nieściśliwy plik i tak nie wraca
+        state[root] = 0
+        self.write_compress_state(state)
+        self.assertEqual(self.dry_run_count(), 0)
+        with open(noise, "ab") as f:
+            f.write(os.urandom(1024))
+        self.assertEqual(self.dry_run_count(), 1)
+
+    def test_state_from_1_20_0_loads(self):
+        root = os.path.realpath(self.logs)
+        log = self.write("session.jsonl")
+        self.write_compress_state({root: time.time() - 3600})
+        self.env.sweep()
+        self.assertTrue(compressed(log))
+        state = self.compress_state()
+        self.assertIsInstance(state[root], float)
+        self.assertEqual(state["pending_bundles"], {})
+
     def test_dry_run_compresses_nothing(self):
         log = self.write("session.jsonl")
         out = self.env.sweep("--dry-run")
@@ -501,8 +546,8 @@ class CompressSweepTest(unittest.TestCase):
         self.assertFalse(compressed(log))
         self.assertFalse(os.path.exists(os.path.join(self.env.state_dir, "janitor-compress.json")))
 
-    @unittest.skipUnless(shutil.which("cc"), "brak kompilatora C")
-    def test_running_app_stays_whole(self):
+    def start_live_app(self):
+        """Live.app z działającym procesem i Idle.app obok; [proces, plik Live.app, plik Idle.app]"""
         apps = os.path.join(self.env.work, "logs/Apps")
         live = os.path.join(apps, "Live.app/Contents")
         os.makedirs(os.path.join(live, "MacOS"))
@@ -517,9 +562,29 @@ class CompressSweepTest(unittest.TestCase):
         self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         time.sleep(0.3)
+        return proc, resource, idle
+
+    @unittest.skipUnless(shutil.which("cc"), "brak kompilatora C")
+    def test_running_app_stays_whole(self):
+        _, resource, idle = self.start_live_app()
         self.env.sweep()
         self.assertFalse(compressed(resource))
         self.assertTrue(compressed(idle))
+
+    @unittest.skipUnless(shutil.which("cc"), "brak kompilatora C")
+    def test_running_app_is_compressed_after_it_quits(self):
+        proc, resource, _ = self.start_live_app()
+        self.env.sweep()
+        self.assertFalse(compressed(resource))
+        state = self.compress_state()
+        bundle = os.path.join(os.path.realpath(self.logs), "Apps/Live.app")
+        self.assertEqual(state["pending_bundles"], {os.path.realpath(self.logs): [bundle]})
+        proc.kill()
+        proc.wait()
+        time.sleep(1.1)  # granica katalogu jest już za plikami aplikacji
+        self.env.sweep()
+        self.assertTrue(compressed(resource))
+        self.assertEqual(self.compress_state()["pending_bundles"], {})
 
 
 if __name__ == "__main__":
