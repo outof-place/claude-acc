@@ -195,6 +195,9 @@ APP="$HOME/Applications/Claude Acc.app"
 pkill -x ClaudeAcc 2>/dev/null || true
 rm -rf "$APP"
 ditto "$APP_SRC" "$APP"
+# podpis, który trzyma zgody macOS dyktowania (Mikrofon, Dostępność, Monitorowanie wejścia) przez
+# aktualizacje: certyfikat z Pęku kluczy albo ad hoc ze stałym designated requirement (sign-app.sh)
+[ -x "$SRC/sign-app.sh" ] && { "$SRC/sign-app.sh" "$APP" || echo "uwaga: podpis aplikacji nie wyszedł, zgody dyktowania mogą wymagać ponownego nadania" >&2; }
 # tuż po pkill LaunchServices potrafi odrzucić pierwsze open (-600)
 open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
 
