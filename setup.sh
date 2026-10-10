@@ -215,6 +215,8 @@ if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
   "$STATE/python" "$STATE/acc.py" desktop install --refresh >/dev/null 2>&1 || true
   "$STATE/python" "$STATE/acc.py" hint sync >/dev/null 2>&1 || true
 fi
+# wspólne serwery MCP: plisty mostów z ustawieniami tej wersji (działające mosty do następnego logowania)
+[ -f "$STATE/mcpshare.py" ] && { "$STATE/python" "$STATE/acc.py" mcpshare refresh || true; }
 # wtyczka Orki: z --orca-plugin instalacja, bez niej tylko odświeżenie tej, którą już zainstalowano
 # (ustawień Orki nie rusza; system wtyczek i zgodę włączasz w Orce)
 if [ -d "$STATE/orca-plugin" ]; then
