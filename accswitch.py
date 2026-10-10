@@ -38,6 +38,14 @@ Komendy:
 Kredyty API z planów (pula kluczy organizacji Console) to osobny skrypt: claude-acc credits --help.
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # PEP 810: od Pythona 3.15 te moduły ładują się dopiero przy pierwszym użyciu, a starsze
 # wersje tę listę ignorują. Żaden nie jest potrzebny przy samym imporcie skryptu.
 __lazy_modules__ = ["glob", "hashlib", "json", "re", "shutil", "signal", "subprocess"]
@@ -46,12 +54,10 @@ import fcntl
 import glob
 import hashlib
 import json
-import os
 import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
 import unicodedata
 from datetime import datetime, timedelta, timezone

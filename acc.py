@@ -12,11 +12,18 @@ finds the files next to it exactly as when started directly.
 
 import os
 import sys
+
+# bytecode only in $STATE: next to a script in Pod's bundle (Pod.app/Contents/Resources/claude-acc) a
+# __pycache__ breaks the app's seal, whatever starts this file and with whatever flags (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 from importlib.machinery import SourceFileLoader
 
 # Bytecode never lands next to the scripts: a __pycache__ inside a signed bundle (Pod.app ships
 # claude-acc in Contents/Resources) breaks its seal, and macOS then calls the app damaged
-# (2026-10-10). Whatever acc.py runs caches under $STATE/pycache instead, wherever it lives.
+# (2026-10-10). In $STATE whatever acc.py runs caches under $STATE/pycache; anywhere else the
+# guard above writes no bytecode at all.
 if sys.pycache_prefix is None and not sys.dont_write_bytecode:
     sys.pycache_prefix = os.path.join(os.path.expanduser("~"), ".local", "share", "claude-acc", "pycache")
 

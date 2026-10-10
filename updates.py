@@ -36,17 +36,23 @@ Komendy:
   status [--json]
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę:
 # pomoc i status nie płacą za moduły potrzebne tylko przebiegowi
 __lazy_modules__ = ["concurrent.futures", "datetime", "json", "shutil", "subprocess", "tempfile"]
 
 import fcntl
 import json
-import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
