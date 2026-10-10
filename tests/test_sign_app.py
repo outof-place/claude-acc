@@ -36,8 +36,10 @@ class SignAppTest(unittest.TestCase):
         done = subprocess.run([CODESIGN, *args, self.app], capture_output=True)
         return done.stdout, done.stderr
 
-    def test_hardened_runtime(self):
-        self.assertIn(b"runtime", self.codesign("-dv")[1])
+    def test_hardened_runtime_with_library_validation(self):
+        flags = self.codesign("-dv")[1]
+        self.assertIn(b"runtime", flags)
+        self.assertIn(b"library", flags)  # CS_REQUIRE_LV: pod-rootd's peer check asks for it
 
     def test_microphone_entitlement_only(self):
         out = self.codesign("-d", "--entitlements", "-", "--xml")[0]
