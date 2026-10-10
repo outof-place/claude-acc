@@ -5,7 +5,8 @@
 #   setup.sh --app "<ścieżka do Claude Acc.app>" [--fanctl <ścieżka do fanctl>] [--hook <ścieżka do claude-acc-hook>]
 #            [--orca-plugin]   wtyczka claude-acc w Orce (bez flagi tylko odświeża już zainstalowaną)
 #   setup.sh --uninstall   zdejmuje automaty, aplikację, komendę i hooki pauzy limitów;
-#                          stan i konfiguracja zostają
+#                          stan i konfiguracja zostają. Także gdy claude-acc należy do Pod: wtedy
+#                          owner.json dostaje nagrobek "none" i Pod zdejmuje swoje agenty
 #   --owner pod [--owner-app <Pod.app>]   instaluje aplikacja, która wozi claude-acc w sobie (paczka
 #                          z scripts/payload.sh); zapisuje $STATE/owner.json, po czym setup.sh bez
 #                          --owner pod (Homebrew, install.sh) odmawia z kodem 3 (owner.py)
@@ -44,14 +45,17 @@ fi
 # kto jest właścicielem instalacji: z owner.json w $STATE; obcy setup nie nadpisuje skryptów i hooków Pod
 OWNER=""
 OWNER_APP=""
+UNINSTALL=""
 ARGS=("$@")
 for ((i = 0; i < ${#ARGS[@]}; i++)); do
   case "${ARGS[i]}" in
     --owner) OWNER="${ARGS[i + 1]:-}" ;;
     --owner-app) OWNER_APP="${ARGS[i + 1]:-}" ;;
+    --uninstall) UNINSTALL=1 ;;
   esac
 done
-if [ -f "$SRC/owner.py" ]; then
+# odinstalować wolno każdemu (`claude-acc uninstall`); instalować tylko właścicielowi
+if [ -f "$SRC/owner.py" ] && [ -z "$UNINSTALL" ]; then
   /usr/bin/python3 "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
 fi
 
@@ -103,8 +107,9 @@ while [ $# -gt 0 ]; do
       [ -f "$STATE/mcpshare.py" ] && /usr/bin/python3 "$STATE/mcpshare.py" unshare --all >/dev/null 2>&1 || true
       # wtyczka w katalogu wtyczek Orki (zgoda i ustawienia Orki zostają)
       [ -f "$STATE/orcaplugin.py" ] && /usr/bin/python3 "$STATE/orcaplugin.py" uninstall || true
-      # właściciel zdejmuje też swoje oznaczenie
-      [ -n "$OWNER" ] && rm -f "$STATE/owner.json"
+      # claude-acc Poda: nagrobek "none" zamiast pliku, żeby Pod nie zainstalował go znowu przy
+      # następnym starcie (bez owner.json robi pierwszą instalację), tylko zdjął swoje agenty i Pod Menu
+      [ -f "$SRC/owner.py" ] && { /usr/bin/python3 "$SRC/owner.py" uninstalled || true; }
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -275,6 +280,15 @@ case "$1" in
     [ -x "$BIN" ] || BIN="$STATE/fanctl"
     exec "$BIN" "${@:-read}" ;;
   uninstall) exec "$(cat "$STATE/source")/setup.sh" --uninstall ;;
+  # claude-acc z Pod z powrotem do Homebrew: nagrobek "brew" w owner.json (Pod zdejmuje swoje agenty
+  # i Pod Menu przy następnym starcie), potem instalacja z formuły
+  handback)
+    "$PY" "$STATE/owner.py" clear || exit 1
+    for setup in "$(command -v claude-acc-setup 2>/dev/null)" /opt/homebrew/bin/claude-acc-setup; do
+      [ -n "$setup" ] && [ -x "$setup" ] && exec "$setup"
+    done
+    echo "instalacja z Homebrew: brew install outof-place/tap/claude-acc && claude-acc-setup" >&2
+    exit 0 ;;
 esac
 exec "$PY" "$RUN" accswitch "$@"
 EOF
