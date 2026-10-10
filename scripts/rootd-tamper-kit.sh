@@ -29,6 +29,7 @@ int main(int argc, char **argv) {
 }
 EOF
 sed 's/genuine probe ran/REPLACED binary ran/' "$SRC/probe.c" > "$SRC/evil.c"
+sed 's/genuine probe ran/OTHER team binary ran/' "$SRC/probe.c" > "$SRC/other.c"
 cat > "$SRC/registrar.swift" <<'EOF'
 import Foundation
 import ServiceManagement
@@ -52,6 +53,10 @@ EOF
 
 clang -O2 -o "$DIR/probe" "$SRC/probe.c"
 clang -O2 -o "$DIR/evil" "$SRC/evil.c"  # linker-signed ad hoc, like anything an attacker builds
+# signed by the same team under another identifier: what a swap with another binary from the same
+# vendor (Pod's own helpers, an old build) looks like
+clang -O2 -o "$DIR/other" "$SRC/other.c"
+codesign --force --sign "$IDENTITY" --options runtime --timestamp=none --identifier codes.pod.tamper.other "$DIR/other"
 swiftc -O -o "$DIR/registrar" "$SRC/registrar.swift"
 
 for variant in constrained plain; do
@@ -78,21 +83,32 @@ for variant in constrained plain; do
 done
 
 cat <<EOF
-kit in $DIR (nothing registered). Manual steps, best on a scratch Mac or VM:
+kit in $DIR (nothing registered). Manual steps, best on a scratch Mac or VM; sudo only where shown:
   K=$DIR
+  # 1. register and approve both
   for v in constrained plain; do "\$K/\$v.app/Contents/MacOS/registrar" register; done   # requiresApproval
-  # approve both: System Settings > General > Login Items & Extensions > Allow in the Background
+  #    System Settings > General > Login Items & Extensions > Allow in the Background: both on
   for v in constrained plain; do "\$K/\$v.app/Contents/MacOS/registrar"; done            # enabled
+  sudo sfltool dumpbtm | grep -B2 -A14 codes.pod.tamper   # what BTM recorded: team, identifier, path
+  # 2. the genuine probes as root
   for v in constrained plain; do sudo launchctl kickstart -k system/codes.pod.tamper.\$v.probe; done
-  cat /var/tmp/pod-rootd-tamper.log      # two "genuine probe ran uid=0" lines
-  # the attack: swap the daemon binary as the user, no sudo
+  cat /var/tmp/pod-rootd-tamper.log                       # two "genuine probe ran uid=0" lines
+  # 3. swap in a binary of the same team under another identifier (as the user, no sudo)
+  for v in constrained plain; do cp "\$K/other" "\$K/\$v.app/Contents/Resources/probe"; done
+  for v in constrained plain; do sudo launchctl kickstart -k system/codes.pod.tamper.\$v.probe; done
+  cat /var/tmp/pod-rootd-tamper.log                       # "OTHER team binary ran uid=0": that variant doesn't check the identifier
+  # 4. swap in an ad hoc binary (as the user)
   for v in constrained plain; do cp "\$K/evil" "\$K/\$v.app/Contents/Resources/probe"; done
   for v in constrained plain; do sudo launchctl kickstart -k system/codes.pod.tamper.\$v.probe; done
-  cat /var/tmp/pod-rootd-tamper.log      # a "REPLACED binary ran uid=0" line: that variant runs tampered code as root
-  log show --last 10m --predicate 'process == "launchd" OR subsystem == "com.apple.xpc.launchd" OR subsystem == "com.apple.backgroundtaskmanagement"' | grep -i -E "tamper|constraint|codesign|signature" | tail -30
-  # the plist is in the bundle too: drop the constraint, restart, look again
+  cat /var/tmp/pod-rootd-tamper.log                       # "REPLACED binary ran uid=0": that variant runs foreign code as root
+  log show --last 15m --info --predicate 'process == "launchd" OR subsystem == "com.apple.xpc.launchd" OR subsystem == "com.apple.backgroundtaskmanagement" OR process == "amfid" OR process == "kernel"' | grep -i -E "tamper|constraint|codesign|signature|team" | tail -40
+  # 5. the plist is in the bundle too: drop the constraint (as the user), restart, run again
   /usr/libexec/PlistBuddy -c "Delete :SpawnConstraint" "\$K/constrained.app/Contents/Library/LaunchDaemons/codes.pod.tamper.constrained.probe.plist"
-  # reboot, then: cat /var/tmp/pod-rootd-tamper.log
-  # clean up
+  #    reboot, then:
+  sudo launchctl kickstart -k system/codes.pod.tamper.constrained.probe; cat /var/tmp/pod-rootd-tamper.log
+  # 6. clean up
   for v in constrained plain; do "\$K/\$v.app/Contents/MacOS/registrar" unregister; done; sudo rm -f /var/tmp/pod-rootd-tamper.log
+What to read: "plain" answers whether launchd/BTM itself checks the BundleProgram against the
+registration (team and identifier), "constrained" whether SpawnConstraint stops what that misses,
+and step 5 whether an edited plist in the bundle undoes it.
 EOF
