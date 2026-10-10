@@ -63,10 +63,16 @@ func sessionShaperBoundaries() {
         == .verbNotAllowed(verb: "shaper.set", caller: .app))
 }
 
-@Test("Pod's Electron process: tier A goes through, every tier B verb is refused before it runs")
+@Test("Pod's Electron process: tier A goes through but a lid hold, every tier B verb is refused before it runs")
 func electronTierAOnly() {
     let rig = Rig()
-    for verb in tierA { #expect(rig.send(verb, as: .app).refusal == nil, "\(verb.name)") }
+    for verb in tierA where verb.name != "lid.hold" { #expect(rig.send(verb, as: .app).refusal == nil, "\(verb.name)") }
+    // anything can run Electron Pod as Node, and a closed-lid hold keeps a Mac awake in a bag
+    #expect(rig.send(.lidHold(seconds: LidSeconds(600)!), as: .app).refusal == .verbNotAllowed(verb: "lid.hold", caller: .app))
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.send(.lidHold(seconds: LidSeconds(600)!), as: .menu).refusal == nil)
+    #expect(rig.backend.sleepIsDisabled)
+    rig.send(.lidRelease, as: .menu)
     let before = rig.backend.calls
     for verb in tierB {
         #expect(rig.send(verb, as: .app).refusal == .verbNotAllowed(verb: verb.name, caller: .app), "\(verb.name)")

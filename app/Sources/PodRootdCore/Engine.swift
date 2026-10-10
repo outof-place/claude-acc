@@ -32,6 +32,10 @@ public final class Engine {
     static let othersWarnBytes: UInt64 = 8 << 30
     /// The SMC rounds a limit to what ifconfig prints (10 kb/s); closer than this is the same rate.
     static let rateSlack: Int64 = 10
+    /// A lid hold whose session ended without a release, or that the helper held when it restarted,
+    /// keeps `SleepDisabled` this long for Pod Menu to hold it again: a reconnect must not let a
+    /// closed-lid Mac sleep. A release, SIGTERM, low battery or heat end it at once.
+    public static let lidRehold: Double = 60
 
     public let backend: Backend
     private let store: StateStore
@@ -51,6 +55,8 @@ public final class Engine {
     private var leases: [SessionID: Double] = [:]
     private var cooledUntil: Double?
     private var lastRelease: String?
+    /// The re-hold window after a dropped session or a restart, and the reason it ends with.
+    private var rehold: (until: Double, reason: String)?
 
     /// When each CLI parent last authenticated a tier B verb (the grace window).
     private var approvals: [String: Double] = [:]
@@ -117,9 +123,9 @@ public final class Engine {
             }
         }
         if state.lidHeldByUs {
-            if backend.sleepDisabled() { try? backend.setSleepDisabled(false) }
-            state.lidHeldByUs = false
-            lastRelease = "helper restarted"
+            // held before the restart: kept for the window in which Pod Menu holds it again
+            rehold = (now() + Self.lidRehold, "helper restarted")
+            evaluateLid(because: "helper restarted")
         }
         if case .fixed = state.fans { driveFans() }
         persist()
@@ -133,6 +139,7 @@ public final class Engine {
             fansApplied = .auto
         }
         leases.removeAll()
+        rehold = nil
         evaluateLid(because: "helper stopped")
         for (name, _) in shaperOwners {
             if let interface = InterfaceName(name) { _ = try? clearShaper(interface) }
@@ -166,6 +173,7 @@ public final class Engine {
 
     public func sessionEnded(_ session: SessionID) {
         if leases.removeValue(forKey: session) != nil {
+            if leases.isEmpty, state.lidHeldByUs { rehold = (now() + Self.lidRehold, "session ended") }
             evaluateLid(because: "session ended")
             Log.engine.notice("session \(session.description, privacy: .public) ended: lid lease dropped")
         }
@@ -202,9 +210,9 @@ public final class Engine {
         let outcome: Outcome
         if !verb.isValid {
             outcome = .refused(.invalid("a parameter is out of range"))
-        } else if !policy.permits(tier(of: verb, session: session), for: caller) {
+        } else if !policy.permits(tier(of: verb, session: session, caller: caller), for: caller) {
             outcome = .refused(.verbNotAllowed(verb: verb.name, caller: caller))
-        } else if !approved(request, tier: tier(of: verb, session: session), from: caller) {
+        } else if !approved(request, tier: tier(of: verb, session: session, caller: caller), from: caller) {
             outcome = .refused(.needsApproval(verb: verb.name))
         } else if let after = limiter.take(verb.kind, for: caller, now: now()) {
             outcome = .refused(.rateLimited(retryAfter: after))
@@ -238,9 +246,13 @@ public final class Engine {
 
     /// `Verb.tier`, with what only the state knows about upload limits: a session's limit may not
     /// cover one set until reboot (its end would not bring that one back), and clearing the limit of
-    /// your own session, or a limit that isn't there, is as harmless as setting it.
-    func tier(of verb: Verb, session: SessionID) -> VerbTier {
+    /// your own session, or a limit that isn't there, is as harmless as setting it. A lid hold from
+    /// Pod's Electron process is B: anything can run that binary as Node, and a closed-lid hold
+    /// keeps a Mac awake in a bag.
+    func tier(of verb: Verb, session: SessionID, caller: Caller) -> VerbTier {
         switch verb {
+        case .lidHold where caller == .app:
+            return .b
         case .shaperSet(let interface, _, .session) where verb.tier == .a:
             return state.shapers[interface.name]?.scope == .untilReboot ? .b : .a
         case .shaperClear(let interface):
@@ -374,6 +386,7 @@ public final class Engine {
     private func holdLid(_ seconds: LidSeconds, session: SessionID) -> Bool {
         let before = state.lidHeldByUs
         leases[session] = now() + Double(seconds.value)
+        rehold = nil
         evaluateLid(because: "released")
         return before != state.lidHeldByUs
     }
@@ -381,19 +394,26 @@ public final class Engine {
     private func releaseLid(session: SessionID) -> Bool {
         guard leases.removeValue(forKey: session) != nil else { return false }
         let before = state.lidHeldByUs
+        if leases.isEmpty { rehold = nil }
         evaluateLid(because: "released")
         return before != state.lidHeldByUs
     }
 
     /// fanctl `Lid.tick`: hold `SleepDisabled` while a lease is live, the battery is above 10% and
-    /// the Mac is not hot; turn it off only when we turned it on (someone else's setting stays).
+    /// the Mac is not hot; turn it off only when we turned it on (someone else's setting stays). The
+    /// re-hold window only keeps a hold of ours, it never takes one.
     private func evaluateLid(because reason: String) {
         let t = now()
         if backend.thermalSerious() { cooledUntil = t + Self.thermalPause }
         leases = leases.filter { $0.value > t }
-        let lowBattery = !leases.isEmpty && backend.batteryLow()
+        if !leases.isEmpty { rehold = nil }
+        let keeping = leases.isEmpty && state.lidHeldByUs && t < (rehold?.until ?? -.infinity)
+        let lowBattery = (!leases.isEmpty || keeping) && backend.batteryLow()
         let cooling = t < (cooledUntil ?? -.infinity)
-        let wanted = !leases.isEmpty && !lowBattery && !cooling
+        let wanted = (!leases.isEmpty || keeping) && !lowBattery && !cooling
+        // a window that ran out ends the hold with the window's reason
+        let reason = rehold?.reason ?? reason
+        if !keeping { rehold = nil }
         let disabled = backend.sleepDisabled()
         if wanted, !state.lidHeldByUs, !disabled {
             do {
@@ -637,6 +657,8 @@ public final class Engine {
         if let gpu, gpu > 0 {
             if let mb = GPUMegabytes(gpu), gpu <= backend.memoryMB - 4096 {
                 _ = try setSysctl(.gpuWiredLimit(.megabytes(mb)), persist: true)
+                // the old daemon's value is not what macOS had: the GPU limit's default is 0
+                state.sysctls[SysctlKey.gpuWiredLimitMB.rawValue]?.original = 0
             } else {
                 notes.append("iogpu.wired_limit_mb=\(gpu) is not allowed on this Mac, left to the kernel")
             }
@@ -691,6 +713,7 @@ public final class Engine {
         attempt("lid") {
             let held = state.lidHeldByUs || !leases.isEmpty
             leases.removeAll()
+            rehold = nil
             evaluateLid(because: "restored")
             return held
         }
@@ -733,6 +756,7 @@ public final class Engine {
         status.lid.sleepDisabled = backend.sleepDisabled()
         status.lid.leaseUntil = leases.values.max()
         status.lid.cooledUntil = cooledUntil.flatMap { $0 > now() ? $0 : nil }
+        status.lid.reholdUntil = state.lidHeldByUs && leases.isEmpty ? rehold.flatMap { $0.until > now() ? $0.until : nil } : nil
         status.lid.lastRelease = lastRelease
         status.power.ac = backend.powerMode(.ac)
         status.power.battery = backend.powerMode(.battery)

@@ -39,6 +39,9 @@ public struct LidStatus: Codable, Hashable, Sendable {
     public var cooledUntil: Double?
     /// Why the last hold ended: "released", "expired", "session ended", "battery", "thermal", ...
     public var lastRelease: String?
+    /// A hold of ours kept after its session ended or the helper restarted, until Pod Menu holds it
+    /// again or this passes.
+    public var reholdUntil: Double?
 
     public init() {}
 }
