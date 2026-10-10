@@ -5,8 +5,9 @@ reads the kernel directly (sysctl, `proc_pid_rusage`, `proc_pidinfo`, kqueue, Di
 instead of starting Python every few seconds. Every action stays in Python. When a tick would act,
 acc-cored hands that tick to the script, which reads the Mac again and acts exactly as before.
 
-Status: the measuring tool and the readers the guard's loop needs (these branches); the loops
-follow in stacked branches. Nothing is registered on a Mac by the build or the tests.
+Status: the measuring tool, the readers and the dev-server guard's tick (these stacked branches).
+Nothing is registered on a Mac by the build or the tests. The switch from `devguard run` to
+`acc-cored guard` is a separate step with its own undo (see [Switching](#switching)).
 
 ## What the loops cost
 
@@ -62,3 +63,60 @@ Results on 2026-10-10:
 - tables: 5,403 of 5,403 rows and 120 of 120 sockets identical;
 - patterns: 112,840 checks over 28 patterns, 0 different;
 - cache: 37,023 lines over 3 minutes, 0 wrong, with 8.5% of them read.
+
+## The guard
+
+`acc-cored guard` runs the loop of `acc.py devguard run`: the same tick on the same cadence
+(`interval_seconds`, or 2 s while memory is tight). It also ticks as soon as the kernel reports
+memory pressure (a Dispatch memory-pressure source).
+
+- **Ported line by line:** `World` (`discover`, `Server`, `Unit`, simulators, the socket table,
+  Orca's tabs, worktrees and terminals), `Pressure`, `lastresort.stage`, `decide`,
+  `simulator_plans`, `check_pending`, the inventory, the history and the snapshot. List orders, float
+  sums (CPython 3.12+ compensates `sum()` of floats), `round()`, `%.Nf`, `shlex.join`, `json.dumps`
+  bytes and the regular expressions all follow Python. Python's `re` classes (`\s`, `\w`, `\b`, `.`,
+  `$`) are spelled out for ICU in `PyRegex`.
+- **Handed to Python:** a tick whose first plan would act, or whose memory brake is due. acc-cored
+  saves the state as it was before that tick and releases `devguard.lock`. It then runs
+  `acc.py devguard once` and reloads the state Python saved. The caps run through
+  `acc.py devguard caps` every `caps_minutes`, as before.
+- **Kept between ticks:** process lines and their pattern answers (`ProcCache`, see
+  [Readers](#readers)).
+
+### Parity
+
+- `tests/acc_cored/devguard_replay.py record` records live ticks. Each fixture holds every reading
+  the tick made (processes, sockets, rusage sequences per pid, cwd, argv, sysctls, files, Orca's
+  answers) plus the state, plans and verdict Python produced. Actions are replaced by recorders.
+- `devguard_replay.py fuzz` builds synthetic Macs and runs them through the same tick. They include
+  dev servers under launchers, shells and agents, duplicates, orphans, protected and pinned servers,
+  simulators with leases, host tabs and terminals, memory pressure and histories.
+- `acc-cored guard-replay` runs the native tick on every fixture. The state, the Orca view, the plans
+  and the verdict must match.
+- `tests/test_acc_cored.py` runs a short fuzz replay (200 fixtures) besides the readers' checks.
+
+Results on 2026-10-10:
+- fuzz: 10,000 of 10,000 fixtures identical;
+- live: 26 of 26 recorded ticks identical, with two dev servers and real Orca reads.
+
+### Cost
+
+Native tick, from `acc-cored guard --profile` with the first tick excluded:
+- no dev servers: about 2.2 ms of CPU per 5 s tick, about 0.44 ms/s;
+- two servers: about 7 ms per tick;
+- footprint: 5 MB, against 16 MB for the Python guard.
+
+The Python guard spends 6 to 7.5 ms/s.
+
+Pod's runtime answers `browser.tabList` in about 8 s. While dev servers run, the guard's Orca
+refresh (every `orca_seconds`) blocks the tick for that long, in Python as well as here.
+
+## Switching
+
+Not done by this branch. The plan:
+- Pod registers `codes.pod.app.acc.cored` in place of the devguard agent.
+- Standalone installs swap `com.filip.claude-acc.devguard` for a `cored` plist.
+- Undo: bootout the cored job and bootstrap the devguard plist again.
+
+Both loops hold `devguard.lock`, so they never run together. `acc-cored guard --shadow FILE` runs
+the native loop beside the Python one, observe-only, and writes its state to FILE.

@@ -2349,6 +2349,13 @@ def cmd_once(cfg, args):
     return 0
 
 
+def cmd_caps(cfg, args):
+    """Limity katalogów z wynikami agentów raz, teraz: to samo, co pętla robi co caps_minutes.
+    acc-cored (natywny strażnik) woła to we własnym rytmie, bo sam katalogów nie kasuje."""
+    check_caps(cfg, {}, time.time(), dry_run="--dry-run" in args)
+    return 0
+
+
 def cmd_status(cfg, args):
     state = janitor.load_json(STATE_PATH, {})
     snap = state.get("snapshot")
@@ -2834,6 +2841,7 @@ def cmd_room(cfg, args):
 COMMANDS = {
     "run": cmd_run,
     "once": cmd_once,
+    "caps": cmd_caps,
     "status": cmd_status,
     "stop": cmd_manual("stop"),
     "recycle": cmd_manual("recycle"),
