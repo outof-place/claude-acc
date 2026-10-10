@@ -110,6 +110,7 @@ struct ClaudeAccApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBar: MenuBarController?
+    private var presence: MenuBarPresence?
     private var widget: DictationWidget?
     private var store: Store?
     /// URLs that arrive before the store exists: `open -g` that starts the app delivers its URL early.
@@ -125,11 +126,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let store = Store()
         self.store = store
-        menuBar = MenuBarController(store: store)
+        let menuBar = MenuBarController(store: store)
+        self.menuBar = menuBar
+        // Pod's copy hands the ring to Pod's native shell when the user picks it; the standalone one
+        // always shows it
+        let presence = MenuBarPresence { [weak menuBar] shown in menuBar?.setShown(shown) }
+        self.presence = presence
+        presence.start()
         widget = DictationWidget(dictation: store.dictation)
         store.dictation.activate()
         early.forEach(handle)
         early = []
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        presence?.stop()
     }
 
     @objc private func openURL(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
@@ -144,6 +155,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch url.host() {
         // `claude-acc awake on|off|toggle`: Stay Awake from the terminal or Orca
         case "awake": store.awake.command(url)
+        // `claude-acc awake lid on|off`: the lid-closed setting, from Pod's native window
+        case "awake-lid": store.awake.lidCommand(url)
         // claude-acc://panel[/<section>]: Pod's "claude-acc settings…" and `claude-acc panel`
         case "panel": menuBar?.showPanel(section: PanelRoute.section(of: url))
         case "dictate":

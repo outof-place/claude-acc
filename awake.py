@@ -5,9 +5,12 @@
   awake.py on [--for 2h|90m|3600]   trzymaj Maca na nogach (bez --for: do wyłączenia)
   awake.py off                      wyłącz (włączone samo na hotspocie wraca przy następnym hotspocie)
   awake.py toggle [--for ...]
+  awake.py lid on|off               czy sesja włączona ręcznie trzyma Maca także z zamkniętą klapą
 
 on, off i toggle otwierają w tle claude-acc://awake/<on|off|toggle>[?for=sekundy] (`open -g`, jak
-`claude-acc dictate`); aplikacja wstaje, jeśli nie biegnie. Asercje zasilania trzyma tylko jej
+`claude-acc dictate`); aplikacja wstaje, jeśli nie biegnie. `lid` otwiera claude-acc://awake-lid/<on|off>
+(osobny host: aplikacja sprzed niego go pomija, zamiast wziąć `on` za zwykłe Stay Awake) i tylko
+wtedy, gdy plik stanu ma `lid_settable`. Asercje zasilania trzyma tylko jej
 proces, więc stan bez żywego pid aplikacji to "wyłączone". Komenda czeka do 4 s na potwierdzenie
 w pliku stanu.
 """
@@ -92,9 +95,35 @@ def describe(state):
     return "Stay Awake: " + text
 
 
-def send(verb, seconds=None):
-    url = f"claude-acc://awake/{verb}" + (f"?for={seconds}" if seconds else "")
+def send(verb, seconds=None, host="awake"):
+    url = f"claude-acc://{host}/{verb}" + (f"?for={seconds}" if seconds else "")
     return subprocess.run(["open", "-g", url], capture_output=True, text=True)
+
+
+def lid(rest):
+    """`lid on|off`: ustawienie aplikacji, potwierdzone w pliku stanu jak on/off."""
+    if rest not in (["on"], ["off"]):
+        print("lid on|off", file=sys.stderr)
+        return 2
+    want = rest[0] == "on"
+    before = read_state()
+    if before["running"] and not before.get("lid_settable"):
+        print("ta wersja aplikacji Claude Acc zmienia to tylko w swoim panelu", file=sys.stderr)
+        return 1
+    done = send(rest[0], host="awake-lid")
+    if done.returncode != 0:
+        print(f"open claude-acc://awake-lid/{rest[0]}: {(done.stderr or done.stdout).strip()}", file=sys.stderr)
+        return 1
+    end = time.time() + CONFIRM_S
+    while True:
+        state = read_state()
+        if state["running"] and state.get("lid_closed") == want:
+            print("Stay Awake z zamkniętą klapą: " + ("tak" if want else "nie"))
+            return 0
+        if time.time() >= end:
+            print("aplikacja Claude Acc nie potwierdziła zmiany w 4 s (działa? claude-acc awake status)", file=sys.stderr)
+            return 1
+        time.sleep(0.1)
 
 
 def confirmed(verb, before, want):
@@ -115,6 +144,8 @@ def main(argv):
         print(__doc__)
         return 0 if argv else 2
     verb, rest = argv[0], argv[1:]
+    if verb == "lid":
+        return lid(rest)
     if verb == "status":
         state = read_state()
         print(json.dumps(state, ensure_ascii=False) if "--json" in rest else describe(state))
