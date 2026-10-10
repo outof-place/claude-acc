@@ -5,9 +5,12 @@ import SwiftUI
 /// nor animate it, and a panel wider than the room left of the ring ran off the screen. This
 /// one is centred under the menu bar of the ring's screen and opens with a Core Animation
 /// drop that runs in the render server, so it stays smooth while SwiftUI catches up.
+///
+/// The ring is on the bar only while `setShown(true)` (MenuBarPresence decides). Taking it off
+/// touches nothing else: the lid lease, Stay Awake, dictation and the root helper stay with Pod Menu.
 final class MenuBarController: NSObject {
     private let store: Store
-    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private var item: NSStatusItem?
     private let panel = PanelWindow()
     private var outsideClicks: Any?
     private var settle: DispatchWorkItem?
@@ -15,17 +18,6 @@ final class MenuBarController: NSObject {
     init(store: Store) {
         self.store = store
         super.init()
-        if let button = item.button {
-            let label = PassThroughHostingView(rootView: StatusLabel(store: store) { [weak self] width in
-                self?.item.length = width
-            })
-            label.frame = button.bounds
-            label.autoresizingMask = [.width, .height]
-            button.addSubview(label)
-            button.target = self
-            button.action = #selector(toggle)
-            button.sendAction(on: [.leftMouseDown, .rightMouseDown])
-        }
         panel.setContent(PanelView(store: store)) { [weak self] size in self?.place(size) }
         panel.onCancel = { [weak self] in self?.close() }
         NotificationCenter.default.addObserver(
@@ -38,6 +30,32 @@ final class MenuBarController: NSObject {
         if CommandLine.arguments.contains("--open-panel") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.open() }
         }
+    }
+
+    /// Puts the ring on the menu bar, or takes it off (closing the panel first).
+    func setShown(_ shown: Bool) {
+        guard shown != (item != nil) else { return }
+        guard shown else {
+            close()
+            if let item { NSStatusBar.system.removeStatusItem(item) }
+            item = nil
+            return
+        }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // where the user ⌘-dragged it, across a hand-over and back
+        item.autosaveName = "claude-acc"
+        if let button = item.button {
+            let label = PassThroughHostingView(rootView: StatusLabel(store: store) { [weak item] width in
+                item?.length = width
+            })
+            label.frame = button.bounds
+            label.autoresizingMask = [.width, .height]
+            button.addSubview(label)
+            button.target = self
+            button.action = #selector(toggle)
+            button.sendAction(on: [.leftMouseDown, .rightMouseDown])
+        }
+        self.item = item
     }
 
     @objc private func toggle() {
@@ -61,7 +79,7 @@ final class MenuBarController: NSObject {
 
     private func open() {
         place(panel.contentSize)
-        item.button?.highlight(true)
+        item?.button?.highlight(true)
         panel.present()
         // a click anywhere else closes it, like a menu
         outsideClicks = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
@@ -79,7 +97,7 @@ final class MenuBarController: NSObject {
         settle?.cancel()
         if let outsideClicks { NSEvent.removeMonitor(outsideClicks) }
         outsideClicks = nil
-        item.button?.highlight(false)
+        item?.button?.highlight(false)
         // the panel stops its clocks and spinners only once it's gone: that re-render must
         // not land in the middle of the fade
         panel.dismiss { [weak self] in self?.store.panelDisappeared() }
@@ -87,7 +105,8 @@ final class MenuBarController: NSObject {
 
     /// Centred on the ring's screen, right under the menu bar, never past its edges.
     private func place(_ size: CGSize) {
-        guard size.width > 0, let screen = item.button?.window?.screen ?? NSScreen.main else { return }
+        // without the ring (Pod's native shell has the item), under the main screen's menu bar
+        guard size.width > 0, let screen = item?.button?.window?.screen ?? NSScreen.main else { return }
         let area = screen.visibleFrame
         let width = min(size.width, area.width - 16)
         let x = (area.midX - width / 2).rounded()
