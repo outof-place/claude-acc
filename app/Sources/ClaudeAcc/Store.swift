@@ -222,7 +222,13 @@ final class Store {
     /// panel closed only what the menu bar label needs is read, and kept back from the panel.
     func readLocal() {
         let live = panelOpen || isPreview
-        if let data = changedFile(CLI.fanState) {
+        if RootHelper.shared.owns {
+            // Pod's root helper drives the fans; the readings come from the SMC in this app
+            if let fresh = RootHelper.shared.fanState, fresh.at != latestFan?.at {
+                latestFan = fresh
+                if live { fanState = latestFan }
+            }
+        } else if let data = changedFile(CLI.fanState) {
             latestFan = Self.decode(FanState.self, from: data)
             if live { fanState = latestFan }
         }
@@ -346,6 +352,7 @@ final class Store {
     /// While the panel is open the guard's numbers move every few seconds.
     func panelAppeared() {
         panelOpen = true
+        RootHelper.shared.panelOpen = true
         // what came in while it was closed
         if let latestSnapshot { snapshot = latestSnapshot }
         fanState = latestFan
@@ -418,6 +425,7 @@ final class Store {
 
     func panelDisappeared() {
         panelOpen = false
+        RootHelper.shared.panelOpen = false
         live?.cancel()
         live = nil
     }
@@ -674,8 +682,19 @@ final class Store {
         return state.mode
     }
 
-    /// The root daemon reads this file every 2 seconds; it only accepts auto or 30-100%.
+    /// In Pod, through the root helper; otherwise the root daemon reads this file every 2 seconds and
+    /// only accepts auto or 30-100%.
     func setFanMode(_ mode: String) {
+        if RootHelper.shared.owns {
+            fanPick = mode
+            Task {
+                if let problem = await RootHelper.shared.setFans(mode) {
+                    notice = Notice(text: "Couldn't set the fans: \(problem)", isError: true)
+                    fanPick = nil
+                }
+            }
+            return
+        }
         let config: [String: Any] = mode == "auto" ? ["mode": "auto"] : ["mode": "fixed", "percent": Int(mode) ?? 100]
         do {
             let data = try JSONSerialization.data(withJSONObject: config, options: [.prettyPrinted, .sortedKeys])
