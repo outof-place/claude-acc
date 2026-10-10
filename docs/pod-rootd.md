@@ -382,7 +382,8 @@ What has to land before it, or the migration leaves a feature without its daemon
 - Pod Menu talks to the helper: fan mode and the lid hold through `PodRootdClient` (one client
   kept while Stay Awake with the lid closed is on), fan readings from `SMCKit` instead of
   `fans-state.json`. Until then the old fans daemon is what follows `fans.json` and `awake.json`.
-- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, `sudo` otherwise.
+- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, `sudo` otherwise:
+  `rootroute.py` (the wrapper's `perf-root` and `janitor-root` in Pod).
 - `hotspot.py` as the user with `pod-rootctl shaper follow`, then `hotspot` joins `Engine.migrating`.
 - Pod registers the daemon as `daemonService` and signs both binaries (see Signing). The payload
   carries `pod-rootd`, `pod-rootctl` and `LaunchDaemons/codes.pod.app.rootd.plist`
