@@ -1,8 +1,10 @@
 // What the guard's patterns say about one command line, each asked at most once per line. A process
 // keeps its facts as long as its line stays (ProcCache), so a tick runs the patterns only on new
 // processes: on this Mac a full pass over the table costs 25 ms of ICU, a cached one microseconds.
+// Not Sendable: the answers are lazy, so a row's facts stay on the queue that read the table.
+// `sacred` and `clientKind` read GuardContext.host when first asked.
 
-public final class CommandFacts: @unchecked Sendable {
+public final class CommandFacts {
     public let command: String
 
     public init(_ command: String) { self.command = command }
