@@ -220,3 +220,24 @@ func stageFifoAndMount() throws {
     defer { close(fd) }
     #expect(HelperFiles.onLocalVolume(fd))
 }
+
+/// What `fstatfs` would fill in for a mount of `type` with `flags`.
+private func mount(_ type: String, flags: Int32) -> statfs {
+    var fs = statfs()
+    fs.f_flags = UInt32(flags)
+    withUnsafeMutableBytes(of: &fs.f_fstypename) { $0.copyBytes(from: type.utf8.prefix($0.count - 1)) }
+    return fs
+}
+
+@Test("the volume check takes MNT_LOCAL and APFS or HFS together: a network mount fails, so does FUSE marked local")
+func localVolumeVerdict() {
+    #expect(HelperFiles.isLocal(mount("apfs", flags: MNT_LOCAL)))
+    #expect(HelperFiles.isLocal(mount("hfs", flags: MNT_LOCAL | MNT_JOURNALED)))
+    #expect(!HelperFiles.isLocal(mount("smbfs", flags: 0)))
+    #expect(!HelperFiles.isLocal(mount("nfs", flags: 0)))
+    #expect(!HelperFiles.isLocal(mount("apfs", flags: 0)))  // MNT_LOCAL is needed as well as the name
+    #expect(!HelperFiles.isLocal(mount("macfuse", flags: MNT_LOCAL)))  // macFUSE's `local` mount option
+    #expect(!HelperFiles.isLocal(mount("osxfuse", flags: MNT_LOCAL)))
+    #expect(!HelperFiles.isLocal(mount("apfsfuse", flags: MNT_LOCAL)))  // a name is matched whole
+    #expect(!HelperFiles.onLocalVolume(-1))  // fstatfs fails: not local
+}

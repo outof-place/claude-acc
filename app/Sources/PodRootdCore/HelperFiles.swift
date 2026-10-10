@@ -60,7 +60,12 @@ nonisolated public enum HelperFiles {
     /// alone isn't enough.
     public static func onLocalVolume(_ fd: Int32) -> Bool {
         var fs = statfs()
-        guard fstatfs(fd, &fs) == 0, fs.f_flags & UInt32(MNT_LOCAL) != 0 else { return false }
+        return fstatfs(fd, &fs) == 0 && isLocal(fs)
+    }
+
+    /// The verdict on what `fstatfs` filled in, apart so the tests can hand it any mount.
+    static func isLocal(_ fs: statfs) -> Bool {
+        guard fs.f_flags & UInt32(MNT_LOCAL) != 0 else { return false }
         let type = withUnsafeBytes(of: fs.f_fstypename) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
         return type == "apfs" || type == "hfs"
     }
