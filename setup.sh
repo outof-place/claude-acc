@@ -319,14 +319,14 @@ case "$1" in
   # Pod's root helper: fans, Stay Awake with the lid closed, Ultra's root tweaks, the old daemons' migration
   rootd)
     shift
-    [ -x "$STATE/pod-rootctl" ] || { echo "Pod's root helper is not installed (it comes with Pod)" >&2; exit 69; }
+    [ -x "$STATE/pod-rootctl" ] || { echo "brak pomocnika roota Poda (przychodzi razem z Podem)" >&2; exit 69; }
     exec "$STATE/pod-rootctl" "$@" ;;
   fans)
     shift
     case "${1:-read}" in
       install | uninstall)
         if [ -x "$STATE/pod-rootctl" ]; then
-          echo "the fans go through Pod's root helper: claude-acc rootd fans auto|<30-100>" >&2
+          echo "wiatraki idą przez pomocnika roota Poda: claude-acc rootd fans auto|<30-100>" >&2
           exit 2
         fi ;;
     esac
@@ -390,7 +390,7 @@ fi
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
 if [ -n "$ROOTCTL" ]; then
-  echo "root (fans, Stay Awake with the lid closed, Ultra): Pod's root helper, turned on in Pod; state: claude-acc rootd status"
+  echo "root (wiatraki, Stay Awake z zamkniętą klapą, Ultra): pomocnik roota Poda, włączany w Podzie; stan: claude-acc rootd status"
   echo "hook dla agentów: README, sekcja Dev server guard"
 else
   echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"

@@ -320,7 +320,7 @@ class PodAgentsSetupTest(SetupHarness):
         rc, out = self.install()
         self.assertEqual(rc, 0, out)
         self.assertEqual(os.readlink(os.path.join(self.state, "pod-rootctl")), rootctl)
-        self.assertIn("Pod's root helper", out)
+        self.assertIn("pomocnik roota Poda", out)
         self.assertNotIn("claude-acc fans install", out)
         command = os.path.join(self.home, ".local/bin/claude-acc")
         env = dict(os.environ, HOME=self.home)
