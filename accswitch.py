@@ -38,6 +38,14 @@ Komendy:
 Kredyty API z planów (pula kluczy organizacji Console) to osobny skrypt: claude-acc credits --help.
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # PEP 810: od Pythona 3.15 te moduły ładują się dopiero przy pierwszym użyciu, a starsze
 # wersje tę listę ignorują. Żaden nie jest potrzebny przy samym imporcie skryptu.
 __lazy_modules__ = ["glob", "hashlib", "json", "re", "shutil", "signal", "subprocess"]
@@ -46,13 +54,12 @@ import fcntl
 import glob
 import hashlib
 import json
-import os
 import re
 import shutil
 import signal
 import subprocess
-import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import orcahost
@@ -344,6 +351,8 @@ def kc_delete(service, account):
 
 
 def scoped_service(config_dir):
+    """Wpis Claude Code 2.1+ dla CLAUDE_CONFIG_DIR: pierwsze 8 znaków sha256(NFC(katalog))."""
+    config_dir = unicodedata.normalize("NFC", config_dir)
     return f"{ACTIVE_SERVICE}-{hashlib.sha256(config_dir.encode()).hexdigest()[:8]}"
 
 
@@ -382,7 +391,12 @@ def orca_selected(accounts):
     selected = orca_selected_id()
     if not selected:
         return None
-    return next((a.email for a in accounts if a.id == selected), selected)
+    email = next((a.email for a in accounts if a.id == selected), None)
+    if email is None and orcahost.PROFILE_ID.fullmatch(selected):
+        # konto dodane w Pod to profil: jego e-mail jest w .claude.json profilu
+        login = profile_login(os.path.join(ORCA_DIR, orcahost.PROFILES_DIR, selected, "home"))
+        email = login[0] if login else None
+    return email or selected
 
 
 def live_services(cfg):
@@ -801,6 +815,142 @@ def next_renewal(since):
         year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     day = min(start.day, [31, 29 if year % 4 == 0 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
     return datetime(year, month, day)
+
+
+# ---------- profile Claude aplikacji: tylko odczyt ----------
+#
+# Konto dodane w Pod (od 5.1, upstream #26801) to profil: własny katalog konfiguracji
+# (<userData>/claude-profiles/<id>/home, orcahost.claude_profiles) i własny wpis w Pęku kluczy,
+# `Claude Code-credentials-<sha256(NFC(katalog))[:8]>`, który trzyma i odświeża Pod razem z sesjami
+# Claude Code w tym katalogu. Profil pokazujemy w panelu z limitami i niczym więcej:
+#
+# - wpisu profilu nigdy nie zapisujemy, nie kasujemy i nie odświeżamy. Odświeżenie obraca refresh
+#   token (Claude Code 2.1.295 bierze `refresh_token` z odpowiedzi, a na starym dostaje invalid_grant
+#   i ma go za martwy), więc nasze odświeżenie wylogowałoby profil w Pod;
+# - access token profilu służy tylko do odczytu limitów i tylko póki jest ważny: z wygasłym limity
+#   są „nieaktualne”, aż odświeży go sesja w Pod;
+# - danych logowania profilu nigdy nie kopiujemy do wpisu bazowego ani do sejfu kont: ten sam
+#   token w dwóch miejscach pada przy pierwszym odświeżeniu;
+# - profil nie jest kontem do rotacji: tick, kolejka i przełączanie widzą tylko load_accounts().
+#
+# Pilnuje tego tests/test_pod_profiles.py na atrapach `security` i API.
+
+# token tuż przed końcem ważności traktujemy jak wygasły: odczyt nie zdąży, a Pod i tak go odświeży
+PROFILE_EXPIRY_MARGIN = 60
+# profil, w którym Pod uruchamia sesje, spala limity: jego odczyt wystarcza na krócej
+PROFILE_SELECTED_MAX_AGE = 300
+
+
+class PodProfile:
+    """Profil Claude aplikacji: e-mail z jego .claude.json, dane logowania z jego wpisu w Pęku
+    kluczy, tylko do odczytu (patrz wyżej). Nie ma metody, która by cokolwiek zapisała."""
+
+    def __init__(self, profile_id, home, email, since=None):
+        self.id = profile_id
+        self.home = home
+        self.email = email
+        self.since = since
+
+    def services(self):
+        """Wpis z katalogu tak, jak go podaje Pod, i z jego realpath: Pod czyta oba."""
+        return [scoped_service(d) for d in dict.fromkeys([self.home, os.path.realpath(self.home)])]
+
+    @property
+    def creds_json(self):
+        for service in self.services():
+            blob = kc_peek(service, KEYCHAIN_USER)
+            if blob:
+                return blob
+        return None
+
+    def __repr__(self):
+        return f"<profil {self.email}>"
+
+
+def profile_login(home):
+    """(e-mail, dzień startu subskrypcji albo None) z pliku stanu Claude Code w katalogu profilu,
+    albo None przed zalogowaniem. Starszy .config.json wygrywa z .claude.json, jak w Claude Code."""
+    legacy = os.path.join(home, ".config.json")
+    data = load_json(legacy if os.path.exists(legacy) else os.path.join(home, ".claude.json"), {})
+    account = data.get("oauthAccount") if isinstance(data, dict) else None
+    email = (account or {}).get("emailAddress") if isinstance(account, dict) else None
+    if not isinstance(email, str) or not email.strip():
+        return None
+    since = account.get("subscriptionCreatedAt")
+    return email.strip(), since[:10] if isinstance(since, str) and since else None
+
+
+def load_profiles(accounts):
+    """Zalogowane profile aplikacji, poza tymi, które są już naszymi kontami (ten sam e-mail)."""
+    owned = {(a.email or "").lower() for a in accounts}
+    found = []
+    for profile_id, home in orcahost.claude_profiles(HOST):
+        login = profile_login(home)
+        if login and login[0].lower() not in owned:
+            found.append(PodProfile(profile_id, home, *login))
+    return found
+
+
+def profile_usage(profile, max_age):
+    """(dane, notatka, nieaktualne) limitów profilu. Nigdy nie odświeża tokenu i nie pisze do wpisu
+    profilu: bez ważnego tokenu oddaje ostatnie znane liczby jako nieaktualne."""
+    hit = load_json(USAGE_CACHE_PATH, {}).get(profile.email)
+    known = settled(hit["data"]) if hit else None
+    if hit:
+        age = time.time() - hit["ts"]
+        until = full_until(known)
+        if age <= max_age or (until and age <= FULL_RECHECK):
+            return known, "z pamięci podręcznej", False
+    oauth = oauth_of(profile.creds_json)
+    if not oauth.get("accessToken"):
+        return known, "brak wpisu profilu w Pęku kluczy", True
+    if oauth.get("expiresAt", 0) <= (time.time() + PROFILE_EXPIRY_MARGIN) * 1000:
+        return known, f"limity nieaktualne: token profilu wygasł, odświeży go sesja w {HOST.name}", True
+    status, data = fetch_usage(oauth["accessToken"], profile.email)
+    if status != 200 or not data:
+        # 401 też: token odświeża tylko Pod, my najwyżej poczekamy na nowy
+        return known, f"limity nieaktualne: odczyt nieudany (HTTP {status})", True
+    cache = load_json(USAGE_CACHE_PATH, {})
+    cache[profile.email] = {"ts": time.time(), "data": data}
+    write_json(USAGE_CACHE_PATH, cache)
+    return data, "", False
+
+
+def profile_items(accounts):
+    """Wiersze panelu dla profili aplikacji: same limity, bez kolejki i bez przełączania."""
+    selected = orcahost.selected_profile_home(HOST)
+    selected = os.path.realpath(selected) if selected else None
+    now = time.time()
+    items = []
+    for p in load_profiles(accounts):
+        in_use = selected == os.path.realpath(p.home)
+        data, note, stale = profile_usage(p, PROFILE_SELECTED_MAX_AGE if in_use else IDLE_MAX_AGE)
+        hit = load_json(USAGE_CACHE_PATH, {}).get(p.email)
+        renewal = next_renewal(p.since)
+        tier = oauth_of(p.creds_json).get("rateLimitTier") or ""
+        items.append({
+            "id": f"profile:{p.id}",
+            "email": p.email,
+            "real_email": None,
+            "tier": tier.replace("default_claude_", "").replace("max_", "Max "),
+            "active": False,
+            "last_resort": False,
+            "status": "ok" if data else "error",
+            "note": note if stale else f"profil {HOST.name}: tylko limity",
+            "usable": False,
+            "queue": None,
+            "session": window_view(data.get("five_hour")) if data else None,
+            "weekly": window_view(data.get("seven_day")) if data else None,
+            "data_age": int(now - hit["ts"]) if hit and data else None,
+            "full_until": full_until(data) if data else None,
+            "renews_at": renewal.timestamp() if renewal else None,
+            "subscription_status": None,
+            "subscription_since": p.since,
+            "source": "profile",
+            "stale": stale,
+            "host_selected": in_use,
+        })
+    return items
 
 
 # ---------- historia i tempo spalania ----------
@@ -1414,6 +1564,8 @@ def snapshot(cfg, accounts=None):
     # najpierw kolejka automatu, potem wypalone od najbliższego resetu tygodnia
     items.sort(key=lambda i: (not i["active"], i["queue"] or 99, i["status"] != "ok",
                               (i["weekly"] or {}).get("resets_at") or 9e12))
+    # na końcu profile aplikacji: limity do wglądu, automat ich nie bierze
+    items += profile_items(accounts)
 
     active_row = next((r for r in rows if active and r["account"].id == active.id and r["data"]), None)
     state = load_state()
@@ -1478,6 +1630,18 @@ def cmd_status(cfg, args):
     nxt = queue(rows)
     if nxt:
         print(f"\nnastępne w kolejce: {', '.join(r['account'].email for r in nxt[:3])}")
+    profiles = profile_items(accounts)
+    if profiles:
+        print(f"\nprofile {HOST.name} (tylko limity, automat ich nie bierze):")
+    for item in profiles:
+        mark = "*" if item["host_selected"] else " "
+        if not item["weekly"]:
+            print(f"{mark} {item['email']:<26} {item['note']}")
+            continue
+        weekly_left = 100 - (item["weekly"]["used"] or 0)
+        session_left = 100 - ((item["session"] or {}).get("used") or 0)
+        note = f"   {item['note']}" if item["stale"] else ""
+        print(f"{mark} {item['email']:<26}{weekly_left:>7.0f}% {session_left:>8.0f}%{note}")
     summary = credits_summary()
     if summary:
         import credits

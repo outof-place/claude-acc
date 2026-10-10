@@ -342,7 +342,10 @@ working in between.
 1. reads what they hold: `kern.maxvnodes=N` and `iogpu.wired_limit_mb=N` from their
    `ProgramArguments`, the fan mode from the `fans.json` named by the fans plist (opened with
    `O_NOFOLLOW`, 4 KB at most), fsguard present or not, and the Spotlight list `perf-root.sh` saved
-   before apps-only (so `spotlight.restore` still has it);
+   before apps-only (so `spotlight.restore` still has it). That file is then renamed to
+   `spotlight-exclusions.json.migrated` in its folder, every folder from the home opened without
+   following a link (`UserFiles.rename`), so after a restore neither the root copy nor `rootroute.py`
+   takes it for the live list;
 2. `launchctl bootout system/<label>` for each (the fans daemon hands the fans back on SIGTERM and
    drops its lid hold);
 3. moves each plist to `/var/db/codes.pod.app.rootd/legacy/<label>.plist`; the binaries in
@@ -354,8 +357,9 @@ The labels are a fixed list, nothing else in `/Library/LaunchDaemons` is touched
 changes nothing.
 
 `legacy.rollback` undoes it: helper features the migration turned on go off (fans auto, persisted
-sysctls cleared, fsguard off), each saved plist goes back to `/Library/LaunchDaemons` as root:wheel
-0644 and `launchctl bootstrap system` starts it. A later cleanup (after a few releases) can remove
+sysctls cleared, fsguard off, the helper's copy of the Spotlight list dropped and the file renamed
+back), each saved plist goes back to `/Library/LaunchDaemons` as root:wheel 0644 and `launchctl
+bootstrap system` starts it. A later cleanup (after a few releases) can remove
 `/usr/local/libexec/claude-acc-{fanctl,fsguard,hotspot}` and the backups.
 
 ## Installing and removing it
@@ -417,9 +421,12 @@ end
   1. The candidates are `Contents/Resources/claude-acc/pod-rootd` in the app the package was opened
      from (`/var/db/codes.pod.app.rootd/app`), then in `/Applications/Pod.app`. Nothing in a message
      names a path, and only a helper running as its installed program updates.
-  2. The helper copies a candidate, opened with `O_NOFOLLOW`, a regular file of at most 64 MB, into
-     `/Library/PrivilegedHelperTools/.codes.pod.app.rootd.new` (`HelperFiles.stage`). Nothing but
-     root can change that copy after the check.
+  2. The helper copies a candidate into `/Library/PrivilegedHelperTools/.codes.pod.app.rootd.new`
+     (`HelperFiles.stage`). Nothing but root can change that copy after the check. The candidate is
+     opened with `O_NOFOLLOW | O_NONBLOCK`, so a FIFO put in its place can't hold `open`. It must be a
+     regular file of at most 64 MB on a local APFS or HFS volume (`fstatfs`: `MNT_LOCAL`, which
+     macFUSE can set, plus the file system's name), so a network or FUSE mount can't stall the read.
+     Only then is `O_NONBLOCK` cleared for the copy.
   3. It checks the copy with `SecStaticCodeCheckValidityWithErrors` (`kSecCSStrictValidate`,
      `kSecCSCheckAllArchitectures`) against `anchor apple generic and certificate leaf[subject.OU] =
      "75Y2KR6P5W" and identifier "codes.pod.rootd" and notarized`. The `notarized` clause holds for a
@@ -431,6 +438,13 @@ end
      the two equal, so every release bump moves both.
   5. It renames the copy over its program, persists state and exits with `EX_TEMPFAIL`; `KeepAlive`
      starts the new binary. A lid hold stays on through the restart (see Restart safety).
+
+  Steps 2 to 4 run on their own queue (`UpdateRunner`) with a 10 s deadline. The main queue, which
+  serves XPC, the lid, heat, battery and SIGTERM, never waits for them. A look that misses the
+  deadline is skipped, and its copy is thrown away when it comes back; the next look is an hour
+  later. The `notarized` check may ask Apple's notary service. Offline, or for a build Apple hasn't
+  assessed yet, it fails: the update is skipped, the installed helper keeps running, and the next
+  look tries again. A cdhash the app's notarization doesn't cover fails the same way.
 
   The job's plist changes only with a new package. A release that needs a different plist has Pod
   offer "Update root helper", which opens the bundled package: one administrator prompt.
@@ -464,6 +478,15 @@ hardened process carries `CS_REQUIRE_LV` only when it is signed with `library` (
 team-signed `--options runtime` binary reports `0x62011311`, with `runtime,library` it reports
 `0x62013301`). Pod's Electron process loads native modules and gets tier A only, so it needs the
 hardened runtime, not library validation.
+
+A debuggable caller is refused too, whatever it is signed as: a build with
+`com.apple.security.get-task-allow` (`CS_GET_TASK_ALLOW`) or a process a debugger is attached to
+(`CS_DEBUGGED`). Pod's terminals have Developer Tools access (Ultra's `devtools` tweak), so anything
+they run could take over such a process with `task_for_pid`. Lightweight code requirements have no
+"not", so each message is tested against `isDebuggable` and `isDebugged` (`PeerPolicy.refused`) and
+refused when it matches. Measured: a binary with the entitlement runs with csflags `0x22011315`, one
+without with `0x22011311`, and only the first launches under a launch requirement of `isDebuggable`.
+SwiftPM's test runner is debuggable, and the PeerTests see it refused.
 
 Pod's Electron binary keeps RunAsNode on (its terminal daemon needs it), which is why
 `codes.pod.app` gets tier A only (see [Tiers](#tiers)).
@@ -532,8 +555,10 @@ What has to land before it, or the migration leaves a feature without its daemon
 
 - Pod Menu talks to the helper: fan mode and the lid hold through `PodRootdClient`, fan readings from
   `SMCKit` (#110).
-- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, the root copy
-  otherwise (#113).
+- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there: `rootroute.py`
+  (the wrapper's `perf-root` and `mac root-clean` in Pod), ahead of 1.31.2's root copy
+  (`root-run.sh`), which stays the path when the helper doesn't answer or an old daemon still owns
+  the tweak (#113).
 - `hotspot.py` as the user with `pod-rootctl shaper follow`, and `hotspot` in `Engine.migrating`
   (#116).
 - Pod: the "Enable root helper" button opens the package (b2); `release.sh` signs `pod-rootd` and

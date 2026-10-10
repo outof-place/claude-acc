@@ -238,16 +238,22 @@ CLAUDE_ACC_JOBS_RUNNER (atrapa `jobs run`), CLAUDE_ACC_JOBS_TICK_DIE (punkt, w k
 SIGKILL: after-spawn, after-banner).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import fcntl
 import html
 import json
-import os
 import re
 import selectors
 import shutil
 import signal
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request

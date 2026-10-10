@@ -35,12 +35,20 @@ panelu Orki albo Poda (ORCA_PANE_KEY, POD_PANE_KEY): wtedy wszystkie joby tego p
 tylko czekające.
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6); wczytany
+# loaderem bez __file__ (niżej) też nie pisze bajtkodu
+if not os.path.realpath(globals().get("__file__", "/")).startswith(
+        os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import functools  # bez kosztu: `re` i tak go ładuje
 import json
-import os
 import re
 import shlex
-import sys
 import time
 import types
 

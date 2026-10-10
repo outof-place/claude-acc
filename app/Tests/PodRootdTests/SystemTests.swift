@@ -161,3 +161,83 @@ func stageRefuses() throws {
     _ = try HelperFiles.stage(real, into: into.path, name: "h")
     #expect(FileManager.default.contents(atPath: decoy) == Data("keep".utf8))
 }
+
+// MARK: Root's rename in the user's home
+
+@Test("migrate's rename of spotlight-exclusions.json stays in its folder and follows no link on the way")
+func userFileRename() throws {
+    let home = try scratch()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let folder = home.appendingPathComponent(".local/share/claude-acc")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let file = folder.appendingPathComponent("spotlight-exclusions.json").path
+    FileManager.default.createFile(atPath: file, contents: Data("[]".utf8))
+    let parts = [".local", "share", "claude-acc"]
+
+    try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json",
+                         to: "spotlight-exclusions.json.migrated", owner: getuid())
+    #expect(!FileManager.default.fileExists(atPath: file))
+    #expect(FileManager.default.fileExists(atPath: file + ".migrated"))
+    // someone else's file, or a link in its place, is left alone
+    #expect(throws: BackendError.self) {
+        try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json.migrated",
+                             to: "spotlight-exclusions.json", owner: getuid() + 1)
+    }
+    try FileManager.default.createSymbolicLink(atPath: file, withDestinationPath: "/etc/hosts")
+    #expect(throws: BackendError.self) {
+        try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json", to: "x", owner: getuid())
+    }
+    // a folder on the way swapped for a link: the walk stops there
+    let elsewhere = home.appendingPathComponent("elsewhere")
+    try FileManager.default.createDirectory(at: elsewhere.appendingPathComponent("claude-acc"), withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: elsewhere.appendingPathComponent("claude-acc/spotlight-exclusions.json").path, contents: Data())
+    try FileManager.default.removeItem(at: home.appendingPathComponent(".local/share"))
+    try FileManager.default.createSymbolicLink(at: home.appendingPathComponent(".local/share"), withDestinationURL: elsewhere)
+    #expect(throws: BackendError.self) {
+        try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json", to: "y", owner: getuid())
+    }
+    #expect(FileManager.default.fileExists(atPath: elsewhere.appendingPathComponent("claude-acc/spotlight-exclusions.json").path))
+}
+
+@Test("staging opens without blocking: a FIFO is refused at once, and so is a file on a volume that isn't local",
+      .timeLimit(.minutes(1)))
+func stageFifoAndMount() throws {
+    let dir = try scratch()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let into = dir.appendingPathComponent("into")
+    try FileManager.default.createDirectory(at: into, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
+    let fifo = dir.appendingPathComponent("fifo").path
+    #expect(mkfifo(fifo, 0o600) == 0)
+    let started = Date.now
+    #expect(throws: BackendError.self) { try HelperFiles.stage(fifo, into: into.path, name: "h") }
+    #expect(Date.now.timeIntervalSince(started) < 1)
+    let real = dir.appendingPathComponent("real").path
+    FileManager.default.createFile(atPath: real, contents: Data("x".utf8))
+    #expect(throws: BackendError.self) { try HelperFiles.stage(real, into: into.path, name: "h", onLocalVolume: { _ in false }) }
+    #expect(try FileManager.default.contentsOfDirectory(atPath: into.path).isEmpty)
+    // the scratch folder is on the boot volume: APFS, local
+    let fd = open(real, O_RDONLY)
+    defer { close(fd) }
+    #expect(HelperFiles.onLocalVolume(fd))
+}
+
+/// What `fstatfs` would fill in for a mount of `type` with `flags`.
+private func mount(_ type: String, flags: Int32) -> statfs {
+    var fs = statfs()
+    fs.f_flags = UInt32(flags)
+    withUnsafeMutableBytes(of: &fs.f_fstypename) { $0.copyBytes(from: type.utf8.prefix($0.count - 1)) }
+    return fs
+}
+
+@Test("the volume check takes MNT_LOCAL and APFS or HFS together: a network mount fails, so does FUSE marked local")
+func localVolumeVerdict() {
+    #expect(HelperFiles.isLocal(mount("apfs", flags: MNT_LOCAL)))
+    #expect(HelperFiles.isLocal(mount("hfs", flags: MNT_LOCAL | MNT_JOURNALED)))
+    #expect(!HelperFiles.isLocal(mount("smbfs", flags: 0)))
+    #expect(!HelperFiles.isLocal(mount("nfs", flags: 0)))
+    #expect(!HelperFiles.isLocal(mount("apfs", flags: 0)))  // MNT_LOCAL is needed as well as the name
+    #expect(!HelperFiles.isLocal(mount("macfuse", flags: MNT_LOCAL)))  // macFUSE's `local` mount option
+    #expect(!HelperFiles.isLocal(mount("osxfuse", flags: MNT_LOCAL)))
+    #expect(!HelperFiles.isLocal(mount("apfsfuse", flags: MNT_LOCAL)))  // a name is matched whole
+    #expect(!HelperFiles.onLocalVolume(-1))  // fstatfs fails: not local
+}

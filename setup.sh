@@ -54,9 +54,10 @@ for ((i = 0; i < ${#ARGS[@]}; i++)); do
     --uninstall) UNINSTALL=1 ;;
   esac
 done
-# odinstalować wolno każdemu (`claude-acc uninstall`); instalować tylko właścicielowi
+# odinstalować wolno każdemu (`claude-acc uninstall`); instalować tylko właścicielowi. Python z $SRC
+# zawsze z -B: $SRC bywa wnętrzem podpisanej Pod.app, a __pycache__ w niej łamie jej pieczęć
 if [ -f "$SRC/owner.py" ] && [ -z "$UNINSTALL" ]; then
-  /usr/bin/python3 "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
+  /usr/bin/python3 -B "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
 fi
 
 STATE="$HOME/.local/share/claude-acc"
@@ -92,7 +93,7 @@ while [ $# -gt 0 ]; do
       # sesje budzimy, kasując jej plik
       for hook in "$STATE/hook.py" "$SRC/hook.py"; do
         if [ -f "$hook" ]; then
-          /usr/bin/python3 "$hook" uninstall "$CLAUDE_SETTINGS" || true
+          /usr/bin/python3 -B "$hook" uninstall "$CLAUDE_SETTINGS" || true
           break
         fi
       done
@@ -109,7 +110,7 @@ while [ $# -gt 0 ]; do
       [ -f "$STATE/orcaplugin.py" ] && /usr/bin/python3 "$STATE/orcaplugin.py" uninstall || true
       # claude-acc Poda: nagrobek "none" zamiast pliku, żeby Pod nie zainstalował go znowu przy
       # następnym starcie (bez owner.json robi pierwszą instalację), tylko zdjął swoje agenty i Pod Menu
-      [ -f "$SRC/owner.py" ] && { /usr/bin/python3 "$SRC/owner.py" uninstalled || true; }
+      [ -f "$SRC/owner.py" ] && { /usr/bin/python3 -B "$SRC/owner.py" uninstalled || true; }
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -129,6 +130,9 @@ cp "$SRC"/*.py "$STATE/"
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 # drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
 [ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
+# paczka Poda ma plik __pycache__ obok każdego .py (scripts/payload.sh), żeby nic nie pisało bajtkodu w
+# Pod.app; w $STATE bajtkod jest mile widziany, więc te pliki tu nie przechodzą
+find "$STATE/hooks" "$STATE/sdk" -name __pycache__ -type f -delete 2>/dev/null || true
 # wtyczka Orki (orcaplugin.py instaluje ją stąd w katalogu wtyczek Orki); bez testów
 if [ -d "$SRC/orca-plugin" ]; then
   rm -rf "$STATE/orca-plugin.new" && cp -R "$SRC/orca-plugin" "$STATE/orca-plugin.new" && rm -rf "$STATE/orca-plugin.new/test"
@@ -175,8 +179,9 @@ if [ "$PY" = /usr/bin/python3 ]; then
   PY="$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.executable))' 2>/dev/null || echo /usr/bin/python3)"
 fi
 ln -sfn "$PY" "$STATE/python"
-# bytecode up front: acc.py runs every script from it, so no start compiles one
-"$STATE/python" -m compileall -q "$STATE"/*.py >/dev/null 2>&1 || true
+# bytecode up front, under $STATE/pycache where acc.py looks for it (sys.pycache_prefix), so no start
+# compiles one and nothing is written next to a script
+"$STATE/python" -X pycache_prefix="$STATE/pycache" -m compileall -q "$STATE"/*.py >/dev/null 2>&1 || true
 # the hook's native front reads the words that send a command to Python from here
 "$STATE/python" "$STATE/acc.py" devguard words > "$STATE/hook-words.json.new" 2>/dev/null \
   && mv -f "$STATE/hook-words.json.new" "$STATE/hook-words.json" || rm -f "$STATE/hook-words.json.new"
@@ -198,6 +203,11 @@ if [ -f "$SRC/hook.py" ]; then
     || echo "hooki pauzy limitów: $action nieudany, szczegóły wyżej" >&2
 else
   echo "brak hook.py w $SRC: pauza limitów bez hooków w sesjach Claude Code" >&2
+fi
+# hook admit obok łańcucha fasthooks (admitchain.py): łańcuch woła claude-acc-hook sam, więc nasz wpis
+# znika; łańcuch przestał działać, więc wpis wraca (to samo co 5 minut robi `perf keep`)
+if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ] && [ -f "$STATE/admitchain.py" ]; then
+  "$STATE/python" "$STATE/acc.py" admitchain heal "$CLAUDE_SETTINGS" || true
 fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
@@ -252,12 +262,20 @@ case "$1" in
     # porządki roota z kopii roota (claude-acc root install): nigdy skrypt z $STATE pod sudo
     if [ "${1:-}" = root-clean ]; then
       shift
+      # in Pod its root helper does it, without sudo (rootroute.py); 75 falls through to the root copy
+      if [ -x "$STATE/pod-rootctl" ]; then
+        "$PY" "$STATE/rootroute.py" janitor-root "$@"
+        rc=$?
+        [ "$rc" -eq 75 ] || exit "$rc"
+      fi
       [ -x /usr/local/libexec/claude-acc-root/root-run.sh ] || { echo "najpierw raz: claude-acc root install" >&2; exit 1; }
       exec sudo /usr/local/libexec/claude-acc-root/root-run.sh janitor-root "$@"
     fi
     exec "$PY" "$RUN" janitor "$@" ;;
   clean) shift; exec "$PY" "$RUN" janitor sweep --force "$@" ;;
   guard) shift; exec "$PY" "$RUN" devguard "$@" ;;
+  # hook admit obok łańcucha fasthooks: status albo heal (to robi też `perf keep` co 5 minut)
+  admitchain) shift; exec "$PY" "$RUN" admitchain "$@" ;;
   perf) shift; exec "$PY" "$RUN" perf "$@" ;;
   sched) shift; exec "$PY" "$RUN" sched "$@" ;;
   # ciężka komenda spoza agentów (terminal, skrypt, automatyzacja Orki) przez scheduler pamięci
@@ -277,6 +295,25 @@ case "$1" in
   desktop) shift; exec "$PY" "$RUN" desktop "$@" ;;
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
+  # strażnik fseventsd (demon roota): install|uninstall przez install-fsguard.sh (sudo, Touch ID), status bez roota
+  fsguard)
+    case "${2:-status}" in
+      install) exec "$(cat "$STATE/source")/install-fsguard.sh" ;;
+      uninstall) exec "$(cat "$STATE/source")/install-fsguard.sh" --uninstall ;;
+      *)
+        PLIST=/Library/LaunchDaemons/com.filip.claude-acc.fsguard.plist
+        if [ ! -f "$PLIST" ]; then echo "strażnik fseventsd: nie zainstalowany (claude-acc fsguard install)"; exit 0; fi
+        first="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null || true)"
+        flag="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$PLIST" 2>/dev/null || true)"
+        # dobry start to interpreter roota z -I (rootpy.py), nigdy zaślepka /usr/bin/python3: ta idzie
+        # do wybranego Xcode'a, a Xcode z DMG należy do użytkownika
+        if [ "$first" != /usr/bin/python3 ] && [ "$flag" = -I ] && [ "$(stat -f %u "$first" 2>/dev/null)" = 0 ]; then
+          echo "strażnik fseventsd: zainstalowany, startuje przez $first -I"
+        else
+          echo "strażnik fseventsd: startuje przez ${first:-?} (nie interpreter roota z -I); przeinstaluj: claude-acc fsguard install"
+        fi
+        exit 0 ;;
+    esac ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
   # biegi blogów bez człowieka: płatnik z puli, licznik, limity czuwania, zapis biegu (jobs.py)
   jobs) shift; exec "$PY" "$RUN" jobs "$@" ;;
@@ -284,6 +321,13 @@ case "$1" in
   mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)
     shift
+    # in Pod its root helper does it, without sudo (rootroute.py); 75: Pod doesn't own claude-acc,
+    # the helper doesn't answer, or an old root daemon still owns the tweak, so the root copy below
+    if [ -x "$STATE/pod-rootctl" ]; then
+      "$PY" "$STATE/rootroute.py" perf-root "$@"
+      rc=$?
+      [ "$rc" -eq 75 ] || exit "$rc"
+    fi
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     # stan limitu GPU to tylko odczyt sysctl i plisty demona

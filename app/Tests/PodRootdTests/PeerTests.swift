@@ -22,6 +22,16 @@ private func ownIdentifier() throws -> String {
     return try #require((info as? [String: Any])?[kSecCodeInfoIdentifier as String] as? String)
 }
 
+/// This process's code signing flags as the kernel has them (`csops`, `CS_OPS_STATUS`).
+@_silgen_name("csops")
+private func csops(_ pid: pid_t, _ ops: UInt32, _ useraddr: UnsafeMutableRawPointer?, _ usersize: Int) -> Int32
+
+private func ownFlags() -> UInt32 {
+    var flags: UInt32 = 0
+    _ = csops(getpid(), 0, &flags, MemoryLayout<UInt32>.size)
+    return flags
+}
+
 /// A policy this process passes, as the given caller.
 private func admitting(as caller: Caller) throws -> PeerPolicy {
     let me = try ownIdentifier()
@@ -84,6 +94,27 @@ func nonHardenedPeerRejected() async throws {
     #expect(try await open.client.send(.status).refusal == nil)
 }
 
+@Test("a debuggable sender (get-task-allow, or under a debugger) is turned away even with the right identity")
+func debuggablePeerRejected() async throws {
+    // the runner stands in for a debuggable build: the refused requirement is one it satisfies
+    let me = try ownIdentifier()
+    let admit = try PeerPolicy.requirement(team: nil, identifiers: [me], flags: [])
+    let wire = try Wire(peers: PeerPolicy(listener: admit, callers: [(.menu, admit)], refused: [admit]))
+    defer { wire.close() }
+    let reply = try await wire.client.send(.status)
+    #expect(reply.refusal == .peerNotAllowed)
+    #expect(reply.status == nil)
+    // the production check against the real flags: swiftpm's test runner is itself debuggable
+    // (CS_GET_TASK_ALLOW 0x4 or CS_DEBUGGED 0x10000000), so it is turned away exactly when they're set
+    #expect(try PeerPolicy.production().refused.count == 2)
+    let flags = ownFlags()
+    let debuggable = flags & 0x4 != 0 || flags & 0x1000_0000 != 0
+    let real = try Wire(peers: PeerPolicy(listener: admit, callers: [(.menu, admit)], refused: try PeerPolicy.debuggable()))
+    defer { real.close() }
+    #expect(try await real.client.send(.status).refusal == (debuggable ? .peerNotAllowed : nil), "flags 0x\(String(flags, radix: 16))")
+    #expect(PeerPolicy(listener: admit, callers: [(.menu, admit)], refused: [admit]).classify { _ in true } == nil)
+}
+
 @Test("Pod Menu and the CLI need library validation too; Electron Pod the hardened runtime only")
 func hardeningPerCaller() {
     #expect(PeerPolicy.hardening(.menu) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
@@ -97,7 +128,9 @@ func productionCallers() throws {
     #expect(policy.callers.map(\.0) == [.app, .menu, .cli])
     // nothing here is signed by that team, so no identity matches
     #expect(policy.classify { _ in false } == nil)
-    #expect(policy.classify { _ in true } == .app)
+    // a sender that matches everything is debuggable too, and that wins
+    #expect(policy.classify { _ in true } == nil)
+    #expect(PeerPolicy(listener: policy.listener, callers: policy.callers).classify { _ in true } == .app)
 }
 
 @Test("an admitted peer gets the verb done and the status back over XPC")

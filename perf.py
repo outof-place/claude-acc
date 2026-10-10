@@ -38,17 +38,23 @@ Komendy:
   list                                poprawki z opisem i zmierzonym efektem
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import ctypes
 import ctypes.util
 import glob
 import hashlib
 import json
-import os
 import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -4455,12 +4461,28 @@ def cmd_record(cfg, args, system=None):
     return 0
 
 
+def cmd_keep_launchd(cfg, args):
+    """`keep` z launchd: poprawki, a po nich hook admit obok łańcucha fasthooks (admitchain.py).
+    Testy wołają cmd_keep wprost, więc prawdziwy settings.json zostaje poza nimi."""
+    rc = cmd_keep(cfg, args)
+    try:
+        import admitchain
+
+        change = admitchain.heal()
+    except Exception as err:  # noqa: BLE001 - poprawki są ważniejsze niż ten krok
+        log(f"keep: admitchain: błąd {err!r}")
+    else:
+        if change:
+            log(f"keep: {change}")
+    return rc
+
+
 COMMANDS = {
     "status": cmd_status,
     "bench": cmd_bench,
     "apply": cmd_apply,
     "undo": cmd_undo,
-    "keep": cmd_keep,
+    "keep": cmd_keep_launchd,
     "link": cmd_link,
     "list": cmd_list,
     "ultra": cmd_ultra,
