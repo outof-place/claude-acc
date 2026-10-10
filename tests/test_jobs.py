@@ -31,11 +31,11 @@ os.environ["PATH"] = os.pathsep.join(
 )
 
 try:
-    from tests.test_credits import FAKES, FAKES_CREDITS, KEY_A, PY, ROOT, read, write_json
+    from tests.test_credits import FAKES, FAKES_CREDITS, KEY_A, KEY_D, PY, ROOT, read, write_json
     from tests.test_runenv import FAKES_RUNENV, VERSION, accounts
     from tests.test_runenv import World as RunWorld
 except ImportError:  # uruchomione z katalogu tests
-    from test_credits import FAKES, FAKES_CREDITS, KEY_A, PY, ROOT, read, write_json
+    from test_credits import FAKES, FAKES_CREDITS, KEY_A, KEY_D, PY, ROOT, read, write_json
     from test_runenv import FAKES_RUNENV, VERSION, accounts
     from test_runenv import World as RunWorld
 
@@ -543,6 +543,16 @@ class Facts(Base):
                 r, rec = self.w.run_job(FAKE_JOB_CLAUDE="1", FAKE_CLAUDE_ERROR=error, FAKE_JOB_EXIT="4")
                 self.assertEqual((rec["outcome"], rec["retryable"], rec["override"]), ("BŁĄD", True, kind))
                 self.assertTrue(rec["switch_payment"])
+
+    def test_after_a_credit_401_the_next_auto_run_takes_another_org_not_the_same_one(self):
+        # tik po 401 na kredycie woła `jobs run` bez --mode (auto): runenv ma ominąć org-a sam
+        self.w.add_job()
+        self.w.credit("d@example.com", KEY_D, 500, 30)  # wygasa po org-a (20 dni): bez omijania płaci org-a
+        r, rec = self.w.run_job(FAKE_JOB_CLAUDE="1", FAKE_CLAUDE_ERROR="401", FAKE_JOB_EXIT="4")
+        self.assertEqual((rec["override"], rec["payer"]["org_id"]), ("auth", "org-a"), r.stderr)
+        r, rec = self.w.run_job(FAKE_JOB_CLAUDE="1")
+        self.assertEqual((rec["outcome"], rec["payer"]["mode"], rec["payer"]["org_id"]), ("OPUBLIKOWANO", "credits", "org-d"), rec["reason"])
+        self.assertTrue(rec["metering_complete"])
 
     def test_payer_mismatch_kills_the_run_and_is_final_with_a_banner(self):
         self.w.add_job()

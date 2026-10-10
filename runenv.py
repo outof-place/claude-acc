@@ -59,7 +59,10 @@ Subskrypcja odmawia (kind "payer") przy awake_minutes + 30 > 450: token dostępu
 Alarmy: payer albo leak to błąd konfiguracji, zabij bieg (SIGTERM, potem finish). exhausted:
 kredyt skończył się w trakcie (organizacja już oznaczona), zatrzymaj, kod 76, bez ponawiania w
 tym biegu. auth i limit: 401 albo 429, decyzja należy do wołającego; przy 429 konto subskrypcji
-omijamy w kolejnych biegach do resetu sesji. Wcześniejszy 429 nie zasłania późniejszego payer.
+omijamy w kolejnych biegach do resetu sesji (avoid.json), a organizację kredytu po 401 albo 429
+omija wybór auto i credits przez ORG_AVOID_S od końca biegu (avoid-orgs.json): 401 to klucz albo
+organizacja odrzucone, co samo nie mija, 429 to limit na minuty. Wcześniejszy 429 nie zasłania
+późniejszego payer.
 
 finish(run, exit_code, stopped, exhausted, grace): exit_code to kod komendy (None, gdy go nie
 ma); stopped to powód, dla którego wołający zatrzymał bieg ("budget", "payer", "leak",
@@ -83,12 +86,17 @@ zwykłego `claude` z PATH i bazowego logowania). Rachunek: run_id, purpose, mode
 version, budget_usd, started_at, ended_at, cost_usd, by_model, sessions, requests,
 sessions_seen, sessions_started, metering {complete, problems}, payer_check {verdict
 ok|mismatch|unverified, problems}, errors, exhausted, ledger_usd, killed, leaks, stopped,
-crashed, precheck, exit_code. Wyciek to Claude Code bez katalogu biegu w jego drzewie procesów
-albo sesja `claude -p` czy Agent SDK (nie Twoja interaktywna) zapisana w ~/.claude/projects/<cwd>
-między startem a końcem biegu. Bieg, którego właściciel zginął (hamulec pamięci, launchd),
-sprząta sweep() (prepare() woła go sam): zabija jego procesy, księguje to, co doszło, raz, i
-usuwa katalog oraz wpis Pęku kluczy; sesja w jego katalogu daje wtedy płatnika niesprawdzonego,
-nie niezgodnego, bo okna biegu nie da się już ustalić. Żywego biegu nie dotyka.
+crashed, precheck, exit_code. sessions_started to nowe sesje: `claude -p` przez bin/claude biegu
+bez --resume, -r, --continue i -c (albo z --fork-session); wznowienie niesie session.id sesji,
+którą wznawia, więc nie jest nową sesją, której licznik ma oczekiwać, a jego zapytania i tak
+liczą się do kosztu. `-c` w pierwszym `claude -p` biegu to nowa sesja (nie ma jeszcze czego
+kontynuować). Licznik jest pełny, gdy każda nowa sesja przysłała zapytanie. Wyciek to Claude Code
+bez katalogu biegu w jego drzewie procesów albo sesja `claude -p` czy Agent SDK (nie Twoja
+interaktywna) zapisana w ~/.claude/projects/<cwd> między startem a końcem biegu. Bieg, którego
+właściciel zginął (hamulec pamięci, launchd), sprząta sweep() (prepare() woła go sam): zabija
+jego procesy, księguje to, co doszło, raz, i usuwa katalog oraz wpis Pęku kluczy; sesja w jego
+katalogu daje wtedy płatnika niesprawdzonego, nie niezgodnego, bo okna biegu nie da się już
+ustalić. Żywego biegu nie dotyka.
 
 Wersja Claude Code: biegi używają wersji z runenv/pin.json. Nowszą przypina dopiero canary()
 (`claude-acc credits canary`): `claude auth status --json` w środowisku biegu i jedno `claude -p`
@@ -126,6 +134,8 @@ RUNENV_DIR = os.path.join(STATE_DIR, "runenv")
 RUNS_DIR = os.path.join(RUNENV_DIR, "runs")
 PIN_PATH = os.path.join(RUNENV_DIR, "pin.json")
 AVOID_PATH = os.path.join(RUNENV_DIR, "avoid.json")
+# organizacje kredytu, które dały 401 albo 429 w biegu: {org_id: {until, email, kind, reason}}
+AVOID_ORGS_PATH = os.path.join(RUNENV_DIR, "avoid-orgs.json")
 HISTORY_PATH = os.path.join(RUNENV_DIR, "history.jsonl")
 LOCK_PATH = os.path.join(RUNENV_DIR, ".lock")
 SWEEP_LOCK_PATH = os.path.join(RUNENV_DIR, ".sweep.lock")
@@ -144,6 +154,13 @@ REFUSED = credits.NO_CREDIT  # 75: nikt nie zapłaci, nic nie wystartowało
 EXHAUSTED = credits.EXHAUSTED  # 76: kredyt skończył się w trakcie
 MISMATCH = 78  # EX_CONFIG: zapłacił ktoś inny niż wybrany płatnik
 STOP_FACTOR = 1.5  # jobs zatrzymuje bieg przy 1,5 × budżet, więc tyle musi mieć organizacja
+# ile sekund od końca biegu wybór kredytu omija organizację po błędzie z licznika. auth: 401 przy
+# kluczu z apiKeyHelper to "invalid x-api-key" albo organizacja wyłączona czy wstrzymana
+# (organization_disabled, organization_on_hold; Claude Code 2.1.294), a helper Claude Code woła już
+# po 401 sam: bez Ciebie to nie mija, doba ogranicza koszt chwilowej awarii logowania API do jednego
+# dnia bez tej organizacji. limit: 429 na kluczu API (rate_limit_error) to limity na minutę, które
+# Claude Code ponawia sam; 3 h od końca biegu obejmują następną próbę slotu jobs (godzinę po końcu).
+ORG_AVOID_S = {"auth": 24 * 3600, "limit": 3 * 3600}
 DEFAULT_RESERVE = 20.0
 DEFAULT_AWAKE = 120
 TOKEN_MARGIN_MIN = 30
@@ -288,6 +305,16 @@ def count_lines(path):
         return 0
 
 
+def new_sessions(path):
+    """Nowe sesje w starts.log biegu: każda linia poza "PID resume" (linia z samym PID-em to zapis
+    wrappera sprzed rozróżnienia, liczy się jak nowa)."""
+    try:
+        with open(path) as f:
+            return sum(1 for line in f if line.strip() and line.split()[1:2] != ["resume"])
+    except OSError:
+        return 0
+
+
 def usd4(value):
     return f"${value:,.4f}"
 
@@ -332,13 +359,35 @@ def pinned_binary():
     return pin["version"], path
 
 
-# ---------- konta omijane przez biegi (429 w trakcie) ----------
+# ---------- konta i organizacje omijane przez biegi (429, 401 w trakcie) ----------
 
 
-def avoided():
-    data = read_json(AVOID_PATH, {})
+def avoided(path=AVOID_PATH, horizon=None):
+    """Wpisy, które jeszcze nie wygasły: konta subskrypcji (AVOID_PATH, po e-mailu) albo organizacje
+    kredytu (AVOID_ORGS_PATH, po org_id). Plik mógł ktoś ręcznie poprawić, a błąd tutaj zatrzymałby
+    każdy bieg, więc bierzemy tylko wpisy-słowniki z liczbowym `until` w przyszłości (przy horizon
+    także nie dalej niż horizon sekund od teraz) i resztę pomijamy z jedną linią w logu."""
+    data = read_json(path, {})
     now = time.time()
-    return {e: v for e, v in (data or {}).items() if isinstance(v, dict) and v.get("until", 0) > now}
+    if not isinstance(data, dict):
+        credits.log(f"runenv: {path} nie jest słownikiem, pomijam cały plik")
+        return {}
+    kept, ignored = {}, 0
+    for key, value in data.items():
+        until = value.get("until") if isinstance(value, dict) else None
+        if not isinstance(until, (int, float)) or isinstance(until, bool):
+            ignored += 1
+        elif now < until and (horizon is None or until <= now + horizon):
+            kept[key] = value
+        elif horizon is not None and until > now + horizon:
+            ignored += 1  # za daleko w przyszłości: taki wpis blokowałby organizację na zawsze
+    if ignored:
+        credits.log(f"runenv: pomijam {ignored} nieprawidłowych wpisów w {path}")
+    return kept
+
+
+def avoided_orgs():
+    return avoided(AVOID_ORGS_PATH, max(ORG_AVOID_S.values()))
 
 
 def avoid(email, until, reason):
@@ -347,6 +396,35 @@ def avoid(email, until, reason):
         data[email.lower()] = {"until": until, "reason": reason}
         credits.write_json(AVOID_PATH, data)
     credits.log(f"runenv: {email} omijane przez biegi do {datetime.fromtimestamp(until):%d.%m %H:%M} ({reason})")
+
+
+def avoid_org(org_id, email, kind, why, base=None):
+    """Organizacja kredytu poza wyborem auto i credits przez ORG_AVOID_S[kind] od `base` (domyślnie
+    od teraz). Dłuższy wpis zostaje: limit po 401 nie skraca doby. Woła to licznik przy błędzie i
+    settle() na końcu biegu, więc czas liczy się od końca biegu, a równoległy prepare() widzi wpis
+    od razu."""
+    until = (time.time() if base is None else base) + ORG_AVOID_S[kind]
+    with Locked():
+        data = avoided_orgs()
+        if (data.get(org_id) or {}).get("until", 0) >= until:
+            return
+        status = {"auth": "401", "limit": "429"}[kind]
+        data[org_id] = {"until": until, "email": email, "kind": kind, "reason": f"{status} {why}"}
+        credits.write_json(AVOID_ORGS_PATH, data)
+    credits.log(f"runenv: kredyt {email} ({org_id}) omijany przez biegi do {datetime.fromtimestamp(until):%d.%m %H:%M} ({kind}, {why})")
+
+
+def lift_org_avoid(org_id):
+    """Zdejmuje organizację z listy omijanych (`credits add`: nowy klucz albo ponowne połączenie).
+    Inne wpisy zostają; zepsute odpadają przy okazji."""
+    with Locked():
+        data = avoided_orgs()
+        if org_id not in data:
+            return False
+        del data[org_id]
+        credits.write_json(AVOID_ORGS_PATH, data)
+    credits.log(f"runenv: organizacja {org_id} znów w wyborze kredytu (credits add)")
+    return True
 
 
 # ---------- wybór płatnika ----------
@@ -385,7 +463,12 @@ def pick_credits(budget, reserve, reasons):
             if row.get("org_id") in held and row.get("state") == "linked":
                 row["remaining_usd"] = round(max(row["remaining_usd"] - held[row["org_id"]], 0.0), 4)
                 row["_held"] = round(held[row["org_id"]], 4)
+    skip = avoided_orgs()
     for row in credits.targets(data, "own", None, need):
+        gone = skip.get(row["org_id"])
+        if gone:
+            reasons.append(f"kredyt {row['email']}: omijany do {datetime.fromtimestamp(gone['until']):%d.%m %H:%M} ({gone.get('reason')})")
+            continue
         try:
             key = credits.key_read(row["email"])
         except subprocess.TimeoutExpired:
@@ -398,13 +481,16 @@ def pick_credits(budget, reserve, reasons):
         key = None
         return {"mode": "credits", "email": row["email"], "org_id": row["org_id"], "scope": row["scope"],
                 "remaining_usd": row["remaining_usd"], "ends": row["_ends"]}  # fmt: skip
-    own = [r for r in data["accounts"] if r["state"] == "linked" and r["scope"] == "own" and r["org_id"]]
+    own = [r for r in data["accounts"] if r["state"] == "linked" and r["scope"] == "own" and r["org_id"] and r["org_id"] not in skip]
     best = max(own, key=lambda r: r["remaining_usd"], default=None)
-    have = f"; najwięcej ma {best['email']}: {credits.money(best['remaining_usd'])}" if best else "; pula jest pusta"
+    if best:
+        have = f"; najwięcej ma {best['email']}: {credits.money(best['remaining_usd'])}"
+    else:
+        have = "; poza omijanymi nie ma żadnej" if skip else "; pula jest pusta"
     if best and best.get("_held"):
         have += f" (po odjęciu {credits.money(best['_held'])} trzymanych przez biegi w toku)"
     reasons.append(
-        f"kredyt: żadna organizacja nie ma {credits.money(need)} (budżet {credits.money(budget)} × 1,5 "
+        f"kredyt: żadna {'inna ' if skip else ''}organizacja nie ma {credits.money(need)} (budżet {credits.money(budget)} × 1,5 "
         f"+ zapas {credits.money(reserve)}){have}"
     )
     return None
@@ -832,9 +918,22 @@ def wrapper_text(meta):
         f"  echo 'claude-acc: nie ma przypiętego Claude Code {meta['version']}; claude nie wystartuje' >&2",
         "  exit 78",
         "fi",
+        # start `claude -p` w starts.log: "new" to nowa sesja, "resume" wznowienie z session.id sesji,
+        # którą wznawia (--fork-session daje nowe id, więc to nowa sesja); new_sessions() liczy nowe
+        "_acc_p= _acc_r= _acc_c= _acc_f=",
         'for a in "$@"; do',
-        f'  case "$a" in -p|--print) echo "$$" >> {q(meta["starts_path"])}; break ;; esac',
+        '  case "$a" in',
+        "    -p|--print) _acc_p=1 ;;",
+        "    -r|--resume|--resume=*) _acc_r=1 ;;",
+        "    -c|--continue) _acc_c=1 ;;",
+        "    --fork-session) _acc_f=1 ;;",
+        "  esac",
         "done",
+        # `-c` bez żadnej sesji w biegu (starts.log pusty) zaczyna nową: config biegu jest świeży
+        f'if [ -n "$_acc_c" ] && [ -s {q(meta["starts_path"])} ]; then _acc_r=1; fi',
+        'if [ -n "$_acc_p" ]; then',
+        f'  if [ -n "$_acc_r" ] && [ -z "$_acc_f" ]; then echo "$$ resume"; else echo "$$ new"; fi >> {q(meta["starts_path"])}',
+        "fi",
         "unset " + " ".join(AUTH_ENV),
     ]
     lines += [f"export {k}={q(v)}" for k, v in fixed_env(meta).items()]
@@ -934,6 +1033,8 @@ def on_error_for(meta):
         if meta["mode"] == "credits" and kind == "billing":
             credits.mark_exhausted(meta["payer"]["email"])
             credits.log(f"run {meta['purpose']}: kredyt {meta['payer']['org_id']} wyczerpany w biegu {meta['run_id']}")
+        elif meta["mode"] == "credits" and kind in ORG_AVOID_S:
+            avoid_org(meta["payer"]["org_id"], meta["payer"]["email"], kind, f"w biegu {meta['run_id']}")
         elif meta["mode"] == "subscription" and kind == "limit":
             until = meta.get("session_resets_at") or 0
             if until < time.time() + 60:
@@ -1242,7 +1343,17 @@ def settle(meta, exit_code=None, stopped=None, exhausted=False, killed=0, crashe
         # dowodu w obie strony, więc płatnik niesprawdzony, nie niezgodny
         metering_problems += [f"możliwy wyciek, nie do rozstrzygnięcia po śmierci właściciela: {x}" for x in sessions_out]
     rep = meter.report(events, meta["mode"], meta["payer"].get("identity") or meta["payer"]["email"],
-                       count_lines(meta["starts_path"]), payer_problems, metering_problems)
+                       new_sessions(meta["starts_path"]), payer_problems, metering_problems)
+    if meta["mode"] == "credits":
+        # licznik zapisał wpis przy błędzie; tu liczymy go od nowa od końca biegu (martwego: od jego
+        # ostatniej aktywności), żeby długi bieg nie zjadł okna, w którym następna próba slotu ma
+        # wziąć inną organizację. Zapis jest dodatkiem: błąd tutaj nie może zatrzymać księgowania.
+        for kind in sorted({e["kind"] for e in rep["errors"]} & set(ORG_AVOID_S)):
+            try:
+                avoid_org(meta["payer"]["org_id"], meta["payer"]["email"], kind, f"w biegu {meta['run_id']}",
+                          base=last_activity(meta, events) if crashed else ended_at)
+            except Exception as exc:
+                credits.log(f"runenv: nie zapisałem omijania {meta['payer']['org_id']}: {exc}")
     if exhausted and not rep["exhausted"] and meta["mode"] == "credits" and exit_code not in (0, None):
         credits.mark_exhausted(meta["payer"]["email"])  # zdanie z wyjścia jak w `exec`; licznik go nie widział
     rep["exhausted"] = rep["exhausted"] or bool(exhausted and exit_code not in (0, None))
@@ -1502,7 +1613,7 @@ def print_summary(summary):
     lines = [
         f"bieg {summary['run_id']} ({summary['purpose']}): {describe(summary)}",
         f"koszt {usd4(summary['cost_usd'])}; zapytania: {summary['requests']}, sesje: {summary['sessions_seen']} "
-        f"(uruchomione przez claude biegu: {summary['sessions_started']})"
+        f"(nowe uruchomione przez claude biegu: {summary['sessions_started']}, bez --resume i --continue)"
         + ("; " + ", ".join(f"{m} {usd4(v)}" for m, v in summary["by_model"].items()) if summary["by_model"] else ""),
         "płatnik: " + {"ok": "sprawdzony", "mismatch": "NIEZGODNY", "unverified": "niesprawdzony"}[p["verdict"]]
         + (f" ({'; '.join(p['problems'])})" if p["problems"] else ""),

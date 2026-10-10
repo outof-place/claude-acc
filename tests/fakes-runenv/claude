@@ -23,7 +23,10 @@ FAKE_CLAUDE_FORCE_EMAIL / FAKE_CLAUDE_FORCE_ORG (zły płatnik w OTEL), FAKE_CLA
 FAKE_CLAUDE_COPY_SETTINGS=plik, FAKE_CLAUDE_TOOL=Monitor (narzędzie FAKE_CLAUDE_BASH to Monitor:
 lista permissions.deny, potem hooki z pasującym matcherem), FAKE_CLAUDE_AUTH_ORG=<orgId> i
 FAKE_CLAUDE_AUTH_LOGGED_OUT=1 (co pokaże `auth status`). Sesja z -p zapisuje transkrypt z
-"entrypoint" jak prawdziwy: CLAUDE_CODE_ENTRYPOINT albo "sdk-cli".
+"entrypoint" jak prawdziwy: CLAUDE_CODE_ENTRYPOINT albo "sdk-cli". `--resume ID` i `-r ID` wznawiają
+sesję ID (też `--resume=ID`), a `--continue` i `-c` ostatnią sesję tego katalogu konfiguracji
+(config/last-session; bieg ma własny, więc pierwszy -c biegu zaczyna nową): zapytania niosą wtedy
+tę samą session.id, jak u Claude Code; `--fork-session` daje nową.
 """
 import hashlib
 import json
@@ -209,12 +212,25 @@ def main():
                           "total_cost_usd": 0}))
         return 1
     kind, payer = who
-    session = str(uuid.uuid4())
+    # `--continue` bierze ostatnią sesję katalogu konfiguracji: w świeżym biegu nie ma żadnej i
+    # zaczyna się nowa, jak u Claude Code (2.1.294, tengu_continue success:false)
+    last_path = os.path.join(config_dir(), "last-session")
+    resumed = opt("--resume") or opt("-r") or next((a.split("=", 1)[1] for a in args if a.startswith("--resume=")), None)
+    if not resumed and ("--continue" in args or "-c" in args):
+        try:
+            with open(last_path) as f:
+                resumed = f.read().strip() or None
+        except OSError:
+            resumed = None
+    session = resumed if resumed and "--fork-session" not in args else str(uuid.uuid4())
+    os.makedirs(os.path.dirname(last_path), exist_ok=True)
+    with open(last_path, "w") as f:
+        f.write(session)
     if "--no-session-persistence" not in args:
         slug = "".join(c if c.isalnum() else "-" for c in os.getcwd())
         folder = os.path.join(config_dir(), "projects", slug)
         os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, f"{session}.jsonl"), "w") as f:
+        with open(os.path.join(folder, f"{session}.jsonl"), "a") as f:
             f.write(json.dumps({"type": "queue-operation", "sessionId": session}) + "\n")
             f.write(json.dumps({"type": "user", "sessionId": session, "cwd": os.getcwd(),
                                 "entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT") or "sdk-cli"}) + "\n")
