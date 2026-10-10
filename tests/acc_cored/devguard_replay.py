@@ -217,6 +217,7 @@ def run_tick(dg, janitor, lastresort, probe, cfg, state, orca, now, absolute, ma
     return {
         "plans": [p.summary() for p in plans],
         "act": act,
+        "calls": calls,
         "brake": reaps[0] if reaps else None,
         "log": logs,
         "notify": notes,
@@ -350,9 +351,15 @@ def fuzz_fixture(rng, home, i):
     apps = [f"{home}/Documents/proj{n}" for n in range(rng.randint(1, 4))]
     ports = {}
     links = []
-    for _ in range(rng.randint(0, 6)):
+    # a quarter of the Macs: the first server bloated in a plain Orca terminal and pinned, the case
+    # for `recycle bloated` (and, with restarts, `warn loop_watched`)
+    focus = rng.random() < 0.25
+    focus_shell = focus_server = None
+    for n in range(rng.randint(1 if focus else 0, 6)):
         app = rng.choice(apps)
-        parent = rng.choice(
+        if focus and n == 0:
+            focus_shell = add(host, rng.choice(SHELLS), tree_cwd=app)
+        parent = focus_shell if focus and n == 0 else rng.choice(
             [
                 1,
                 host,
@@ -364,10 +371,14 @@ def fuzz_fixture(rng, home, i):
             parent = add(parent, rng.choice(LAUNCHERS), tree_cwd=app)
         if rng.random() < 0.3:
             parent = add(parent, rng.choice(LAUNCHERS), tree_cwd=app)
-        port = rng.choice([3000, 3001, 5173, 8081, 6006, 4321, 3000])
+        port = 3000 if focus and n == 0 else rng.choice([3000, 3001, 5173, 8081, 6006, 4321, 3000])
+        command = rng.choice(SERVER_COMMANDS[:2]).format(d=app, port=port) if focus and n == 0 else rng.choice(SERVER_COMMANDS).format(d=app, port=port)
         server = add(
-            parent, rng.choice(SERVER_COMMANDS).format(d=app, port=port), tree_cwd=app
+            parent, command, tree_cwd=app, fp=int((6 + rng.random() * 3) * GB) if focus and n == 0 else None,
+            args=command.split() if focus and n == 0 else None,
         )
+        if focus and n == 0:
+            focus_server = server
         for _ in range(rng.randint(0, 3)):
             child = add(server, rng.choice(["node " + app + "/node_modules/next/dist/server/lib/start-server.js",
                                             "next-server (v16)", rng.choice(SERVER_COMMANDS).format(d=app, port=port)]), tree_cwd=app)  # fmt: skip
@@ -415,6 +426,10 @@ def fuzz_fixture(rng, home, i):
         "vm.compressor.compactor.swapouts_queued_pressure": rng.choice([None, rng.randint(0, 5000)]),
     }  # fmt: skip
     units_hist = {}
+    if focus_server is not None:
+        # an hour old, quiet for twenty minutes: past the grace and the quiet time
+        units_hist[f"{focus_server}:{(usage.get(str(focus_server)) or {}).get('start', 0)}"] = {
+            "first": now - 3600, "cpu": 100.0, "at": now - 5, "busy": now - 1200, "watched": now - rng.choice([60, 1200])}  # fmt: skip
     for r in rows:
         if rng.random() < 0.3:
             units_hist[f"{r[0]}:{(usage.get(str(r[0])) or {}).get('start', 0)}"] = {
@@ -435,6 +450,11 @@ def fuzz_fixture(rng, home, i):
         "sims": {f"{u}:0": {"first": now - 3000, "cpu": 1.0, "at": now - 5, "busy": now - rng.random() * 4000} for u in sims},
     }  # fmt: skip
     cfg = {}
+    # a value of the wrong type now and then: the native engine must hand such ticks to Python
+    if rng.random() < 0.04:
+        key, value = rng.choice([("runtimes", "node"), ("protect", ":3000"), ("max_server_gb", "5"), ("simulator_pool_prefix", 3),
+                                 ("scope", [1]), ("budget_percent", None)])  # fmt: skip
+        cfg[key] = value
     for key, choices in (("budget_percent", [25, 35, 10]), ("max_server_gb", [4, 5, 2.5]), ("grace_minutes", [3, 0]),
                          ("idle_minutes", [45, 1]), ("orphan_minutes", [10, 0]), ("duplicate_minutes", [5, 0]),
                          ("quiet_seconds", [30, 0]), ("max_booted_simulators", [2, 1, 0]), ("kernel_pressure", [True, False]),
@@ -447,8 +467,8 @@ def fuzz_fixture(rng, home, i):
     worktrees = [{"worktreeId": w, "path": rng.choice(apps), "isActive": rng.random() < 0.5,
                   "status": rng.choice(["working", "idle"]), "agents": [{"state": rng.choice(["working", "idle"])}]} for w in ("w1", "w2")]  # fmt: skip
     shells = [r[0] for r in rows if r[2] in SHELLS]
-    terminals = [{"ptyId": f"p{n}", "title": f"t{n}", "agentIdentity": rng.choice([None, "claude"]),
-                  "lastOutputAt": (now - rng.random() * 600) * 1000} for n in range(len(shells))]  # fmt: skip
+    terminals = [{"ptyId": f"p{n}", "title": f"t{n}", "agentIdentity": None if s == focus_shell else rng.choice([None, "claude"]),
+                  "lastOutputAt": (now - rng.random() * 600) * 1000} for n, s in enumerate(shells)]  # fmt: skip
     memory = {
         "worktrees": [
             {
@@ -475,7 +495,12 @@ def fuzz_fixture(rng, home, i):
                 },
                 "app": "a",
             }
-    json_files = {f"{home}/.local/share/claude-acc/devguard-pins.json": {"pins": [{"target": rng.choice([":3000", apps[0]]), "until": rng.choice([None, now + 100, now - 100]), "level": rng.choice(["hold", None])}]} if rng.random() < 0.3 else None,
+    pins = None
+    if focus:
+        pins = {"pins": [{"target": ":3000", "until": rng.choice([None, now + 1000]), "level": rng.choice([None, None, "hold"])}]}
+    elif rng.random() < 0.3:
+        pins = {"pins": [{"target": rng.choice([":3000", apps[0]]), "until": rng.choice([None, now + 100, now - 100]), "level": rng.choice(["hold", None])}]}
+    json_files = {f"{home}/.local/share/claude-acc/devguard-pins.json": pins,
                   "/var/db/claude-acc-fsguard.json": {"last_restart": now - rng.random() * 9000} if rng.random() < 0.3 else None,
                   f"{home}/.local/share/claude-acc/sched/state.json": {"running": [{"child_pgid": rng.choice([r[0] for r in rows])}]} if rng.random() < 0.3 else None}  # fmt: skip
     json_files.update(leases)

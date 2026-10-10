@@ -26,6 +26,13 @@ func fail(_ text: String, _ code: Int32 = 64) -> Never {
     exit(code)
 }
 
+/// The value after `flag`, nil without the flag; a flag given last is a usage error.
+func value(_ flag: String, in args: [String]) -> String? {
+    guard let i = args.firstIndex(of: flag) else { return nil }
+    guard i + 1 < args.count else { fail("\(flag) needs a value\n" + usage) }
+    return args[i + 1]
+}
+
 var args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else { fail(usage) }
 args.removeFirst()
@@ -103,13 +110,15 @@ case "cache-check":
     exit(wrong == 0 ? 0 : 1)
 case "guard-replay":
     guard let path = args.first, let data = Files.read(path) else { fail(usage) }
-    let show = args.firstIndex(of: "--show").flatMap { Int(args[$0 + 1]) } ?? 3
-    var same = 0, different = 0, incomplete = 0, shown = 0
+    let show = value("--show", in: args).flatMap { Int($0) } ?? 3
+    var same = 0, different = 0, incomplete = 0, shown = 0, config = 0
     for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where !line.isEmpty {
         guard let fixture = (try? PyJSON.loads(String(line)))?.object else { fail("unreadable fixture") }
         let outcome = GuardReplay.run(fixture)
         if !outcome.missing.isEmpty { incomplete += 1 }
-        if outcome.differences.isEmpty {
+        if outcome.configHandedOver {
+            config += 1
+        } else if outcome.differences.isEmpty {
             same += 1
         } else {
             different += 1
@@ -121,7 +130,7 @@ case "guard-replay":
             }
         }
     }
-    print("same \(same), different \(different), fixtures with readings Python never made \(incomplete)")
+    print("same \(same), different \(different), fixtures with readings Python never made \(incomplete), handed to Python (config types) \(config)")
     exit(different == 0 ? 0 : 1)
 case "orca-read":
     let home = ProcessInfo.processInfo.environment["HOME"] ?? "/"
@@ -149,9 +158,8 @@ case "guard-bench":
     exit(0)
 case "guard":
     let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
-    let shadowAt = args.firstIndex(of: "--shadow")
-    let shadow = shadowAt.map { args[$0 + 1] }
-    let seconds = args.firstIndex(of: "--for").flatMap { Double(args[$0 + 1]) }
+    let shadow = value("--shadow", in: args)
+    let seconds = value("--for", in: args).flatMap { Double($0) }
     let engine = GuardEngine(.init(home: home, shadow: shadow != nil, shadowPath: shadow))
     Profile.on = args.contains("--profile")
     guard engine.start() else {

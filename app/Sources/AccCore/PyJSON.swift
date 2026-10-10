@@ -67,6 +67,7 @@ public enum PyJSON: Equatable, Sendable {
     public var array: [PyJSON]? { if case .array(let a) = self { a } else { nil } }
     public var object: PyObject? { if case .object(let o) = self { o } else { nil } }
     public var isNull: Bool { self == .null }
+    public var isRaw: Bool { if case .raw = self { true } else { false } }
 
     /// Python truthiness: None, False, 0, 0.0, "", [] and {} are false.
     public var truthy: Bool {

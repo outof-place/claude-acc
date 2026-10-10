@@ -7,13 +7,32 @@ public enum GuardLog {
     nonisolated(unsafe) public static var notifications = true
     /// The replay's capture: ("log", line) and ("notify", title + "\n" + text) instead of writing
     nonisolated(unsafe) public static var capture: [(String, String)]? = nil
+    /// A tick's lines and notifications, kept until the engine knows whether Python takes the tick
+    /// over (it logs and notifies from its own reading, so these would come twice) or not.
+    nonisolated(unsafe) static var held: [(kind: String, a: String, b: String)]? = nil
     /// janitor.LOG_MAX_BYTES: past it the log keeps its last 1000 lines
     static let maxBytes = 512 * 1024
+
+    public static func hold() { held = [] }
+
+    /// The held lines written (`write`) or dropped.
+    public static func release(write: Bool) {
+        guard let lines = held else { return }
+        held = nil
+        guard write else { return }
+        for line in lines {
+            if line.kind == "log" { self.write(line.a) } else { notify(line.a, line.b) }
+        }
+    }
 
     /// "2026-10-10 21:08:22  line"
     public static func write(_ line: String) {
         if capture != nil {
             capture!.append(("log", line))
+            return
+        }
+        if held != nil {
+            held!.append(("log", line, ""))
             return
         }
         guard let path else { return }
@@ -39,6 +58,10 @@ public enum GuardLog {
     public static func notify(_ title: String, _ text: String) {
         if capture != nil {
             capture!.append(("notify", title + "\n" + text))
+            return
+        }
+        if held != nil {
+            held!.append(("notify", title, text))
             return
         }
         guard notifications else { return }
