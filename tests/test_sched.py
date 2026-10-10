@@ -2551,6 +2551,18 @@ class HostTest(Paths):
         out = subprocess.run([sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, check=True)
         self.assertEqual(out.stdout.strip(), f"False {orcahost.CLI_NAMES} {panes}")
 
+    def test_job_qos_clamps_only_when_configured(self):
+        argv = ["pnpm", "test"]
+        self.assertEqual(S.job_argv(argv, dict(S.DEFAULTS)), argv)  # domyślnie bez zmian
+        self.assertIsNone(S.DEFAULTS["job_qos"])
+        with mock.patch.object(S.os, "access", return_value=True):
+            self.assertEqual(S.job_argv(argv, {"job_qos": "utility"}), [S.TASKPOLICY, "-c", "utility", *argv])
+            self.assertEqual(S.job_argv(argv, {"job_qos": "background"})[:3], [S.TASKPOLICY, "-c", "background"])
+            # nic spoza listy: wartość z configu nie trafia do argv
+            self.assertEqual(S.job_argv(argv, {"job_qos": "-p 1"}), argv)
+        with mock.patch.object(S.os, "access", return_value=False):
+            self.assertEqual(S.job_argv(argv, {"job_qos": "utility"}), argv)  # bez taskpolicy jak dotąd
+
     def test_agent_pane_comes_from_the_host_env(self):
         with mock.patch.dict(os.environ, {"ORCA_PANE_KEY": "tab-1:pane-2"}):
             self.assertEqual(S.agent_info("abcdef123456", "worker")["pane"], "tab-1:pane-2")
