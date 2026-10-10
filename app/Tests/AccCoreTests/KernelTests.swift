@@ -28,3 +28,30 @@ func ownUsage() throws {
 func noCoalition() {
     #expect(CoalitionUsage.read(UInt64.max - 1) == nil)
 }
+
+@Test("children: all of them, past the first buffer (proc_listchildpids answers a count)")
+func manyChildren() {
+    var pids: [pid_t] = []
+    let argv: [UnsafeMutablePointer<CChar>?] = [strdup("/bin/sleep"), strdup("5"), nil]
+    defer { argv.forEach { free($0) } }
+    for _ in 0..<300 {
+        var pid: pid_t = 0
+        if posix_spawn(&pid, "/bin/sleep", nil, nil, argv, environ) == 0 { pids.append(pid) }
+    }
+    let children = Set(Proc.children(of: getpid()))
+    #expect(Set(pids).isSubset(of: children))
+    for pid in pids {
+        kill(pid, SIGKILL)
+        var status: Int32 = 0
+        waitpid(pid, &status, 0)
+    }
+}
+
+@Test("Spawn: a child that outlives its deadline is killed with its group")
+func spawnDeadline() {
+    let start = Kernel.wall()
+    #expect(Spawn.run(["/bin/sh", "-c", "sleep 30 & sleep 30"], timeout: 0.3) == 124)
+    #expect(Spawn.output(["/bin/sh", "-c", "exec >&-; sleep 30"], timeout: 0.3) == nil)
+    #expect(Spawn.output(["/bin/echo", "hi"], timeout: 5) == Array("hi\n".utf8))
+    #expect(Kernel.wall() - start < 5)
+}

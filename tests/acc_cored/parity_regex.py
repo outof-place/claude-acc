@@ -18,6 +18,9 @@ import sys
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+# the host apps come from the environment on both sides: the defaults (Orca, Pod) here and there
+for key in ("CLAUDE_ACC_HOST_APP", "POD_APP_PATH"):
+    os.environ.pop(key, None)
 import devguard_core as dg  # noqa: E402
 
 WORDS = ["next", "dev", "vite", "serve", "expo", "start", "webpack", "astro", "storybook", "nuxi", "nuxt", "pnpm", "npm",
@@ -48,6 +51,17 @@ def main(argv):
     binary = argv[0]
     n = int(argv[argv.index("--fuzz") + 1]) if "--fuzz" in argv else 3000
     patterns = subprocess.run([binary, "regex-check", "--patterns"], capture_output=True, text=True, check=True).stdout.splitlines()
+    # the native texts must be devguard_core's own, not just compile the same in re
+    python = [rx.pattern for _kind, rx in dg.SERVER_KINDS] + [
+        rx.pattern for rx in (dg.LAUNCHER, dg.SHELL, dg.AGENT, dg.BROWSER, dg.HEADLESS, dg.UDID, dg.SIM_DEVICE, dg.LAUNCHD_SIM,
+                              dg.SERVE_SIM, dg.SIMCTL_BOOTED)
+    ] + [rx.pattern for _name, rx in dg.FAMILIES] + [dg.HOST_APP.pattern, dg.SACRED.pattern]  # fmt: skip
+    if patterns != python:
+        for i, (mine, theirs) in enumerate(zip(patterns, python)):
+            if mine != theirs:
+                print(f"pattern {i} differs from devguard_core:\n  native {mine!r}\n  python {theirs!r}")
+        print(f"patterns: native {len(patterns)}, devguard_core {len(python)}")
+        return 1
     corpus = [cmd for _pid, _ppid, cmd in dg.processes()] + fuzz(random.Random(7), n)
     corpus = [c for c in corpus if "\t" not in c and "\n" not in c] + [c for c in corpus if "\t" in c or "\n" in c]
     lines, expect = [], []

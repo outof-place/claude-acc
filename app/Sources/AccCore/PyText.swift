@@ -93,18 +93,24 @@ public func pyLess(_ a: String, _ b: String) -> Bool {
     a.unicodeScalars.lexicographicallyPrecedes(b.unicodeScalars)
 }
 
-/// os.path.dirname
+/// os.path.dirname, split at the last "/" code point (a "/" may carry a combining mark, which a
+/// Character search would miss)
 public func dirname(_ s: String) -> String {
-    guard let slash = s.lastIndex(of: "/") else { return "" }
-    var head = s[..<slash]
-    while head.count > 1, head.hasSuffix("/") { head = head.dropLast() }
-    return head.isEmpty ? "/" : String(head)
+    let u = s.utf8
+    guard let slash = u.lastIndex(of: 0x2F) else { return "" }
+    var head = u[...slash]
+    // the head loses its trailing slashes unless it is nothing else
+    if !head.allSatisfy({ $0 == 0x2F }) {
+        while head.last == 0x2F { head = head.dropLast() }
+    }
+    return String(Substring(head))
 }
 
 /// os.path.basename
 public func basename(_ s: String) -> String {
-    guard let slash = s.lastIndex(of: "/") else { return s }
-    return String(s[s.index(after: slash)...])
+    let u = s.utf8
+    guard let slash = u.lastIndex(of: 0x2F) else { return s }
+    return String(Substring(u[u.index(after: slash)...]))
 }
 
 extension String {

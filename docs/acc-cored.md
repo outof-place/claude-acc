@@ -36,8 +36,12 @@ What devguard_core reads through ctypes, read the same way in Swift, so the two 
 - `SocketTable.read()` is `sockets()`: `PROC_PIDLISTFDS` and `PROC_PIDFDSOCKETINFO`, the answer
   `lsof -nP -a -u $UID -iTCP` gave.
 - `PyJSON` reads and writes JSON as the scripts do: key order kept, ints stay ints, `json.dumps`
-  bytes (`ensure_ascii`, `", "` and `": "`, float repr).
-- `PyRegex` runs Python patterns on ICU with Python's meaning of `\s`, `\w`, `\b`, `.` and `$`.
+  bytes (`ensure_ascii`, `", "` and `": "`, float repr). Strings and keys compare by code point, as
+  Python's do; Swift's `String ==` would merge "é" and "e" + U+0301. An int beyond Int64 or a string
+  with a lone surrogate (from `os.fsdecode`) stays as its JSON text and is written back unchanged.
+- `PyRegex` runs Python patterns on ICU with Python's meaning of `\s`, `\S`, `\w`, `\W`, `\b`, `\B`,
+  `\v`, `\Z`, `.` and `$`, and escapes the punctuation ICU reads as set syntax inside a class.
+  Inline flags, `(?P…)` and `--` in a class aren't translated: such a pattern stops at its build.
   NSRegularExpression costs about 2.7 µs a call, so each pattern carries literals one of which every
   match contains, and a line without any is a miss without ICU.
 - `ProcCache` keeps process lines between reads. It reads a process's arguments again only when it

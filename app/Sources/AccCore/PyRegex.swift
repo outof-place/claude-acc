@@ -2,19 +2,14 @@
 // ICU's \s leaves out \v, \x1c-\x1f and \x85, its \w and \b take in combining marks, its `.` stops at
 // U+2028 and its `$` before a final line break. The guard's patterns run over ps-style command lines,
 // so a match must be the one devguard_core gets; tests/acc_cored/parity_regex.py checks them on a corpus.
+// A construct outside the translated subset stops the build of the pattern (a precondition): the
+// patterns are constants, so a test that loads them finds it.
 import Darwin
 import Foundation
-import Synchronization
 
 public struct PyRegex: @unchecked Sendable {
     public let pattern: String
     let regex: NSRegularExpression
-    /// search() answers per string: the guard asks the same few hundred command lines every tick
-    let memo = Memo()
-
-    final class Memo: Sendable {
-        let answers = Mutex<[String: Bool]>([:])
-    }
 
     /// Python's str \s (str.isspace) and \w ([\p{L}\p{N}_], what str.isalnum() and _ cover).
     static let space = #"[\t\n\x{0B}\f\r\x{1C}-\x{1F}\x{85}\p{Z}]"#
@@ -31,7 +26,8 @@ public struct PyRegex: @unchecked Sendable {
     public init(_ pattern: String, anyOf: [String] = []) {
         self.pattern = pattern
         self.anyOf = anyOf.map { Array($0.utf8) }
-        regex = try! NSRegularExpression(pattern: Self.translate(pattern))
+        guard let translated = Self.translate(pattern) else { preconditionFailure("PyRegex can't translate \(pattern)") }
+        regex = try! NSRegularExpression(pattern: translated)
     }
 
     @inline(__always)
@@ -45,10 +41,12 @@ public struct PyRegex: @unchecked Sendable {
         }
     }
 
-    /// The pattern with Python's \s \S \w \W \b . $ spelled out for ICU.
-    static func translate(_ p: String) -> String {
+    /// The pattern with Python's meaning spelled out for ICU: \s \S \w \W \b \B \v \Z . and $, and
+    /// inside a class the punctuation ICU reads as set syntax (`[`, `&`, `:`, …) escaped. nil for what
+    /// isn't translated: inline flags, (?P…), `--` inside a class.
+    static func translate(_ p: String) -> String? {
         var out = ""
-        var chars = Array(p)
+        let chars = Array(p.unicodeScalars)
         var i = 0
         var inClass = false
         while i < chars.count {
@@ -63,43 +61,53 @@ public struct PyRegex: @unchecked Sendable {
                 case ("W", false): out += notWord
                 case ("s", true): out += spaceInClass
                 case ("w", true): out += wordInClass
+                case ("S", true): out += "[^" + spaceInClass + "]"
+                case ("W", true): out += "[^" + wordInClass + "]"
                 case ("b", false): out += "(?:(?<=\(word))(?!\(word))|(?<!\(word))(?=\(word)))"
+                case ("B", false): out += "(?:(?<=\(word))(?=\(word))|(?<!\(word))(?!\(word)))"
+                case ("b", true): out += "\\x{08}"
+                case ("v", _): out += "\\x{0B}"
+                case ("Z", false): out += "\\z"
                 default: out += "\\" + String(n)
                 }
                 continue
             }
             if inClass {
-                if c == "]" { inClass = false }
-                out.append(c)
+                if c == "]" {
+                    inClass = false
+                } else if c == "-" {
+                    if i + 1 < chars.count, chars[i + 1] == "-" { return nil }
+                } else if c.value > 0x20, c.value < 0x7F, !c.properties.isAlphabetic, !("0"..."9").contains(c) {
+                    out += "\\"  // literal in Python, maybe set syntax in ICU
+                }
+                out.unicodeScalars.append(c)
             } else if c == "[" {
                 inClass = true
-                out.append(c)
+                out.unicodeScalars.append(c)
                 // a ] right after [ or [^ is a literal
                 if i + 1 < chars.count, chars[i + 1] == "^" { out.append("^"); i += 1 }
                 if i + 1 < chars.count, chars[i + 1] == "]" { out.append("\\]"); i += 1 }
+            } else if c == "(", i + 2 < chars.count, chars[i + 1] == "?",
+                      !([":", "=", "!", "<", ">", "#"] as [Unicode.Scalar]).contains(chars[i + 2])
+                          || (chars[i + 2] == "<" && i + 3 < chars.count && !(["=", "!"] as [Unicode.Scalar]).contains(chars[i + 3]))
+            {
+                return nil  // inline flags, (?P<name>…), (?(1)…): not translated
             } else if c == "." {
                 out += "[^\\n]"
             } else if c == "$" {
                 out += "(?=\\n?\\z)"
             } else {
-                out.append(c)
+                out.unicodeScalars.append(c)
             }
             i += 1
         }
-        chars.removeAll()
         return out
     }
 
     /// re.search: any match at all.
     public func search(_ s: String) -> Bool {
         guard mayMatch(s) else { return false }
-        if let known = memo.answers.withLock({ $0[s] }) { return known }
-        let found = regex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
-        memo.answers.withLock { answers in
-            if answers.count >= 16384 { answers.removeAll(keepingCapacity: true) }
-            answers[s] = found
-        }
-        return found
+        return regex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
     }
 
     /// re.match: a match starting at the beginning.
