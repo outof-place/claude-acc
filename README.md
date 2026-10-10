@@ -250,6 +250,7 @@ Everything claude-acc knows about the IDE (where its accounts and settings live,
 | `claude-acc perf-root vnodes trial [--keep]` | Root: a bigger vnode cache, measured before and after; `vnodes apply --persist` keeps it across reboots |
 | `claude-acc perf-root spotlight apps-only\|undo` | Root: Spotlight indexes apps only; undo restores the previous privacy list |
 | `claude-acc perf-root iogpu set [MB]\|undo\|status` | Root: more memory for the GPU (`iogpu.wired_limit_mb`), so local models stay on Metal; kept across reboots, `status` without sudo |
+| `claude-acc rootd status` and the other `pod-rootctl` commands | In Pod: its root helper ([`docs/pod-rootd.md`](docs/pod-rootd.md)); there `perf-root` and `mac root-clean` go through it instead of the root copy under `sudo`, with Touch ID for system changes |
 | `claude-acc perf-root devtools add\|undo\|status` | Opens Developer Tools in System Settings and waits until Orca is on the list, so fresh Go test binaries skip Gatekeeper |
 | `claude-acc perf bench agents [--hours N]` | Where agents spend their time, from Claude Code transcripts (last day by default): model latency by context size, the floor of a Bash call, cache re-writes after idle gaps, tool turnaround and the hooks that cost the most, among those that print something ([why](#silent-hooks)) |
 | `claude-acc perf bench gatekeeper` | How long the first run of a freshly built binary waits for Gatekeeper from this terminal |

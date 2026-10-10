@@ -555,8 +555,10 @@ What has to land before it, or the migration leaves a feature without its daemon
 
 - Pod Menu talks to the helper: fan mode and the lid hold through `PodRootdClient`, fan readings from
   `SMCKit` (#110).
-- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, the root copy
-  otherwise (#113).
+- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there: `rootroute.py`
+  (the wrapper's `perf-root` and `mac root-clean` in Pod), ahead of 1.31.2's root copy
+  (`root-run.sh`), which stays the path when the helper doesn't answer or an old daemon still owns
+  the tweak (#113).
 - `hotspot.py` as the user with `pod-rootctl shaper follow`, and `hotspot` in `Engine.migrating`
   (#116).
 - Pod: the "Enable root helper" button opens the package (b2); `release.sh` signs `pod-rootd` and
