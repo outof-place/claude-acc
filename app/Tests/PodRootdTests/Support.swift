@@ -20,18 +20,22 @@ struct Rig {
 
     init(
         backend: FakeBackend = FakeBackend(), store: MemoryStateStore = MemoryStateStore(), clock: Clock = Clock(),
-        limits: [VerbKind: RateLimiter.Limit] = [:], updates: Bool = false
+        limits: [VerbKind: RateLimiter.Limit] = [:], updates: Bool = false, updateRunner: UpdateRunner = UpdateRunner(deadline: 2)
     ) {
         self.backend = backend
         self.store = store
         self.clock = clock
         self.updates = updates
-        engine = Engine(backend: backend, store: store, now: { clock.now }, limits: limits, updates: updates)
+        self.updateRunner = updateRunner
+        engine = Engine(
+            backend: backend, store: store, now: { clock.now }, limits: limits, updates: updates, updateRunner: updateRunner)
         engine.start()
     }
 
+    let updateRunner: UpdateRunner
+
     /// The same machine and state file after the helper restarted (a crash, an idle exit, an update).
-    func restarted() -> Rig { Rig(backend: backend, store: store, clock: clock, updates: updates) }
+    func restarted() -> Rig { Rig(backend: backend, store: store, clock: clock, updates: updates, updateRunner: updateRunner) }
 
     @discardableResult
     func send(_ verb: Verb, as caller: Caller = .menu, session: SessionID = SessionID(1)) -> Reply {
@@ -45,3 +49,9 @@ struct Rig {
 
 let fan50 = FanMode.fixed(FanPercent(unchecked: 50))
 let en0 = InterfaceName("en0")!
+
+/// Until `condition` holds or `seconds` go by, letting the main queue run what other queues hand it.
+func settled(_ condition: () -> Bool, seconds: Double = 3) async {
+    let end = Date.now.addingTimeInterval(seconds)
+    while !condition(), Date.now < end { try? await Task.sleep(for: .milliseconds(10)) }
+}
