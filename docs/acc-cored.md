@@ -341,6 +341,47 @@ Two timings change:
 - A running wrapper enforces `class_timeout_s` when it wakes, every 5 s. Its SIGKILL can come up to
   about 5 s later than with the wrapper's own 4 Hz loop.
 
+## The account switcher's tick
+
+launchd runs `acc.py accswitch tick` every 120 s. A tick reads every account's Keychain item (about 27
+`security` processes), often asks the usage API, and costs about 2.4 to 2.9 ms/s. Most ticks change
+nothing: while the active account carries, the tick reads the same cached usage and returns.
+
+`acc-cored run --accswitch` keeps launchd's 120 s slots, but a slot runs the tick only when that
+tick could do something the last one didn't:
+- **An input changed** since the last tick ended. The inputs are the login Keychain's file (its
+  stamp, never its contents), accswitch's config, pause, usage cache and state, the jobs' held
+  accounts, the host app's account list and its account selection (`orca-data.json`).
+- **The last tick wasn't quiet, or its deadline passed.** The tick computes that deadline itself,
+  with its own functions, and writes it to `state.json` as `tick_due`:
+  - The tick is quiet when the active account carries, or when the switcher stands aside (an
+    account selected in the host app, foreign data in the runtime).
+  - Its deadline is the earliest of three times: when the active account's cached reading stops
+    being enough (`active_max_age`), when the active token expires (the tick then waits for a
+    session, and refreshes it itself after 15 minutes), and the deadline of Depot's fast path.
+  - Every other tick leaves the next slot, as today.
+- **Eight minutes passed** since the last tick (`TICK_MAX_GAP`). The menu bar calls the switcher
+  silent after ten.
+
+acc-cored never reads, refreshes or copies credentials. The tick stays Python's.
+
+Some refreshes are the panel's: other accounts' readings after 30 minutes, and an idle account's
+token near its expiry. They can come up to eight minutes later than today. They change what the
+panel shows, not which account the switcher picks: when the switcher looks for another account it
+reads again anyway.
+
+### Shadow
+
+`acc-cored run --accswitch-shadow FILE` runs nothing. It watches launchd's own ticks: a tick starts
+with its `last_tick` write and ends with `status.json`. For each tick it records whether this
+schedule would have run it, and what the tick changed:
+- hard: its own log lines, the Keychain file, the pause file, the active account's reading, or
+  state other than the panel's caches;
+- soft: other accounts' readings, the profile cache and the fingerprints.
+
+A claude-acc without `tick_due` gets an estimate from the files: the active reading's expiry, and
+Depot's. The active token's expiry is not in any file, so the estimate cannot know it.
+
 ## Switching
 
 Not done by this branch. The plan:

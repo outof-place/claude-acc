@@ -1402,6 +1402,7 @@ def depot_sync(accounts, cfg, active, force=False):
     depot = depot_bin(cfg)
     if not depot:
         return None
+    _DEPOT_DUE["at"] = "slot"  # każda ścieżka poza szybką: następny przebieg, jak dotąd
     state = load_state()
     now = time.time()
     min_valid = cfg["depot_min_valid_hours"] * 3600
@@ -1410,6 +1411,11 @@ def depot_sync(accounts, cfg, active, force=False):
             and state.get("depot_expires_at", 0) - now > min_valid:
         data, _ = cached_usage(current, cfg, max_age=600, refresh=False)
         if data and has_room(data, cfg):
+            # ta ścieżka zmienia się, gdy token sandboxów straci zapas ważności albo odczyt
+            # konta sandboxów przestanie starczać (max_age wyżej)
+            hit = load_json(USAGE_CACHE_PATH, {}).get(current.email)
+            if hit:
+                _DEPOT_DUE["at"] = min(state.get("depot_expires_at", 0) - min_valid, hit["ts"] + 600)
             return current.email  # konto sandboxów niesie, token ważny: nic do roboty
 
     rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
@@ -2111,8 +2117,48 @@ def cmd_resume(cfg, _args):
     return 0
 
 
+# ---------- termin następnego przebiegu ----------
+#
+# acc-cored (natywny demon claude-acc, docs/acc-cored.md) może uruchamiać tick w tych samych
+# 2-minutowych slotach co launchd, ale tylko wtedy, gdy przebieg mógłby zrobić coś innego niż
+# poprzedni: zmienił się Pęk kluczy albo pliki, które tick czyta, minął termin, który tick sam
+# tu zapisał, albo od ostatniego przebiegu minęło TICK_MAX_GAP (panel w pasku menu uznaje
+# automat za żywy przez 10 minut). Spokojny przebieg (konto niesie, automat stoi przy koncie
+# wybranym w Orca albo obcym runtime) zapisuje w stanie tick_due z najbliższym terminem, po
+# którym jego wynik by się zmienił; każdy inny przebieg: następny slot, jak dotąd. launchd
+# niczego z tego nie czyta i dalej uruchamia tick co 2 minuty.
+TICK_MAX_GAP = 480
+_TICK_DUE = {"quiet": False, "at": None, "why": ""}
+_DEPOT_DUE = {"at": None}
+
+
+def quiet(at=None, why=""):
+    """Spokojny koniec przebiegu: bez zmian na wejściu następny zrobiłby to samo aż do `at`
+    (None: bez terminu, tylko zmiana na wejściu albo TICK_MAX_GAP)."""
+    _TICK_DUE.update(quiet=True, at=at, why=why)
+
+
+def quiet_active(cfg, active):
+    """Spokojny koniec z aktywnym kontem, które niesie. Wynik zmienia się, gdy odczyt limitów
+    w pamięci przestaje starczać (active_max_age), gdy token aktywnego konta wygaśnie (wtedy
+    tick czeka na sesję, a po kwadransie odświeża sam) i w terminie z szybkiej ścieżki Depot.
+    Bez odczytu w pamięci albo przy Depot poza szybką ścieżką: następny slot."""
+    hit = load_json(USAGE_CACHE_PATH, {}).get(active.email)
+    if not hit or _DEPOT_DUE["at"] == "slot":
+        return
+    terms = [(hit["ts"] + active_max_age(active, cfg), "odczyt limitów aktywnego konta")]
+    expires = active.oauth.get("expiresAt", 0) / 1000
+    if expires > time.time():
+        terms.append((expires, "token aktywnego konta wygasa"))
+    if _DEPOT_DUE["at"] is not None:
+        terms.append((_DEPOT_DUE["at"], "token albo konto sandboxów Depot"))
+    quiet(*min(terms))
+
+
 def cmd_tick(cfg, _args):
     """Jeden przebieg pilnowania. Uruchamiany przez launchd co 2 minuty."""
+    _TICK_DUE.update(quiet=False, at=None, why="")
+    _DEPOT_DUE["at"] = None
     try:  # baner, gdy tik jobów stoi: sprawdza go proces inny niż ten tik (jobs.py, same pliki)
         import jobs
         jobs.heartbeat_alarm()
@@ -2129,6 +2175,10 @@ def cmd_tick(cfg, _args):
     try:
         return tick(cfg, accounts)
     finally:
+        try:
+            update_state(tick_due=dict(_TICK_DUE))
+        except Exception as err:  # noqa: BLE001 - termin to wskazówka, przebieg ważniejszy
+            log(f"tick: zapis terminu nieudany: {err}")
         save_status(cfg, accounts)
 
 
@@ -2154,6 +2204,7 @@ def tick(cfg, accounts):
             log(f"tick: {HOST.name} ma wybrane konto {orca}, automat stoi, dopóki w {HOST.name} nie będzie System default")
             notify("Claude: automat wstrzymany", f"W {HOST.name} wybrane jest {orca}. Wybierz System default.")
             update_state(orca_notified=orca)
+        quiet(why=f"konto wybrane w {HOST.name}")
         return 0
     if load_state().get("orca_notified"):
         update_state(orca_notified=None)
@@ -2167,6 +2218,7 @@ def tick(cfg, accounts):
             log(f"tick: wpis runtime zawiera dane spoza {HOST.name}, nie przełączam")
             notify("Claude: nieznane konto", f"Runtime ma dane spoza {HOST.name}. Automat nic nie zmienia.")
             update_state(hands_off_notified=True)
+        quiet(why="obce dane w runtime")
         return 0
     if state.get("hands_off_notified"):
         update_state(hands_off_notified=False)
@@ -2197,9 +2249,11 @@ def tick(cfg, accounts):
         roomy = has_room(data, cfg)
     if roomy:
         end_pause(f"{active.email} ma znowu zapas")
+        quiet_active(cfg, active)
         return 0
     paused = os.path.exists(PAUSE_PATH)
     if carries and not paused:
+        quiet_active(cfg, active)
         return 0  # konto jeszcze niesie, nie ruszamy go
     # Kolejka z pamięci, a świeży odczyt tylko dla konta, na które naprawdę przechodzimy:
     # w pauzie i przy dobijaniu automat czytał wszystkie konta co dwie minuty, a zapas
