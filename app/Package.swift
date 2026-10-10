@@ -25,10 +25,16 @@ func infoPlist(_ target: String) -> [LinkerSetting] {
 let package = Package(
     name: "ClaudeAcc",
     platforms: [.macOS("26.0")],
+    dependencies: [
+        // claude-acc's state as Swift models; Pod Menu gives its views pod-rootd through AccRootHelper
+        .package(url: "https://github.com/outof-place/acc-kit", from: "0.7.0")
+    ],
     targets: [
         // the menu bar app
         .executableTarget(
-            name: "ClaudeAcc", dependencies: ["DictationCore", "PodRootdClient", "SMCKit"], path: "Sources/ClaudeAcc",
+            name: "ClaudeAcc",
+            dependencies: ["DictationCore", "PodRootdClient", "SMCKit", .product(name: "AccKit", package: "acc-kit")],
+            path: "Sources/ClaudeAcc",
             swiftSettings: settings),
         // dictation without AppKit: text rules, the AI Gateway client, audio math, the right ⌥ trigger
         .target(name: "DictationCore", path: "Sources/DictationCore", swiftSettings: core),
@@ -37,8 +43,9 @@ let package = Package(
             resources: [.copy("Fixtures")], swiftSettings: core),
         // the panel's own logic: what a state file or a script's answer means on screen
         .testTarget(
-            name: "ClaudeAccTests", dependencies: ["ClaudeAcc", "PodRootdCore"], path: "Tests/ClaudeAccTests",
-            swiftSettings: settings),
+            name: "ClaudeAccTests",
+            dependencies: ["ClaudeAcc", "PodRootdCore", .product(name: "AccKit", package: "acc-kit")],
+            path: "Tests/ClaudeAccTests", swiftSettings: settings),
         // fan control through the SMC; runs as a root LaunchDaemon, see install-fans.sh
         .executableTarget(name: "fanctl", dependencies: ["SMCKit"], path: "Sources/fanctl", swiftSettings: settings),
         // the SMC and the fans, for fanctl, pod-rootd and the panel (reading needs no root)
