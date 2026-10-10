@@ -1,3 +1,4 @@
+import AccKit
 import AppKit
 import Observation
 import ServiceManagement
@@ -92,6 +93,9 @@ final class Store {
     /// Launches, quits, System Settings leaving the front and display changes, while the panel is open.
     @ObservationIgnored private var panelObservers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
     @ObservationIgnored private var live: Task<Void, Never>?
+    /// While the panel is open, a write to one of `panelFiles` reads them at once (acc-kit's
+    /// AccFileWatch, one kqueue vnode per file); the 3 s tick only samples what has no file.
+    @ObservationIgnored private var fileWatch: AccFileWatch?
     /// The state files as last read: a file that didn't change costs one stat and wakes no view.
     @ObservationIgnored private var files: [String: StateFile] = [:]
     /// The newest readings while the panel is closed. The closed panel is still a live view
@@ -228,13 +232,8 @@ final class Store {
     /// panel closed only what the menu bar label needs is read, and kept back from the panel.
     func readLocal() {
         let live = panelOpen || isPreview
-        if RootHelper.shared.owns {
-            // Pod's root helper drives the fans; the readings come from the SMC in this app
-            if let fresh = RootHelper.shared.fanState, fresh.at != latestFan?.at {
-                latestFan = fresh
-                if live { fanState = latestFan }
-            }
-        } else if let data = changedFile(CLI.fanState) {
+        readSamples()
+        if !RootHelper.shared.owns, let data = changedFile(CLI.fanState) {
             latestFan = Self.decode(FanState.self, from: data)
             if live { fanState = latestFan }
         }
@@ -256,10 +255,6 @@ final class Store {
             let enabled = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["enabled"] as? Bool ?? false
             if enabled != hotspotConfigEnabled { hotspotConfigEnabled = enabled }
         }
-        // in Pod the controller is the user's agent and the root helper sets the limit
-        let installed = FileManager.default.fileExists(atPath: CLI.hotspotDaemon)
-            || (PodMenu.active && FileManager.default.isExecutableFile(atPath: CLI.directory + "/pod-rootctl"))
-        if installed != hotspotInstalled { hotspotInstalled = installed }
         if let data = changedFile(CLI.schedState) {
             sched = Self.decode(SchedState.self, from: data)
         }
@@ -278,13 +273,48 @@ final class Store {
         if let data = changedFile(CLI.desktopPanel) {
             desktop = Self.decode(DesktopPanel.self, from: data)
         }
-        let level = Self.kernelMemoryLevel()
-        if level != memoryLevel { memoryLevel = level }
         if let data = changedFile(CLI.perfState) {
             ultra = Self.decode(PerfFile.self, from: data)?.ultra
         }
         if let mode = guardModeOverride, mode == guardState?.snapshot?.mode { guardModeOverride = nil }
+    }
+
+    /// What has no state file to follow: the root helper's SMC readings, the kernel's memory level,
+    /// whether the hotspot controller is installed, and free disk space (at most once a minute).
+    func readSamples() {
+        let live = panelOpen || isPreview
+        if RootHelper.shared.owns {
+            // Pod's root helper drives the fans; the readings come from the SMC in this app
+            if let fresh = RootHelper.shared.fanState, fresh.at != latestFan?.at {
+                latestFan = fresh
+                if live { fanState = latestFan }
+            }
+        }
+        guard live else { return }
+        // in Pod the controller is the user's agent and the root helper sets the limit
+        let installed = FileManager.default.fileExists(atPath: CLI.hotspotDaemon)
+            || (PodMenu.active && FileManager.default.isExecutableFile(atPath: CLI.directory + "/pod-rootctl"))
+        if installed != hotspotInstalled { hotspotInstalled = installed }
+        let level = Self.kernelMemoryLevel()
+        if level != memoryLevel { memoryLevel = level }
         refreshDisk()
+    }
+
+    /// The state files `readLocal` reads while the panel is open. The scripts write each one
+    /// atomically; the scheduler's every second while builds run, which the 1 s tick used to chase.
+    static let panelFiles: [String] = [
+        CLI.fanState, CLI.guardState, CLI.janitorState, CLI.hotspotState, CLI.hotspotConfig, CLI.schedState,
+        CLI.depotState, CLI.updatesState, CLI.mailPanel, CLI.browserPanel, CLI.desktopPanel, CLI.perfState,
+    ]
+
+    private func followPanelFiles() {
+        guard fileWatch == nil else { return }
+        let watch = AccFileWatch(queue: DispatchQueue(label: "claude-acc.panel-files"), window: .milliseconds(150)) {
+            [weak self] _ in
+            Task { @MainActor [weak self] in self?.readLocal() }
+        }
+        watch.watch(Set(Self.panelFiles.map { URL(fileURLWithPath: $0) }))
+        fileWatch = watch
     }
 
     /// Free space for important use is what Finder shows, and asking for it takes 15-58 ms
@@ -370,16 +400,17 @@ final class Store {
         let age = Date.now.timeIntervalSince1970 - (snapshot?.generatedAt ?? 0)
         if age > 30 { Task { await refresh() } }
         observeWhilePanelOpen()
+        readLocal()
+        followPanelFiles()
         live?.cancel()
         live = Task { [weak self] in
             while !Task.isCancelled {
-                self?.readLocal()
+                self?.readSamples()
                 self?.sampleLoad()
                 self?.syncDepot()
                 self?.syncBrowser()
                 self?.syncDesktop()
-                // the scheduler rewrites its state every second while builds run
-                try? await Task.sleep(for: .seconds(self?.sched?.busy == true ? 1 : 3))
+                try? await Task.sleep(for: .seconds(3))
             }
         }
     }
@@ -457,6 +488,8 @@ final class Store {
         RootHelper.shared.panelOpen = false
         live?.cancel()
         live = nil
+        fileWatch?.cancel()
+        fileWatch = nil
         for (center, token) in panelObservers { center.removeObserver(token) }
         panelObservers = []
     }
@@ -468,7 +501,7 @@ final class Store {
     private func observeWhilePanelOpen() {
         guard panelObservers.isEmpty else { return }
         let workspace = NSWorkspace.shared.notificationCenter
-        let app: (Notification) -> String? = {
+        let app: @Sendable (Notification) -> String? = {
             ($0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier?.lowercased()
         }
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
