@@ -1,13 +1,13 @@
 {
-  "originHash" : "a26178746b0a7536ca5a5b889aa518e6a263ffe50e883f068b213362c802cb1c",
+  "originHash" : "f009ccdfe126c832cf77b62b265bab4eb88c3ae523d3175172946effa0dd4732",
   "pins" : [
     {
       "identity" : "acc-kit",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/outof-place/acc-kit",
       "state" : {
-        "revision" : "e290571ca84920c05f8de850df31f0f1a506ea53",
-        "version" : "0.8.3"
+        "revision" : "128824f013167bbf1255b0a358abb140d8e57b25",
+        "version" : "0.8.4"
       }
     }
   ],
