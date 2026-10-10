@@ -1,8 +1,8 @@
 # pod-rootd: one root helper for Pod
 
 pod-rootd replaces claude-acc's five root LaunchDaemons and its `sudo` scripts with one
-privileged helper. Pod.app ships it, `SMAppService` registers it as a launch daemon, and clients
-reach it over XPC. The helper accepts a fixed set of typed verbs. It runs no shell, takes no free
+privileged helper. Pod.app ships it inside a signed installer package that puts it in root-only
+paths as a launch daemon, and clients reach it over XPC. The helper accepts a fixed set of typed verbs. It runs no shell, takes no free
 paths and never executes a binary it was handed.
 
 Status: design plus the first implementation (this branch). Nothing is installed by the build or
@@ -53,6 +53,7 @@ reaches the engine is already valid.
 | `legacy.migrate` | none | the five `com.filip.claude-acc.*` daemons | bootout system jobs, move their plists | `legacy`: per label present/migrated |
 | `legacy.rollback` | none | same | same | same |
 | `restoreDefaults` | none | `install-fans.sh --uninstall`, `hotspot.py uninstall`, every `undo` | all of the above | every section back to its default |
+| `helper.uninstall` | none | removing the five daemons by hand | `restoreDefaults`, then the package's files in `/Library`, `pkgutil --forget`, its own `launchctl bootout` | `helperVersion` |
 | `status` | none | `fanctl read`, `hotspot.py status`, `perf-root.sh * status` | none (one place to read) | everything above |
 
 ### Ranges
@@ -172,14 +173,24 @@ Docs used (ctx7, `/websites/developer_apple_servicemanagement`, `/websites/devel
 `/websites/developer_apple_kernel`, `/websites/developer_apple_iokit`, `/electron/electron`), plus
 the Xcode 27 SDK interfaces for exact Swift signatures where the docs only had the C side:
 
-- SMAppService: `daemon(plistName:)` ("must correspond to a property list in the calling app's
-  Contents/Library/LaunchDaemons directory"), `register()` ("the system bootstraps it after admin
-  approval in System Preferences and on each subsequent boot"), `unregister()` (terminates a running
-  daemon), `Status.requiresApproval` (also returned when the user revokes consent),
-  `openSystemSettingsLoginItems()`;
-  developer.apple.com/documentation/servicemanagement/smappservice.
-- `BundleProgram` "relative to the bundle, such as Contents/Resources/mydaemon";
+- SMAppService: `statusForLegacyPlist(at:)` for "apps that don't use the new bundle structure",
+  `openSystemSettingsLoginItems()`, `Status.requiresApproval` (also returned when the user switches
+  the helper off); `AssociatedBundleIdentifiers` ("If an app installs a legacy property list, the
+  property list needs to include the AssociatedBundleIdentifiers key with a value of the app's
+  bundle identifier", and the `Program`'s team must match the app's);
   developer.apple.com/documentation/servicemanagement/updating-helper-executables-from-earlier-versions-of-macos.
+- `NSUpdateSecurityPolicy` ("For signed apps, macOS allows apps from the same developer — those
+  sharing the same Team ID — to modify the app's bundle");
+  developer.apple.com/documentation/bundleresources/information-property-list/nsupdatesecuritypolicy.
+- `SecStaticCodeCreateWithPath`, `SecStaticCodeCheckValidityWithErrors` (TN3127),
+  `kSecCSStrictValidate`, `kSecCSCheckAllArchitectures`, `kSecCodeInfoPList` ("the secured Info.plist
+  as seen by code signing") in the SDK's `SecStaticCode.h` and `SecCode.h`.
+- Developer ID Installer: "Sign and distribute a Mac Installer Package, containing your signed app,
+  outside the Mac App Store"; developer.apple.com/help/account/certificates/certificates-overview.
+  `stapler` takes flat installer packages; `notarytool submit --wait`.
+- Homebrew's Cask Cookbook (`pkg` "must always be accompanied by `uninstall`", the uninstall keys and
+  their order, `auto_updates`) and the FAQ on self-updating casks; docs.brew.sh. The `pkg` artifact
+  runs `/usr/sbin/installer -pkg … -target /` through `sudo` (Homebrew's `cask/artifact/pkg.rb`).
 - `XPCListener.init(service:targetQueue:options:requirement:incomingSessionHandler:)` and
   `XPCSession.init(machService:targetQueue:options:requirement:...)`;
   developer.apple.com/documentation/xpc/xpclistener, .../xpc/xpcsession.
@@ -193,43 +204,46 @@ the Xcode 27 SDK interfaces for exact Swift signatures where the docs only had t
 - `sysctlbyname`: "newp ... Requires root-level privileges"; developer.apple.com/documentation/kernel/1387446-sysctlbyname.
 - `IOServiceOpen`, `IOConnectCallStructMethod`; developer.apple.com/documentation/iokit. The SMC
   selector and key layout are not Apple API; they stay as `fanctl` has used them.
-- Electron `app.setLoginItemSettings`/`getLoginItemSettings` with `type: 'daemonService'`, `serviceName`
-  the plist name, status `not-registered`/`enabled`/`requires-approval`/`not-found`.
 
 Not found in the docs, so not relied on: an IOPMAssertion page (power assertions stay in Pod Menu,
 no root needed), a public API for `SleepDisabled` and `powermode` (`IOPMSetSystemPowerSetting` and
 `IOPMSetPMPreferences` are exported by IOKit.tbd but declared in no public header, so the helper runs
 `/usr/bin/pmset` with fixed arguments instead of calling SPI), and the `ifconfig tbr` ioctl
 (`SIOCSIFLINKPARAMS` is private; the helper runs `/sbin/ifconfig` with a validated interface and rate).
-`SpawnConstraint` was found later, see [A tampered helper](#a-tampered-helper).
+`SpawnConstraint` was found later, see [Why a package](#why-a-package-a-tampered-helper).
 
 The helper executes only these Apple binaries, each with an argument vector built from enums and
 validated numbers through `posix_spawn` (no shell): `/usr/bin/pmset`, `/sbin/ifconfig`,
-`/usr/bin/mdutil`, `/bin/launchctl`, all on the sealed system volume. It never runs
+`/usr/bin/mdutil`, `/bin/launchctl`, `/usr/sbin/pkgutil` (`--forget` at uninstall), all on the sealed
+system volume. It never runs
 `/usr/bin/python3` (as root that is the xcrun shim, which can lead into a user-owned Xcode), Homebrew,
 anything under `$STATE` or in `/Applications`. Everything else is a syscall or a framework call:
 `sysctlbyname`, IOKit (SMC, `IOPMrootDomain`, IOPS), `proc_listallpids`/`proc_pid_rusage`, `kill`,
 `PropertyListSerialization`, `rename`/`unlink` with symlink checks.
 
-## Bundle and plist layout
+## Install layout
 
-| Item | Name | Where in Pod.app |
+Pod.app stays a drag-installed bundle that belongs to the user and updates itself (ShipIt). The
+helper doesn't run from it: Pod's signed package installs it outside the bundle, in directories that
+only root can write.
+
+| Path | Owner, mode | What |
 |---|---|---|
-| helper | `pod-rootd`, signing identifier `codes.pod.rootd` | `Contents/Resources/claude-acc/pod-rootd` (next to `pod-acc-run`) |
-| CLI | `pod-rootctl`, signing identifier `codes.pod.rootctl` | `Contents/Resources/claude-acc/pod-rootctl` |
-| plist | `codes.pod.app.rootd.plist` | `Contents/Library/LaunchDaemons/codes.pod.app.rootd.plist` |
-| Mach service and label | `codes.pod.app.rootd` | |
-| state | `/var/db/codes.pod.app.rootd/state.json` (root, 0600) | outside the bundle |
+| `/Library/PrivilegedHelperTools/codes.pod.app.rootd` | root:wheel 0755 | the helper, signing identifier `codes.pod.rootd` |
+| `/Library/LaunchDaemons/codes.pod.app.rootd.plist` | root:wheel 0644 | the job |
+| `/var/db/codes.pod.app.rootd/` | root 0700 | state, the old daemons' plists after `legacy.migrate`, the Pod.app the package came from (`app`) |
+| receipt `codes.pod.rootd.pkg` | | for `pkgutil --forget` and the cask's `uninstall` |
+| Pod.app `Contents/Resources/claude-acc/` | the user's | `pod-rootd` (the update source, never started by launchd), `pod-rootctl`, `pod-rootd.pkg` |
 
-The payload carries the plist as `LaunchDaemons/codes.pod.app.rootd.plist` (from
-`launchd/codes.pod.app.rootd.plist`); Pod's `extraFiles` put it in `Contents/Library/LaunchDaemons`.
-Both binaries embed an `__info_plist` section with their `CFBundleIdentifier`, so `codesign` keeps the
-identifier whoever signs them.
+Both system directories are `root:wheel` and `drwxr-xr-x` (`PrivilegedHelperTools` also has the
+sticky bit), so a process of an admin user can't write them. The program and the job are named after
+the service (`<Pod's bundle id>.rootd`), so another Pod build gets its own.
 
 ```xml
 <key>Label</key><string>codes.pod.app.rootd</string>
-<key>BundleProgram</key><string>Contents/Resources/claude-acc/pod-rootd</string>
-<key>ProgramArguments</key><array><string>pod-rootd</string></array>
+<key>Program</key><string>/Library/PrivilegedHelperTools/codes.pod.app.rootd</string>
+<key>ProgramArguments</key><array><string>codes.pod.app.rootd</string></array>
+<key>AssociatedBundleIdentifiers</key><array><string>codes.pod.app</string></array>
 <key>MachServices</key><dict><key>codes.pod.app.rootd</key><true/></dict>
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -241,13 +255,42 @@ identifier whoever signs them.
 </dict>
 ```
 
+- `AssociatedBundleIdentifiers`: Login Items lists the helper under Pod, with its switch.
+- `SpawnConstraint`: launchd kills anything at that path that isn't `codes.pod.rootd` of Pod's team
+  before it runs. With the program in a root-only directory this is defence in depth.
 - `RunAtLoad`: at boot the helper puts back what the kernel forgot (persisted sysctls, a fixed fan
   setting) and starts fsguard if it is on. That is what the vnodes and iogpu one-shots did.
-- `KeepAlive` on a crash only: a crash under a fixed fan setting must not leave the 95 °C rule
-  unattended. With nothing to watch (fans on auto, no lease, fsguard off, no sessions for 60 s) the
-  helper exits 0 and launchd starts it again on the next connection.
-- SIGTERM (reboot, unregister, Login Items switch) hands the fans back to macOS, drops the lid hold
+- `KeepAlive` on a non-zero exit only: a crash under a fixed fan setting must not leave the 95 °C
+  rule unattended, and a self-update exits with `EX_TEMPFAIL` to get the new binary started. With
+  nothing to watch (fans on auto, no lease, fsguard off, no sessions for 60 s) the helper exits 0 and
+  launchd starts it again on the next connection.
+- SIGTERM (reboot, bootout, the Login Items switch) hands the fans back to macOS, drops the lid hold
   and session-scoped shaper limits, and keeps the persisted state for the next start.
+- The helper takes its service name from its own file name (`<app id>.rootd`); both binaries embed an
+  `__info_plist` with `CFBundleIdentifier` and `CFBundleVersion`, so `codesign` keeps the identifier
+  and binds the version whoever signs them.
+
+### The package
+
+`scripts/rootd-pkg.sh --binary pod-rootd --version N --out pod-rootd.pkg [--sign IDENTITY]` (the
+payload carries it in `rootd/`, next to the job's plist):
+
+- `pkgbuild --root <dir> --identifier codes.pod.rootd.pkg --version N --scripts <dir> --ownership
+  recommended --install-location /`, then `productbuild --package`, with `--sign` when given. The
+  PackageInfo says `relocatable="false"`, `auth="root"` and `overwrite-permissions="true"`, so the
+  payload's directories carry macOS's own modes (0755, and 1755 for `PrivilegedHelperTools`).
+- `preinstall`: `launchctl bootout system/codes.pod.app.rootd`, a failure ignored.
+- `postinstall`: when the package was opened from inside a Pod.app (`$1` ends in
+  `.app/Contents/Resources/claude-acc/pod-rootd.pkg`), that app's path goes to
+  `/var/db/codes.pod.app.rootd/app`; then `launchctl bootstrap system
+  /Library/LaunchDaemons/codes.pod.app.rootd.plist`.
+- Pod's `release.sh` builds it with the release's `pod-rootd`, signs it with
+  `productbuild --sign "Developer ID Installer: OUTOFPLACE POLAND SP. Z O.O (75Y2KR6P5W)"`, submits
+  it with `notarytool submit --wait`, staples it, and ships it as
+  `Contents/Resources/claude-acc/pod-rootd.pkg` and as a release asset for the cask.
+- The tests build it unsigned and read it back (`pkgutil --expand-full`, `lsbom`); nothing installs
+  it. The files' `com.apple.provenance` shows up in the Bom as `._` entries, which Installer folds
+  back into extended attributes (the expanded payload has no `._` files).
 
 ## Restart safety
 
@@ -272,12 +315,17 @@ The file is written atomically (temporary file, `fsync`, `rename`) in a root-onl
 
 ## Uninstall and restore
 
-`restoreDefaults` (Pod calls it before `SMAppService.unregister()`, `pod-rootctl restore` does it
-by hand) puts every section back: fans to auto, `SleepDisabled` off if we set it, each sysctl back to
-its saved original, the shaper back to the rate before (or none), the Spotlight list back to the
-saved one, the power mode back to its original, fsguard off. It clears the persisted state, so a
-later start changes nothing. A sysctl the kernel resets at boot anyway is still set back, so the
-change does not wait for a reboot.
+`restoreDefaults` (`pod-rootctl restore`) puts every section back: fans to auto, `SleepDisabled` off
+if we set it, each sysctl back to its saved original, the shaper back to the rate before (or none),
+the Spotlight list back to the saved one, the power mode back to its original, fsguard off. It clears
+the persisted state, so a later start changes nothing. A sysctl the kernel resets at boot anyway is
+still set back, so the change does not wait for a reboot.
+
+`helper.uninstall` (tier B: Pod Menu on a click, `pod-rootctl uninstall` with Touch ID, the cask's
+`early_script`) runs `restoreDefaults` first; if any part of it fails, nothing is removed. Then it
+removes the job's plist, the program, `state.json` and `app`, runs `pkgutil --forget
+codes.pod.rootd.pkg`, replies, and at the next tick runs `launchctl bootout` of its own job, which ends
+it. The old daemons' plists stay in `/var/db/codes.pod.app.rootd/legacy` for a rollback by hand.
 
 Switching the helper off in Login Items stops it with SIGTERM: fans, lid and session limits go back
 at once and the sysctls at the next boot, but the Spotlight list and the power mode stay. Pod shows
@@ -310,34 +358,95 @@ sysctls cleared, fsguard off), each saved plist goes back to `/Library/LaunchDae
 0644 and `launchctl bootstrap system` starts it. A later cleanup (after a few releases) can remove
 `/usr/local/libexec/claude-acc-{fanctl,fsguard,hotspot}` and the backups.
 
-## Approval UX
+## Installing and removing it
 
-Registering is an explicit user gesture in Pod's own UI (an "Enable root helper" button next to
-the root features), never automatic and never from a URL scheme. Pod Menu and AccKit only say where
-to turn it on when the helper doesn't answer.
+Installing is an explicit user gesture in Pod's own UI (an "Enable root helper" button next to the
+root features), never automatic and never from a URL scheme. Pod Menu and AccKit only say where to
+turn it on when the helper doesn't answer.
 
-1. Pod reads the status: `SMAppService.daemon(plistName: "codes.pod.app.rootd.plist").status`
-   (native shell) or `app.getLoginItemSettings({type: 'daemonService', serviceName:
-   'codes.pod.app.rootd.plist'})` (Electron).
-2. `.notRegistered`: on that click Pod calls `register()`. A daemon is not started until an admin
-   approves it, so the status becomes `.requiresApproval`.
-3. `.requiresApproval`: a card says what the helper does and that Pod lists it under Login Items >
-   Allow in the Background, with one button: `SMAppService.openSystemSettingsLoginItems()`. While
-   the card shows (and when Pod becomes active) Pod reads the status again every 2 s.
-4. `.enabled`: Pod connects, and if any of the five old plists exist, offers `legacy.migrate`.
-5. `.notFound`: the bundle lacks the plist; Pod reports a damaged install.
+1. Pod reads the status: `SMAppService.statusForLegacyPlist(at: /Library/LaunchDaemons/
+   codes.pod.app.rootd.plist)` (`PodRootdService.step`, `pod-rootctl service status`) and whether
+   the helper answers.
+2. `.notRegistered` or `.notFound` (step `install`): on that click Pod opens the bundled
+   `pod-rootd.pkg` (`shell.openPath`, `NSWorkspace.open`, `pod-rootctl service install`). Installer
+   checks the signature and the notarization and asks for an administrator. Pod registers nothing.
+3. `.requiresApproval` (step `approve`): the helper is installed but switched off in Login Items. A
+   card says what it does, with one button: `SMAppService.openSystemSettingsLoginItems()`.
+4. `.enabled` (step `ready`): Pod connects, and if any of the five old plists exist, offers
+   `legacy.migrate`.
 
-The same status a user who revoked consent sees (`requiresApproval`) brings back the same card.
-`PodRootdService` in `PodRootdClient` wraps these calls for the native shell; Electron uses the API
-above (the register call must come from Pod.app's main process: `daemon(plistName:)` resolves the
-plist in the calling app's bundle, so Pod Menu and `pod-rootctl` cannot register it).
+The docs I found don't say whether macOS also asks to approve an admin-installed legacy daemon
+before it first runs; the first real install shows it, and step 3 covers it either way.
+
+Through Homebrew, an optional cask next to `pod`, in outof-place/homebrew-tap:
+
+```ruby
+cask "pod-rootd" do
+  version "0.1.0"
+  sha256 "<sha256 of pod-rootd-#{version}.pkg>"
+  url "https://github.com/outof-place/pod/releases/download/v#{version}/pod-rootd-#{version}.pkg"
+  name "Pod root helper"
+  desc "Privileged helper for Pod: fans, Stay Awake with the lid closed, sysctls, uplink shaper"
+  homepage "https://pod.codes"
+  auto_updates true
+  depends_on cask: "pod"
+  pkg "pod-rootd-#{version}.pkg"
+  uninstall early_script: {
+              executable: "/Applications/Pod.app/Contents/Resources/claude-acc/pod-rootctl",
+              args:       ["uninstall"],
+            },
+            launchctl:    "codes.pod.app.rootd",
+            pkgutil:      "codes.pod.rootd.pkg"
+end
+```
+
+- `brew install --cask pod-rootd` runs `/usr/sbin/installer -pkg … -target /` through `sudo`, so it
+  asks for the password in the terminal.
+- The version is Pod's release version, because the package is built with each release.
+  `auto_updates true` keeps `brew upgrade` away: the helper updates itself, and for a package
+  Homebrew can't compare versions, which per its FAQ means it "normally skips the self-updating cask".
+- `uninstall` runs `early_script` before `launchctl`. That order matters, because SIGTERM keeps the
+  persisted settings. `launchctl` and `pkgutil` then clean up when the helper is already gone.
+
+## Updates
+
+- **Pod.app**: unchanged. electron-updater and ShipIt swap the user-owned bundle with no prompt. The
+  `pod` cask keeps `app "Pod.app"` and `auto_updates true`.
+- **The helper** updates itself from Pod.app, with no prompt and no package per release. After a
+  message from Pod or Pod Menu, at most once an hour per process (the CLI's messages don't count):
+  1. The candidates are `Contents/Resources/claude-acc/pod-rootd` in the app the package was opened
+     from (`/var/db/codes.pod.app.rootd/app`), then in `/Applications/Pod.app`. Nothing in a message
+     names a path, and only a helper running as its installed program updates.
+  2. The helper copies a candidate, opened with `O_NOFOLLOW`, a regular file of at most 64 MB, into
+     `/Library/PrivilegedHelperTools/.codes.pod.app.rootd.new` (`HelperFiles.stage`). Nothing but
+     root can change that copy after the check.
+  3. It checks the copy with `SecStaticCodeCheckValidityWithErrors` (`kSecCSStrictValidate`,
+     `kSecCSCheckAllArchitectures`) against `anchor apple generic and certificate leaf[subject.OU] =
+     "75Y2KR6P5W" and identifier "codes.pod.rootd" and notarized`. The `notarized` clause holds for a
+     binary nested in a notarized app (checked with `codesign --verify -R` on a nested Mach-O of a
+     notarized app; an ad hoc build fails it).
+  4. It reads the copy's `CFBundleVersion` from the Info.plist its signature binds
+     (`kSecCodeInfoPList`). Only a higher version than its own goes on, so a genuine older build
+     can't be swapped back in. The version is the app's build number (`app/Info.plist`); a test keeps
+     the two equal, so every release bump moves both.
+  5. It renames the copy over its program, persists state and exits with `EX_TEMPFAIL`; `KeepAlive`
+     starts the new binary. A lid hold stays on through the restart (see Restart safety).
+
+  The job's plist changes only with a new package. A release that needs a different plist has Pod
+  offer "Update root helper", which opens the bundled package: one administrator prompt.
 
 ## Signing
 
-Both binaries: Developer ID Application, team 75Y2KR6P5W, hardened runtime (`--options runtime`),
-secure timestamp, no entitlements (the helper is not sandboxed; IOKit's AppleSMC user client,
-sysctl, `posix_spawn` and the files it writes need none). Identifiers `codes.pod.rootd` and
-`codes.pod.rootctl`; pass `--identifier` explicitly when re-signing.
+Both binaries: Developer ID Application, team 75Y2KR6P5W, hardened runtime with library validation
+(`--options runtime,library`), secure timestamp, no entitlements (the helper is not sandboxed;
+IOKit's AppleSMC user client, sysctl, `posix_spawn` and the files it writes need none). Identifiers
+`codes.pod.rootd` and `codes.pod.rootctl`; pass `--identifier` explicitly when re-signing. The app is
+notarized with them inside, which is what the self-update's `notarized` clause checks.
+
+The package: Developer ID Installer of the same team ("Sign and distribute a Mac Installer Package,
+containing your signed app, outside the Mac App Store"), then notarized and stapled. The release
+keychain holds only the Developer ID Application identity today; the Account Holder creates the
+Installer one.
 
 The helper's peer requirement (`PeerPolicy.production`) checks more than team and identifier:
 
@@ -359,11 +468,11 @@ hardened runtime, not library validation.
 Pod's Electron binary keeps RunAsNode on (its terminal daemon needs it), which is why
 `codes.pod.app` gets tier A only (see [Tiers](#tiers)).
 
-## A tampered helper
+## Why a package: a tampered helper
 
-`/Applications/Pod.app` belongs to the user when it was dragged there, so
-`Contents/Resources/claude-acc/pod-rootd` is writable without root. The question is whether launchd
-runs a swapped BundleProgram as root.
+`/Applications/Pod.app` belongs to the user when it was dragged there, so a helper started from inside
+it could be swapped without root. That is why launchd runs the package's copy in
+`/Library/PrivilegedHelperTools` instead.
 
 Tested on macOS 27 in a scratch folder as the user (nothing registered, `scripts/rootd-tamper-kit.sh`
 and the commands in this section). Binaries were signed with an Apple Development certificate of team
@@ -386,196 +495,72 @@ the key (`LAUNCH_JOBKEY_SPAWNCONSTRAINT` in `launch.h`), and `codesign` takes th
 format. The helper's plist therefore carries `SpawnConstraint` = `{team-identifier: 75Y2KR6P5W,
 signing-identifier: codes.pod.rootd}`: a replaced pod-rootd is killed before it runs as root.
 
-The plist lives in the same writable bundle, and editing it breaks the app's seal. What isn't
-proven yet is whether launchd/BTM validates the bundle, or keeps its own copy of the plist from
-registration, before it honours `SpawnConstraint`. Proving it takes a registered daemon, which is
-the user's system. `scripts/rootd-tamper-kit.sh DIR IDENTITY` builds two throwaway apps, one
-daemon with the constraint and one without, and prints the steps (register, approve, kickstart,
-swap, kickstart, read the log, drop the constraint, reboot). Run them on a scratch Mac or VM. Until
-they pass, this is a cutover blocker. If the edited plist wins, the fallback is to install the
-helper itself from a `.pkg` into root-only paths, see
-[Option: install the helper with a .pkg](#option-install-the-helper-with-a-pkg).
+So the kernel does not stop a swapped binary that carries a valid signature of its own, ad hoc
+included. A launch constraint does stop it, which is why the job carries `SpawnConstraint`
+(developer.apple.com/documentation/security/applying-launch-environment-and-library-constraints:
+"Spawn constraints for launchd daemons and agents are not embedded in the code signature ... add the
+constraint to the `SpawnConstraint` key in the launchd property list"; `LAUNCH_JOBKEY_SPAWNCONSTRAINT`
+in the SDK's `launch.h`). With a job in the user's bundle, an edited plist could drop the constraint,
+and whether launchd/BTM would notice was never proven. With the job and the program in root-only
+directories the question doesn't come up. `scripts/rootd-tamper-kit.sh` builds the throwaway apps for
+that test; it is informative now, not a blocker.
+
+Two cheaper ideas don't close the hole:
+
+- A root-owned Pod.app: `/Applications` is `root:admin` `drwxrwxr-x` without the sticky bit, so any
+  process of an admin user can rename the bundle aside and put another one at the same path.
+- App Management: macOS lets apps of the same team modify the bundle (`NSUpdateSecurityPolicy`), and
+  agents run as Pod's children.
+
+The whole app as a package would also break Pod's updates. ShipIt can't write a root-owned bundle, so
+Squirrel.Mac takes its privileged path (`launchPrivileged:` with `AuthorizationCreate` and
+`SMJobSubmit`, both in Electron 43.7.5's `Squirrel.framework`; the SDK marks `SMJobSubmit` deprecated
+since 10.10, "will be removed in a future release"): an administrator prompt at every update, if it
+works on macOS 27 at all, for every user, including those who never turn the helper on.
 
 pod-rootd also checks its own signature at start (`anchor apple generic`, team 75Y2KR6P5W,
 identifier `codes.pod.rootd`) and exits without touching anything otherwise. That catches an ad hoc
-or unsigned build registered by mistake. It can't stop a replacement, which simply won't contain
-the check.
-
-## Option: install the helper with a .pkg
-
-Not built yet; written up so the choice between this and a VM run of the tamper kit is concrete.
-
-Making the whole Pod.app root-owned does not close the hole. `/Applications` is `root:admin`
-`drwxrwxr-x` without the sticky bit, so any process of an admin user can rename a root-owned
-`Pod.app` aside and put another one at the same path. Whether BTM then runs the new bundle's
-`BundleProgram` is the same unproven question. App Management doesn't help either: "For signed
-apps, macOS allows apps from the same developer — those sharing the same Team ID — to modify the
-app's bundle" (`NSUpdateSecurityPolicy`), and agents run as Pod's children.
-
-So the package installs only the helper, outside the bundle, in directories that only root can
-write. Pod.app stays a drag-installed, user-owned bundle that updates itself as it does today.
-
-### Install layout
-
-| Path | Owner, mode | What |
-|---|---|---|
-| `/Library/PrivilegedHelperTools/codes.pod.rootd` | root:wheel 0755 | the helper, the same binary and signature as now |
-| `/Library/LaunchDaemons/codes.pod.app.rootd.plist` | root:wheel 0644 | the job |
-| `/var/db/codes.pod.app.rootd/` | root 0700 | state, unchanged |
-| receipt `codes.pod.rootd.pkg` | | for `pkgutil` and the cask's `uninstall` |
-
-Both directories are `root:wheel drwxr-xr-x`, so an admin user's process can't write them. The
-plist differs from the bundle one in two keys: `Program` =
-`/Library/PrivilegedHelperTools/codes.pod.rootd` replaces `BundleProgram`, and
-`AssociatedBundleIdentifiers` = `[codes.pod.app]` is added. Apple: "If an app installs a legacy
-property list, the property list needs to include the AssociatedBundleIdentifiers key with a
-value of the app's bundle identifier", and the `Program`'s team must match the app's. Label,
-`MachServices`, `RunAtLoad`, `KeepAlive`, `ProcessType` and `SpawnConstraint` stay. The constraint
-now guards a root-owned path, so it is defence in depth rather than the only barrier.
-
-`pod-rootctl` stays in Pod.app: it is an unprivileged client and the helper checks its signature.
-The `pod-rootd` copy inside Pod.app stays too. launchd never starts it; it is the update source.
-
-### The package
-
-- `pkgbuild --root <dir> --identifier codes.pod.rootd.pkg --version <helper version> --scripts
-  <dir>` with the two files above.
-- `preinstall`: `launchctl bootout system/codes.pod.app.rootd`, a failure ignored.
-- `postinstall`: `launchctl bootstrap system /Library/LaunchDaemons/codes.pod.app.rootd.plist`.
-- `productbuild --sign "Developer ID Installer: OUTOFPLACE POLAND SP. Z O.O (75Y2KR6P5W)"`, then
-  `notarytool submit --wait` and `stapler staple` (stapler takes flat installer packages).
-- Pod's `release.sh` builds it, because the signature needs the release Mac's keychain. It ships
-  as `Contents/Resources/claude-acc/pod-rootd.pkg` and as a release asset for the cask.
-
-Prerequisite: a **Developer ID Installer** certificate. Apple's certificate list says it is for
-"Sign and distribute a Mac Installer Package, containing your signed app, outside the Mac App
-Store". The release keychain holds only the Developer ID Application identity. As with that one,
-the Account Holder has to create it.
-
-### Installing and removing it
-
-- **In Pod**: "Enable root helper" opens the bundled package in Installer.app (`shell.openPath`, or
-  `NSWorkspace.open` in the native shell). Installer checks the signature and the notarization and
-  asks for an administrator. There is no `register()`. The status comes from
-  `SMAppService.statusForLegacyPlist(at:)` on the plist path, which Apple documents for helpers
-  outside the bundle, and from `pod-rootctl status`. Login Items lists the helper under Pod with
-  the usual switch. The docs I found don't say whether macOS also asks to approve an admin-installed
-  legacy daemon; check that at the first real install.
-- **Through brew**: an optional cask next to `pod`, in outof-place/homebrew-tap.
-  `brew install --cask pod-rootd` runs `/usr/sbin/installer -pkg … -target /` through `sudo`, so it
-  asks for the password in the terminal (Homebrew's pkg artifact has `requires_sudo? = true`).
-
-  ```ruby
-  cask "pod-rootd" do
-    version "0.1.0"
-    sha256 "<sha256 of pod-rootd-#{version}.pkg>"
-    url "https://github.com/outof-place/pod/releases/download/v#{version}/pod-rootd-#{version}.pkg"
-    name "Pod root helper"
-    desc "Privileged helper for Pod: fans, Stay Awake with the lid closed, sysctls, uplink shaper"
-    homepage "https://pod.codes"
-    auto_updates true
-    depends_on cask: "pod"
-    pkg "pod-rootd-#{version}.pkg"
-    uninstall early_script: {
-                executable: "/Applications/Pod.app/Contents/Resources/claude-acc/pod-rootctl",
-                args:       ["uninstall"],
-              },
-              launchctl:    "codes.pod.app.rootd",
-              pkgutil:      "codes.pod.rootd.pkg"
-  end
-  ```
-
-  The version is Pod's release version, because the package is built with each release.
-  `auto_updates true` keeps `brew upgrade` away: the helper updates itself (below), and for a
-  package Homebrew can't compare versions, which per its FAQ means it "normally skips the
-  self-updating cask". `uninstall` runs `early_script` before `launchctl`. That order matters,
-  because SIGTERM keeps persisted settings. `launchctl` and `pkgutil` then clean up when the helper
-  is already gone.
-- **Removing**: a new tier B verb, `helper.uninstall`. It runs `restoreDefaults`, removes the plist,
-  the binary and the state directory, runs `/usr/sbin/pkgutil --forget codes.pod.rootd.pkg`, then
-  `launchctl bootout system/codes.pod.app.rootd`, which ends the helper. Pod Menu, `pod-rootctl
-  uninstall` and the cask call it. Pod's Electron process can't, being tier A only.
-
-### Updates
-
-- **Pod.app**: unchanged. electron-updater and ShipIt swap the user-owned bundle with no prompt.
-  The `pod` cask keeps `app "Pod.app"` and `auto_updates true`.
-- **The helper** updates itself from the Pod.app next to it, with no prompt and no package per
-  release. After a session from `codes.pod.app` or Pod Menu opens (at most once an hour):
-  1. The candidate is `Contents/Resources/claude-acc/pod-rootd` in `/Applications/Pod.app`, or in
-     the app the package was opened from (`postinstall` records it). Nothing in a message names a
-     path.
-  2. The helper copies the candidate with `O_NOFOLLOW`, 64 MB at most, into
-     `/Library/PrivilegedHelperTools/.codes.pod.rootd.new`. That copy can't change after the check.
-  3. It checks the copy with `SecStaticCodeCheckValidityWithErrors` (`kSecCSStrictValidate`,
-     `kSecCSCheckAllArchitectures`) against `anchor apple generic and certificate leaf[subject.OU]
-     = "75Y2KR6P5W" and identifier "codes.pod.rootd" and notarized`. The `notarized` clause holds
-     for a binary nested in a notarized app (checked with `codesign --verify -R` on a nested Mach-O
-     of a notarized app; an ad hoc build fails it).
-  4. It reads the copy's `CFBundleVersion` from its `__info_plist`. Only a higher version than its
-     own goes on, so a genuine older build can't be swapped back in.
-  5. It renames the copy over `codes.pod.rootd`, persists state and exits with a non-zero status.
-     `KeepAlive` = `{SuccessfulExit: false}` then starts the new binary.
-
-  The plist changes only with a new package. A release that needs a different plist has Pod offer
-  "Update root helper", which opens the bundled package: one administrator prompt.
-
-### The whole app as a .pkg (not recommended)
-
-- It doesn't close the hole (the rename above).
-- ShipIt can't write a root-owned bundle. Squirrel.Mac then takes its privileged path:
-  `launchPrivileged:` with `AuthorizationCreate` and `SMJobSubmit`, both in Electron 43.7.5's
-  `Squirrel.framework`. The SDK marks `SMJobSubmit` deprecated since 10.10, "will be removed in a
-  future release". So that means an administrator prompt on every update, if the path still works
-  on macOS 27, which is unproven. Pod's serve-update handoff is built on the unprivileged ShipIt
-  swap.
-- Every user pays an administrator prompt at install and at each update, including those who
-  never turn the helper on. There is no drag install, and the cask moves from `app` to `pkg` with
-  `sudo` on every upgrade.
-
-### What changes in this branch if the package is chosen
-
-- `launchd/codes.pod.app.rootd.plist`: `Program` and `AssociatedBundleIdentifiers` instead of
-  `BundleProgram`. The bundle variant goes.
-- `PodRootdService`: status from `statusForLegacyPlist(at:)`, install by opening the package, no
-  `register()`/`unregister()`.
-- The engine: the self-update steps and `helper.uninstall`, tested against the fake backend
-  (version order, symlinked candidate, copy before check, check failure leaves the live binary).
-- The Pod side (b2): the button opens the package instead of `setLoginItemSettings`.
-- Packaging (nt-packaging): the Installer identity and the `pkgbuild`/`productbuild`/notarize step.
-- The tamper kit stops being a blocker, because no launchd job points into a writable path.
-  Verbs, tiers, the peer requirement, the migration from the five root daemons and the restore
-  stay as they are.
+or unsigned build installed by mistake.
 
 ## Cutover
 
-Nothing in this branch registers or installs anything. The real cutover is a manual step with the
-user present (Login Items approval, Touch ID); the command list goes to the lead with the PR.
+Nothing in this branch installs anything. The first install is a manual step with the user present
+(Installer's administrator prompt, Touch ID for the CLI); the command list goes to the lead with the
+PR.
 
 What has to land before it, or the migration leaves a feature without its daemon:
 
-- Pod Menu talks to the helper: fan mode and the lid hold through `PodRootdClient` (one client
-  kept while Stay Awake with the lid closed is on), fan readings from `SMCKit` instead of
-  `fans-state.json`. Until then the old fans daemon is what follows `fans.json` and `awake.json`.
-- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, `sudo` otherwise.
-- `hotspot.py` as the user with `pod-rootctl shaper follow`, then `hotspot` joins `Engine.migrating`.
-- Pod registers the daemon as `daemonService` and signs both binaries (see Signing). The payload
-  carries `pod-rootd`, `pod-rootctl` and `LaunchDaemons/codes.pod.app.rootd.plist`
-  (`scripts/payload.sh`). With `--pod-agents`, `setup.sh` links `$STATE/pod-rootctl` when the owner
-  app has the helper: `claude-acc rootd ...` runs it, and `claude-acc fans install` points there.
-- The tampered-helper steps above pass, or the helper ships as a `.pkg` (see the option above).
+- Pod Menu talks to the helper: fan mode and the lid hold through `PodRootdClient`, fan readings from
+  `SMCKit` (#110).
+- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, the root copy
+  otherwise (#113).
+- `hotspot.py` as the user with `pod-rootctl shaper follow`, and `hotspot` in `Engine.migrating`
+  (#116).
+- Pod: the "Enable root helper" button opens the package (b2); `release.sh` signs `pod-rootd` and
+  `pod-rootctl` with `--options runtime,library`, builds the package with `rootd/rootd-pkg.sh`, signs
+  it with the Developer ID Installer identity, notarizes and staples it, and ships it in
+  `Contents/Resources/claude-acc/` and as a release asset (nt-packaging). With `--pod-agents`,
+  `setup.sh` links `$STATE/pod-rootctl` when the owner app carries it: `claude-acc rootd ...` runs it,
+  and `claude-acc fans install` points there.
+- The Developer ID Installer certificate exists (the Account Holder's step).
 
 ## Code
 
-- `app/Sources/PodRootdProtocol`: verbs, validated parameter types, replies, status, names.
-- `app/Sources/PodRootdClient`: `PodRootdClient` (XPC session, async calls, leases) and
-  `PodRootdService` (SMAppService status, register, open Login Items). Also exported from the
-  repository's root `Package.swift`, so Pod can depend on it by URL.
+- `app/Sources/PodRootdProtocol`: verbs, validated parameter types, replies, status, names and the
+  install layout.
+- `app/Sources/PodRootdClient`: `PodRootdClient` (XPC session, async calls, leases; letting go of it
+  cancels the session) and `PodRootdService` (`statusForLegacyPlist`, the package's place in Pod.app,
+  Login Items). Also exported from the repository's root `Package.swift`, so Pod can depend on it by
+  URL.
 - `app/Sources/PodRootdCore`: the engine (policy, rate limits, state, leases, fan safety, fsguard
-  logic, migration, restore) against a `Backend` protocol; `FakeBackend` for tests and `--fake`.
+  logic, migration, restore, self-update, uninstall) against a `Backend` protocol; `FakeBackend` for
+  tests and `--fake`; `HelperFiles` for the self-update's copy.
 - `app/Sources/SMCKit`: the SMC and fan code, shared by `fanctl`, the helper and Pod Menu.
 - `app/Sources/pod-rootd`: the listener and the real backend.
-- `app/Sources/pod-rootctl`: the CLI for scripts (`status`, every verb, `shaper follow`).
+- `app/Sources/pod-rootctl`: the CLI for scripts (`status`, every verb, `shaper follow`, `uninstall`,
+  `service status|install|open-settings`).
 - `app/Tests/PodRootdTests`: validation, peer rejection, the tier table and the CLI's approval
-  grace, idempotency, rate limits, leases, restart, migration and restore against the fake backend.
+  grace, idempotency, rate limits, leases, restart, migration, restore, self-update and uninstall
+  against the fake backend, the staging copy against real files.
+- `scripts/rootd-pkg.sh` and `tests/test_rootd_pkg.py`: the package and its layout.
 - `scripts/rootd-tamper-kit.sh`: the throwaway apps for the tampered-helper test.

@@ -20,6 +20,8 @@ public enum Verb: Codable, Hashable, Sendable {
     case legacyMigrate
     case legacyRollback
     case restoreDefaults
+    /// `restoreDefaults`, then the package's files and receipt go and the helper boots itself out.
+    case helperUninstall
 
     /// Stable name for logs and the CLI.
     public var name: String {
@@ -41,6 +43,7 @@ public enum Verb: Codable, Hashable, Sendable {
         case .legacyMigrate: "legacy.migrate"
         case .legacyRollback: "legacy.rollback"
         case .restoreDefaults: "restoreDefaults"
+        case .helperUninstall: "helper.uninstall"
         }
     }
 
@@ -69,7 +72,7 @@ public enum Verb: Codable, Hashable, Sendable {
         case .shaperSet, .shaperClear: .shaper
         case .fsguardSet: .config
         case .sysctlSet, .sysctlReset, .spotlightAppsOnly, .spotlightRestore, .launchdParkOrphans,
-             .logsPruneDiagnostics, .legacyMigrate, .legacyRollback, .restoreDefaults:
+             .logsPruneDiagnostics, .legacyMigrate, .legacyRollback, .restoreDefaults, .helperUninstall:
             .system
         }
     }

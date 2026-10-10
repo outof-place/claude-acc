@@ -2,6 +2,8 @@
 /// seconds since 1970.
 public struct Status: Codable, Hashable, Sendable {
     public var version = PodRootd.protocolVersion
+    /// The running helper's CFBundleVersion, bound to its signature; a self-update takes only a higher one.
+    public var helperVersion: String?
     public var fans = FansStatus()
     public var lid = LidStatus()
     public var power = PowerStatus()

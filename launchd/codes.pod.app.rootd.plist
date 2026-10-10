@@ -3,10 +3,17 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>codes.pod.app.rootd</string>
-  <key>BundleProgram</key><string>Contents/Resources/claude-acc/pod-rootd</string>
+  <!-- Pod's package installs this as /Library/LaunchDaemons/codes.pod.app.rootd.plist, root:wheel 0644,
+       and the program next to it in root-only /Library/PrivilegedHelperTools (docs/pod-rootd.md) -->
+  <key>Program</key><string>/Library/PrivilegedHelperTools/codes.pod.app.rootd</string>
   <key>ProgramArguments</key>
   <array>
-    <string>pod-rootd</string>
+    <string>codes.pod.app.rootd</string>
+  </array>
+  <!-- Login Items lists it under Pod; the program's team must be Pod's -->
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>codes.pod.app</string>
   </array>
   <key>MachServices</key>
   <dict>

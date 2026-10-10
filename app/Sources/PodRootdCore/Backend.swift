@@ -74,6 +74,28 @@ public protocol Backend: AnyObject {
     /// Moves the plist aside into the helper's directory, or back to /Library/LaunchDaemons.
     func moveLegacyPlist(_ daemon: LegacyDaemon, aside: Bool) throws
     func bootstrap(_ daemon: LegacyDaemon) throws
+
+    // MARK: The package's install (docs/pod-rootd.md, "Updates")
+
+    /// The running helper's CFBundleVersion, as its signature binds it.
+    var ownVersion: String? { get }
+    /// Copies of pod-rootd in Pod.app that may be newer: fixed places, never a path from a message.
+    func updateCandidates() -> [String]
+    /// Copies a candidate (no symlink, a regular file, at most 64 MB) into the root-only directory
+    /// next to the installed helper; the copy's path. The check that follows reads this copy, which
+    /// nothing but root can change.
+    func stageUpdate(from candidate: String) throws -> String
+    /// The copy's CFBundleVersion when it is Pod's notarized helper (team, identifier, notarized,
+    /// every architecture valid); nil otherwise.
+    func verifiedVersion(ofStaged path: String) -> String?
+    /// Renames the checked copy over the installed helper.
+    func installUpdate(_ staged: String) throws
+    func discardUpdate(_ staged: String)
+    /// The job's plist, the program, the state files and the package receipt; the old daemons'
+    /// backups stay.
+    func removeInstall() throws
+    /// `launchctl bootout` of the helper's own job: launchd ends this process.
+    func bootoutSelf()
 }
 
 public struct FanSnapshot: Sendable, Equatable {
