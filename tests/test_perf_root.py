@@ -208,6 +208,33 @@ class SudoUserTest(unittest.TestCase):
         self.assertEqual(done.stdout.count("\n"), 1, done.stdout)  # jedna linia, bez przejścia do accswitch
         self.assertTrue(done.stdout.startswith("strażnik fseventsd:"), done.stdout)
 
+    def test_fsguard_status_wants_a_root_interpreter_with_isolation(self):
+        """Tylko interpreter roota z -I jest dobrym startem; /usr/bin/python3 (zaślepka do Xcode'a
+        użytkownika), brak -I albo interpreter użytkownika to przeinstalowanie."""
+        path, _ = self.wrapper()
+        plist = os.path.join(self.tmp, "fsguard.plist")
+        with open(path) as f:
+            text = f.read().replace("/Library/LaunchDaemons/com.filip.claude-acc.fsguard.plist", plist)
+        with open(path, "w") as f:
+            f.write(text)
+        mine = os.path.join(self.tmp, "python3")
+        shutil.copy("/bin/sh", mine)  # plik użytkownika, nie roota
+        cases = [
+            (["/bin/sh", "-I", "/usr/local/libexec/claude-acc-fsguard"], True),  # root:wheel
+            (["/usr/bin/python3", "-I", "/usr/local/libexec/claude-acc-fsguard"], False),
+            (["/bin/sh", "/usr/local/libexec/claude-acc-fsguard"], False),
+            ([mine, "-I", "/usr/local/libexec/claude-acc-fsguard"], False),
+            (["/usr/local/libexec/claude-acc-fsguard"], False),  # sprzed 1.31.1: #!/usr/bin/python3
+        ]
+        for argv, good in cases:
+            with self.subTest(argv=argv):
+                with open(plist, "wb") as f:
+                    plistlib.dump({"Label": "com.filip.claude-acc.fsguard", "ProgramArguments": argv}, f)
+                done = subprocess.run(["/bin/sh", path, "fsguard", "status"], env=self.env(uid=501),
+                                      capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual("przeinstaluj" not in done.stdout, good, done.stdout)
+
     def test_root_outside_the_root_copy_is_refused(self):
         """perf-root.sh i janitor-root.sh z katalogu źródeł pod rootem: odmowa, zanim cokolwiek zmienią."""
         for script, args in (("perf-root.sh", ["spotlight", "apps-only"]), ("janitor-root.sh", [])):

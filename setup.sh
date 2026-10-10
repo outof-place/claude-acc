@@ -284,10 +284,14 @@ case "$1" in
         PLIST=/Library/LaunchDaemons/com.filip.claude-acc.fsguard.plist
         if [ ! -f "$PLIST" ]; then echo "strażnik fseventsd: nie zainstalowany (claude-acc fsguard install)"; exit 0; fi
         first="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null || true)"
-        case "$first" in
-          */python3) echo "strażnik fseventsd: zainstalowany, startuje przez $first -I" ;;
-          *) echo "strażnik fseventsd: startuje przez /usr/bin/python3 (zaślepka do Xcode'a użytkownika); przeinstaluj: claude-acc fsguard install" ;;
-        esac
+        flag="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$PLIST" 2>/dev/null || true)"
+        # dobry start to interpreter roota z -I (rootpy.py), nigdy zaślepka /usr/bin/python3: ta idzie
+        # do wybranego Xcode'a, a Xcode z DMG należy do użytkownika
+        if [ "$first" != /usr/bin/python3 ] && [ "$flag" = -I ] && [ "$(stat -f %u "$first" 2>/dev/null)" = 0 ]; then
+          echo "strażnik fseventsd: zainstalowany, startuje przez $first -I"
+        else
+          echo "strażnik fseventsd: startuje przez ${first:-?} (nie interpreter roota z -I); przeinstaluj: claude-acc fsguard install"
+        fi
         exit 0 ;;
     esac ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
