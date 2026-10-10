@@ -52,6 +52,9 @@ public final class Engine {
     private var cooledUntil: Double?
     private var lastRelease: String?
 
+    /// When each CLI parent last authenticated a tier B verb (the grace window).
+    private var approvals: [String: Double] = [:]
+
     /// Session-scoped upload limits and the session that owns each.
     private var shaperOwners: [String: SessionID] = [:]
 
@@ -199,8 +202,10 @@ public final class Engine {
         let outcome: Outcome
         if !verb.isValid {
             outcome = .refused(.invalid("a parameter is out of range"))
-        } else if !policy.permits(verb.kind, for: caller) {
+        } else if !policy.permits(verb.tier, for: caller) {
             outcome = .refused(.verbNotAllowed(verb: verb.name, caller: caller))
+        } else if !approved(request, from: caller) {
+            outcome = .refused(.needsApproval(verb: verb.name))
         } else if let after = limiter.take(verb.kind, for: caller, now: now()) {
             outcome = .refused(.rateLimited(retryAfter: after))
         } else {
@@ -214,6 +219,21 @@ public final class Engine {
             Log.verb.notice("\(caller.rawValue, privacy: .public) \(session.description, privacy: .public) \(verb.summary, privacy: .public) -> \(line, privacy: .public)")
         }
         return Reply(outcome, status: status())
+    }
+
+    /// Tier B from a caller that needs an approval: authenticated in this request (which starts the
+    /// grace for its parent), or within the grace for the same parent. The CLI's signed code is what
+    /// builds the approval; nothing else can send as the CLI.
+    private func approved(_ request: Request, from caller: Caller) -> Bool {
+        guard request.verb.tier == .b, policy.approvalNeeded.contains(caller) else { return true }
+        let t = now()
+        approvals = approvals.filter { t - $0.value <= policy.grace }
+        guard let approval = request.approval, !approval.parent.isEmpty else { return false }
+        if approval.authenticated {
+            approvals[approval.parent] = t
+            return true
+        }
+        return approvals[approval.parent] != nil
     }
 
     static func describe(_ outcome: Outcome) -> String {

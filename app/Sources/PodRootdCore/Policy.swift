@@ -2,20 +2,27 @@ import LightweightCodeRequirements
 import PodRootdProtocol
 import XPC
 
-/// Who may send which kind of verb. System verbs go only to Pod Menu and the CLI: the CLI asks for
-/// Touch ID before one, and the Electron main process stays off them until its Node fuses are known
-/// to be off (docs/pod-rootd.md, "Signing").
+/// Who may send which tier (docs/pod-rootd.md, "Tiers"). Pod's Electron process runs its helpers
+/// with ELECTRON_RUN_AS_NODE, so the RunAsNode fuse stays on and any local process can run Pod's
+/// signed binary as Node: it gets tier A only. `pod-rootctl` can be run by anything, so its tier B
+/// needs an approval; Pod Menu's tier B comes from a click.
 public struct VerbPolicy: Sendable {
-    public var allowed: [VerbKind: Set<Caller>]
+    public var allowed: [VerbTier: Set<Caller>]
+    /// Callers whose tier B needs an `Approval`: authenticated now, or within `grace` for the same parent.
+    public var approvalNeeded: Set<Caller>
+    public var grace: Double
 
-    public init(allowed: [VerbKind: Set<Caller>]) { self.allowed = allowed }
+    public init(allowed: [VerbTier: Set<Caller>], approvalNeeded: Set<Caller>, grace: Double) {
+        self.allowed = allowed
+        self.approvalNeeded = approvalNeeded
+        self.grace = grace
+    }
 
-    public static let standard = VerbPolicy(allowed: Dictionary(uniqueKeysWithValues: VerbKind.allCases.map {
-        ($0, $0 == .system ? [.menu, .cli] : Set(Caller.allCases))
-    }))
+    public static let standard = VerbPolicy(
+        allowed: [.a: [.app, .menu, .cli], .b: [.menu, .cli]], approvalNeeded: [.cli], grace: 5 * 60)
 
-    public func permits(_ kind: VerbKind, for caller: Caller) -> Bool {
-        allowed[kind]?.contains(caller) ?? false
+    public func permits(_ tier: VerbTier, for caller: Caller) -> Bool {
+        allowed[tier]?.contains(caller) ?? false
     }
 }
 

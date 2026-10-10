@@ -27,7 +27,8 @@ let usage = """
       service open-settings                     System Settings at Login Items
 
     Options: --json (the helper's whole reply), --app-id <bundle id> (another Pod build).
-    System verbs (sysctl, spotlight, launchd, logs, legacy, restore) ask for Touch ID first.
+    Tier B (everything but status, fans and lid) asks for Touch ID, once per run; within 5 minutes
+    the same parent (shell, script) doesn't ask again.
     Exit: 0 done, 1 refused or failed, 2 usage, 69 helper unreachable.
     """
 
@@ -157,12 +158,26 @@ if case .openSettings = command {
     exit(0)
 }
 
-/// sudo asked for a password or Touch ID before every root change; a system verb still does.
+/// Who ran this command, for the helper's 5-minute grace: the session, the parent pid with its start
+/// time (a reused pid is another parent) and the terminal. A script started from the same shell is
+/// another parent, so it gets no grace from the shell's Touch ID.
+func parentKey() -> String {
+    let parent = getppid()
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    let started = proc_pidinfo(parent, PROC_PIDTBSDINFO, 0, &info, size) == size ? info.pbi_start_tvsec : 0
+    let tty = ttyname(0).map { String(cString: $0) } ?? "-"
+    return "sid=\(getsid(0)) ppid=\(parent)@\(started) tty=\(tty)"
+}
+
+/// sudo asked for a password or Touch ID before a root change; a tier B verb still does, once per run.
+var authenticated = false
+
 func authenticate(for verb: Verb) async {
-    guard verb.kind == .system else { return }
     let context = LAContext()
     do {
         _ = try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "change the system: \(verb.summary)")
+        authenticated = true
     } catch {
         fail("authentication: \(error.localizedDescription)", code: 1)
     }
@@ -206,17 +221,26 @@ do {
     fail("cannot reach \(PodRootd.serviceName(appIdentifier: appIdentifier)): \(error)", code: 69)
 }
 
+/// Tier B goes with an approval; the helper answers needsApproval when the grace doesn't cover it,
+/// and then Touch ID decides.
 func send(_ verb: Verb) async -> Reply {
-    do {
-        return try await client.send(verb)
-    } catch {
-        fail("\(PodRootd.serviceName(appIdentifier: appIdentifier)) did not answer (not approved in Login Items, or not running): \(error)", code: 69)
+    let parent = parentKey()
+    func attempt() async -> Reply {
+        let approval = verb.tier == .b ? Approval(authenticated: authenticated, parent: parent) : nil
+        do {
+            return try await client.send(verb, approval: approval)
+        } catch {
+            fail("\(PodRootd.serviceName(appIdentifier: appIdentifier)) did not answer (not approved in Login Items, or not running): \(error)", code: 69)
+        }
     }
+    let reply = await attempt()
+    guard case .needsApproval? = reply.refusal, !authenticated else { return reply }
+    await authenticate(for: verb)
+    return await attempt()
 }
 
 switch command {
 case .verb(let verb):
-    await authenticate(for: verb)
     exit(show(await send(verb), verb: verb))
 
 case .hold(let seconds):

@@ -83,15 +83,20 @@ func admittedPeer() async throws {
     #expect(try await wire.client.status().fans.applied == fan50)
 }
 
-@Test("Pod's main process is kept off system verbs; Pod Menu and the CLI may send them")
-func systemVerbsByCaller() async throws {
+@Test("over XPC: Electron Pod gets tier A only, Pod Menu tier B on a click, the CLI tier B only approved")
+func tiersByCaller() async throws {
     let app = try Wire(peers: try admitting(as: .app))
     defer { app.close() }
     #expect(try await app.client.send(.spotlightAppsOnly).refusal == .verbNotAllowed(verb: "spotlight.appsOnly", caller: .app))
     #expect(try await app.client.send(.fansSet(mode: .auto)).refusal == nil)
+    let menu = try Wire(peers: try admitting(as: .menu))
+    defer { menu.close() }
+    #expect(try await menu.client.send(.spotlightAppsOnly).refusal == nil)
     let cli = try Wire(peers: try admitting(as: .cli))
     defer { cli.close() }
-    #expect(try await cli.client.send(.spotlightAppsOnly).refusal == nil)
+    #expect(try await cli.client.send(.spotlightRestore).refusal == .needsApproval(verb: "spotlight.restore"))
+    let approved = Approval(authenticated: true, parent: "sid=1 ppid=2@3 tty=ttys001")
+    #expect(try await cli.client.send(.spotlightRestore, approval: approved).refusal == nil)
 }
 
 @Test("closing the client ends its lid hold: a quit or crashed Pod Menu can't keep the Mac from sleeping")

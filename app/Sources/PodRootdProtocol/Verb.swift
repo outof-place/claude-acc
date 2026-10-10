@@ -74,6 +74,17 @@ public enum Verb: Codable, Hashable, Sendable {
         }
     }
 
+    /// Tier A is harmless and rate-limited: anyone admitted may send it, no prompt. Tier B changes the
+    /// system: Pod Menu sends it on a click (the click is the consent), `pod-rootctl` only with an
+    /// approval (Touch ID, or a grace of 5 minutes for the same parent), Pod's Electron process never
+    /// (docs/pod-rootd.md, "Tiers").
+    public var tier: VerbTier {
+        switch self {
+        case .status, .fansSet, .lidHold, .lidRelease: .a
+        default: .b
+        }
+    }
+
     /// Every bounded parameter within its range. Decoding guarantees it; a verb built in code with
     /// `init(unchecked:)` might not.
     public var isValid: Bool {
@@ -90,25 +101,45 @@ public enum Verb: Codable, Hashable, Sendable {
     }
 }
 
-/// Verb classes for the rate limits and the per-caller policy.
+public enum VerbTier: String, Codable, Sendable, CaseIterable {
+    case a
+    case b
+}
+
+/// Verb classes for the rate limits.
 public enum VerbKind: String, Codable, Sendable, CaseIterable {
     case read
     case fans
     case power
     case shaper
     case config
-    /// Changes to the system beyond fans and power: only Pod Menu and the CLI (which asks for Touch
-    /// ID first) may send them.
     case system
+}
+
+/// What `pod-rootctl` says about the person behind a tier B verb. Only the CLI's own signed code
+/// builds it, so the helper can trust it: `authenticated` after a LocalAuthentication approval in this
+/// invocation, `parent` names the process that ran the CLI (session, parent pid and its start, tty)
+/// for the grace window.
+public struct Approval: Codable, Hashable, Sendable {
+    public var authenticated: Bool
+    public var parent: String
+
+    public init(authenticated: Bool, parent: String) {
+        self.authenticated = authenticated
+        self.parent = parent
+    }
 }
 
 /// One message to the helper.
 public struct Request: Codable, Hashable, Sendable {
     public var version: Int
     public var verb: Verb
+    /// Only from `pod-rootctl`, for tier B.
+    public var approval: Approval?
 
-    public init(_ verb: Verb, version: Int = PodRootd.protocolVersion) {
+    public init(_ verb: Verb, approval: Approval? = nil, version: Int = PodRootd.protocolVersion) {
         self.version = version
         self.verb = verb
+        self.approval = approval
     }
 }

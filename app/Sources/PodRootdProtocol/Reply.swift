@@ -47,6 +47,8 @@ public enum Refusal: Error, Codable, Hashable, Sendable, CustomStringConvertible
     /// The sender matched none of the allowed signing identities.
     case peerNotAllowed
     case verbNotAllowed(verb: String, caller: Caller)
+    /// A tier B verb from the CLI without a fresh approval: authenticate and send it again.
+    case needsApproval(verb: String)
     case rateLimited(retryAfter: Double)
     /// The request did not decode, or a parameter is outside what this Mac allows.
     case invalid(String)
@@ -60,6 +62,7 @@ public enum Refusal: Error, Codable, Hashable, Sendable, CustomStringConvertible
         switch self {
         case .peerNotAllowed: "caller not allowed"
         case .verbNotAllowed(let verb, let caller): "\(verb) is not allowed for \(caller.rawValue)"
+        case .needsApproval(let verb): "\(verb) needs your approval (Touch ID)"
         case .rateLimited(let after): "rate limited, retry in \(Int(after.rounded(.up))) s"
         case .invalid(let why): "invalid: \(why)"
         case .versionMismatch(let helper): "protocol version mismatch (helper speaks \(helper))"

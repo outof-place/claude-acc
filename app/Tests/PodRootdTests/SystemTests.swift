@@ -63,20 +63,6 @@ func ifconfigTbr() {
     #expect(SystemText.tbr("") == nil)
 }
 
-@Test("the policy: system verbs for Pod Menu and the CLI only, the rest for all three")
-func verbPolicy() {
-    let policy = VerbPolicy.standard
-    for kind in VerbKind.allCases {
-        #expect(policy.permits(kind, for: .menu))
-        #expect(policy.permits(kind, for: .cli))
-        #expect(policy.permits(kind, for: .app) == (kind != .system))
-    }
-    #expect(Verb.restoreDefaults.kind == .system)
-    #expect(Verb.legacyMigrate.kind == .system)
-    #expect(Verb.fansSet(mode: .auto).kind == .fans)
-    #expect(Verb.lidHold(seconds: LidSeconds(60)!).kind == .power)
-}
-
 @Test("old reports go, new ones and everything behind a link stay; a dry run only counts")
 func pruneOldFiles() throws {
     let fm = FileManager.default

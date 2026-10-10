@@ -39,7 +39,12 @@ public final class PodRootdClient: Sendable {
     /// One verb; a refusal comes back in the reply, not as an error. Errors are the transport's
     /// (helper not running, not approved, not ours).
     public func send(_ verb: Verb) async throws -> Reply {
-        let request = Request(verb)
+        try await send(verb, approval: nil)
+    }
+
+    /// With the CLI's approval for a tier B verb; from any other caller the helper ignores it.
+    public func send(_ verb: Verb, approval: Approval?) async throws -> Reply {
+        let request = Request(verb, approval: approval)
         return try await withCheckedThrowingContinuation { continuation in
             do {
                 try session.send(request) { (result: Result<Reply, any Error>) in
