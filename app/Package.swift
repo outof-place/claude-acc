@@ -43,7 +43,8 @@ let package = Package(
             resources: [.copy("Fixtures")], swiftSettings: core),
         // the panel's own logic: what a state file or a script's answer means on screen
         .testTarget(
-            name: "ClaudeAccTests", dependencies: ["ClaudeAcc", .product(name: "AccKit", package: "acc-kit")],
+            name: "ClaudeAccTests",
+            dependencies: ["ClaudeAcc", "PodRootdCore", .product(name: "AccKit", package: "acc-kit")],
             path: "Tests/ClaudeAccTests", swiftSettings: settings),
         // fan control through the SMC; runs as a root LaunchDaemon, see install-fans.sh
         .executableTarget(name: "fanctl", dependencies: ["SMCKit"], path: "Sources/fanctl", swiftSettings: settings),

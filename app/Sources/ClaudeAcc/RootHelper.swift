@@ -19,6 +19,8 @@ final class RootHelper {
     private(set) var fanState: FanState?
 
     @ObservationIgnored private let appIdentifier: String?
+    /// Opens the session in tests (an anonymous listener); nil: the helper's Mach service.
+    @ObservationIgnored private let connector: (() throws -> PodRootdClient)?
     @ObservationIgnored private var client: PodRootdClient?
     @ObservationIgnored private var ticker: Task<Void, Never>?
     @ObservationIgnored private var fans: Fans?
@@ -28,15 +30,25 @@ final class RootHelper {
     @ObservationIgnored private var lidWanted: Date?
     @ObservationIgnored private var lidSentAt: Date?
     @ObservationIgnored private var lidSentFor: Date?
-    @ObservationIgnored var panelOpen = false
+    /// A lid sync is running; another asked for meanwhile runs right after it.
+    @ObservationIgnored private var lidBusy = false
+    @ObservationIgnored private var lidAgain = false
+    /// Failed status reads in a row, and when the next may go. The helper is opt-in, so on most Macs
+    /// nothing answers, and a new XPC session every 5 s forever would be waste.
+    @ObservationIgnored private var failures = 0
+    @ObservationIgnored private var retryAt = -Double.infinity
+    @ObservationIgnored var panelOpen = false {
+        didSet { if panelOpen, !oldValue { retryAt = -.infinity } }  // opening the panel tries again now
+    }
 
     /// A hold is renewed this often, so a hold without an end outlasts the helper's 24 h cap.
     private static let lidRenew: TimeInterval = 30 * 60
     private static let sampleEvery: Duration = .seconds(5)
 
-    init(appIdentifier: String?) {
+    init(appIdentifier: String?, connector: (() throws -> PodRootdClient)? = nil, ticking: Bool = true) {
         self.appIdentifier = appIdentifier
-        guard appIdentifier != nil else { return }
+        self.connector = connector
+        guard appIdentifier != nil || connector != nil, ticking else { return }
         fans = (try? SMC()).map(Fans.init)
         ticker = Task { [weak self] in
             while !Task.isCancelled {
@@ -59,7 +71,14 @@ final class RootHelper {
 
     /// Fan mode as the card picks it: "auto" or a percent.
     func setFans(_ mode: String) async -> String? {
-        let wanted: FanMode = mode == "auto" ? .auto : .fixed(FanPercent(Int(mode) ?? 100) ?? FanPercent(unchecked: 100))
+        let wanted: FanMode
+        if mode == "auto" {
+            wanted = .auto
+        } else if let percent = Int(mode).flatMap({ FanPercent($0) }) {
+            wanted = .fixed(percent)
+        } else {
+            return "\(mode) is not auto or 30-100%"
+        }
         guard let client = connect() else { return "Pod's root helper doesn't answer" }
         do {
             let reply = try await client.send(.fansSet(mode: wanted))
@@ -108,10 +127,11 @@ final class RootHelper {
 
     // MARK: Loop
 
-    private func tick() async {
+    func tick() async {
         // the helper's status every 5 s with the panel open, every minute otherwise (and at once
-        // when the lid hold is due)
+        // when the lid hold is due); after failed reads only on the backoff
         let now = Date.now.timeIntervalSince1970
+        guard now >= retryAt else { return }
         if panelOpen || now - statusAt >= 60 || status == nil {
             await refreshStatus()
         }
@@ -120,15 +140,32 @@ final class RootHelper {
     }
 
     private func refreshStatus() async {
-        guard let client = connect() else { return set(owns: false) }
+        guard let client = connect() else {
+            set(owns: false)
+            return failed()
+        }
         do {
             take(try await client.status())
         } catch {
             dropped()
+            failed()
         }
     }
 
+    /// The wait after `failures` failed reads in a row: the first retry at the next tick, then 5 s
+    /// doubling up to 5 minutes.
+    static func backoff(after failures: Int) -> TimeInterval {
+        failures <= 1 ? 0 : min(5 * pow(2, Double(failures - 2)), 300)
+    }
+
+    private func failed() {
+        failures += 1
+        retryAt = Date.now.timeIntervalSince1970 + Self.backoff(after: failures)
+    }
+
     private func take(_ fresh: Status) {
+        failures = 0
+        retryAt = -.infinity
         statusAt = Date.now.timeIntervalSince1970
         if fresh != status { status = fresh }
         set(owns: Self.owns(fresh))
@@ -141,30 +178,62 @@ final class RootHelper {
     }
 
     private func set(owns value: Bool) {
+        let lost = owns && !value
         if value != owns { owns = value }
         if !value, fanState != nil { fanState = nil }
+        // the old fans daemon is back (a rollback): our hold would outlive the flip, because the
+        // session stays up and so does its lease
+        if lost, lidSentAt != nil, let client {
+            lidSentAt = nil
+            lidSentFor = nil
+            Task { _ = try? await client.send(.lidRelease) }
+        }
     }
 
     private func connect() -> PodRootdClient? {
         if let client { return client }
-        guard let appIdentifier else { return nil }
-        client = try? PodRootdClient(appIdentifier: appIdentifier) { [weak self] _ in
-            Task { @MainActor in self?.dropped() }
+        if let connector {
+            client = try? connector()
+        } else if let appIdentifier {
+            client = try? PodRootdClient(appIdentifier: appIdentifier) { [weak self] _ in
+                Task { @MainActor in self?.dropped() }
+            }
         }
         return client
     }
 
-    /// The session ended (the helper restarted, was switched off, or never ran): leases went with it.
-    private func dropped() {
+    /// The session ended (the helper restarted, was switched off, or never ran): leases went with
+    /// it. The next tick reads the status again and holds the lid again, within the minute the
+    /// helper keeps a dropped hold.
+    func dropped() {
         client = nil
         lidSentAt = nil
+        statusAt = -.infinity
         set(owns: false)
+    }
+
+    /// One sync at a time: wantLid's task and the tick both ask, and two interleaved at an await
+    /// would each act on the other's half-done state. A call during one runs right after it and
+    /// answers nil: the running one reports.
+    @discardableResult
+    private func syncLid() async -> AccRootError? {
+        guard !lidBusy else {
+            lidAgain = true
+            return nil
+        }
+        lidBusy = true
+        defer { lidBusy = false }
+        var problem: AccRootError?
+        repeat {
+            lidAgain = false
+            problem = await syncLidOnce()
+        } while lidAgain
+        return problem
     }
 
     /// The hold renews before it runs out, and again after a reconnect; nil releases it. A refused
     /// hold (a rate limit) is tried again at the next tick.
-    @discardableResult
-    private func syncLid() async -> AccRootError? {
+    private func syncLidOnce() async -> AccRootError? {
         guard owns, let client = connect() else { return nil }
         let now = Date.now
         if let until = lidWanted, until > now {

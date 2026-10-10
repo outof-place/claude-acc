@@ -84,11 +84,12 @@ Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`,
 
 | Tier | Verbs | Pod Menu | `pod-rootctl` | Pod (Electron, `codes.pod.app`) |
 |---|---|---|---|---|
-| A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release`; `shaper.set` scoped to the session at 6 Mb/s or more; `shaper.clear` of the caller's own session limit | yes | yes, no prompt | yes |
+| A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release`; `shaper.set` scoped to the session at 6 Mb/s or more; `shaper.clear` of the caller's own session limit | yes | yes, no prompt | yes, except `lid.hold` |
 | B: changes the system | `power.mode`, `sysctl.*`, `shaper.*`, `spotlight.*`, `fsguard.set`, `launchd.parkOrphans`, `logs.pruneDiagnostics`, `legacy.*`, `restoreDefaults` | yes, no prompt: the click is the consent | only approved | never |
 
 - Tier A can't do lasting harm. A fan setting keeps the 95 °C rule. A lid hold ends with its
-  session, at 24 h, at 10 % battery and when the Mac gets hot. A session's upload limit ends with
+  session (a minute later, see [Restart safety](#restart-safety)), at 24 h, at 10 % battery and
+  when the Mac gets hot. A session's upload limit ends with
   its session and can't go below 6 Mb/s (hotspot.py's floor), so the worst a forged call does is a
   temporary slowdown. That keeps the hotspot controller (`pod-rootctl shaper follow`, a background
   agent) free of prompts. Two cases stay tier B: a session limit on an interface that has a limit
@@ -106,7 +107,9 @@ Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`,
   `ELECTRON_RUN_AS_NODE=1`, so the RunAsNode fuse has to stay on, and fuses are app-wide: any process
   can run Pod's signed binary as Node with its own JavaScript (`ELECTRON_RUN_AS_NODE=1
   /Applications/Pod.app/Contents/MacOS/Pod -e ...`), and that passes the requirement for
-  `codes.pod.app`. Electron Pod reaches tier B only through Pod Menu or `pod-rootctl`.
+  `codes.pod.app`. Electron Pod reaches tier B only through Pod Menu or `pod-rootctl`. For the
+  same reason a lid hold from `codes.pod.app` is tier B: a closed-lid hold keeps a Mac awake in a
+  bag, and Stay Awake is Pod Menu's anyway.
 - PodNative (nt-lean's Swift shell, `codes.pod.native` while it is a second window) is not
   admitted. Once it ships as `codes.pod.app` without Electron, it gets tier B like Pod Menu.
 
@@ -253,8 +256,11 @@ The state file holds what was asked and what was there before:
 - `fans`: the mode; at start a fixed mode is applied again (the SMC forgets it over a restart).
 - `sysctls`: per key the original value (read before the first change, refreshed at each boot from
   the kernel default) and the persisted value; at start the persisted value is applied again.
-- `lid`: `heldByUs`. A lease never survives the helper: at start a `SleepDisabled` that we set is
-  turned off, and Pod Menu asks again when it reconnects.
+- `lid`: `heldByUs`. A lease never survives the helper or its session, but the hold does for a
+  minute (`Engine.lidRehold`): after a restart, or a session that ended without `lid.release`, a
+  `SleepDisabled` that we set stays on until Pod Menu holds it again or the minute passes. A Mac with
+  the lid closed doesn't sleep through a Pod update or a helper crash. The minute only keeps a hold
+  of ours, it never takes one. A release, SIGTERM, 10 % battery and heat end it at once.
 - `shaper`: interface, our rate, the rate before, the scope. Session scope is dropped at start;
   `untilReboot` is dropped when the boot time differs from the one recorded.
 - `spotlight`: the list before apps-only (only from the first apply), applied or not.
@@ -333,6 +339,23 @@ secure timestamp, no entitlements (the helper is not sandboxed; IOKit's AppleSMC
 sysctl, `posix_spawn` and the files it writes need none). Identifiers `codes.pod.rootd` and
 `codes.pod.rootctl`; pass `--identifier` explicitly when re-signing.
 
+The helper's peer requirement (`PeerPolicy.production`) checks more than team and identifier:
+
+| Caller | Required of the running process |
+|---|---|
+| all | team 75Y2KR6P5W, validation category Developer ID, `isHardenedRuntimeEnforced` |
+| Pod Menu, `pod-rootctl` | also `isLibraryValidationRequired` |
+
+So Pod signs Pod Menu and `pod-rootctl` with `--options runtime,library`, and without the
+`allow-dyld-environment-variables`, `disable-library-validation` and `get-task-allow`
+entitlements. An Apple Development copy (claude-acc's own `~/Applications/Claude Acc.app`) or a
+non-hardened build with the right team and identifier is turned away, so `DYLD_INSERT_LIBRARIES`
+into a tier B caller gets nothing. The flags are the process's own at run time. On macOS 27 a
+hardened process carries `CS_REQUIRE_LV` only when it is signed with `library` (measured: a
+team-signed `--options runtime` binary reports `0x62011311`, with `runtime,library` it reports
+`0x62013301`). Pod's Electron process loads native modules and gets tier A only, so it needs the
+hardened runtime, not library validation.
+
 Pod's Electron binary keeps RunAsNode on (its terminal daemon needs it), which is why
 `codes.pod.app` gets tier A only (see [Tiers](#tiers)).
 
@@ -369,13 +392,160 @@ registration, before it honours `SpawnConstraint`. Proving it takes a registered
 the user's system. `scripts/rootd-tamper-kit.sh DIR IDENTITY` builds two throwaway apps, one
 daemon with the constraint and one without, and prints the steps (register, approve, kickstart,
 swap, kickstart, read the log, drop the constraint, reboot). Run them on a scratch Mac or VM. Until
-they pass, this is a cutover blocker. If the edited plist wins, the fallback is to install Pod.app
-root-owned (a `.pkg`), so a user-level process can't write the bundle at all.
+they pass, this is a cutover blocker. If the edited plist wins, the fallback is to install the
+helper itself from a `.pkg` into root-only paths, see
+[Option: install the helper with a .pkg](#option-install-the-helper-with-a-pkg).
 
 pod-rootd also checks its own signature at start (`anchor apple generic`, team 75Y2KR6P5W,
 identifier `codes.pod.rootd`) and exits without touching anything otherwise. That catches an ad hoc
 or unsigned build registered by mistake. It can't stop a replacement, which simply won't contain
 the check.
+
+## Option: install the helper with a .pkg
+
+Not built yet; written up so the choice between this and a VM run of the tamper kit is concrete.
+
+Making the whole Pod.app root-owned does not close the hole. `/Applications` is `root:admin`
+`drwxrwxr-x` without the sticky bit, so any process of an admin user can rename a root-owned
+`Pod.app` aside and put another one at the same path. Whether BTM then runs the new bundle's
+`BundleProgram` is the same unproven question. App Management doesn't help either: "For signed
+apps, macOS allows apps from the same developer — those sharing the same Team ID — to modify the
+app's bundle" (`NSUpdateSecurityPolicy`), and agents run as Pod's children.
+
+So the package installs only the helper, outside the bundle, in directories that only root can
+write. Pod.app stays a drag-installed, user-owned bundle that updates itself as it does today.
+
+### Install layout
+
+| Path | Owner, mode | What |
+|---|---|---|
+| `/Library/PrivilegedHelperTools/codes.pod.rootd` | root:wheel 0755 | the helper, the same binary and signature as now |
+| `/Library/LaunchDaemons/codes.pod.app.rootd.plist` | root:wheel 0644 | the job |
+| `/var/db/codes.pod.app.rootd/` | root 0700 | state, unchanged |
+| receipt `codes.pod.rootd.pkg` | | for `pkgutil` and the cask's `uninstall` |
+
+Both directories are `root:wheel drwxr-xr-x`, so an admin user's process can't write them. The
+plist differs from the bundle one in two keys: `Program` =
+`/Library/PrivilegedHelperTools/codes.pod.rootd` replaces `BundleProgram`, and
+`AssociatedBundleIdentifiers` = `[codes.pod.app]` is added. Apple: "If an app installs a legacy
+property list, the property list needs to include the AssociatedBundleIdentifiers key with a
+value of the app's bundle identifier", and the `Program`'s team must match the app's. Label,
+`MachServices`, `RunAtLoad`, `KeepAlive`, `ProcessType` and `SpawnConstraint` stay. The constraint
+now guards a root-owned path, so it is defence in depth rather than the only barrier.
+
+`pod-rootctl` stays in Pod.app: it is an unprivileged client and the helper checks its signature.
+The `pod-rootd` copy inside Pod.app stays too. launchd never starts it; it is the update source.
+
+### The package
+
+- `pkgbuild --root <dir> --identifier codes.pod.rootd.pkg --version <helper version> --scripts
+  <dir>` with the two files above.
+- `preinstall`: `launchctl bootout system/codes.pod.app.rootd`, a failure ignored.
+- `postinstall`: `launchctl bootstrap system /Library/LaunchDaemons/codes.pod.app.rootd.plist`.
+- `productbuild --sign "Developer ID Installer: OUTOFPLACE POLAND SP. Z O.O (75Y2KR6P5W)"`, then
+  `notarytool submit --wait` and `stapler staple` (stapler takes flat installer packages).
+- Pod's `release.sh` builds it, because the signature needs the release Mac's keychain. It ships
+  as `Contents/Resources/claude-acc/pod-rootd.pkg` and as a release asset for the cask.
+
+Prerequisite: a **Developer ID Installer** certificate. Apple's certificate list says it is for
+"Sign and distribute a Mac Installer Package, containing your signed app, outside the Mac App
+Store". The release keychain holds only the Developer ID Application identity. As with that one,
+the Account Holder has to create it.
+
+### Installing and removing it
+
+- **In Pod**: "Enable root helper" opens the bundled package in Installer.app (`shell.openPath`, or
+  `NSWorkspace.open` in the native shell). Installer checks the signature and the notarization and
+  asks for an administrator. There is no `register()`. The status comes from
+  `SMAppService.statusForLegacyPlist(at:)` on the plist path, which Apple documents for helpers
+  outside the bundle, and from `pod-rootctl status`. Login Items lists the helper under Pod with
+  the usual switch. The docs I found don't say whether macOS also asks to approve an admin-installed
+  legacy daemon; check that at the first real install.
+- **Through brew**: an optional cask next to `pod`, in outof-place/homebrew-tap.
+  `brew install --cask pod-rootd` runs `/usr/sbin/installer -pkg … -target /` through `sudo`, so it
+  asks for the password in the terminal (Homebrew's pkg artifact has `requires_sudo? = true`).
+
+  ```ruby
+  cask "pod-rootd" do
+    version "0.1.0"
+    sha256 "<sha256 of pod-rootd-#{version}.pkg>"
+    url "https://github.com/outof-place/pod/releases/download/v#{version}/pod-rootd-#{version}.pkg"
+    name "Pod root helper"
+    desc "Privileged helper for Pod: fans, Stay Awake with the lid closed, sysctls, uplink shaper"
+    homepage "https://pod.codes"
+    auto_updates true
+    depends_on cask: "pod"
+    pkg "pod-rootd-#{version}.pkg"
+    uninstall early_script: {
+                executable: "/Applications/Pod.app/Contents/Resources/claude-acc/pod-rootctl",
+                args:       ["uninstall"],
+              },
+              launchctl:    "codes.pod.app.rootd",
+              pkgutil:      "codes.pod.rootd.pkg"
+  end
+  ```
+
+  The version is Pod's release version, because the package is built with each release.
+  `auto_updates true` keeps `brew upgrade` away: the helper updates itself (below), and for a
+  package Homebrew can't compare versions, which per its FAQ means it "normally skips the
+  self-updating cask". `uninstall` runs `early_script` before `launchctl`. That order matters,
+  because SIGTERM keeps persisted settings. `launchctl` and `pkgutil` then clean up when the helper
+  is already gone.
+- **Removing**: a new tier B verb, `helper.uninstall`. It runs `restoreDefaults`, removes the plist,
+  the binary and the state directory, runs `/usr/sbin/pkgutil --forget codes.pod.rootd.pkg`, then
+  `launchctl bootout system/codes.pod.app.rootd`, which ends the helper. Pod Menu, `pod-rootctl
+  uninstall` and the cask call it. Pod's Electron process can't, being tier A only.
+
+### Updates
+
+- **Pod.app**: unchanged. electron-updater and ShipIt swap the user-owned bundle with no prompt.
+  The `pod` cask keeps `app "Pod.app"` and `auto_updates true`.
+- **The helper** updates itself from the Pod.app next to it, with no prompt and no package per
+  release. After a session from `codes.pod.app` or Pod Menu opens (at most once an hour):
+  1. The candidate is `Contents/Resources/claude-acc/pod-rootd` in `/Applications/Pod.app`, or in
+     the app the package was opened from (`postinstall` records it). Nothing in a message names a
+     path.
+  2. The helper copies the candidate with `O_NOFOLLOW`, 64 MB at most, into
+     `/Library/PrivilegedHelperTools/.codes.pod.rootd.new`. That copy can't change after the check.
+  3. It checks the copy with `SecStaticCodeCheckValidityWithErrors` (`kSecCSStrictValidate`,
+     `kSecCSCheckAllArchitectures`) against `anchor apple generic and certificate leaf[subject.OU]
+     = "75Y2KR6P5W" and identifier "codes.pod.rootd" and notarized`. The `notarized` clause holds
+     for a binary nested in a notarized app (checked with `codesign --verify -R` on a nested Mach-O
+     of a notarized app; an ad hoc build fails it).
+  4. It reads the copy's `CFBundleVersion` from its `__info_plist`. Only a higher version than its
+     own goes on, so a genuine older build can't be swapped back in.
+  5. It renames the copy over `codes.pod.rootd`, persists state and exits with a non-zero status.
+     `KeepAlive` = `{SuccessfulExit: false}` then starts the new binary.
+
+  The plist changes only with a new package. A release that needs a different plist has Pod offer
+  "Update root helper", which opens the bundled package: one administrator prompt.
+
+### The whole app as a .pkg (not recommended)
+
+- It doesn't close the hole (the rename above).
+- ShipIt can't write a root-owned bundle. Squirrel.Mac then takes its privileged path:
+  `launchPrivileged:` with `AuthorizationCreate` and `SMJobSubmit`, both in Electron 43.7.5's
+  `Squirrel.framework`. The SDK marks `SMJobSubmit` deprecated since 10.10, "will be removed in a
+  future release". So that means an administrator prompt on every update, if the path still works
+  on macOS 27, which is unproven. Pod's serve-update handoff is built on the unprivileged ShipIt
+  swap.
+- Every user pays an administrator prompt at install and at each update, including those who
+  never turn the helper on. There is no drag install, and the cask moves from `app` to `pkg` with
+  `sudo` on every upgrade.
+
+### What changes in this branch if the package is chosen
+
+- `launchd/codes.pod.app.rootd.plist`: `Program` and `AssociatedBundleIdentifiers` instead of
+  `BundleProgram`. The bundle variant goes.
+- `PodRootdService`: status from `statusForLegacyPlist(at:)`, install by opening the package, no
+  `register()`/`unregister()`.
+- The engine: the self-update steps and `helper.uninstall`, tested against the fake backend
+  (version order, symlinked candidate, copy before check, check failure leaves the live binary).
+- The Pod side (b2): the button opens the package instead of `setLoginItemSettings`.
+- Packaging (nt-packaging): the Installer identity and the `pkgbuild`/`productbuild`/notarize step.
+- The tamper kit stops being a blocker, because no launchd job points into a writable path.
+  Verbs, tiers, the peer requirement, the migration from the five root daemons and the restore
+  stay as they are.
 
 ## Cutover
 
@@ -393,7 +563,7 @@ What has to land before it, or the migration leaves a feature without its daemon
   carries `pod-rootd`, `pod-rootctl` and `LaunchDaemons/codes.pod.app.rootd.plist`
   (`scripts/payload.sh`). With `--pod-agents`, `setup.sh` links `$STATE/pod-rootctl` when the owner
   app has the helper: `claude-acc rootd ...` runs it, and `claude-acc fans install` points there.
-- The tampered-helper steps above pass.
+- The tampered-helper steps above pass, or the helper ships as a `.pkg` (see the option above).
 
 ## Code
 
