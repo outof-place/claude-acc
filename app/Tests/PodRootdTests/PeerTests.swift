@@ -64,6 +64,33 @@ func foreignPeerRejected() async throws {
     #expect(status.status == nil)
 }
 
+@Test("the right signing identity without the hardened runtime is turned away before any verb")
+func nonHardenedPeerRejected() async throws {
+    // This runner is ad hoc and not hardened, like a team-signed copy built without `--options
+    // runtime,library`. The team and the Developer ID category are left out because an ad hoc
+    // runner has neither, so only the flags can refuse it.
+    let me = try ownIdentifier()
+    let hardened = try PeerPolicy.requirement(team: nil, identifiers: [me], flags: PeerPolicy.hardening(.menu))
+    let wire = try Wire(peers: PeerPolicy(listener: hardened, callers: [(.menu, hardened)]))
+    defer { wire.close() }
+    let reply = try await wire.client.send(.restoreDefaults)
+    #expect(reply.refusal == .peerNotAllowed)
+    #expect(reply.status == nil)
+    #expect(wire.rig.backend.calls.isEmpty)
+    // the same identity without the flags gets in: the flags are what turned it away
+    let plain = try PeerPolicy.requirement(team: nil, identifiers: [me], flags: [])
+    let open = try Wire(peers: PeerPolicy(listener: plain, callers: [(.menu, plain)]))
+    defer { open.close() }
+    #expect(try await open.client.send(.status).refusal == nil)
+}
+
+@Test("Pod Menu and the CLI need library validation too; Electron Pod the hardened runtime only")
+func hardeningPerCaller() {
+    #expect(PeerPolicy.hardening(.menu) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
+    #expect(PeerPolicy.hardening(.cli) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
+    #expect(PeerPolicy.hardening(.app) == [.isHardenedRuntimeEnforced])
+}
+
 @Test("the production policy names the three signing identities of team 75Y2KR6P5W")
 func productionCallers() throws {
     let policy = try PeerPolicy.production()
@@ -99,7 +126,7 @@ func tiersByCaller() async throws {
     #expect(try await cli.client.send(.spotlightRestore, approval: approved).refusal == nil)
 }
 
-@Test("closing the client ends its lid hold: a quit or crashed Pod Menu can't keep the Mac from sleeping")
+@Test("closing the client ends its lid hold after the re-hold minute: a quit Pod Menu can't keep the Mac up")
 func leaseEndsWithSession() async throws {
     let wire = try Wire(peers: try admitting(as: .menu))
     defer { wire.server.cancel() }
@@ -109,6 +136,9 @@ func leaseEndsWithSession() async throws {
     wire.client.close()
     await eventually { wire.server.sessions == 0 }
     #expect(wire.server.sessions == 0)
+    #expect(wire.rig.engine.status().lid.reholdUntil != nil)
+    wire.rig.clock.advance(Engine.lidRehold + 1)
+    wire.rig.engine.tick()
     #expect(!wire.rig.backend.sleepIsDisabled)
     #expect(wire.rig.engine.status().lid.lastRelease == "session ended")
 }

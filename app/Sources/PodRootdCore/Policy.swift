@@ -38,20 +38,39 @@ nonisolated public struct PeerPolicy: Sendable {
         self.callers = callers
     }
 
-    /// Team `PodRootd.teamIdentifier` with one of the three signing identifiers.
+    /// Team `PodRootd.teamIdentifier`, Developer ID, the hardened runtime, one of the three signing
+    /// identifiers; Pod Menu and pod-rootctl also with library validation (`codesign --options
+    /// runtime,library`), so nothing can be injected into a tier B caller. An Apple Development or
+    /// non-hardened copy with the right team and identifier is turned away (docs/pod-rootd.md,
+    /// "Signing").
     public static func production(team: String = PodRootd.teamIdentifier) throws -> PeerPolicy {
-        let ids = Caller.allCases.map(\.signingIdentifier)
-        let listener = try ProcessCodeRequirement.allOf {
-            TeamIdentifier(team)
-            SigningIdentifier.in(ids)
-        }
+        let listener = try requirement(
+            team: team, identifiers: Caller.allCases.map(\.signingIdentifier), flags: [.isHardenedRuntimeEnforced])
         let callers = try Caller.allCases.map { caller in
-            (caller, XPCPeerRequirement.codeRequirement(try ProcessCodeRequirement.allOf {
-                TeamIdentifier(team)
-                SigningIdentifier(caller.signingIdentifier)
-            }))
+            (caller, try requirement(team: team, identifiers: [caller.signingIdentifier], flags: hardening(caller)))
         }
-        return PeerPolicy(listener: .codeRequirement(listener), callers: callers)
+        return PeerPolicy(listener: listener, callers: callers)
+    }
+
+    /// The code signing flags a running caller must have. Pod's Electron process loads native
+    /// modules and gets tier A only, so it needs the hardened runtime but not library validation.
+    public static func hardening(_ caller: Caller) -> ProcessCodeSigningFlags.ValueSet {
+        caller == .app ? [.isHardenedRuntimeEnforced] : [.isHardenedRuntimeEnforced, .isLibraryValidationRequired]
+    }
+
+    /// One requirement: the identity, and the flags the running process must carry. `team` nil
+    /// leaves out the team and the Developer ID category, for tests whose runner is ad hoc signed.
+    static func requirement(
+        team: String?, identifiers: [String], flags: ProcessCodeSigningFlags.ValueSet
+    ) throws -> XPCPeerRequirement {
+        .codeRequirement(try ProcessCodeRequirement.allOf {
+            if let team {
+                TeamIdentifier(team)
+                ValidationCategory(.developerID)
+            }
+            SigningIdentifier.in(identifiers)
+            ProcessCodeSigningFlags.isSuperset(of: flags)
+        })
     }
 
     /// The caller a message comes from, or nil when it matches none (it never should: the listener
