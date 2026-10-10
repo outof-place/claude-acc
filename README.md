@@ -111,11 +111,12 @@ flowchart LR
 
 ### Accounts under the hood
 
-A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Claude Code reads `Claude Code-credentials`, plus `Claude Code-credentials-<first 8 hex chars of sha256(config dir)>` when `CLAUDE_CONFIG_DIR` is set. [Orca](https://github.com/stablyai/orca) keeps a copy of every account you add to it under `Orca Claude Code Managed Credentials`. Switching accounts means copying one account's `claudeAiOauth` into the entries the live sessions read.
+A Claude Code account is the `claudeAiOauth` object inside a Keychain entry. Claude Code reads `Claude Code-credentials`, plus `Claude Code-credentials-<first 8 hex chars of sha256(NFC(config dir))>` when `CLAUDE_CONFIG_DIR` is set. [Orca](https://github.com/stablyai/orca) keeps a copy of every account you add to it under `Orca Claude Code Managed Credentials`. Switching accounts means copying one account's `claudeAiOauth` into the entries the live sessions read.
 
 - `accswitch.py` holds all the logic. launchd runs `accswitch.py tick` every 2 minutes, with or without the app.
 - Usage comes from `GET https://api.anthropic.com/api/oauth/usage`, and the account behind a token from `/api/oauth/profile`.
 - It asks for usage only when the answer could have changed. Usage in a window only grows until the window resets, so an account with a full window isn't read again before that reset, apart from a check every 3 to 4 hours in case Anthropic resets limits early. An account nobody works on keeps its numbers for 30 minutes and is read once more right before the watcher switches to it. The active account is read as often as the fastest burn seen so far (5% of the 5-hour window a minute) could bring it to the switch threshold: every 2 minutes close to it, every 15 minutes far from it.
+- An account you add in Pod (5.1 and later) is a profile with its own config folder (`<Pod's userData>/claude-profiles/<id>/home`) and its own Keychain entry, and Pod refreshes its token. The panel and `claude-acc status` list such a profile with its usage only, marked with Pod's name. The profile's token is used only to read usage, and only while it hasn't expired. claude-acc never writes, deletes or refreshes the profile's entry and never copies its login anywhere: a refresh hands out a new refresh token and kills the old one, so a refresh from claude-acc would sign the profile out of Pod. With an expired token the profile shows its last known numbers as stale until a Pod session refreshes it. The watcher never switches to a profile. A profile with the same email as one of claude-acc's own accounts shows only as that account.
 
 ## Numbers
 
