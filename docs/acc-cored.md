@@ -5,8 +5,8 @@ reads the kernel directly (sysctl, `proc_pid_rusage`, `proc_pidinfo`, kqueue, Di
 instead of starting Python every few seconds. Every action stays in Python. When a tick would act,
 acc-cored hands that tick to the script, which reads the Mac again and acts exactly as before.
 
-Status: the measuring tool, the readers and the dev-server guard's tick (these stacked branches).
-Nothing is registered on a Mac by the build or the tests. The switch from `devguard run` to
+Status: the measuring tool, the readers, the dev-server guard's tick and the scheduler's per-second
+pass (these stacked branches). Nothing is registered on a Mac by the build or the tests. The switch from `devguard run` to
 `acc-cored guard` is a separate step with its own undo (see [Switching](#switching)).
 
 ## What the loops cost
@@ -135,6 +135,76 @@ The Python guard spends 6 to 7.5 ms/s.
 Pod's runtime answers `browser.tabList` in about 8 s. While dev servers run, the guard's Orca
 refresh (every `orca_seconds`) blocks the tick for that long, in Python as well as here.
 
+## The scheduler
+
+Today every `sched run` wrapper runs its own loops. A queued wrapper reloads `state.json` every
+0.5 s. A running one samples its job's process tree at 4 Hz and writes a heartbeat once a second.
+Each of them runs `reap`, `refresh_memory`, `safety`, `plan` and `update_queue_view` on every pass,
+so ten wrappers do the same housekeeping ten times.
+
+`acc-cored run --sched` does that work once for all jobs:
+- **One pass a second, under `sched/lock`:** the heartbeats of the jobs it watches, then `reap`,
+  `refresh_memory`, `safety`, `plan` and `update_queue_view`, ported line by line (`Sched.tick`).
+  The pass reads memory as `probe_memory` does, the guard's snapshot from the guard in the same
+  process when there is one, and native builds as `native_scan` does.
+- **Job trees:** sampled on the wrapper's own cadence (10 ms, then 50 ms, then 250 ms), for the peak,
+  the CPU, the class limit and the stall clock.
+- **Wake-ups:** when `plan` admits a queued job, acc-cored sends that wrapper SIGUSR1. The wrapper
+  then admits itself, as before.
+- **Idle:** with no job left the timers stop, and acc-cored only watches the `sched` directory.
+
+The wrapper (`sched.py`) cooperates only when acc-cored marks the state (`"cored": {"pid": ...}`)
+and that pid is a live `acc-cored`. `SCHED_NO_CORED=1` keeps the old loops.
+- **Queued:** the wrapper marks its entry `"wake": "usr1"` and waits in a kqueue for the signal
+  (`EVFILT_SIGNAL`, with a no-op handler so a late signal can't kill it and the job's disposition
+  stays default). It still wakes every 5 s for its own checks (timeout, reroute).
+- **Running:** the wrapper marks its entry `"monitor": "cored"` and blocks on the child's exit
+  (kqueue `NOTE_EXIT`, `wait4`). Every 5 s it writes the stall log from acc-cored's `stalled_s` and
+  enforces the class limit. At exit it asks for the job's final peak and CPU over the control socket
+  (`sched.final`).
+- **Fallback:** if acc-cored disappears, a queued wrapper drops its mark and polls again. A running
+  one goes back to its own loop, starting from the last peak acc-cored saved. When acc-cored stops,
+  it removes its mark.
+
+The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
+checked (`LOCAL_PEERCRED`).
+
+### Parity
+
+- `tests/acc_cored/sched_replay.py fuzz` builds synthetic states. They cover queues and running jobs
+  (local and Depot, small, native, paused, stalled, passed heads, starving heads, simulators), plus
+  memory readings, guard snapshots and configs. Each one runs through sched.py's own five functions.
+  `record` reads the live state and readings without writing anything.
+- `acc-cored sched-replay` runs the native pass on every fixture. The state, the admissions and the
+  signals sent must match.
+- `tests/test_acc_cored.py` runs 300 fuzzed fixtures.
+
+Results on 2026-10-10:
+- fuzz: 10,500 of 10,500 fixtures identical (again after the review fixes, 2026-10-11);
+- live: 10 of 10 recorded passes identical (6 on 2026-10-10, 4 on 2026-10-11, one job running).
+
+### Cost
+
+End to end with a scratch `HOME`, `SCHED_FAKE_MEMORY` and 20 s jobs started at once. The wrapper
+numbers come from `proc_pid_rusage` on each wrapper process:
+
+| Jobs | | wrapper CPU (median) | wrapper wakeups (median) | acc-cored |
+|---|---|---|---|---|
+| 4 | wrappers' own loops | 1.40 ms/s | 4.86/s | |
+| 4 | with acc-cored | 0.05 ms/s | 0.21/s | 51.2 ms in total, 3.1 MB footprint |
+| 8 | wrappers' own loops | 1.28 ms/s | 5.00/s | |
+| 8 | with acc-cored | 0.05 ms/s | 0.21/s | 106.2 ms in total (about 4.4 ms/s), 15 wakeups/s, 3.6 MB |
+
+With eight jobs that is about 10 ms/s and 40 wakeups/s for the wrappers' own loops, against about
+4.8 ms/s and 17 wakeups/s with acc-cored. Every job finished with rc 0 and a history row in all
+runs.
+
+The queue frees faster too. Three jobs waited on memory that freed 10 s in. The jobs started
+0.24 to 0.26 s after the change with the wrappers' own polling, and 0.06 to 0.09 s with acc-cored.
+
+The test jobs are sleeping processes. A real build's tree is larger, so a wrapper's own sampling
+costs more there (2.5 to 5 ms/s per job, see [What the loops cost](#what-the-loops-cost)).
+
 ## Switching
 
 Not done by this branch. The plan:
@@ -142,5 +212,8 @@ Not done by this branch. The plan:
 - Standalone installs swap `com.filip.claude-acc.devguard` for a `cored` plist.
 - Undo: bootout the cored job and bootstrap the devguard plist again.
 
-Both loops hold `devguard.lock`, so they never run together. `acc-cored guard --shadow FILE` runs
+The scheduler needs no switch of its own. Wrappers use acc-cored only while it runs with `--sched`
+and marks the state, and they fall back on their own when it stops.
+
+Both guard loops hold `devguard.lock`, so they never run together. `acc-cored guard --shadow FILE` runs
 the native loop beside the Python one, observe-only, and writes its state to FILE.

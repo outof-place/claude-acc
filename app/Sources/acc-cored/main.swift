@@ -14,6 +14,8 @@ let usage = """
            acc-cored guard-replay F.jsonl [--show N]   the native guard tick on parity fixtures
            acc-cored guard-bench [N]      N ticks back to back, CPU per phase
            acc-cored orca-read            the host's four reads over its socket, timed
+           acc-cored sched-replay F.jsonl [--show N]   the scheduler's housekeeping on parity fixtures
+           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS]   the daemon
     """
 
 func json(_ value: Any) -> String {
@@ -185,6 +187,79 @@ case "guard":
     int.setEventHandler { stop(0) }
     int.resume()
     if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stop(0) } }
+    dispatchMain()
+case "sched-replay":
+    guard let path = args.first, let data = Files.read(path) else { fail(usage) }
+    let show = value("--show", in: args).flatMap { Int($0) } ?? 3
+    var same = 0, different = 0, shown = 0
+    for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where !line.isEmpty {
+        guard let fixture = (try? PyJSON.loads(String(line)))?.object else { fail("unreadable fixture") }
+        let diffs = Sched.replay(fixture)
+        if diffs.isEmpty {
+            same += 1
+        } else {
+            different += 1
+            if shown < show {
+                shown += 1
+                print("fixture \(same + different): \(diffs.count) differences")
+                for d in diffs.prefix(12) { print("  " + d) }
+            }
+        }
+    }
+    print("same \(same), different \(different)")
+    exit(different == 0 ? 0 : 1)
+case "run":
+    // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let state = GuardPaths.state(home)
+    let shadow = value("--shadow-guard", in: args)
+    let seconds = value("--for", in: args).flatMap { Double($0) }
+    var guardEngine: GuardEngine?
+    if args.contains("--guard") || shadow != nil {
+        let engine = GuardEngine(.init(home: home, shadow: shadow != nil, shadowPath: shadow))
+        guard engine.start() else {
+            print("strażnik już działa")
+            exit(0)
+        }
+        guardEngine = engine
+    }
+    var schedEngine: SchedEngine?
+    if args.contains("--sched") {
+        let engine = SchedEngine(stateDir: state)
+        if let guardEngine { engine.snapshot = { guardEngine.latestSnapshot() } }
+        engine.start()
+        schedEngine = engine
+    }
+    let guardRunning = guardEngine
+    let schedRunning = schedEngine
+    let control = ControlSocket(path: state + "/acc-cored.sock") { request in
+        switch request["op"]?.string {
+        case "sched.final":
+            return schedRunning?.final(request["id"]?.string ?? "") ?? .object(PyObject([("ok", false)]))
+        case "ping":
+            return .object(PyObject([
+                ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
+            ]))
+        default:
+            return .object(PyObject([("ok", false), ("error", "unknown op")]))
+        }
+    }
+    _ = control.start()
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let stopAll = { (code: Int32) in
+        control.stop()
+        schedRunning?.stop()
+        guardRunning?.stop()
+        exit(code)
+    }
+    let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    term.setEventHandler { stopAll(0) }
+    term.resume()
+    let int = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    int.setEventHandler { stopAll(0) }
+    int.resume()
+    if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stopAll(0) } }
     dispatchMain()
 case "-h", "--help", "help":
     print(usage)
