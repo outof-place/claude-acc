@@ -290,7 +290,7 @@ case "$1" in
   dictate) exec open -g "claude-acc://dictate/${2:-toggle}" ;;
   # panel aplikacji paska menu (claude-acc://panel[/sekcja]), jak komenda Poda "claude-acc settings…"
   panel) exec open -g "claude-acc://panel${2:+/$2}" ;;
-  # Stay Awake aplikacji: on [--for 2h], off, toggle, status [--json]; przez claude-acc://awake
+  # Stay Awake aplikacji: on [--for 2h], off, toggle, lid on|off, status [--json]; przez claude-acc://awake
   awake) shift; exec "$PY" "$RUN" awake "$@" ;;
   # wtyczka claude-acc w Orce: install, uninstall, status
   orca) shift; exec "$PY" "$RUN" orcaplugin "$@" ;;

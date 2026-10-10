@@ -110,6 +110,17 @@ final class Awake {
         }
     }
 
+    /// `claude-acc awake lid on|off` opens claude-acc://awake-lid/<on|off> in the background: the
+    /// "awake with the lid closed" setting, for Pod's native window. A host of its own, so an app
+    /// from before it ignores the URL instead of reading `on` as a plain Stay Awake.
+    func lidCommand(_ url: URL) {
+        switch url.lastPathComponent {
+        case "on": lidClosed = true
+        case "off": lidClosed = false
+        default: lidClosed.toggle()
+        }
+    }
+
     // MARK: Internals
 
     /// Asks perf.py where the default route goes (about 0.4 s, off the main actor); path changes
@@ -192,6 +203,8 @@ final class Awake {
             "auto_on_hotspot": autoOnHotspot,
             "keep_display": keepDisplayOn,
             "lid_closed": lidClosed,
+            // `lidCommand`: readers offer the lid setting only to an app that takes it
+            "lid_settable": true,
             "pid": Int(getpid()),
         ]
         if manualActive, !forever, let until = manualUntil { state["until"] = until.timeIntervalSince1970 }
