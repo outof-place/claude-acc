@@ -237,7 +237,38 @@ def save(path, data):
     os.replace(tmp, path)
 
 
+def interpreter_problem(paths=None):
+    """Pierwsza ścieżka interpretera tego procesu, która nie należy do roota albo jest zapisywalna dla
+    grupy lub świata (plik, prawdziwa ścieżka, biblioteka standardowa i ich katalogi nadrzędne), albo
+    None. Ta sama reguła co rootpy.unsafe_reason przy instalacji: demon sprawdza ją jeszcze raz przy
+    każdym starcie, bo interpreter mógł się zmienić od instalacji. `paths` podstawiają testy."""
+    if paths is None:
+        import sysconfig
+
+        paths = [sys.executable, os.path.realpath(sys.executable), sysconfig.get_paths()["stdlib"]]
+    for path in paths:
+        step = os.path.abspath(path)
+        while True:
+            try:
+                info = os.lstat(step)
+            except OSError:
+                return step
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return step
+            parent = os.path.dirname(step)
+            if parent == step:
+                break
+            step = parent
+    return None
+
+
 def main(args):
+    if os.geteuid() == 0:
+        bad = interpreter_problem()
+        if bad:
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} odmawiam: {bad} nie należy do roota albo jest "
+                  "zapisywalny dla innych; przeinstaluj strażnika (install-fsguard.sh)", file=sys.stderr)
+            return 78
     guard = Guard(args)
     try:
         guard.run()

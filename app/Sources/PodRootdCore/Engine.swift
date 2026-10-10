@@ -202,9 +202,9 @@ public final class Engine {
         let outcome: Outcome
         if !verb.isValid {
             outcome = .refused(.invalid("a parameter is out of range"))
-        } else if !policy.permits(verb.tier, for: caller) {
+        } else if !policy.permits(tier(of: verb, session: session), for: caller) {
             outcome = .refused(.verbNotAllowed(verb: verb.name, caller: caller))
-        } else if !approved(request, from: caller) {
+        } else if !approved(request, tier: tier(of: verb, session: session), from: caller) {
             outcome = .refused(.needsApproval(verb: verb.name))
         } else if let after = limiter.take(verb.kind, for: caller, now: now()) {
             outcome = .refused(.rateLimited(retryAfter: after))
@@ -224,8 +224,8 @@ public final class Engine {
     /// Tier B from a caller that needs an approval: authenticated in this request (which starts the
     /// grace for its parent), or within the grace for the same parent. The CLI's signed code is what
     /// builds the approval; nothing else can send as the CLI.
-    private func approved(_ request: Request, from caller: Caller) -> Bool {
-        guard request.verb.tier == .b, policy.approvalNeeded.contains(caller) else { return true }
+    private func approved(_ request: Request, tier: VerbTier, from caller: Caller) -> Bool {
+        guard tier == .b, policy.approvalNeeded.contains(caller) else { return true }
         let t = now()
         approvals = approvals.filter { t - $0.value <= policy.grace }
         guard let approval = request.approval, !approval.parent.isEmpty else { return false }
@@ -234,6 +234,22 @@ public final class Engine {
             return true
         }
         return approvals[approval.parent] != nil
+    }
+
+    /// `Verb.tier`, with what only the state knows about upload limits: a session's limit may not
+    /// cover one set until reboot (its end would not bring that one back), and clearing the limit of
+    /// your own session, or a limit that isn't there, is as harmless as setting it.
+    func tier(of verb: Verb, session: SessionID) -> VerbTier {
+        switch verb {
+        case .shaperSet(let interface, _, .session) where verb.tier == .a:
+            return state.shapers[interface.name]?.scope == .untilReboot ? .b : .a
+        case .shaperClear(let interface):
+            if shaperOwners[interface.name] == session { return .a }
+            if state.shapers[interface.name] == nil, backend.uplinkLimit(interface) == nil { return .a }
+            return .b
+        default:
+            return verb.tier
+        }
     }
 
     static func describe(_ outcome: Outcome) -> String {

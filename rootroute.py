@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """perf-root.sh and janitor-root.sh through Pod's root helper (docs/pod-rootd.md).
 
-In Pod, `claude-acc perf-root ...` and `claude-acc janitor-root ...` come here instead of going
-through sudo: the same commands, done by `pod-rootctl` as the user. Its tier B verbs ask for Touch
-ID once, then 5 minutes for this process. The benches and perf.py's record of root tweaks run as
-the user, as perf-root.sh ran them through `sudo -u`. Without the helper (Homebrew, the source
-checkout) the wrapper keeps `sudo perf-root.sh`.
+In Pod, `claude-acc perf-root ...` and `claude-acc mac root-clean ...` come here before the root
+copy (root-run.sh under sudo): the same commands, done by `pod-rootctl` as the user. Its tier B
+verbs ask for Touch ID once, then 5 minutes for this process. The benches and perf.py's record of
+root tweaks run as the user, as perf-root.sh ran them through `sudo -u`. Exit 75 when Pod doesn't
+own claude-acc or the helper doesn't answer: the wrapper then goes on to the root copy.
 
   rootroute.py perf-root [--dry-run] <perf-root.sh command>
   rootroute.py janitor-root [--dry-run] [--high-power]
@@ -22,6 +22,8 @@ STATE = os.path.join(os.path.expanduser("~"), ".local", "share", "claude-acc")
 ROOTCTL = os.path.join(STATE, "pod-rootctl")
 VNODES = 786432
 DIAGNOSTIC_DAYS = 30
+# the wrapper's cue to go on to root-run.sh (EX_TEMPFAIL)
+FALLBACK = 75
 
 
 class Route:
@@ -362,10 +364,30 @@ def janitor_root(args):
     return rc
 
 
+def pod_owns():
+    try:
+        with open(os.path.join(STATE, "owner.json")) as f:
+            return json.load(f).get("owner") == "pod"
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def answers():
+    """The helper is registered, approved and reachable (pod-rootctl exits 69 when it isn't)."""
+    try:
+        return subprocess.run([ROOTCTL, "status", "--json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def main(argv):
-    if not os.access(ROOTCTL, os.X_OK):
-        print("Pod's root helper is not installed (%s)" % ROOTCTL, file=sys.stderr)
-        return 69
+    if not os.access(ROOTCTL, os.X_OK) or not pod_owns():
+        return FALLBACK
+    if argv[:1] in (["perf-root"], ["janitor-root"]) and not answers():
+        print("Pod's root helper doesn't answer (turn it on in Pod and allow it in Login Items); "
+              "the root copy instead", file=sys.stderr)
+        return FALLBACK
     if argv[:1] == ["perf-root"]:
         return perf_root(argv[1:])
     if argv[:1] == ["janitor-root"]:

@@ -46,7 +46,8 @@ rm -rf "$DEST" "$DEST.new"
 mkdir -p "$DEST.new"
 cd "$ROOT"
 # to samo, co formuła kładzie w libexec (setup.sh kopiuje każdy *.py, więc nowy skrypt nie wymaga zmian)
-cp ./*.py janitor-root.sh perf-root.sh setup.sh install-fans.sh install-fsguard.sh sign-app.sh "$DEST.new/"
+cp ./*.py janitor-root.sh perf-root.sh root-install.sh root-run.sh setup.sh install-fans.sh install-fsguard.sh \
+  sign-app.sh "$DEST.new/"
 for dir in launchd hooks skills sdk dictation orca-plugin; do
   if [ -d "$dir" ]; then cp -R "$dir" "$DEST.new/$dir"; fi
 done

@@ -30,6 +30,8 @@ if args[:2] == ["launchd", "park-orphans"]:
                                   "program": "/Library/gone", "domain": "system"}], "parked": "--dry-run" not in args}}
 if args[:2] == ["logs", "prune"]:
     report = {"pruned": {"files": 3, "bytes": 4096, "dryRun": "--dry-run" in args}}
+if os.environ.get("ROOTCTL_DOWN"):
+    sys.exit(69)
 refuse = os.environ.get("ROOTCTL_REFUSE")
 if refuse and args[:1] == [refuse]:
     print(json.dumps({"outcome": {"refused": {"needsApproval": {"verb": refuse}}}, "status": status}))
@@ -53,6 +55,8 @@ class RootRouteTest(unittest.TestCase):
         os.chmod(self.rootctl, 0o755)
         with open(os.path.join(self.state, "source"), "w") as f:
             f.write(ROOT + "\n")
+        with open(os.path.join(self.state, "owner.json"), "w") as f:
+            json.dump({"owner": "pod"}, f)
         self.calls_path = os.path.join(self.home, "calls.jsonl")
 
     def run_route(self, *args, **env):
@@ -100,7 +104,8 @@ class RootRouteTest(unittest.TestCase):
         self.assertEqual(self.run_route("perf-root", "spotlight", "apps-only").returncode, 0)
         self.assertEqual(self.applied()["spotlight"]["detail"], "apps-only")
         self.assertEqual(self.run_route("perf-root", "spotlight", "undo").returncode, 0)
-        self.assertEqual([c[:2] for c in self.calls()], [["spotlight", "apps-only"], ["spotlight", "restore"]])
+        verbs = [c[:2] for c in self.calls() if c[0] != "status"]  # each run asks first whether the helper answers
+        self.assertEqual(verbs, [["spotlight", "apps-only"], ["spotlight", "restore"]])
         self.assertNotIn("spotlight", self.applied())
 
     def test_a_refusal_records_nothing(self):
@@ -125,12 +130,23 @@ class RootRouteTest(unittest.TestCase):
         self.assertIn("/Library/LaunchDaemons/com.gone.plist -> /Library/gone", done.stdout)
         self.assertIn("DiagnosticReports: 3", done.stdout)
 
-    def test_unknown_commands_and_a_missing_helper(self):
+    def test_unknown_commands(self):
         self.assertEqual(self.run_route("perf-root", "nonsense").returncode, 2)
         self.assertEqual(self.run_route("janitor-root", "--bogus").returncode, 2)
+
+    def test_falls_back_to_the_root_copy(self):
+        # the helper doesn't answer, Pod doesn't own claude-acc, or there is no helper: 75 and no verb
+        done = self.run_route("perf-root", "vnodes", "apply", ROOTCTL_DOWN="1")
+        self.assertEqual(done.returncode, 75)
+        self.assertIn("the root copy instead", done.stderr)
+        self.assertEqual([c for c in self.calls() if c[0] != "status"], [])
+        with open(os.path.join(self.state, "owner.json"), "w") as f:
+            json.dump({"owner": "homebrew"}, f)
+        self.assertEqual(self.run_route("perf-root", "vnodes", "apply").returncode, 75)
+        os.remove(os.path.join(self.state, "owner.json"))
         os.remove(self.rootctl)
-        self.assertEqual(self.run_route("perf-root", "vnodes", "apply").returncode, 69)
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.run_route("janitor-root").returncode, 75)
+        self.assertEqual([c for c in self.calls() if c[0] != "status"], [])
 
 
 if __name__ == "__main__":
