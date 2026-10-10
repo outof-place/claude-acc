@@ -23,7 +23,10 @@ let usage = """
       launchd park-orphans [--dry-run]
       logs prune [--days N] [--dry-run]
       legacy migrate|rollback                   the five com.filip.claude-acc root daemons
-      restore                                   everything back to macOS's defaults (before uninstall)
+      restore                                   everything back to macOS's defaults
+      uninstall                                 restore, then the package's files and the job go
+      service status                            install, approve (switched off in Login Items) or ready
+      service install                           opens Pod's signed package in Installer
       service open-settings                     System Settings at Login Items
 
     Options: --json (the helper's whole reply), --app-id <bundle id> (another Pod build).
@@ -62,19 +65,21 @@ func interface(_ text: String?) -> InterfaceName {
     return name
 }
 
-/// The Pod.app this binary sits in, for the helper's service name.
-func hostAppIdentifier() -> String {
+/// The Pod.app this binary sits in, if any.
+func hostApp() -> URL? {
     var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-    guard proc_pidpath(getpid(), &buffer, UInt32(buffer.count)) > 0 else { return PodRootd.appIdentifier }
+    guard proc_pidpath(getpid(), &buffer, UInt32(buffer.count)) > 0 else { return nil }
     var url = URL(fileURLWithPath: String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
     while url.pathComponents.count > 1 {
         url.deleteLastPathComponent()
-        guard url.pathExtension == "app",
-              let bundle = Bundle(url: url), let id = bundle.bundleIdentifier
-        else { continue }
-        return id
+        if url.pathExtension == "app", Bundle(url: url)?.bundleIdentifier != nil { return url }
     }
-    return PodRootd.appIdentifier
+    return nil
+}
+
+/// The Pod.app this binary sits in, for the helper's service name.
+func hostAppIdentifier() -> String {
+    hostApp().flatMap { Bundle(url: $0)?.bundleIdentifier } ?? PodRootd.appIdentifier
 }
 
 let json = flag("--json")
@@ -98,6 +103,8 @@ enum Command {
     case follow(InterfaceName)
     case hold(LidSeconds)
     case openSettings
+    case serviceStatus
+    case install
 }
 
 func parse() -> Command {
@@ -142,7 +149,10 @@ func parse() -> Command {
     case ("legacy", "migrate"): return .verb(.legacyMigrate)
     case ("legacy", "rollback"): return .verb(.legacyRollback)
     case ("restore", _): return .verb(.restoreDefaults)
+    case ("uninstall", _): return .verb(.helperUninstall)
     case ("service", "open-settings"): return .openSettings
+    case ("service", "status"): return .serviceStatus
+    case ("service", "install"): return .install
     case ("-h", _), ("--help", _), ("help", _):
         print(usage)
         exit(0)
@@ -156,6 +166,29 @@ let command = parse()
 if case .openSettings = command {
     PodRootdService.openLoginItems()
     exit(0)
+}
+
+if case .serviceStatus = command {
+    let step = PodRootdService(appIdentifier: appIdentifier).step
+    print(json ? "{\"step\": \"\(step)\"}" : "\(step)")
+    exit(0)
+}
+
+if case .install = command {
+    // Installer.app checks the package's signature and notarization and asks for an administrator
+    guard let app = hostApp() else { fail("not inside a Pod.app: open its \(PodRootd.packageName) by hand", code: 1) }
+    let package = PodRootdService.package(in: app)
+    guard FileManager.default.isReadableFile(atPath: package.path) else { fail("\(package.path) is missing", code: 1) }
+    let open = Process()
+    open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    open.arguments = [package.path]
+    do {
+        try open.run()
+        open.waitUntilExit()
+    } catch {
+        fail("open \(package.path): \(error)", code: 1)
+    }
+    exit(open.terminationStatus == 0 ? 0 : 1)
 }
 
 /// Who ran this command, for the helper's 5-minute grace: the session, the parent pid with its start
@@ -271,6 +304,6 @@ case .follow(let name):
     client.close()
     exit(0)
 
-case .openSettings:
+case .openSettings, .serviceStatus, .install:
     exit(0)
 }

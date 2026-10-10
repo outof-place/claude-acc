@@ -68,18 +68,20 @@ for name in fanctl claude-acc-hook claude-acc-pause claude-acc-desktop pod-acc-r
 done
 # automaty dla SMAppService z szablonów setup.sh (te same harmonogramy i logi)
 /usr/bin/python3 scripts/pod_agents.py --out "$DEST.new/LaunchAgents" >/dev/null
-# Pod's root helper (docs/pod-rootd.md): Pod puts the plist in Contents/Library/LaunchDaemons
-mkdir -p "$DEST.new/LaunchDaemons"
-cp launchd/codes.pod.app.rootd.plist "$DEST.new/LaunchDaemons/"
+# Pod's root helper (docs/pod-rootd.md): its job and the script Pod's release.sh builds the signed
+# package with (rootd/rootd-pkg.sh --binary pod-rootd ... --out pod-rootd.pkg)
+mkdir -p "$DEST.new/rootd"
+cp launchd/codes.pod.app.rootd.plist scripts/rootd-pkg.sh "$DEST.new/rootd/"
 # podpisy jak w formule; setup.sh podpisuje aplikację jeszcze raz po skopiowaniu (sign-app.sh)
 if [ -z "${PAYLOAD_NO_SIGN:-}" ]; then
   DESKTOP_ID="com.filip.claude-acc.desktop"
   codesign --force --sign - --identifier "$DESKTOP_ID" -r="designated => identifier \"$DESKTOP_ID\"" \
     "$DEST.new/claude-acc-desktop"
   codesign --force --sign - --identifier com.filip.claude-acc.pod-acc-run "$DEST.new/pod-acc-run"
-  # the helper's peer requirement names these identifiers; Pod signs them again with its team
-  codesign --force --sign - --identifier codes.pod.rootd "$DEST.new/pod-rootd"
-  codesign --force --sign - --identifier codes.pod.rootctl "$DEST.new/pod-rootctl"
+  # the helper's peer requirement names these identifiers and wants the hardened runtime and library
+  # validation; Pod signs them again with its team and the same options
+  codesign --force --sign - --options runtime,library --identifier codes.pod.rootd "$DEST.new/pod-rootd"
+  codesign --force --sign - --options runtime,library --identifier codes.pod.rootctl "$DEST.new/pod-rootctl"
   codesign --force --sign - "$APP"
 fi
 

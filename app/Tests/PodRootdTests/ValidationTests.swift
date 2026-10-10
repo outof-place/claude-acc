@@ -1,5 +1,7 @@
 import Foundation
 import Testing
+@testable import PodRootdClient
+import ServiceManagement
 @testable import PodRootdCore
 import PodRootdProtocol
 
@@ -86,28 +88,59 @@ func badRequests() {
     #expect(rig.engine.handle(old, from: .cli, session: SessionID(1)).refusal == .versionMismatch(helper: PodRootd.protocolVersion))
 }
 
-@Test("names: the plist, label and Mach service hang off Pod's bundle id")
+@Test("names: the plist, label, Mach service and install paths hang off Pod's bundle id")
 func names() {
     #expect(PodRootd.serviceName() == "codes.pod.app.rootd")
     #expect(PodRootd.plistName() == "codes.pod.app.rootd.plist")
     #expect(PodRootd.serviceName(appIdentifier: "codes.pod.canary") == "codes.pod.canary.rootd")
+    #expect(PodRootd.installedProgram() == "/Library/PrivilegedHelperTools/codes.pod.app.rootd")
+    #expect(PodRootd.installedPlist() == "/Library/LaunchDaemons/codes.pod.app.rootd.plist")
     #expect(Caller.allCases.map(\.signingIdentifier) == ["codes.pod.app", "com.filip.claude-acc.menubar", "codes.pod.rootctl"])
+    #expect(PodRootd.helperRequirementText(notarized: true)
+        == "anchor apple generic and certificate leaf[subject.OU] = \"75Y2KR6P5W\" and identifier \"codes.pod.rootd\" and notarized")
 }
 
-@Test("the launchd plist Pod ships: label, Mach service, BundleProgram next to pod-acc-run, restart only on a crash")
+private let repository = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+
+private func plist(_ path: String) throws -> [String: Any] {
+    try #require(try PropertyListSerialization.propertyList(
+        from: Data(contentsOf: repository.appendingPathComponent(path)), format: nil) as? [String: Any])
+}
+
+@Test("the job the package installs: the program in root-only PrivilegedHelperTools, listed under Pod")
 func launchdPlist() throws {
-    let url = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("launchd/codes.pod.app.rootd.plist")
-    let plist = try #require(try PropertyListSerialization.propertyList(from: Data(contentsOf: url), format: nil) as? [String: Any])
+    let plist = try plist("launchd/codes.pod.app.rootd.plist")
     #expect(plist["Label"] as? String == PodRootd.serviceName())
     #expect((plist["MachServices"] as? [String: Bool]) == [PodRootd.serviceName(): true])
-    #expect(plist["BundleProgram"] as? String == "Contents/Resources/claude-acc/pod-rootd")
-    #expect(plist["ProgramArguments"] as? [String] == ["pod-rootd"])
+    #expect(plist["Program"] as? String == PodRootd.installedProgram())
+    #expect(plist["ProgramArguments"] as? [String] == [PodRootd.serviceName()])
+    #expect(plist["BundleProgram"] == nil)
+    // Apple: a legacy plist names its app here, and the program's team must be the app's
+    #expect(plist["AssociatedBundleIdentifiers"] as? [String] == [PodRootd.appIdentifier])
     #expect(plist["RunAtLoad"] as? Bool == true)
     #expect((plist["KeepAlive"] as? [String: Bool]) == ["SuccessfulExit": false])
-    #expect(plist["Program"] == nil)
     // launchd spawns it only as codes.pod.rootd of Pod's team (a lightweight code requirement)
     #expect((plist["SpawnConstraint"] as? [String: String]) == [
         "team-identifier": PodRootd.teamIdentifier, "signing-identifier": PodRootd.helperIdentifier])
+}
+
+@Test("the helper's version is the app's build number: every release bumps both, so Pod.app's copy is newer")
+func helperVersionFollowsTheApp() throws {
+    let helper = try plist("app/Sources/pod-rootd/Info.plist")
+    let app = try plist("app/Info.plist")
+    #expect(helper["CFBundleIdentifier"] as? String == PodRootd.helperIdentifier)
+    #expect(helper["CFBundleVersion"] as? String == app["CFBundleVersion"] as? String)
+    #expect(Int(try #require(helper["CFBundleVersion"] as? String)) != nil)
+}
+
+@Test("the package's job: Login Items' state says install, approve or ready; the package sits in Pod.app")
+func serviceSteps() {
+    #expect(PodRootdService.step(for: .enabled) == .ready)
+    #expect(PodRootdService.step(for: .requiresApproval) == .approve)
+    #expect(PodRootdService.step(for: .notRegistered) == .install)
+    #expect(PodRootdService.step(for: .notFound) == .install)
+    #expect(PodRootdService().plist.path == "/Library/LaunchDaemons/codes.pod.app.rootd.plist")
+    #expect(PodRootdService.package(in: URL(fileURLWithPath: "/Applications/Pod.app")).path
+        == "/Applications/Pod.app/Contents/Resources/claude-acc/pod-rootd.pkg")
 }

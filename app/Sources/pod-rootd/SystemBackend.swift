@@ -4,18 +4,20 @@ import IOKit
 import IOKit.ps
 import PodRootdCore
 import PodRootdProtocol
+import Security
 import SMCKit
 
-/// The machine as root sees it. Syscalls and IOKit where macOS has an API; four Apple tools with
+/// The machine as root sees it. Syscalls and IOKit where macOS has an API; five Apple tools with
 /// argument vectors built from validated values where it has none (docs/pod-rootd.md): `pmset`
-/// (`SleepDisabled` and `powermode` have only SPI), `ifconfig` (the tbr ioctl is private), `mdutil`
-/// and `launchctl`. No shell, no path from a caller.
+/// (`SleepDisabled` and `powermode` have only SPI), `ifconfig` (the tbr ioctl is private), `mdutil`,
+/// `launchctl` and `pkgutil`. No shell, no path from a caller.
 final class SystemBackend: Backend {
     enum Tool: String {
         case pmset = "/usr/bin/pmset"
         case ifconfig = "/sbin/ifconfig"
         case mdutil = "/usr/bin/mdutil"
         case launchctl = "/bin/launchctl"
+        case pkgutil = "/usr/sbin/pkgutil"
     }
 
     static let spotlightConfig = "/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist"
@@ -23,12 +25,15 @@ final class SystemBackend: Backend {
 
     /// The helper's own directory (state, old plists moved aside), root only.
     let directory: String
+    /// Pod's bundle id: the job's label, plist and program name hang off it.
+    let appIdentifier: String
     private let fans: Fans?
     private var power: (at: Double, modes: [PowerSource: PowerMode])?
     private lazy var capable: Bool = Self.run(.pmset, ["-g", "cap"]).output.contains("highpowermode")
 
-    init(directory: String) {
+    init(directory: String, appIdentifier: String) {
         self.directory = directory
+        self.appIdentifier = appIdentifier
         fans = (try? SMC()).map(Fans.init)
     }
 
@@ -369,6 +374,90 @@ final class SystemBackend: Backend {
     func bootstrap(_ daemon: LegacyDaemon) throws {
         Self.run(.launchctl, ["bootout", "system/\(daemon.rawValue)"])
         try Self.check(.launchctl, ["bootstrap", "system", daemon.plistPath])
+    }
+
+    // MARK: The package's install
+
+    private var program: String { PodRootd.installedProgram(appIdentifier: appIdentifier) }
+
+    lazy var ownVersion: String? = {
+        var code: SecCode?
+        var staticCode: SecStaticCode?
+        guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+              SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode
+        else { return nil }
+        return Self.signedVersion(staticCode)
+    }()
+
+    /// The Pod.app the package was opened from (its postinstall records it), then /Applications.
+    func updateCandidates() -> [String] {
+        var apps: [String] = []
+        if let data = try? Self.readFile(directory + "/app", limit: 4096),
+           let recorded = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .newlines),
+           recorded.hasPrefix("/"), recorded.hasSuffix(".app"), !recorded.contains("/../") {
+            apps.append(recorded)
+        }
+        if !apps.contains("/Applications/Pod.app") { apps.append("/Applications/Pod.app") }
+        return apps.map { $0 + "/" + PodRootd.bundleDirectory + "/pod-rootd" }
+    }
+
+    func stageUpdate(from candidate: String) throws -> String {
+        // only the package's install updates itself: a helper started from anywhere else stays as it is
+        guard Self.ownPath() == program else { throw BackendError("not running as \(program)") }
+        return try HelperFiles.stage(candidate, into: (program as NSString).deletingLastPathComponent,
+                                     name: (program as NSString).lastPathComponent)
+    }
+
+    func verifiedVersion(ofStaged path: String) -> String? {
+        var code: SecStaticCode?
+        var requirement: SecRequirement?
+        var error: Unmanaged<CFError>?
+        let text = PodRootd.helperRequirementText(notarized: true)
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess, let code,
+              SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement
+        else { return nil }
+        let flags = SecCSFlags(rawValue: UInt32(kSecCSStrictValidate) | UInt32(kSecCSCheckAllArchitectures))
+        guard SecStaticCodeCheckValidityWithErrors(code, flags, requirement, &error) == errSecSuccess else {
+            error?.release()
+            return nil
+        }
+        return Self.signedVersion(code)
+    }
+
+    func installUpdate(_ staged: String) throws {
+        try HelperFiles.install(staged, as: program)
+    }
+
+    func discardUpdate(_ staged: String) {
+        unlink(staged)
+    }
+
+    func removeInstall() throws {
+        for path in [PodRootd.installedPlist(appIdentifier: appIdentifier), program, directory + "/state.json", directory + "/app"] {
+            guard unlink(path) == 0 || errno == ENOENT else { throw Self.posix("unlink \(path)") }
+        }
+        rmdir(directory)  // stays while the old daemons' backups are in it
+        // no receipt (a copy installed by hand) is as good as forgotten
+        Self.run(.pkgutil, ["--forget", PodRootd.packageIdentifier])
+    }
+
+    func bootoutSelf() {
+        Self.run(.launchctl, ["bootout", "system/" + PodRootd.serviceName(appIdentifier: appIdentifier)])
+    }
+
+    /// CFBundleVersion of the Info.plist the signature binds (`kSecCodeInfoPList`), not of the file.
+    static func signedVersion(_ code: SecStaticCode) -> String? {
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(code, [], &info) == errSecSuccess,
+              let plist = (info as? [String: Any])?[kSecCodeInfoPList as String] as? [String: Any]
+        else { return nil }
+        return plist["CFBundleVersion"] as? String
+    }
+
+    static func ownPath() -> String? {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(getpid(), &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 
     // MARK: Plumbing

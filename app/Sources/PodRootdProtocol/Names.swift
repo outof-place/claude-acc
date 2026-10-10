@@ -18,9 +18,36 @@ public enum PodRootd {
         appIdentifier + ".rootd"
     }
 
-    /// The plist in Contents/Library/LaunchDaemons: the name `SMAppService.daemon(plistName:)` takes.
+    /// The job's plist name; the package installs it in /Library/LaunchDaemons.
     public static func plistName(appIdentifier: String = appIdentifier) -> String {
         serviceName(appIdentifier: appIdentifier) + ".plist"
+    }
+
+    // The package's install layout (docs/pod-rootd.md, "Install layout"): root-only directories, so
+    // nothing running as the user can swap the program or edit the job.
+
+    /// The helper as launchd runs it.
+    public static func installedProgram(appIdentifier: String = appIdentifier) -> String {
+        "/Library/PrivilegedHelperTools/" + serviceName(appIdentifier: appIdentifier)
+    }
+
+    /// The job.
+    public static func installedPlist(appIdentifier: String = appIdentifier) -> String {
+        "/Library/LaunchDaemons/" + plistName(appIdentifier: appIdentifier)
+    }
+
+    /// The package receipt, for `pkgutil --forget` and the cask's `uninstall pkgutil:`.
+    public static let packageIdentifier = "codes.pod.rootd.pkg"
+    /// The package's name in Contents/Resources/claude-acc of Pod.app, next to pod-rootd and pod-rootctl.
+    public static let packageName = "pod-rootd.pkg"
+    /// Where pod-rootd and the package sit inside Pod.app.
+    public static let bundleDirectory = "Contents/Resources/claude-acc"
+
+    /// What the helper must be, as code signing language: Developer ID of Pod's team, its identifier.
+    /// A self-update also requires `notarized` of the copy it takes.
+    public static func helperRequirementText(team: String = teamIdentifier, notarized: Bool = false) -> String {
+        "anchor apple generic and certificate leaf[subject.OU] = \"\(team)\" and identifier \"\(helperIdentifier)\""
+            + (notarized ? " and notarized" : "")
     }
 }
 
