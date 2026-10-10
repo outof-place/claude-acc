@@ -71,7 +71,13 @@ func engineHandovers() throws {
     }
     let calls = Calls()
     engine.runner = { _ in calls.once += 1; return 0 }
-    engine.capsRunner = { calls.caps += 1 }
+    engine.capsRunner = {
+        calls.caps += 1
+        return PyObject([("ran", true), ("freed", 0), ("busy", 0), ("retry_at", .null)])
+    }
+    let capped = home + "/caps/p/builds"
+    Files.mkdirs(capped)
+    #expect(Files.writeAtomic(stateDir + "/janitor.json", "{\"caps\": [{\"path\": \"\(home)/caps/*/builds\", \"max_gb\": 10}]}"))
 
     engine.benchTick()  // over half the RAM: the brake is due at any stage
     #expect(calls.once == 1 && calls.caps == 1)
@@ -93,4 +99,21 @@ func engineHandovers() throws {
     now += 2
     engine.benchTick()
     #expect(calls.once == 4)
+
+    // enforcing again: the caps' interval passes, but nothing under the capped folders changed
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "caps_minutes": 10, "notify": false, "last_resort": false}"#))
+    now += 700
+    engine.benchTick()
+    #expect(calls.caps == 1)
+    // a build lands in a capped folder: the next interval runs the caps
+    #expect(Files.writeAtomic(capped + "/out.bin", "x"))
+    var seen = false
+    for _ in 0..<50 where !seen {
+        usleep(100_000)
+        seen = engine.queue.sync { engine.capsWatch.dirty }
+    }
+    #expect(seen)
+    now += 700
+    engine.benchTick()
+    #expect(calls.caps == 2)
 }
