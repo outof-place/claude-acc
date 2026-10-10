@@ -213,13 +213,35 @@ PIN_HOLD = {"target": ":3747", "level": "hold", "until": None, "reason": "film"}
 
 class CapsCommandTest(unittest.TestCase):
     def test_caps_runs_check_caps_once_with_a_fresh_state(self):
-        with mock.patch.object(dg, "check_caps") as check:
+        with mock.patch.object(dg, "check_caps", return_value=None) as check, mock.patch("builtins.print") as out:
             self.assertEqual(dg.cmd_caps(dg.load_config(), ["--dry-run"]), 0)
             self.assertEqual(dg.cmd_caps(dg.load_config(), []), 0)
         self.assertEqual([c.args[1] for c in check.call_args_list], [{}, {}])
         self.assertEqual([c.kwargs["dry_run"] for c in check.call_args_list], [True, False])
+        self.assertEqual(json.loads(out.call_args.args[0]), {"ran": False, "freed": 0, "busy": 0, "retry_at": None})
         self.assertIn("caps", dg.COMMANDS)
         self.assertIn("caps [--dry-run]", entry.__doc__)
+
+    def test_a_fresh_entry_over_the_limit_reports_when_it_may_go(self):
+        # acc-cored calls the caps again only after a change in their folders, a busy entry, or this time
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old, new = os.path.join(tmp, "p", "builds", "old"), os.path.join(tmp, "p", "builds", "new")
+        for path in (old, new):
+            os.makedirs(path)
+            with open(os.path.join(path, "blob"), "wb") as f:
+                f.write(b"x" * 65536)
+        jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(tmp, "*", "builds"), "max_gb": 1e-6, "keep": 0,
+                                                       "fresh_minutes": 10}])  # fmt: skip
+        with mock.patch.object(dg.janitor, "load_config", return_value=jcfg), mock.patch.object(dg, "log"), \
+                mock.patch("builtins.print") as out:
+            self.assertEqual(dg.cmd_caps(dg.load_config(), ["--dry-run"]), 0)
+        report = json.loads(out.call_args.args[0])
+        self.assertTrue(report["ran"])
+        self.assertEqual(report["busy"], 0)
+        newest = max(max(os.stat(p).st_mtime, os.stat(p).st_ctime) for p in (old, new))
+        self.assertLessEqual(report["retry_at"], newest + 600)
+        self.assertGreater(report["retry_at"], time.time() + 590)
 
 
 class NoteTest(unittest.TestCase):

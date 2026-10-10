@@ -2059,14 +2059,15 @@ def check_pending(world, state):
 
 
 def check_caps(cfg, state, now, dry_run):
-    """Limity katalogów z wynikami agentów: zadanie janitora, ale co kilka minut, a nie co 3 h."""
+    """Limity katalogów z wynikami agentów: zadanie janitora, ale co kilka minut, a nie co 3 h.
+    Przebieg zwraca swój Sweep (None, gdy nie było czego sprawdzać)."""
     every = cfg["caps_minutes"] * MINUTE
     if not every or now - state.get("caps_at", 0) < every:
-        return
+        return None
     state["caps_at"] = now
     jcfg = janitor.load_config()
     if not jcfg.get("caps"):
-        return
+        return None
     sweep = janitor.Sweep(jcfg, dry_run)
     janitor.task_caps(sweep, None)
     if sweep.freed:
@@ -2075,6 +2076,7 @@ def check_caps(cfg, state, now, dry_run):
             f"caps: {verb} {janitor.human(sweep.freed)}: "
             + ", ".join(short(p) for _, p, _ in sweep.items)
         )
+    return sweep
 
 
 def shape(cfg, world):
@@ -2351,8 +2353,16 @@ def cmd_once(cfg, args):
 
 def cmd_caps(cfg, args):
     """Limity katalogów z wynikami agentów raz, teraz: to samo, co pętla robi co caps_minutes.
-    acc-cored (natywny strażnik) woła to we własnym rytmie, bo sam katalogów nie kasuje."""
-    check_caps(cfg, {}, time.time(), dry_run="--dry-run" in args)
+    acc-cored (natywny strażnik) woła to we własnym rytmie, bo sam katalogów nie kasuje.
+
+    Na wyjściu jedna linia JSON: ile zwolniono, ile wpisów pominięto jako używane (tego żadna
+    zmiana w katalogu nie zapowie, więc trzeba sprawdzić znowu) i kiedy wpis pominięty jako
+    świeży może już pójść. acc-cored bez zmian w katalogach limitów i przed tym terminem nie
+    woła limitów znowu."""
+    sweep = check_caps(cfg, {}, time.time(), dry_run="--dry-run" in args)
+    busy = len([s for s in sweep.skipped if s[0] == "caps"]) if sweep else 0
+    print(json.dumps({"ran": sweep is not None, "freed": sweep.freed if sweep else 0, "busy": busy,
+                      "retry_at": sweep.retry_at if sweep else None}))
     return 0
 
 

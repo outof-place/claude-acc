@@ -16,6 +16,7 @@ let usage = """
            acc-cored orca-read            the host's four reads over its socket, timed
            acc-cored sched-replay F.jsonl [--show N]   the scheduler's housekeeping on parity fixtures
            acc-cored sched-scan [--sims-since T] [--sims-only]   native_scan() as JSON (parity)
+           acc-cored caps-watch [SECONDS]  how often the capped folders change (FSEvents), nothing run
            acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS] [--wait-lock]   the daemon
     """
 
@@ -217,6 +218,12 @@ case "sched-scan":
     print(PyJSON.object(PyObject([
         ("gb", .double(r.gb)), ("active", .bool(r.active)), ("pids", .array(r.pids.sorted().map { .int(Int($0)) })),
     ])).dumps())
+case "caps-watch":
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let seconds = args.first.flatMap { Double($0) } ?? 300
+    let (prefixes, changes) = CapsWatch.observe(home: home, seconds: seconds)
+    print("watching", prefixes.map { $0.pyReplace(home, "~") })
+    print("seconds with a change: \(changes.count) of \(Int(seconds)); first \(changes.prefix(20))")
 case "run":
     // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
     // A peer gone mid-write (a wrapper whose call timed out, a host that quit) is EPIPE here, never
