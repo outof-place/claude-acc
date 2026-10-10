@@ -66,7 +66,9 @@ class OwnerFileTest(unittest.TestCase):
         self.assertFalse(os.path.exists(O.OWNER_PATH))
 
 
-class SetupOwnerTest(unittest.TestCase):
+class SetupHarness(unittest.TestCase):
+    """setup.sh w osobnym HOME z atrapami pkill, launchctl, open, codesign i ditto na początku PATH."""
+
     def setUp(self):
         self.dir = os.path.realpath(tempfile.mkdtemp(prefix="setup-owner-"))
         self.addCleanup(shutil.rmtree, self.dir, True)
@@ -81,9 +83,12 @@ class SetupOwnerTest(unittest.TestCase):
             os.chmod(os.path.join(self.bin, name), 0o755)
         self.log = os.path.join(self.dir, "calls.log")
 
-    def setup(self, *args):
+    def setup(self, *args, **extra):
         env = dict(os.environ, HOME=self.home, PATH=self.bin + os.pathsep + "/usr/bin:/bin:/usr/sbin:/sbin",
-                   FAKE_LOG=self.log, CLAUDE_CONFIG_DIR=os.path.join(self.home, ".claude"))
+                   FAKE_LOG=self.log, CLAUDE_CONFIG_DIR=os.path.join(self.home, ".claude"),
+                   CLAUDE_ACC_ALLOW_FOREIGN_HOME="1")
+        env.update(extra)
+        env = {k: v for k, v in env.items() if v is not None}
         done = subprocess.run(["/bin/bash", os.path.join(ROOT, "setup.sh"), *args], env=env,
                               capture_output=True, text=True, timeout=60)
         return done.returncode, done.stdout + done.stderr
@@ -98,6 +103,8 @@ class SetupOwnerTest(unittest.TestCase):
         with open(self.log) as f:
             return f.read()
 
+
+class SetupOwnerTest(SetupHarness):
     def test_without_owner_nothing_changes(self):
         rc, out = self.setup()
         self.assertEqual(rc, 2)
@@ -124,6 +131,65 @@ class SetupOwnerTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(os.path.join(self.state, "owner.json")))
         self.assertIn("pkill -x ClaudeAcc", self.calls())
+
+
+class ForeignHomeTest(SetupHarness):
+    """setup.sh z HOME innym niż katalog domowy konta odmawia (kod 4), zanim cokolwiek zawoła.
+
+    Bez argumentów setup.sh i tak kończy się przed launchctl i pkill (kod 2, brak --app), więc
+    przypadek z prawdziwymi programami na PATH nie ma czego zepsuć, nawet gdyby straż nie zadziałała."""
+
+    SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+    def fake_account(self, home):
+        # `id -P` jak z bazy kont, z katalogiem domowym `home`; reszta `id` prawdziwa
+        with open(os.path.join(self.bin, "id"), "w") as f:
+            f.write('#!/bin/sh\n[ "$1" = -P ] && { echo "x:*:501:20::0:0:X:%s:/bin/zsh"; exit 0; }\nexec /usr/bin/id "$@"\n' % home)
+        os.chmod(os.path.join(self.bin, "id"), 0o755)
+
+    def test_foreign_home_is_refused_before_anything_runs(self):
+        for args in (("--app", "/x"), ("--uninstall",), ("--owner", "pod", "--uninstall")):
+            rc, out = self.setup(*args, CLAUDE_ACC_ALLOW_FOREIGN_HOME=None)
+            self.assertEqual(rc, 4, args)
+            self.assertIn("nie katalog domowy konta", out)
+        self.assertEqual(self.calls(), "")  # ani pkill, ani launchctl, ani open
+
+    def test_the_allow_variable_needs_fake_launchctl_and_pkill(self):
+        # prawdziwe launchctl i pkill z PATH: zmienna nie wystarcza
+        rc, out = self.setup(PATH=self.SYSTEM_PATH)
+        self.assertEqual(rc, 4, out)
+        # tylko launchctl podrobiony, pkill prawdziwy
+        only = os.path.join(self.dir, "only-launchctl")
+        os.makedirs(only)
+        shutil.copy(os.path.join(self.bin, "launchctl"), only)
+        rc, out = self.setup(PATH=only + os.pathsep + self.SYSTEM_PATH)
+        self.assertEqual(rc, 4, out)
+        # obie atrapy: dalej niż straż (brak --app)
+        rc, out = self.setup()
+        self.assertEqual(rc, 2, out)
+        self.assertIn("brak aplikacji", out)
+
+    def test_the_account_home_passes_without_the_variable(self):
+        self.fake_account(self.home)
+        rc, out = self.setup(CLAUDE_ACC_ALLOW_FOREIGN_HOME=None)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("brak aplikacji", out)
+        # ten sam katalog inną drogą (dowiązanie, ukośnik na końcu) to dalej konto
+        link = os.path.join(self.dir, "home-link")
+        os.symlink(self.home, link)
+        for home in (link, self.home + "/"):
+            rc, out = self.setup(HOME=home, CLAUDE_ACC_ALLOW_FOREIGN_HOME=None)
+            self.assertEqual(rc, 2, (home, out))
+        # konto ma inny katalog domowy niż HOME: odmowa
+        self.fake_account(os.path.join(self.dir, "elsewhere"))
+        rc, out = self.setup(CLAUDE_ACC_ALLOW_FOREIGN_HOME=None)
+        self.assertEqual(rc, 4, out)
+
+    def test_missing_home_is_refused(self):
+        self.fake_account(self.home)
+        rc, out = self.setup(HOME=os.path.join(self.dir, "missing"), CLAUDE_ACC_ALLOW_FOREIGN_HOME=None)
+        self.assertEqual(rc, 4, out)
+        self.assertEqual(self.calls(), "")
 
 
 class PayloadTest(unittest.TestCase):
