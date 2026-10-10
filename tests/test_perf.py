@@ -35,6 +35,12 @@ ACC = os.path.join(ROOT, "acc.py")
 sys.path.insert(0, ROOT)
 
 import orcahost
+import owner
+
+# owner.json prawdziwego konta (Pod przejął claude-acc na tym Macu) zmieniałby tabele perf liczone
+# przy imporcie (HOST_HOOKS podpisuje ~/.orca Pod): testy biorą instalację bez właściciela, a Pod
+# sprawdzają osobno, z owned_by_pod podanym wprost
+owner.OWNER_PATH = os.path.join(tempfile.gettempdir(), f"perf-test-no-owner-{os.getpid()}", "owner.json")
 import perf
 
 
