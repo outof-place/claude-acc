@@ -190,7 +190,7 @@ case "guard":
     dispatchMain()
 case "sched-replay":
     guard let path = args.first, let data = Files.read(path) else { fail(usage) }
-    let show = args.firstIndex(of: "--show").flatMap { Int(args[$0 + 1]) } ?? 3
+    let show = value("--show", in: args).flatMap { Int($0) } ?? 3
     var same = 0, different = 0, shown = 0
     for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where !line.isEmpty {
         guard let fixture = (try? PyJSON.loads(String(line)))?.object else { fail("unreadable fixture") }
@@ -212,8 +212,8 @@ case "run":
     // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
     let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
     let state = GuardPaths.state(home)
-    let shadow = args.firstIndex(of: "--shadow-guard").map { args[$0 + 1] }
-    let seconds = args.firstIndex(of: "--for").flatMap { Double(args[$0 + 1]) }
+    let shadow = value("--shadow-guard", in: args)
+    let seconds = value("--for", in: args).flatMap { Double($0) }
     var guardEngine: GuardEngine?
     if args.contains("--guard") || shadow != nil {
         let engine = GuardEngine(.init(home: home, shadow: shadow != nil, shadowPath: shadow))
