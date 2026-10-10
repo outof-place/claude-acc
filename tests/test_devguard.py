@@ -211,6 +211,17 @@ PIN_KEEP = {"target": ":3747", "level": "keep", "until": None, "reason": "film"}
 PIN_HOLD = {"target": ":3747", "level": "hold", "until": None, "reason": "film"}
 
 
+class CapsCommandTest(unittest.TestCase):
+    def test_caps_runs_check_caps_once_with_a_fresh_state(self):
+        with mock.patch.object(dg, "check_caps") as check:
+            self.assertEqual(dg.cmd_caps(dg.load_config(), ["--dry-run"]), 0)
+            self.assertEqual(dg.cmd_caps(dg.load_config(), []), 0)
+        self.assertEqual([c.args[1] for c in check.call_args_list], [{}, {}])
+        self.assertEqual([c.kwargs["dry_run"] for c in check.call_args_list], [True, False])
+        self.assertIn("caps", dg.COMMANDS)
+        self.assertIn("caps [--dry-run]", entry.__doc__)
+
+
 class NoteTest(unittest.TestCase):
     """Notka na karcie worktree: tylko gdy karta jest pusta albo ma notkę devguard lub linię wtyczki Orki."""
 

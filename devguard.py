@@ -33,6 +33,8 @@ Komendy:
   run                   pętla dla launchd: pomiar co kilka sekund, najwyżej jedna akcja naraz
   status [--json]       serwery, pamięć, kto je ogląda i co strażnik z nimi zrobi
   once [--dry-run]      jeden pomiar i co najwyżej jedna akcja
+  caps [--dry-run]      limity katalogów z wynikami agentów raz, teraz: to, co `run` robi co
+                        caps_minutes (natywny strażnik acc-cored woła to we własnym rytmie)
   stop <pid|:port>      zatrzymaj serwer tak, jak robi to strażnik
   recycle <pid|:port>   restart w tym samym terminalu Orki
   pin <:port|katalog> [--for 12h | --forever] [--reason TEKST] [--no-restart]
