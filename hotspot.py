@@ -510,6 +510,8 @@ PLIST_BODY = """<?xml version="1.0" encoding="UTF-8"?>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
   <array>
+    <string>{python}</string>
+    <string>-I</string>
     <string>{bin}</string>
     <string>daemon</string>
     <string>--config</string>
@@ -531,11 +533,39 @@ def installed():
     return os.path.exists(BIN) and os.path.exists(PLIST)
 
 
+def launched_with():
+    """Program z plisty demona: [interpreter, -I, BIN, ...] albo starsze [BIN, ...]; [] bez plisty."""
+    try:
+        import plistlib
+
+        with open(PLIST, "rb") as f:
+            args = plistlib.load(f).get("ProgramArguments")
+    except (OSError, ValueError, ImportError):
+        return []
+    return [str(a) for a in args] if isinstance(args, list) else []
+
+
+def root_python():
+    """(interpreter, None) dla demona albo (None, powód): rootpy.py leży obok tego pliku."""
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    try:
+        import rootpy
+    except ImportError as err:
+        return None, f"brak rootpy.py obok hotspot.py ({err})"
+    return rootpy.find()
+
+
 def cmd_install(args):
+    # demon chodzi jako root, więc nie wolno mu startować przez /usr/bin/python3: to zaślepka, która
+    # idzie do wybranego Xcode'a, a Xcode z DMG należy do użytkownika (rootpy.py)
+    python, why = root_python()
+    if not python:
+        print("nie instaluję demona: " + (why or "?"), file=sys.stderr)
+        return 1
     os.makedirs(STATE_DIR, exist_ok=True)
     plist = os.path.join(STATE_DIR, "hotspot.plist.tmp")
     with open(plist, "w") as f:
-        f.write(PLIST_BODY.format(label=LABEL, bin=BIN, config=CONFIG, state=STATE, log=LOG))
+        f.write(PLIST_BODY.format(label=LABEL, python=python, bin=BIN, config=CONFIG, state=STATE, log=LOG))
     src = os.path.realpath(__file__)
     script = (
         "set -e; install -d -o root -g wheel -m 755 /usr/local/libexec; "
@@ -604,9 +634,12 @@ def status(config_path=CONFIG, state_path=STATE, now=None):
     cfg = read_config(config_path)
     state = read_state(state_path) or {}
     running = bool(state) and now - state.get("at", 0) < 15
+    launch = launched_with()
     out = {"enabled": cfg["enabled"], "installed": installed(), "running": running,
            "active": running and bool(state.get("active")),
-           "current": file_hash(os.path.realpath(__file__)) == file_hash(BIN) if installed() else None}
+           "current": file_hash(os.path.realpath(__file__)) == file_hash(BIN) if installed() else None,
+           # plista sprzed 1.31.1 startowała demona przez shebang `#!/usr/bin/python3`
+           "legacy_launch": bool(launch) and os.path.basename(launch[0]) not in ("python3", "python")}
     if out["active"]:
         for key in ("iface", "via", "rate_kbps", "safe_kbps", "cuts", "tx_kbps", "rx_kbps", "delay_p50_ms",
                     "delay_p90_ms", "baseline_ms", "shaping", "lost", "answered", "since"):
@@ -626,6 +659,9 @@ def cmd_status(args):
         print("demon: nie odpowiada (sudo launchctl kickstart -k system/%s, log %s)" % (LABEL, LOG))
     elif s["current"] is False:
         print("demon: starsza wersja niż ta w claude-acc (claude-acc hotspot install)")
+    if s["installed"] and s.get("legacy_launch"):
+        print("demon: startuje przez /usr/bin/python3, czyli interpreter z Xcode'a użytkownika; "
+              "przeinstaluj (claude-acc hotspot install)")
     if s["active"]:
         print("łącze: %s przez %s, limit wysyłania %.1f Mb/s (bezpieczny %.1f), cięć %d%s" % (
             s["iface"], s["via"], s["rate_kbps"] / 1000, s["safe_kbps"] / 1000, s["cuts"],

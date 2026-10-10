@@ -6,9 +6,11 @@ Wykrywanie hotspotu czyta wyjście `route` i `networksetup` z atrapy.
 Uruchomienie: /usr/bin/python3 -m unittest tests.test_hotspot
 """
 
+import argparse
 import importlib.util
 import json
 import os
+import plistlib
 import tempfile
 import unittest
 from unittest import mock
@@ -22,6 +24,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location("hotspot", os.path.join(os.path.dirname(HERE), "hotspot.py"))
 hotspot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hotspot)
+
+_rspec = importlib.util.spec_from_file_location("acc_rootpy", os.path.join(os.path.dirname(HERE), "rootpy.py"))
+R = importlib.util.module_from_spec(_rspec)
+_rspec.loader.exec_module(R)
 
 ROUTE_USB = """   route to: default
 destination: default
@@ -227,6 +233,40 @@ class StatusTest(unittest.TestCase):
         self.assertFalse(s["running"])
         self.assertFalse(s["active"])
         self.assertNotIn("iface", s)
+
+
+class RootLaunchTest(unittest.TestCase):
+    """Demon roota startuje przez interpreter należący do roota, nie przez `#!/usr/bin/python3`."""
+
+    def plist(self, args):
+        """Plista demona z podanym ProgramArguments; status ma powiedzieć, czy start jest stary."""
+        path = os.path.join(tempfile.mkdtemp(prefix="hotspot-plist-"), "daemon.plist")
+        with open(path, "wb") as f:
+            plistlib.dump({"Label": hotspot.LABEL, "ProgramArguments": args}, f)
+        return path
+
+    def test_the_installed_plist_starts_an_interpreter_with_I(self):
+        body = hotspot.PLIST_BODY.format(label=hotspot.LABEL, python="/root/bin/python3", bin=hotspot.BIN,
+                                         config="/c.json", state="/s.json", log="/l.log")
+        args = plistlib.loads(body.encode("utf-8"))["ProgramArguments"]
+        self.assertEqual(args[:4], ["/root/bin/python3", "-I", hotspot.BIN, "daemon"])
+
+    def test_status_flags_a_daemon_installed_the_old_way(self):
+        for args, legacy in (([hotspot.BIN, "daemon"], True),
+                             (["/Library/Developer/CommandLineTools/usr/bin/python3", "-I", hotspot.BIN], False)):
+            with self.subTest(args=args):
+                path = self.plist(args)
+                with mock.patch.object(hotspot, "PLIST", path), mock.patch.object(hotspot, "BIN", __file__):
+                    s = hotspot.status(os.path.join(self.plist([]), "..", "none.json"), "/nie/ma/state.json")
+                self.assertEqual(s["legacy_launch"], legacy)
+
+    def test_install_refuses_without_a_root_owned_interpreter(self):
+        args = argparse.Namespace(dry_run=True)
+        with mock.patch.object(hotspot, "root_python", return_value=(None, "atrapa: nie root")):
+            with mock.patch("sys.stderr"):
+                self.assertEqual(hotspot.cmd_install(args), 1)
+        # rootpy.py leży obok hotspot.py, więc na tym Macu interpreter się znajduje
+        self.assertEqual(hotspot.root_python()[0], R.find()[0])
 
 
 if __name__ == "__main__":
