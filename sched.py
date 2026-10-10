@@ -484,6 +484,60 @@ def alive(pid):
     return True
 
 
+# acc-cored (natywny demon claude-acc, docs/acc-cored.md) robi pracę „co sekundę” za wszystkie wrappery
+# naraz: heartbeaty, reap, refresh_memory, safety, plan i widok kolejki. Wrapper, który go widzi, czeka
+# w kolejce na SIGUSR1 (plan go wpuścił) zamiast co 0,5 s, a job pilnuje wait4 zamiast pętli 4 Hz; budzi
+# się co CORED_WAKE_S po swoje (log postoju, limit klasy) i żeby sprawdzić, czy acc-cored dalej działa
+CORED_SOCK = os.path.join(STATE_DIR, "acc-cored.sock")
+CORED_WAKE_S = 5.0
+
+
+def cored_pid(state):
+    """pid acc-cored, gdy robi pracę kolejki (zostawia znak w stanie) i żyje; inaczej None.
+    SCHED_NO_CORED=1 zostawia wrapper przy własnych pętlach."""
+    if os.environ.get("SCHED_NO_CORED"):
+        return None
+    pid = (state.get("cored") or {}).get("pid")
+    if not isinstance(pid, int) or pid <= 0 or not alive(pid):
+        return None
+    return pid if proc_name(pid) == "acc-cored" else None
+
+
+def cored_waker():
+    """kqueue z każdą próbą doręczenia SIGUSR1, którym acc-cored budzi czekający wrapper. Sygnał ma pusty
+    handler, więc wrappera nie zabije (także spóźniony, po wpuszczeniu); kqueue liczy próby i tak
+    (EVFILT_SIGNAL). Nie SIG_IGN: ignorowany sygnał przeszedłby przez exec do joba, handler wraca do
+    domyślnego."""
+    import select
+    import signal
+
+    signal.signal(signal.SIGUSR1, lambda _sig, _frame: None)
+    kq = select.kqueue()
+    kq.control([select.kevent(signal.SIGUSR1, filter=select.KQ_FILTER_SIGNAL, flags=select.KQ_EV_ADD)], 0, 0)
+    return kq
+
+
+def cored_call(request, timeout=1.0):
+    """Jedno pytanie do gniazda acc-cored; jego odpowiedź z "ok" albo None."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(timeout)
+            conn.connect(CORED_SOCK)
+            conn.sendall(json.dumps(request).encode() + b"\n")
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        answer = json.loads(buf)
+    except (OSError, ValueError):
+        return None
+    return answer if isinstance(answer, dict) and answer.get("ok") else None
+
+
 def fake_memory():
     """Pamięć z pliku SCHED_FAKE_MEMORY (testy) albo None."""
     path = os.environ.get("SCHED_FAKE_MEMORY")
@@ -3385,6 +3439,11 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
         entry["small"] = gb <= cfg["small_gb"] and wall <= cfg["small_wall_s"]
         entry["route"], target = decide_route(state, job, gb, wall, cfg, cache)
         entry["routed_at"] = time.time()
+        waker = None
+        if cored_pid(state):
+            # gotowy na SIGUSR1, zanim acc-cored zobaczy wpis: domyślna akcja zabiłaby wrapper
+            waker = cored_waker()
+            entry["wake"] = "usr1"
         state["queue"].append(entry)
         if target and entry["route"]["choice"] == "depot":
             start_depot(state, entry, target)
@@ -3405,7 +3464,11 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
             )
         cancelled = False
         while entry.get("where") is None:
-            time.sleep(0.5)
+            if entry.get("wake") and waker is not None:
+                left = start + timeout - time.time() if timeout else CORED_WAKE_S
+                waker.control(None, 1, max(0.01, min(CORED_WAKE_S, left)))
+            else:
+                time.sleep(0.5)
             if timeout and time.time() - start > timeout:
                 with Locked():
                     state = load_state(cfg)
@@ -3427,6 +3490,8 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                 if me is None:
                     me = entry
                     state["queue"].append(me)
+                if me.get("wake") and not cored_pid(state):
+                    me["wake"] = None  # acc-cored zniknął: znowu co 0,5 s
                 if time.time() - me.get("routed_at", 0) > 15:
                     me["route"], target = decide_route(
                         state,
@@ -3587,11 +3652,17 @@ def run_local(entry, job, command, argv, cfg):
         finish(entry["id"], cfg, 127, 0.0, 0.0, None)
         return 127
     jid = entry["id"]
+    spawned_at = time.time()
+    cored = False
     with Locked():
         state = load_state(cfg)
         me = next((j for j in state["running"] if j["id"] == jid), None)
         if me is not None:
             me["child_pgid"] = child.pid
+            if cored_pid(state):
+                me["monitor"] = "cored"
+                me["child_started_at"] = spawned_at
+                cored = True
             save_state(state)
 
     def forward(sig, _frame):
@@ -3606,6 +3677,22 @@ def run_local(entry, job, command, argv, cfg):
     started = time.time()
     peak, cpu_live, last_beat = 0.0, 0.0, 0.0
     watch = StallWatch(cfg, job, jid)
+    if cored:
+        done = wait_cored(child, jid, cfg, watch, started)
+        if done is not None:
+            status, rusage, peak, cpu_live = done
+            rc = os.waitstatus_to_exitcode(status)
+            cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
+            finish(jid, cfg, rc, time.time() - started, peak, cpu)
+            return rc if rc >= 0 else 128 - rc
+        # acc-cored zniknął w trakcie: dalej własna pętla, od szczytu, który zdążył zapisać
+        with Locked():
+            state = load_state(cfg)
+            me = next((j for j in state["running"] if j["id"] == jid), None)
+            if me is not None:
+                peak = float(me.get("mem_peak_gb") or 0.0)
+                me["monitor"] = None
+                save_state(state)
     # natywny build: do pamięci joba dochodzą drzewa xcodebuild na Macu (jeden build naraz, więc
     # to jego) i symulator, który `portivo-mobile up` włączył; oba poza drzewem procesów joba
     native = job.get("lang") == "native" and job.get("exclusive")
@@ -3636,6 +3723,43 @@ def run_local(entry, job, command, argv, cfg):
     cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
     finish(jid, cfg, rc, time.time() - started, peak, cpu)
     return rc if rc >= 0 else 128 - rc
+
+
+def wait_cored(child, jid, cfg, watch, started):
+    """Job pod okiem acc-cored: wrapper śpi w kqueue (NOTE_EXIT dziecka) i budzi się co CORED_WAKE_S po log
+    postoju (stalled_s liczy acc-cored), po limit klasy i żeby sprawdzić, czy acc-cored działa. Po końcu
+    joba: (status, rusage, szczyt w GB, CPU żywych procesów) z ostatnich próbek acc-cored; None, gdy
+    acc-cored zniknął przed końcem joba (wtedy wraca pętla wrappera)."""
+    import select
+
+    kq = select.kqueue()
+    try:
+        kq.control([select.kevent(child.pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)], 0, 0)
+    except OSError:
+        pass  # już po końcu: wait4 niżej go odbierze
+    while True:
+        pid, status, rusage = os.wait4(child.pid, os.WNOHANG)
+        if pid == child.pid:
+            final = cored_call({"op": "sched.final", "id": jid})
+            if final is None:
+                state = load_state(cfg)
+                me = next((j for j in state["running"] if j["id"] == jid), None) or {}
+                final = {"peak_gb": me.get("mem_peak_gb") or 0.0, "cpu_s": 0.0}
+            return status, rusage, float(final.get("peak_gb") or 0.0), float(final.get("cpu_s") or 0.0)
+        kq.control(None, 1, CORED_WAKE_S)
+        state = load_state(cfg)
+        if not cored_pid(state):
+            return None
+        me = next((j for j in state["running"] if j["id"] == jid), None) or {}
+        stalled = me.get("stalled_s")
+        if stalled and not watch.notified:
+            watch.notified = True
+            log(f"{watch.label} stoi od {human_s(stalled)}: bez CPU i bez wyjścia; rezerwa pamięci wraca do puli")
+            notify("claude-acc: job stoi", f"{watch.label}: {human_s(stalled)} bez CPU i wyjścia (claude-acc sched status)")
+        elif not stalled and watch.notified:
+            watch.notified = False
+            log(f"{watch.label} znowu pracuje")
+        watch.enforce(time.time() - started, child.pid)
 
 
 class StallWatch:

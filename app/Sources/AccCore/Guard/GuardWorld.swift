@@ -149,24 +149,8 @@ public final class Unit {
         biggest = servers.map(\.footprint).max()!
         peak = max(servers.map(\.peak).max()!, footprint)
         regrow = servers.reduce(0) { $0 + $1.regrow }
-        cpu = Self.sum(servers.map(\.cpu))
+        cpu = pySum(servers.map(\.cpu))
         ports = Array(Set(servers.flatMap(\.ports))).sorted()
-    }
-
-    /// sum() over values that are each an int 0 or a float
-    static func sum(_ xs: [PyNum]) -> PyNum {
-        // the int fast path until the first float, then the compensated sum, as builtin sum does
-        var i = 0
-        var total = 0
-        while i < xs.count, case .int(let v) = xs[i] {
-            total += v
-            i += 1
-        }
-        if i == xs.count { return .int(total) }
-        var floats = [Double(total) + xs[i].value]
-        floats += xs[(i + 1)...].map(\.value)
-        // the first float joined the int total by plain addition; pySum adds it to 0 the same way
-        return pySum(floats)
     }
 
     public var appKey: String { pySorted(Set(servers.map(\.cwd))).joined(separator: "|") }

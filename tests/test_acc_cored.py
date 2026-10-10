@@ -1,7 +1,8 @@
-"""acc-cored's readers, patterns and guard tick against devguard_core's, with the built binary.
+"""acc-cored's readers, patterns, guard tick and scheduler pass against Python's, with the built binary.
 
-The readers' checks read this Mac's process table and sockets; the guard's fixtures are synthetic
-(tests/acc_cored/devguard_replay.py fuzz). Nothing is changed. Build first:
+The readers' checks read this Mac's process table and sockets; the guard's and the scheduler's
+fixtures are synthetic (tests/acc_cored/devguard_replay.py and sched_replay.py fuzz). Nothing is
+changed. Build first:
     cd app && swift build -c release --product acc-cored
 """
 
@@ -62,6 +63,25 @@ class GuardReplayTest(unittest.TestCase):
         self.assertIsNotNone(m, done.stdout)
         self.assertEqual(int(m[1]) + int(m[2]), written, done.stdout)
         self.assertGreater(int(m[1]), 150, done.stdout)
+
+
+@needs_binary
+class SchedReplayTest(unittest.TestCase):
+    def test_fuzzed_passes_match_python(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "sched.jsonl")
+            made = subprocess.run(
+                [sys.executable, "-I", os.path.join(HERE, "acc_cored", "sched_replay.py"), "fuzz", ROOT, "--n", "300",
+                 "--seed", "7", "--out", out],
+                capture_output=True, text=True,
+            )  # fmt: skip
+            self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+            with open(out) as f:
+                count = sum(1 for _ in f)
+            self.assertGreater(count, 250, made.stdout)
+            done = subprocess.run([BUILT, "sched-replay", out], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(f"same {count}, different 0", done.stdout)
 
 
 if __name__ == "__main__":

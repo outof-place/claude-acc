@@ -121,6 +121,11 @@ public final class GuardEngine: @unchecked Sendable {
         return true
     }
 
+    /// The snapshot of the last tick, for the scheduler running in the same process
+    public func latestSnapshot() -> PyObject? {
+        queue.sync { state["snapshot"]?.object }
+    }
+
     public func stop() {
         queue.sync {
             timer?.cancel()

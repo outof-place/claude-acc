@@ -111,10 +111,10 @@ public enum Files {
 
     /// janitor.write_json: the whole text into a temp file next to it, then rename.
     @discardableResult
-    public static func writeAtomic(_ path: String, _ text: String) -> Bool {
+    public static func writeAtomic(_ path: String, _ text: String, tmpSuffix: String? = nil) -> Bool {
         let dir = dirname(path)
         mkdirs(dir)
-        let tmp = "\(path).\(getpid()).tmp"
+        let tmp = path + (tmpSuffix ?? ".\(getpid()).tmp")
         let fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0o644)
         guard fd >= 0 else { return false }
         var ok = true

@@ -187,6 +187,66 @@ extension PyJSON {
         }
     }
 
+    /// json.dumps(value, ensure_ascii=False, indent=n): what sched.py writes its state with
+    public func dumps(indent: Int, ensureASCII: Bool) -> String {
+        var out = ""
+        out.reserveCapacity(8192)
+        write(to: &out, indent: indent, level: 0, ascii: ensureASCII)
+        return out
+    }
+
+    func write(to out: inout String, indent: Int, level: Int, ascii: Bool) {
+        switch self {
+        case .string(let s):
+            if ascii { Self.quote(s, into: &out) } else { Self.quoteUnicode(s, into: &out) }
+        case .array(let a):
+            if a.isEmpty { out += "[]"; return }
+            out += "["
+            let pad = "\n" + String(repeating: " ", count: indent * (level + 1))
+            for (i, v) in a.enumerated() {
+                out += i == 0 ? pad : "," + pad
+                v.write(to: &out, indent: indent, level: level + 1, ascii: ascii)
+            }
+            out += "\n" + String(repeating: " ", count: indent * level) + "]"
+        case .object(let o):
+            if o.isEmpty { out += "{}"; return }
+            out += "{"
+            let pad = "\n" + String(repeating: " ", count: indent * (level + 1))
+            var first = true
+            for (k, v) in o {
+                out += first ? pad : "," + pad
+                first = false
+                if ascii { Self.quote(k, into: &out) } else { Self.quoteUnicode(k, into: &out) }
+                out += ": "
+                v.write(to: &out, indent: indent, level: level + 1, ascii: ascii)
+            }
+            out += "\n" + String(repeating: " ", count: indent * level) + "}"
+        default:
+            write(to: &out)
+        }
+    }
+
+    /// ensure_ascii=False: only the quote, the backslash and control characters are escaped
+    static func quoteUnicode(_ s: String, into out: inout String) {
+        out += "\""
+        for scalar in s.unicodeScalars {
+            switch scalar.value {
+            case 0x22: out += "\\\""
+            case 0x5C: out += "\\\\"
+            case 0x0A: out += "\\n"
+            case 0x0D: out += "\\r"
+            case 0x09: out += "\\t"
+            case 0x08: out += "\\b"
+            case 0x0C: out += "\\f"
+            case 0..<0x20:
+                let hex = String(scalar.value, radix: 16)
+                out += "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
+            default: out.unicodeScalars.append(scalar)
+            }
+        }
+        out += "\""
+    }
+
     static func quote(_ s: String, into out: inout String) {
         out += "\""
         for unit in s.utf16 {
