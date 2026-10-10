@@ -27,7 +27,7 @@ let package = Package(
     platforms: [.macOS("26.0")],
     dependencies: [
         // claude-acc's state as Swift models; Pod Menu gives its views pod-rootd through AccRootHelper
-        .package(url: "https://github.com/outof-place/acc-kit", .upToNextMinor(from: "0.8.4"))
+        .package(url: "https://github.com/outof-place/acc-kit", .upToNextMinor(from: "0.9.0"))
     ],
     targets: [
         // the menu bar app
