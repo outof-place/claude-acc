@@ -16,3 +16,11 @@ func legacyAgentLabel() {
     #expect(!PodMenu.active)
     #expect(PodMenu.agentLabel("devguard") == "com.filip.claude-acc.devguard")
 }
+
+@Test("claude-acc://panel opens the panel; a path names the section to show")
+func panelRoute() throws {
+    #expect(PanelRoute.section(of: try #require(URL(string: "claude-acc://panel"))) == nil)
+    #expect(PanelRoute.section(of: try #require(URL(string: "claude-acc://panel/"))) == nil)
+    #expect(PanelRoute.section(of: try #require(URL(string: "claude-acc://panel/services"))) == "services")
+    #expect(PanelRoute.section(of: try #require(URL(string: "claude-acc://awake/on"))) == nil)
+}

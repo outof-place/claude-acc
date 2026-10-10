@@ -1864,20 +1864,16 @@ def cmd_compress_apps(cfg, args):
     passthrough = ["--afsctool", tool, "--threads", str(opts.threads), "--done-ratio", str(opts.done_ratio)]
     if opts.apps:
         passthrough += ["--apps", opts.apps]
+    rc = compressapps.main(["plan"] + passthrough)
     if opts.dry_run:
-        return compressapps.main(["plan"] + passthrough)
-    out = os.path.join(user_tmpdir(), f"compress-apps-{os.getpid()}.json")
-    rc = subprocess.run(["sudo", "/usr/bin/python3", "-I", script, "run", "--json-out", out] + passthrough).returncode
-    try:
-        with open(out) as f:
-            results = json.load(f)
-        os.unlink(out)
-    except (OSError, ValueError):
-        results = []
-    if results:
-        freed = sum(r.get("freed", 0) for r in results)
-        back = sum(1 for r in results if r.get("rolled_back"))
-        log(f"compress-apps: {len(results)} aplikacji, zwolniono {human(freed)}" + (f", cofnięte: {back}" if back else ""))
+        return rc
+    # Kompresji pod rootem tu nie ma (1.31.1). Pod rootem trzeba by uruchomić i ten skrypt, i
+    # afsctool, a oba leżą w miejscach zapisywalnych bez roota ($STATE, /opt/homebrew): kto ma
+    # konto użytkownika, dostałby roota przy następnym `sudo`. Wróci przez pomocnika roota
+    # (pod-rootd) z własną, przypiętą kopią afsctool.
+    print("\nKompresja aplikacji roota jest wyłączona: wymagałaby uruchomienia pod rootem afsctool "
+          "i tego skryptu z miejsc zapisywalnych bez roota. Wyżej plan; zadanie `compress` janitora "
+          "dalej kompresuje pliki i aplikacje użytkownika bez roota.")
     return rc
 
 

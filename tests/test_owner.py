@@ -71,11 +71,41 @@ class OwnerFileTest(unittest.TestCase):
         os.makedirs(menu)
         self.assertEqual(O.menu_app(), menu)
 
-    def test_clear(self):
-        O.write("pod", "1")
+    def test_clear_leaves_a_brew_tombstone(self):
+        """Oddanie (handback) nie kasuje pliku: bez niego Pod przejąłby claude-acc znowu przy starcie."""
+        O.write("pod", "1.31.0", "/Applications/Pod.app")
         with mock.patch("sys.stdout"):
             O.main(["clear"])
-        self.assertFalse(os.path.exists(O.OWNER_PATH))
+        data = O.record()
+        self.assertEqual((data["owner"], data["version"], data["app"]), ("brew", "1.31.0", None))
+        self.assertIsNone(O.read())  # dla claude-acc to brak właściciela
+        self.assertEqual(O.main(["check"]), 0)  # brew i install.sh instalują
+        self.assertEqual(O.main(["check", "--as", "pod"]), 0)
+        with mock.patch("sys.stdout") as out:
+            O.main(["show", "--json"])
+        self.assertEqual(json.loads(out.write.call_args_list[0].args[0])["owner"], "brew")
+
+    def test_uninstall_tombstone_only_over_pod(self):
+        with mock.patch("sys.stdout"):
+            self.assertEqual(O.main(["uninstalled"]), 0)
+        self.assertFalse(os.path.exists(O.OWNER_PATH))  # brew bez owner.json: dalej bez pliku
+        O.write("pod", "1.31.0")
+        O.main(["uninstalled"])
+        self.assertEqual(O.record()["owner"], "none")
+        self.assertIsNone(O.read())
+        with mock.patch("sys.stdout"):
+            O.main(["clear"])
+        O.main(["uninstalled"])  # nagrobek zostaje nagrobkiem
+        self.assertEqual(O.record()["owner"], "brew")
+        with self.assertRaises(ValueError):
+            O.tombstone("pod")
+
+    def test_forget_deletes_the_file(self):
+        O.write("pod", "1")
+        with mock.patch("sys.stdout"):
+            O.main(["forget"])
+            self.assertFalse(os.path.exists(O.OWNER_PATH))
+            self.assertEqual(O.main(["forget"]), 0)
 
 
 class SetupHarness(unittest.TestCase):
@@ -124,12 +154,29 @@ class SetupOwnerTest(SetupHarness):
 
     def test_homebrew_setup_refuses_when_pod_owns_it(self):
         self.own()
-        for args in ((), ("--app", "/x"), ("--uninstall",)):
+        for args in ((), ("--app", "/x")):
             rc, out = self.setup(*args)
             self.assertEqual(rc, 3, args)
             self.assertIn("należy teraz do Pod", out)
         self.assertEqual(self.calls(), "")  # ani pkill, ani launchctl
         self.assertTrue(os.path.exists(os.path.join(self.state, "owner.json")))
+
+    def test_anyone_uninstalls_and_pod_gets_a_tombstone(self):
+        """`claude-acc uninstall` (setup.sh --uninstall bez --owner) przy claude-acc Poda: zdejmuje i
+        zostawia nagrobek "none", żeby Pod nie zainstalował go od nowa, tylko zdjął swoje agenty."""
+        self.own()
+        rc, out = self.setup("--uninstall")
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.state, "owner.json")) as f:
+            self.assertEqual(json.load(f)["owner"], "none")
+        self.assertIn("pkill -x ClaudeAcc", self.calls())
+
+    def test_a_tombstone_lets_homebrew_install(self):
+        with open(os.path.join(self.state, "owner.json"), "w") as f:
+            json.dump({"owner": "brew", "version": "1.31.0", "app": None, "at": 0}, f)
+        rc, out = self.setup()
+        self.assertEqual(rc, 2, out)  # dalej niż odmowa właściciela: brak --app
+        self.assertIn("brak aplikacji", out)
 
     def test_the_owner_gets_past_the_check(self):
         self.own()
@@ -137,11 +184,13 @@ class SetupOwnerTest(SetupHarness):
         self.assertEqual(rc, 2)  # dalej niż odmowa: brak --app
         self.assertIn("brak aplikacji", out)
 
-    def test_the_owner_uninstalls_and_drops_the_mark(self):
+    def test_the_owner_uninstalls_and_leaves_a_tombstone(self):
         self.own()
         rc, _ = self.setup("--owner", "pod", "--uninstall")
         self.assertEqual(rc, 0)
-        self.assertFalse(os.path.exists(os.path.join(self.state, "owner.json")))
+        with open(os.path.join(self.state, "owner.json")) as f:
+            data = json.load(f)
+        self.assertEqual((data["owner"], data["version"]), ("none", "1.26.0"))
         self.assertIn("pkill -x ClaudeAcc", self.calls())
 
 
