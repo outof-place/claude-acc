@@ -3,13 +3,16 @@
 
   owner.py show [--json]
   owner.py check [--as pod]      kod 3, gdy claude-acc należy do Pod, a woła ktoś inny (brew, install.sh)
-  owner.py write --owner pod --version X [--app PATH]
+  owner.py write --owner pod --version X [--app PATH] [--menu PATH]
+  owner.py menu                  aplikacja paska menu: Pod Menu.app Poda (setup.sh --pod-agents) albo
+                                 ~/Applications/Claude Acc.app
   owner.py clear                 oddanie claude-acc z powrotem instalacji z Homebrew albo ze źródeł
 
 Pliku nie ma: claude-acc instaluje brew (`claude-acc-setup`) albo install.sh, jak dotąd. Gdy Pod
 przejmie claude-acc, sam uruchamia setup.sh ze swojej paczki (`--owner pod`) i zapisuje
-{"owner": "pod", "version", "app", "at"}; od tej chwili setup.sh z Homebrew odmawia, bo dwa źródła
-na zmianę nadpisywałyby sobie skrypty, hooki i automaty.
+{"owner": "pod", "version", "app", "at"}, z `--pod-agents` także "menu" (Pod Menu.app w pakiecie Poda);
+od tej chwili setup.sh z Homebrew odmawia, bo dwa źródła na zmianę nadpisywałyby sobie skrypty, hooki
+i automaty.
 """
 
 import json
@@ -35,17 +38,28 @@ def read():
     return data
 
 
-def write(owner, version, app=None):
+def write(owner, version, app=None, menu=None):
     if owner not in OWNERS:
         raise ValueError(f"nieznany właściciel: {owner}")
     os.makedirs(STATE_DIR, exist_ok=True)
     data = {"owner": owner, "version": version, "app": app, "at": round(time.time())}
+    if menu:
+        data["menu"] = menu
     tmp = f"{OWNER_PATH}.tmp{os.getpid()}"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=1)
         f.write("\n")
     os.replace(tmp, OWNER_PATH)
     return data
+
+
+def menu_app():
+    """Aplikacja paska menu tej instalacji: Pod Menu.app, którą prowadzi Pod, albo kopia setup.sh."""
+    data = read() or {}
+    menu = data.get("menu")
+    if isinstance(menu, str) and menu and os.path.isdir(menu):
+        return menu
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(STATE_DIR))), "Applications", "Claude Acc.app")
 
 
 def option(args, name):
@@ -86,10 +100,13 @@ def main(argv):
             print("użycie: owner.py write --owner pod --version X [--app PATH]", file=sys.stderr)
             return 2
         try:
-            write(owner, version, option(args, "--app"))
+            write(owner, version, option(args, "--app"), option(args, "--menu"))
         except ValueError as err:
             print(err, file=sys.stderr)
             return 2
+        return 0
+    if cmd == "menu":
+        print(menu_app())
         return 0
     if cmd == "clear":
         try:

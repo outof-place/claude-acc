@@ -859,7 +859,8 @@ def cmd_mode(args):
 
 def cli_owner(env=None):
     env = os.environ if env is None else env
-    for var, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), (orcahost.TERMINAL_ENV, "orca"), ("TERM_SESSION_ID", "term")):
+    hosts = tuple((p + orcahost.TERMINAL_KEY, p.rstrip("_").lower()) for p in orcahost.ENV_PREFIXES)
+    for var, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), *hosts, ("TERM_SESSION_ID", "term")):
         if env.get(var):
             return f"cli:{prefix}:{env[var]}"
     return "cli"

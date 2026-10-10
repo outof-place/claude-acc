@@ -188,7 +188,7 @@ AUTH_ENV = (
 )  # fmt: skip
 # zmienne sesji Claude Code, w której ktoś wywołał bieg: bieg startuje czysto, jak z launchd
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "AI_AGENT", "CLAUDE_CONFIG_DIR", "CLAUDE_ACC_RUN")
-DROP_PREFIXES = ("OTEL_", "CLAUDE_CODE_", "CLAUDE_ACC_CREDITS_", orcahost.ENV_PREFIX)
+DROP_PREFIXES = ("OTEL_", "CLAUDE_CODE_", "CLAUDE_ACC_CREDITS_", *orcahost.ENV_PREFIXES)
 HEADLESS_MD = """# Headless run (claude-acc)
 
 Nobody is watching this run and nobody will answer a question.

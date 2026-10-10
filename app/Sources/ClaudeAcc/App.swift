@@ -25,10 +25,7 @@ struct ClaudeAccApp: App {
         }
         if args.contains("--widget-demo") { WidgetDemo.run() }
         // a second copy would put a second ring in the menu bar
-        let mine = Bundle.main.bundleIdentifier ?? ""
-        if NSRunningApplication.runningApplications(withBundleIdentifier: mine).count > 1 {
-            exit(0)
-        }
+        PodMenu.keepOneCopy()
     }
 
     var body: some Scene {

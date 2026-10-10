@@ -31,7 +31,8 @@ dopóki panel jest otwarty.
 cache wołał go w kółko zamiast blokować się dłużej, niż żyje jego cache.
 `cancel` zdejmuje job z kolejki (jego wrapper kończy się kodem 130) albo biegnącemu wysyła SIGTERM
 przez wrapper, który przekazuje go grupie procesów komendy; job wskazuje id (j-...) albo klucz
-panelu Orki (ORCA_PANE_KEY): wtedy wszystkie joby tego panelu, z --queued tylko czekające.
+panelu Orki albo Poda (ORCA_PANE_KEY, POD_PANE_KEY): wtedy wszystkie joby tego panelu, z --queued
+tylko czekające.
 """
 
 import functools  # bez kosztu: `re` i tak go ładuje
@@ -50,9 +51,9 @@ try:
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import orcahost
 
-    HOST_CLIS, PANE_ENV = orcahost.CLI_NAMES, orcahost.PANE_ENV
+    HOST_CLIS, PANE_ENVS = orcahost.CLI_NAMES, tuple(p + orcahost.PANE_KEY for p in orcahost.ENV_PREFIXES)
 except (NameError, ImportError):
-    HOST_CLIS, PANE_ENV = ("orca", "podx"), "ORCA_PANE_KEY"
+    HOST_CLIS, PANE_ENVS = ("orca", "podx"), ("ORCA_PANE_KEY", "POD_PANE_KEY")
 
 # ctypes, subprocess, hashlib, random, threading, signal i fcntl ładują się w funkcjach, które
 # ich używają: hook (hook_rewrite) idzie przy każdej komendzie Go agenta i potrzebuje tylko
@@ -3210,7 +3211,7 @@ def agent_info(session, name):
         "session": (session or "")[:8] or None,
         "name": name,
         "worktree": os.getcwd().replace(HOME, "~", 1),
-        "pane": os.environ.get(PANE_ENV),
+        "pane": next((os.environ[k] for k in PANE_ENVS if os.environ.get(k)), None),
     }
 
 

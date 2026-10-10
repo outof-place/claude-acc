@@ -772,7 +772,7 @@ final class Store {
     /// back unless the switch in the panel was turned off. `.requiresApproval` means it was
     /// turned off in System Settings, which stays the user's call.
     private func registerLoginItemUnlessTurnedOff() {
-        guard !UserDefaults.standard.bool(forKey: Self.loginItemOffKey) else { return }
+        guard !PodMenu.active, !UserDefaults.standard.bool(forKey: Self.loginItemOffKey) else { return }
         switch SMAppService.mainApp.status {
         case .notRegistered, .notFound:
             try? SMAppService.mainApp.register()

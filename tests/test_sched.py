@@ -2539,20 +2539,25 @@ class HostTest(Paths):
         """sched.py wczytany bez __file__ i bez sąsiadów ma te same nazwy, co orcahost."""
         import orcahost
 
-        self.assertEqual((S.HOST_CLIS, S.PANE_ENV), (orcahost.CLI_NAMES, orcahost.PANE_ENV))
+        panes = tuple(p + orcahost.PANE_KEY for p in orcahost.ENV_PREFIXES)
+        self.assertEqual((S.HOST_CLIS, S.PANE_ENVS), (orcahost.CLI_NAMES, panes))
         code = (
             "import sys\n"
             "from importlib.machinery import SourceFileLoader\n"
             "m = type(sys)('acc_sched')\n"
             f"SourceFileLoader('acc_sched', {SCRIPT!r}).exec_module(m)\n"
-            "print('orcahost' in sys.modules, m.HOST_CLIS, m.PANE_ENV)\n"
+            "print('orcahost' in sys.modules, m.HOST_CLIS, m.PANE_ENVS)\n"
         )
         out = subprocess.run([sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, check=True)
-        self.assertEqual(out.stdout.strip(), f"False {orcahost.CLI_NAMES} {orcahost.PANE_ENV}")
+        self.assertEqual(out.stdout.strip(), f"False {orcahost.CLI_NAMES} {panes}")
 
     def test_agent_pane_comes_from_the_host_env(self):
         with mock.patch.dict(os.environ, {"ORCA_PANE_KEY": "tab-1:pane-2"}):
             self.assertEqual(S.agent_info("abcdef123456", "worker")["pane"], "tab-1:pane-2")
+        # Pod's terminals set POD_* since it dropped Orca's names
+        with mock.patch.dict(os.environ, {"POD_PANE_KEY": "tab-3:pane-1"}):
+            os.environ.pop("ORCA_PANE_KEY", None)
+            self.assertEqual(S.agent_info("abcdef123456", "worker")["pane"], "tab-3:pane-1")
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(S.agent_info(None, None)["pane"])
 
