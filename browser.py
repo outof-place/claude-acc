@@ -3021,7 +3021,11 @@ def cmd_config(cmd, args):
 
 
 # sesja agenta, z której przyszło wywołanie z wiersza: zmienna i przedrostek właściciela, od najdokładniejszej
-CLI_SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), (orcahost.TERMINAL_ENV, "orca"), ("TERM_SESSION_ID", "term"))
+CLI_SESSION_VARS = (
+    ("CLAUDE_CODE_SESSION_ID", "claude"),
+    *((p + orcahost.TERMINAL_KEY, p.rstrip("_").lower()) for p in orcahost.ENV_PREFIXES),
+    ("TERM_SESSION_ID", "term"),
+)
 
 
 def cli_owner(env=None):

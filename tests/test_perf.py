@@ -2278,24 +2278,26 @@ class HostFixtureTest(unittest.TestCase):
     """Orca i Pod obok siebie: hooki obu idą w tle, etykiety i krok devtools mówią o hoście."""
 
     def test_one_shared_hook_folder_named_after_the_owner(self):
-        """Pod zostaje przy ~/.orca: jeden katalog hooków statusu, w tle jak dotąd. Gdy claude-acc należy do
-        Pod (owner.json), ten katalog nosi jego hooki i panel podpisuje go Pod."""
+        """Hooki statusu Orki (~/.orca) i Poda (~/.pod od 2026-10-10) idą w tle. Pod, który jeszcze dzieli
+        ~/.orca, i należy do niego claude-acc (owner.json): ten katalog nosi jego hooki, panel podpisuje go Pod."""
         with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
             hosts = orcahost.hook_hosts([orcahost.orca(), pod_host()])
-        self.assertEqual(hosts, {".orca/agent-hooks": "Orca"})
+        self.assertEqual(hosts, {".orca/agent-hooks": "Orca", ".pod/agent-hooks": "Pod"})
         entries = perf.host_async_hooks(hosts)
-        self.assertEqual({e["match"] for e in entries}, {".orca/agent-hooks/claude-hook"})
-        self.assertEqual(len(entries), len(perf.HOST_HOOK_EVENTS))
+        self.assertEqual({e["match"] for e in entries}, {".orca/agent-hooks/claude-hook", ".pod/agent-hooks/claude-hook"})
+        self.assertEqual(len(entries), 2 * len(perf.HOST_HOOK_EVENTS))
         self.assertLessEqual({e["match"] for e in entries}, {e["match"] for e in perf.DEFAULT_CONFIG["async_hooks"]})
         owned = {"owner": "pod", "version": "1.29.2", "app": None, "at": 0}
         with mock.patch.object(orcahost, "owned_by_pod", return_value=owned):
-            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), pod_host()]), {".orca/agent-hooks": "Pod"})
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), pod_host()])[".orca/agent-hooks"], "Pod")
+            moved = pod_host()._replace(hooks=".pod/agent-hooks")
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), moved])[".orca/agent-hooks"], "Orca")
         # Pod, który zgłosi własny katalog (ClaudeAccHost hooksDir), dokłada go obok
         canary = pod_host()._replace(name="Pod Canary", hooks=".pod-canary/agent-hooks")
         with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
             hosts = orcahost.hook_hosts([orcahost.orca(), canary])
         self.assertEqual(hosts[".pod-canary/agent-hooks"], "Pod Canary")
-        self.assertEqual(len(perf.host_async_hooks(hosts)), 2 * len(perf.HOST_HOOK_EVENTS))
+        self.assertEqual(len(perf.host_async_hooks(hosts)), 3 * len(perf.HOST_HOOK_EVENTS))
 
     def test_hook_label_names_the_host(self):
         hook = '/bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"'
