@@ -85,6 +85,12 @@ final class Store {
     @ObservationIgnored private var browserSyncedAt = Date.distantPast
     @ObservationIgnored private var desktopSyncing = false
     @ObservationIgnored private var desktopSyncedAt = Date.distantPast
+    /// Until when the panel waits for the user's step (a browser's checkbox, a permission in System
+    /// Settings) and asks the gateway's `status` at the short interval.
+    @ObservationIgnored private var browserWaitUntil = Date.distantPast
+    @ObservationIgnored private var desktopWaitUntil = Date.distantPast
+    /// Launches, quits, System Settings leaving the front and display changes, while the panel is open.
+    @ObservationIgnored private var panelObservers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
     @ObservationIgnored private var live: Task<Void, Never>?
     /// The state files as last read: a file that didn't change costs one stat and wakes no view.
     @ObservationIgnored private var files: [String: StateFile] = [:]
@@ -363,6 +369,7 @@ final class Store {
         _ = readTickSnapshot()  // a tick that just ran saves the script run
         let age = Date.now.timeIntervalSince1970 - (snapshot?.generatedAt ?? 0)
         if age > 30 { Task { await refresh() } }
+        observeWhilePanelOpen()
         live?.cancel()
         live = Task { [weak self] in
             while !Task.isCancelled {
@@ -391,10 +398,27 @@ final class Store {
         }
     }
 
+    /// How old a gateway's `status` reading may get while the panel is open: 5 s while the panel
+    /// waits for the user (a browser asking for Allow, a checkbox or a permission just sent for),
+    /// otherwise a minute. Each run is 50 to 75 ms of Python; every 5 s for both gateways was
+    /// about 25 ms/s with the panel open. Launches, quits and display changes ask at once.
+    nonisolated static func statusMaxAge(waiting: Bool) -> TimeInterval { waiting ? 5 : 60 }
+
+    /// A browser asking for Allow in its own window: the panel shows the moment it connects.
+    nonisolated static func browserWaits(_ panel: BrowserPanel?) -> Bool {
+        panel?.browsers.contains { $0.installed && $0.state == "connecting" } == true
+    }
+
+    /// The bundle ids browser.py drives: `BROWSERS[...]["bundle"]` in browser.py, lowercase there.
+    /// The panel JSON doesn't carry them; a browser added there has to be added here too.
+    nonisolated static let browserBundles: Set<String> = ["com.google.chrome", "com.brave.browser"]
+
     /// The daemon rewrites the browser file on every change; a browser started, quit or switched
-    /// on without an agent around shows up only through `status`, so it runs every 5 s while open.
+    /// on without an agent around shows up only through `status`.
     private func syncBrowser() {
-        guard !browserSyncing, browser?.installed == true, Date.now.timeIntervalSince(browserSyncedAt) > 5 else { return }
+        let waiting = Self.browserWaits(browser) || Date.now < browserWaitUntil
+        guard !browserSyncing, browser?.installed == true,
+              Date.now.timeIntervalSince(browserSyncedAt) > Self.statusMaxAge(waiting: waiting) else { return }
         browserSyncing = true
         Task { [weak self] in
             _ = await CLI.run(["status", "--json"], script: CLI.browser)
@@ -405,9 +429,11 @@ final class Store {
     }
 
     /// Uprawnienia i wyświetlacze bramy pulpitu zmieniają się poza sesją agenta (przyznanie w
-    /// Ustawieniach, podłączony ekran), więc odświeżamy przez `status` co 5 s, gdy panel otwarty.
+    /// Ustawieniach, podłączony ekran): `status` przy zmianie ekranów i gdy Ustawienia schodzą z
+    /// pierwszego planu, co 5 s po „otwórz uprawnienia”, poza tym co minutę.
     private func syncDesktop() {
-        guard !desktopSyncing, desktop?.installed == true, Date.now.timeIntervalSince(desktopSyncedAt) > 5 else { return }
+        guard !desktopSyncing, desktop?.installed == true,
+              Date.now.timeIntervalSince(desktopSyncedAt) > Self.statusMaxAge(waiting: Date.now < desktopWaitUntil) else { return }
         desktopSyncing = true
         Task { [weak self] in
             _ = await CLI.run(["status", "--json"], script: CLI.desktop)
@@ -421,6 +447,7 @@ final class Store {
 
     /// Otwiera panel Ustawień (Dostępność albo Nagrywanie ekranu), gdzie człowiek zaznacza binarkę pomocnika.
     func openDesktopPermissions() async {
+        desktopWaitUntil = .now + Self.userStepWait
         _ = await CLI.run(["doctor", "--open"], script: CLI.desktop)
         notice = Notice(text: "Opened System Settings: add the helper binary and tick it")
     }
@@ -430,6 +457,41 @@ final class Store {
         RootHelper.shared.panelOpen = false
         live?.cancel()
         live = nil
+        for (center, token) in panelObservers { center.removeObserver(token) }
+        panelObservers = []
+    }
+
+    /// How long a step the user was just sent to (a checkbox, a permission) keeps the 5 s interval.
+    private static let userStepWait: TimeInterval = 180
+
+    /// The events that make a gateway's `status` stale before its interval runs out.
+    private func observeWhilePanelOpen() {
+        guard panelObservers.isEmpty else { return }
+        let workspace = NSWorkspace.shared.notificationCenter
+        let app: (Notification) -> String? = {
+            ($0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier?.lowercased()
+        }
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            let token = workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let bundle = app(note), Self.browserBundles.contains(bundle) else { return }
+                MainActor.assumeIsolated { self?.browserSyncedAt = .distantPast; self?.syncBrowser() }
+            }
+            panelObservers.append((workspace, token))
+        }
+        // back from System Settings: a permission may have just been granted
+        for name in [NSWorkspace.didDeactivateApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            let token = workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard app(note) == "com.apple.systempreferences" else { return }
+                MainActor.assumeIsolated { self?.desktopSyncedAt = .distantPast; self?.syncDesktop() }
+            }
+            panelObservers.append((workspace, token))
+        }
+        let screens = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.desktopSyncedAt = .distantPast; self?.syncDesktop() }
+        }
+        panelObservers.append((NotificationCenter.default, screens))
     }
 
     // MARK: Accounts
@@ -604,6 +666,7 @@ final class Store {
 
     /// Opens the browser's remote debugging page, where the user ticks the checkbox once.
     func enableBrowser(_ browser: BrowserPanel.Browser) async {
+        browserWaitUntil = .now + Self.userStepWait
         let result = await CLI.run(["setup", browser.name], script: CLI.browser)
         notice = result.status == 0
             ? Notice(text: result.message.contains("schowku")
