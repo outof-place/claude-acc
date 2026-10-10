@@ -641,9 +641,9 @@ public final class Engine {
 
     // MARK: The five old daemons
 
-    /// The old daemons the helper takes over today. The hotspot daemon stays until hotspot.py runs its
-    /// controller as the user and sets the limit through `shaper.set` (docs/pod-rootd.md).
-    public static let migrating: [LegacyDaemon] = [.fans, .fsguard, .iogpu, .vnodes]
+    /// The old daemons the helper takes over: all five. The hotspot one's controller runs as the
+    /// user's agent (`hotspot.py daemon --rootd`) and sets the limit through `shaper follow`.
+    public static let migrating: [LegacyDaemon] = LegacyDaemon.allCases
 
     private func migrate() throws -> Outcome {
         let present = Self.migrating.compactMap { daemon in backend.legacyArguments(daemon).map { (daemon, $0) } }
@@ -662,7 +662,7 @@ public final class Engine {
                     fans = backend.legacyFanMode(configPath: arguments[i + 1])
                 }
             case .fsguard: fsguard = true
-            case .hotspot: break  // not in `migrating` yet
+            case .hotspot: break  // the user's agent reads hotspot.json and takes over once the plist is gone
             }
             try backend.bootout(daemon)
             try backend.moveLegacyPlist(daemon, aside: true)
