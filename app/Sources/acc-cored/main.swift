@@ -14,6 +14,7 @@ let usage = """
            acc-cored guard-replay F.jsonl [--show N]   the native guard tick on parity fixtures
            acc-cored guard-bench [N]      N ticks back to back, CPU per phase
            acc-cored orca-read            the host's four reads over its socket, timed
+           acc-cored caps-watch [SECONDS]  how often the capped folders change (FSEvents), nothing run
     """
 
 func json(_ value: Any) -> String {
@@ -186,6 +187,12 @@ case "guard":
     int.resume()
     if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stop(0) } }
     dispatchMain()
+case "caps-watch":
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let seconds = args.first.flatMap { Double($0) } ?? 300
+    let (prefixes, changes) = CapsWatch.observe(home: home, seconds: seconds)
+    print("watching", prefixes.map { $0.pyReplace(home, "~") })
+    print("seconds with a change: \(changes.count) of \(Int(seconds)); first \(changes.prefix(20))")
 case "-h", "--help", "help":
     print(usage)
 default:
