@@ -20,7 +20,8 @@ final class MenuBarController: NSObject {
         super.init()
         panel.setContent(PanelView(store: store)) { [weak self] size in self?.place(size) }
         panel.onCancel = { [weak self] in self?.close() }
-        NotificationCenter.default.addObserver(
+        // NSWorkspace posts it only on its own center, never on NotificationCenter.default
+        NSWorkspace.shared.notificationCenter.addObserver(
             self, selector: #selector(spaceChanged), name: NSWorkspace.activeSpaceDidChangeNotification,
             object: nil)
         // dictation started from the panel: out of the way, the text goes to the app behind it
