@@ -420,6 +420,9 @@ func legacyMigrate() {
     #expect(status.sysctls.first { $0.key == .gpuWiredLimitMB }?.original == 0)
     #expect(status.fsguard.enabled)
     #expect(status.spotlight.appsOnly)
+    // perf-root.sh's saved list went aside: after a restore apps-only stays the helper's
+    #expect(rig.backend.savedSpotlightList == nil)
+    #expect(rig.backend.savedSpotlightAside == ["/Users/x/Movies"])
     #expect(status.legacy.allSatisfy { $0.daemon == .hotspot ? $0.installed && !$0.migrated : $0.migrated && !$0.installed })
     #expect(rig.changed(rig.send(.legacyMigrate)) == false)
     // iogpu undo after the migration: macOS's default now, not at the next boot
@@ -440,6 +443,10 @@ func legacyRollback() {
     #expect(status.sysctls.allSatisfy { $0.persisted == nil })
     #expect(!status.fsguard.enabled)
     #expect(status.legacy.allSatisfy { $0.installed && !$0.migrated })
+    // the root copy's list is back where perf-root.sh keeps it, and the helper lets go of its copy
+    #expect(rig.backend.savedSpotlightList == ["/Users/x/Movies"])
+    #expect(rig.backend.savedSpotlightAside == nil)
+    #expect(status.spotlight.savedEntries == nil && !status.spotlight.appsOnly)
     #expect(rig.changed(rig.send(.legacyRollback)) == false)
 }
 

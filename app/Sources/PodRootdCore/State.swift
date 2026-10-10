@@ -14,6 +14,8 @@ public struct HelperState: Codable, Equatable, Sendable {
     public var shapers: [String: ShaperRecord] = [:]
     public var spotlightApplied = false
     public var spotlightSaved: [String]?
+    /// `legacy.migrate` took perf-root.sh's saved list and put its file aside.
+    public var spotlightFromLegacy: Bool?
     /// By `PowerSource.rawValue`: the mode before the first change.
     public var powerOriginal: [String: PowerMode] = [:]
     public var fsguard = FSGuardRecord()

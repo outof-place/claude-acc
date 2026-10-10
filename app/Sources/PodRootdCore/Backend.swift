@@ -70,6 +70,9 @@ public protocol Backend: AnyObject {
     func legacyFanMode(configPath: String) -> FanMode?
     /// The Spotlight list perf-root.sh saved before apps-only.
     func legacySpotlightList() -> [String]?
+    /// Renames that saved list to `spotlight-exclusions.json.migrated` beside it once the helper holds
+    /// it, or back at a rollback, so only one side takes it for the live one.
+    func moveLegacySpotlightList(aside: Bool) throws
     func bootout(_ daemon: LegacyDaemon) throws
     /// Moves the plist aside into the helper's directory, or back to /Library/LaunchDaemons.
     func moveLegacyPlist(_ daemon: LegacyDaemon, aside: Bool) throws

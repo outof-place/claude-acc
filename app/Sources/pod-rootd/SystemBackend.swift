@@ -352,6 +352,14 @@ final class SystemBackend: Backend {
         return list
     }
 
+    func moveLegacySpotlightList(aside: Bool) throws {
+        guard let user = Self.consoleUser() else { throw BackendError("nobody at the console") }
+        let (from, to) = aside
+            ? ("spotlight-exclusions.json", "spotlight-exclusions.json.migrated")
+            : ("spotlight-exclusions.json.migrated", "spotlight-exclusions.json")
+        try UserFiles.rename(in: user.home, folder: [".local", "share", "claude-acc"], from: from, to: to, owner: user.uid)
+    }
+
     func bootout(_ daemon: LegacyDaemon) throws {
         // a job that is not loaded is as good as booted out
         Self.run(.launchctl, ["bootout", "system/\(daemon.rawValue)"])
