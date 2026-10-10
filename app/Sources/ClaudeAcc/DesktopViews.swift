@@ -72,7 +72,7 @@ struct DesktopCard: View {
         } else if !panel.helperPresent {
             parts.append("build app/build.sh, then setup.sh")
         } else if panel.agent == nil {
-            parts.append("Grants belong to the app that runs the agent (Orca, Terminal); its first desktop call checks them")
+            parts.append("Grants belong to the app that runs the agent (\(HostApp.current.name), Terminal); its first desktop call checks them")
         } else {
             parts.append("Tick the helper binary in System Settings")
         }
