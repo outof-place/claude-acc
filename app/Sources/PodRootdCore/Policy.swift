@@ -32,10 +32,15 @@ public struct VerbPolicy: Sendable {
 nonisolated public struct PeerPolicy: Sendable {
     public var listener: XPCPeerRequirement
     public var callers: [(Caller, XPCPeerRequirement)]
+    /// A sender that satisfies any of these is refused whatever else it matches. Lightweight code
+    /// requirements can't say "not", so the listener can't keep a debuggable build out; each
+    /// message is tested against these instead.
+    public var refused: [XPCPeerRequirement]
 
-    public init(listener: XPCPeerRequirement, callers: [(Caller, XPCPeerRequirement)]) {
+    public init(listener: XPCPeerRequirement, callers: [(Caller, XPCPeerRequirement)], refused: [XPCPeerRequirement] = []) {
         self.listener = listener
         self.callers = callers
+        self.refused = refused
     }
 
     /// Team `PodRootd.teamIdentifier`, Developer ID, the hardened runtime, one of the three signing
@@ -49,7 +54,19 @@ nonisolated public struct PeerPolicy: Sendable {
         let callers = try Caller.allCases.map { caller in
             (caller, try requirement(team: team, identifiers: [caller.signingIdentifier], flags: hardening(caller)))
         }
-        return PeerPolicy(listener: listener, callers: callers)
+        return PeerPolicy(listener: listener, callers: callers, refused: try debuggable())
+    }
+
+    /// A build with `get-task-allow` (`CS_GET_TASK_ALLOW`, LWCR's `isDebuggable`: measured, a binary
+    /// with the entitlement runs under a launch requirement of it, one without is killed) or a
+    /// process a debugger is attached to (`CS_DEBUGGED`). Pod's terminals have Developer Tools access
+    /// (Ultra's devtools tweak), so anything they run could take over such a caller with
+    /// `task_for_pid`.
+    /// One requirement per flag: a requirement can't hold the same constraint twice.
+    public static func debuggable() throws -> [XPCPeerRequirement] {
+        try [ProcessCodeSigningFlags.ValueSet.isDebuggable, .isDebugged].map { flag in
+            .codeRequirement(try ProcessCodeRequirement.allOf { ProcessCodeSigningFlags.isSuperset(of: [flag]) })
+        }
     }
 
     /// The code signing flags a running caller must have. Pod's Electron process loads native
@@ -74,8 +91,9 @@ nonisolated public struct PeerPolicy: Sendable {
     }
 
     /// The caller a message comes from, or nil when it matches none (it never should: the listener
-    /// requirement already let it in).
+    /// requirement already let it in) or matches `refused`.
     public func classify(_ satisfies: (XPCPeerRequirement) -> Bool) -> Caller? {
-        callers.first { satisfies($0.1) }?.0
+        if refused.contains(where: satisfies) { return nil }
+        return callers.first { satisfies($0.1) }?.0
     }
 }

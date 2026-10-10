@@ -35,6 +35,7 @@ public final class FakeBackend: Backend {
     public var legacyBooted: Set<LegacyDaemon> = []
     public var fanConfigs: [String: FanMode] = [:]
     public var savedSpotlightList: [String]?
+    public var savedSpotlightAside: [String]?
     /// A pod-rootd binary in a candidate place, as the self-update sees it.
     public struct Binary: Equatable, Sendable {
         public var version: String
@@ -180,6 +181,17 @@ public final class FakeBackend: Backend {
     public func legacyFanMode(configPath: String) -> FanMode? { fanConfigs[configPath] }
 
     public func legacySpotlightList() -> [String]? { savedSpotlightList }
+
+    public func moveLegacySpotlightList(aside: Bool) throws {
+        try record("moveLegacySpotlightList \(aside ? "aside" : "back")")
+        if aside {
+            guard let list = savedSpotlightList else { throw BackendError("no list") }
+            (savedSpotlightAside, savedSpotlightList) = (list, nil)
+        } else {
+            guard let list = savedSpotlightAside else { throw BackendError("no list aside") }
+            (savedSpotlightList, savedSpotlightAside) = (list, nil)
+        }
+    }
 
     public func bootout(_ daemon: LegacyDaemon) throws {
         try record("bootout \(daemon.rawValue)")

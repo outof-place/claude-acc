@@ -161,3 +161,40 @@ func stageRefuses() throws {
     _ = try HelperFiles.stage(real, into: into.path, name: "h")
     #expect(FileManager.default.contents(atPath: decoy) == Data("keep".utf8))
 }
+
+// MARK: Root's rename in the user's home
+
+@Test("migrate's rename of spotlight-exclusions.json stays in its folder and follows no link on the way")
+func userFileRename() throws {
+    let home = try scratch()
+    defer { try? FileManager.default.removeItem(at: home) }
+    let folder = home.appendingPathComponent(".local/share/claude-acc")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let file = folder.appendingPathComponent("spotlight-exclusions.json").path
+    FileManager.default.createFile(atPath: file, contents: Data("[]".utf8))
+    let parts = [".local", "share", "claude-acc"]
+
+    try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json",
+                         to: "spotlight-exclusions.json.migrated", owner: getuid())
+    #expect(!FileManager.default.fileExists(atPath: file))
+    #expect(FileManager.default.fileExists(atPath: file + ".migrated"))
+    // someone else's file, or a link in its place, is left alone
+    #expect(throws: BackendError.self) {
+        try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json.migrated",
+                             to: "spotlight-exclusions.json", owner: getuid() + 1)
+    }
+    try FileManager.default.createSymbolicLink(atPath: file, withDestinationPath: "/etc/hosts")
+    #expect(throws: BackendError.self) {
+        try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json", to: "x", owner: getuid())
+    }
+    // a folder on the way swapped for a link: the walk stops there
+    let elsewhere = home.appendingPathComponent("elsewhere")
+    try FileManager.default.createDirectory(at: elsewhere.appendingPathComponent("claude-acc"), withIntermediateDirectories: true)
+    FileManager.default.createFile(atPath: elsewhere.appendingPathComponent("claude-acc/spotlight-exclusions.json").path, contents: Data())
+    try FileManager.default.removeItem(at: home.appendingPathComponent(".local/share"))
+    try FileManager.default.createSymbolicLink(at: home.appendingPathComponent(".local/share"), withDestinationURL: elsewhere)
+    #expect(throws: BackendError.self) {
+        try UserFiles.rename(in: home.path, folder: parts, from: "spotlight-exclusions.json", to: "y", owner: getuid())
+    }
+    #expect(FileManager.default.fileExists(atPath: elsewhere.appendingPathComponent("claude-acc/spotlight-exclusions.json").path))
+}
