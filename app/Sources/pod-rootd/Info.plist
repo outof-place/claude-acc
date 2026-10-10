@@ -8,5 +8,7 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>pod-rootd</string>
+	<key>CFBundleVersion</key>
+	<string>56</string>
 </dict>
 </plist>
