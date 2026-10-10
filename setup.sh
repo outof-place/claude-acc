@@ -251,6 +251,8 @@ case "$1" in
   browser) shift; exec "$PY" "$RUN" browser "$@" ;;
   # dyktowanie w aplikacji: toggle (domyślnie), start, stop, cancel; w tle, bez fokusu
   dictate) exec open -g "claude-acc://dictate/${2:-toggle}" ;;
+  # panel aplikacji paska menu (claude-acc://panel[/sekcja]), jak komenda Poda "claude-acc settings…"
+  panel) exec open -g "claude-acc://panel${2:+/$2}" ;;
   # Stay Awake aplikacji: on [--for 2h], off, toggle, status [--json]; przez claude-acc://awake
   awake) shift; exec "$PY" "$RUN" awake "$@" ;;
   # wtyczka claude-acc w Orce: install, uninstall, status

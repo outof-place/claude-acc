@@ -144,6 +144,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch url.host() {
         // `claude-acc awake on|off|toggle`: Stay Awake from the terminal or Orca
         case "awake": store.awake.command(url)
+        // claude-acc://panel[/<section>]: Pod's "claude-acc settings…" and `claude-acc panel`
+        case "panel": menuBar?.showPanel(section: PanelRoute.section(of: url))
         case "dictate":
             dictationLog.notice("command: \(url.absoluteString, privacy: .public)")
             switch url.lastPathComponent {
