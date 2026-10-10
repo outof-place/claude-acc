@@ -394,11 +394,13 @@ final class SystemBackend: Backend {
         guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
               SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess, let staticCode
         else { return nil }
-        return Self.signedVersion(staticCode)
+        return SystemUpdateSource.signedVersion(staticCode)
     }()
 
     /// The Pod.app the package was opened from (its postinstall records it), then /Applications.
+    /// Only the package's install updates itself: a helper started from anywhere else stays as it is.
     func updateCandidates() -> [String] {
+        guard Self.ownPath() == program else { return [] }
         var apps: [String] = []
         if let data = try? Self.readFile(directory + "/app", limit: 4096),
            let recorded = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .newlines),
@@ -409,35 +411,10 @@ final class SystemBackend: Backend {
         return apps.map { $0 + "/" + PodRootd.bundleDirectory + "/pod-rootd" }
     }
 
-    func stageUpdate(from candidate: String) throws -> String {
-        // only the package's install updates itself: a helper started from anywhere else stays as it is
-        guard Self.ownPath() == program else { throw BackendError("not running as \(program)") }
-        return try HelperFiles.stage(candidate, into: (program as NSString).deletingLastPathComponent,
-                                     name: (program as NSString).lastPathComponent)
-    }
-
-    func verifiedVersion(ofStaged path: String) -> String? {
-        var code: SecStaticCode?
-        var requirement: SecRequirement?
-        var error: Unmanaged<CFError>?
-        let text = PodRootd.helperRequirementText(notarized: true)
-        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess, let code,
-              SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement
-        else { return nil }
-        let flags = SecCSFlags(rawValue: UInt32(kSecCSStrictValidate) | UInt32(kSecCSCheckAllArchitectures))
-        guard SecStaticCodeCheckValidityWithErrors(code, flags, requirement, &error) == errSecSuccess else {
-            error?.release()
-            return nil
-        }
-        return Self.signedVersion(code)
-    }
+    var updateSource: any UpdateSource { SystemUpdateSource(program: program) }
 
     func installUpdate(_ staged: String) throws {
         try HelperFiles.install(staged, as: program)
-    }
-
-    func discardUpdate(_ staged: String) {
-        unlink(staged)
     }
 
     func removeInstall() throws {
@@ -451,15 +428,6 @@ final class SystemBackend: Backend {
 
     func bootoutSelf() {
         Self.run(.launchctl, ["bootout", "system/" + PodRootd.serviceName(appIdentifier: appIdentifier)])
-    }
-
-    /// CFBundleVersion of the Info.plist the signature binds (`kSecCodeInfoPList`), not of the file.
-    static func signedVersion(_ code: SecStaticCode) -> String? {
-        var info: CFDictionary?
-        guard SecCodeCopySigningInformation(code, [], &info) == errSecSuccess,
-              let plist = (info as? [String: Any])?[kSecCodeInfoPList as String] as? [String: Any]
-        else { return nil }
-        return plist["CFBundleVersion"] as? String
     }
 
     static func ownPath() -> String? {
@@ -585,5 +553,46 @@ final class SystemBackend: Backend {
         let home = String(cString: dir)
         guard home.hasPrefix("/Users/") else { return nil }
         return (info.st_uid, home)
+    }
+}
+
+/// The self-update's look into Pod.app, on the update's own queue (`UpdateRunner`): the copy into
+/// PrivilegedHelperTools, then Security's check of that copy, which may ask Apple's notary service.
+/// Offline, or for a build Apple hasn't seen, the check fails and the update waits for the next look.
+nonisolated struct SystemUpdateSource: UpdateSource {
+    let program: String
+
+    func stage(_ candidate: String) throws -> String {
+        try HelperFiles.stage(candidate, into: (program as NSString).deletingLastPathComponent,
+                              name: (program as NSString).lastPathComponent)
+    }
+
+    func verifiedVersion(ofStaged path: String) -> String? {
+        var code: SecStaticCode?
+        var requirement: SecRequirement?
+        var error: Unmanaged<CFError>?
+        let text = PodRootd.helperRequirementText(notarized: true)
+        guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: path) as CFURL, [], &code) == errSecSuccess, let code,
+              SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement
+        else { return nil }
+        let flags = SecCSFlags(rawValue: UInt32(kSecCSStrictValidate) | UInt32(kSecCSCheckAllArchitectures))
+        guard SecStaticCodeCheckValidityWithErrors(code, flags, requirement, &error) == errSecSuccess else {
+            error?.release()
+            return nil
+        }
+        return Self.signedVersion(code)
+    }
+
+    func discard(_ staged: String) {
+        unlink(staged)
+    }
+
+    /// CFBundleVersion of the Info.plist the signature binds (`kSecCodeInfoPList`), not of the file.
+    static func signedVersion(_ code: SecStaticCode) -> String? {
+        var info: CFDictionary?
+        guard SecCodeCopySigningInformation(code, [], &info) == errSecSuccess,
+              let plist = (info as? [String: Any])?[kSecCodeInfoPList as String] as? [String: Any]
+        else { return nil }
+        return plist["CFBundleVersion"] as? String
     }
 }

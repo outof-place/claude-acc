@@ -115,29 +115,30 @@ ACC_STATE="$(eval echo "~$USER_NAME")/.local/share/claude-acc"
 HOST_PY="$HERE/orcahost.py"
 [ -f "$HOST_PY" ] || HOST_PY="$ACC_STATE/orcahost.py"
 
-# Python po stronie roota (JSON stanu, plista Spotlight): interpreter z root-python kopii, z -I.
+# Każdy Python stąd z -B: ten plik bywa w Pod.app (`source`), a __pycache__ obok perf.py łamie pieczęć
+# aplikacji. Python po stronie roota (JSON stanu, plista Spotlight): interpreter z root-python kopii, z -I.
 # Nigdy /usr/bin/python3: pod rootem to zaślepka, która idzie do wybranego Xcode'a (rootpy.py)
 pyroot() {
   if [ "$(id -u)" -eq 0 ]; then
-    "$(head -n 1 "$HERE/root-python")" -I "$@"
+    "$(head -n 1 "$HERE/root-python")" -I -B "$@"
   else
-    /usr/bin/python3 "$@"
+    /usr/bin/python3 -B "$@"
   fi
 }
 as_user() {
   if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != root ]; then
-    sudo -u "$USER_NAME" -H /usr/bin/python3 "$PERF" "$@"
+    sudo -u "$USER_NAME" -H /usr/bin/python3 -B "$PERF" "$@"
   else
-    /usr/bin/python3 "$PERF" "$@"
+    /usr/bin/python3 -B "$PERF" "$@"
   fi
 }
 
 # host agentów (Orca albo Pod) według orcahost.py, czytany jako użytkownik: jego HOME i ~/Applications
 host_app() {
   if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != root ]; then
-    sudo -u "$USER_NAME" -H /usr/bin/python3 "$HOST_PY" app
+    sudo -u "$USER_NAME" -H /usr/bin/python3 -B "$HOST_PY" app
   else
-    /usr/bin/python3 "$HOST_PY" app
+    /usr/bin/python3 -B "$HOST_PY" app
   fi
 }
 
