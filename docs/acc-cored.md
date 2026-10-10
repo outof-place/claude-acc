@@ -91,6 +91,14 @@ memory pressure (a Dispatch memory-pressure source).
     reap that finds no victim would start Python every 2 s.
   - Every other plan is tried again on the next tick. Python's reading may disagree for a moment
     (pressure flickering), and it acts as soon as it agrees.
+- **Caps, only when they can do something:** a caps run walks every entry of the capped folders with
+  `du -sk`: 17 processes and about 1.8 s of CPU per run here, every `caps_minutes`. Its outcome
+  changes only in three cases, so at each interval `CapsWatch` lets a run through only then:
+  - something under a capped folder changed, or `janitor.json` did. FSEvents watch the folders'
+    static prefix, or its nearest existing parent; a lost-events flag counts as a change;
+  - the time the last run reported passed: an entry skipped as fresh (a write in progress) may go;
+  - the last run skipped an entry in use: no event says it's free, so the next interval runs again.
+  Six hours bound the rest. `devguard caps` prints its report as one JSON line (`busy`, `retry_at`).
 - **Config types:** a `devguard.json` value whose type differs from the default's is read
   differently by the two sides. `"runtimes": "node"` still finds servers in Python, where `in`
   works on a string, and finds none here. While such a value is set, every tick goes to Python, and

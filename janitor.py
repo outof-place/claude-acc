@@ -458,6 +458,9 @@ class Sweep:
         self.dry_run = dry_run
         self.items = []  # (zadanie, ścieżka albo opis, bajty)
         self.skipped = []  # (zadanie, ścieżka, powód)
+        # najbliższa chwila, w której wpis pominięty jako świeży (zapis w toku) może już pójść:
+        # do niej, bez zmian w katalogach, przebieg limitów nie zrobiłby nic innego
+        self.retry_at = None
         self.warnings = []
         self.failures = []  # (zadanie, błąd) dla panelu
         self.protect = [expand(p) for p in cfg["protect"]]
@@ -977,7 +980,12 @@ def task_caps(sw, _scan):
             total = 0
             for i, path in enumerate(entries):
                 total += du_bytes(path)
-                if i < keep or total <= limit or changed(path) > fresh:
+                if i < keep or total <= limit:
+                    continue
+                last = changed(path)
+                if last > fresh:
+                    ripe = last + cap.get("fresh_minutes", 10) * 60
+                    sw.retry_at = ripe if sw.retry_at is None else min(sw.retry_at, ripe)
                     continue
                 if sw.usage.busy(path):
                     sw.skip("caps", path, "w użyciu")

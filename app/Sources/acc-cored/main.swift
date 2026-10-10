@@ -15,6 +15,7 @@ let usage = """
            acc-cored guard-bench [N]      N ticks back to back, CPU per phase
            acc-cored orca-read            the host's four reads over its socket, timed
            acc-cored sched-replay F.jsonl [--show N]   the scheduler's housekeeping on parity fixtures
+           acc-cored caps-watch [SECONDS]  how often the capped folders change (FSEvents), nothing run
            acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS]   the daemon
     """
 
@@ -208,6 +209,12 @@ case "sched-replay":
     }
     print("same \(same), different \(different)")
     exit(different == 0 ? 0 : 1)
+case "caps-watch":
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let seconds = args.first.flatMap { Double($0) } ?? 300
+    let (prefixes, changes) = CapsWatch.observe(home: home, seconds: seconds)
+    print("watching", prefixes.map { $0.pyReplace(home, "~") })
+    print("seconds with a change: \(changes.count) of \(Int(seconds)); first \(changes.prefix(20))")
 case "run":
     // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
     let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
