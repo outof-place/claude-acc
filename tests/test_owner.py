@@ -257,6 +257,38 @@ class PodAgentsSetupTest(SetupHarness):
         self.assertTrue(os.access(os.path.join(self.home, ".local/bin/claude-acc"), os.X_OK))
         self.assertTrue(os.path.isfile(os.path.join(self.state, "acc.py")))
 
+    def test_pod_rootd_replaces_the_root_installers(self):
+        # Pod's root helper in the owner app: `claude-acc rootd` is its CLI, `fans install` points to it
+        plist = os.path.join(self.pod, "Contents/Library/LaunchDaemons/codes.pod.app.rootd.plist")
+        rootctl = os.path.join(self.pod, "Contents/Resources/claude-acc/pod-rootctl")
+        os.makedirs(os.path.dirname(plist))
+        os.makedirs(os.path.dirname(rootctl))
+        with open(plist, "w") as f:
+            f.write("<plist/>\n")
+        with open(rootctl, "w") as f:
+            f.write('#!/bin/sh\necho "fake pod-rootctl $*"\n')
+        os.chmod(rootctl, 0o755)
+        rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.readlink(os.path.join(self.state, "pod-rootctl")), rootctl)
+        self.assertIn("Pod's root helper", out)
+        self.assertNotIn("claude-acc fans install", out)
+        command = os.path.join(self.home, ".local/bin/claude-acc")
+        env = dict(os.environ, HOME=self.home)
+        done = subprocess.run([command, "rootd", "status"], env=env, capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "fake pod-rootctl status"))
+        done = subprocess.run([command, "fans", "install"], env=env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("claude-acc rootd fans", done.stderr)
+        # without the helper in the app: the old installers again
+        os.remove(plist)
+        rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.lexists(os.path.join(self.state, "pod-rootctl")))
+        self.assertIn("claude-acc fans install", out)
+        done = subprocess.run([command, "rootd", "status"], env=env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 69)
+
     def test_pod_agents_need_the_pod_owner(self):
         rc, out = self.setup("--app", self.menu, "--pod-agents")
         self.assertEqual(rc, 2, out)
@@ -271,7 +303,8 @@ class PayloadTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, work, True)
         products = os.path.join(work, "products")
         os.makedirs(products)
-        for name in ("ClaudeAcc", "fanctl", "claude-acc-hook", "claude-acc-pause", "claude-acc-desktop", "pod-acc-run"):
+        for name in ("ClaudeAcc", "fanctl", "claude-acc-hook", "claude-acc-pause", "claude-acc-desktop", "pod-acc-run",
+                     "pod-rootd", "pod-rootctl"):
             with open(os.path.join(products, name), "w") as f:
                 f.write(f"fake {name}\n")
         out = os.path.join(work, "out")
@@ -283,7 +316,8 @@ class PayloadTest(unittest.TestCase):
         names = set(os.listdir(payload))
         for expected in ("setup.sh", "accswitch.py", "owner.py", "awake.py", "orcaplugin.py", "launchd", "hooks",
                          "orca-plugin", "Pod Menu.app", "fanctl", "claude-acc-hook", "claude-acc-pause",
-                         "claude-acc-desktop", "pod-acc-run", "LaunchAgents", "VERSION", "payload.json"):
+                         "claude-acc-desktop", "pod-acc-run", "pod-rootd", "pod-rootctl", "LaunchAgents",
+                         "LaunchDaemons", "VERSION", "payload.json"):
             self.assertIn(expected, names)
         self.assertNotIn("Claude Acc.app", names)  # układ 2: aplikację paska menu wozi Pod jako Pod Menu
         self.assertNotIn("test", os.listdir(os.path.join(payload, "orca-plugin")))
@@ -302,6 +336,11 @@ class PayloadTest(unittest.TestCase):
             self.assertEqual(json.load(f)["layout"], 2)
         agents = sorted(os.listdir(os.path.join(payload, "LaunchAgents")))
         self.assertEqual(agents, sorted(f"codes.pod.app.acc.{j}.plist" for j in ("tick", "janitor", "devguard", "perf", "updates", "jobs")))
+        # Pod's root helper: its plist goes to Contents/Library/LaunchDaemons, BundleProgram next to pod-acc-run
+        self.assertEqual(os.listdir(os.path.join(payload, "LaunchDaemons")), ["codes.pod.app.rootd.plist"])
+        with open(os.path.join(payload, "LaunchDaemons/codes.pod.app.rootd.plist"), "rb") as f:
+            daemon = plistlib.load(f)
+        self.assertEqual((daemon["Label"], daemon["BundleProgram"]), ("codes.pod.app.rootd", "Contents/Resources/claude-acc/pod-rootd"))
         tarball = os.path.join(out, "claude-acc-payload-9.9.9.tar.gz")
         with open(tarball + ".sha256") as f:
             digest, name = f.read().split()

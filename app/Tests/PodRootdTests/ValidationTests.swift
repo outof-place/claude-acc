@@ -107,4 +107,7 @@ func launchdPlist() throws {
     #expect(plist["RunAtLoad"] as? Bool == true)
     #expect((plist["KeepAlive"] as? [String: Bool]) == ["SuccessfulExit": false])
     #expect(plist["Program"] == nil)
+    // launchd spawns it only as codes.pod.rootd of Pod's team (a lightweight code requirement)
+    #expect((plist["SpawnConstraint"] as? [String: String]) == [
+        "team-identifier": PodRootd.teamIdentifier, "signing-identifier": PodRootd.helperIdentifier])
 }

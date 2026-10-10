@@ -1,6 +1,8 @@
 import Foundation
+import os
 import PodRootdCore
 import PodRootdProtocol
+import Security
 
 // pod-rootd: Pod's one root helper (docs/pod-rootd.md). launchd starts it from
 // Contents/Library/LaunchDaemons/<app id>.rootd.plist: at boot (RunAtLoad, to put back persisted
@@ -36,6 +38,26 @@ func hostAppIdentifier() -> String {
 guard getuid() == 0 else {
     FileHandle.standardError.write(Data("pod-rootd: runs as root under launchd; for scripts there is pod-rootctl\n".utf8))
     exit(77)
+}
+
+/// Root only for the signed codes.pod.rootd of Pod's team: an ad hoc or unsigned build registered by
+/// mistake stops here. A swapped binary doesn't carry this check; the plist's SpawnConstraint and
+/// launchd are what stand against that (docs/pod-rootd.md, "A tampered helper").
+func signedAsPods() -> Bool {
+    var code: SecCode?
+    var requirement: SecRequirement?
+    let text = "anchor apple generic and certificate leaf[subject.OU] = \"\(PodRootd.teamIdentifier)\"" +
+        " and identifier \"\(PodRootd.helperIdentifier)\""
+    guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
+          SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement
+    else { return false }
+    return SecCodeCheckValidity(code, [], requirement) == errSecSuccess
+}
+
+guard signedAsPods() else {
+    Logger(subsystem: "codes.pod.rootd", category: "engine")
+        .fault("refusing to run: not signed as \(PodRootd.helperIdentifier, privacy: .public) of team \(PodRootd.teamIdentifier, privacy: .public)")
+    exit(0)  // a clean exit: KeepAlive restarts only after a crash
 }
 
 let service = PodRootd.serviceName(appIdentifier: hostAppIdentifier())

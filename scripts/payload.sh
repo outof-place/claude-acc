@@ -5,7 +5,7 @@
 #   scripts/payload.sh [--out DIR] [--version X] [--products DIR]
 #
 # --products: gotowe binarki (ClaudeAcc, fanctl, claude-acc-hook, claude-acc-pause, claude-acc-desktop,
-# pod-acc-run) zamiast budowania ze źródeł; testy i CI z osobnym krokiem buildu. Domyślnie --out dist.
+# pod-acc-run, pod-rootd, pod-rootctl) zamiast budowania ze źródeł; testy i CI z osobnym krokiem buildu. Domyślnie --out dist.
 # Wynik: DIR/claude-acc/ (rozpakowana paczka), DIR/claude-acc-payload-<wersja>.tar.gz i .sha256.
 #
 # Układ 2 (od 1.31.0, znak: pod-acc-run w korzeniu): aplikacja paska menu to `Pod Menu.app` (ten sam
@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$VERSION" ] || VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT/app/Info.plist")"
-PRODUCT_NAMES="ClaudeAcc fanctl claude-acc-hook claude-acc-pause claude-acc-desktop pod-acc-run"
+PRODUCT_NAMES="ClaudeAcc fanctl claude-acc-hook claude-acc-pause claude-acc-desktop pod-acc-run pod-rootd pod-rootctl"
 
 if [ -z "$PRODUCTS" ]; then
   (cd "$ROOT/app" && swift build -c release)
@@ -62,17 +62,23 @@ cp app/Info.plist "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Pod Menu" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Delete :CFBundleDisplayName" "$APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Pod Menu" "$APP/Contents/Info.plist"
-for name in fanctl claude-acc-hook claude-acc-pause claude-acc-desktop pod-acc-run; do
+for name in fanctl claude-acc-hook claude-acc-pause claude-acc-desktop pod-acc-run pod-rootd pod-rootctl; do
   cp "$PRODUCTS/$name" "$DEST.new/$name"
 done
 # automaty dla SMAppService z szablonów setup.sh (te same harmonogramy i logi)
 /usr/bin/python3 scripts/pod_agents.py --out "$DEST.new/LaunchAgents" >/dev/null
+# Pod's root helper (docs/pod-rootd.md): Pod puts the plist in Contents/Library/LaunchDaemons
+mkdir -p "$DEST.new/LaunchDaemons"
+cp launchd/codes.pod.app.rootd.plist "$DEST.new/LaunchDaemons/"
 # podpisy jak w formule; setup.sh podpisuje aplikację jeszcze raz po skopiowaniu (sign-app.sh)
 if [ -z "${PAYLOAD_NO_SIGN:-}" ]; then
   DESKTOP_ID="com.filip.claude-acc.desktop"
   codesign --force --sign - --identifier "$DESKTOP_ID" -r="designated => identifier \"$DESKTOP_ID\"" \
     "$DEST.new/claude-acc-desktop"
   codesign --force --sign - --identifier com.filip.claude-acc.pod-acc-run "$DEST.new/pod-acc-run"
+  # the helper's peer requirement names these identifiers; Pod signs them again with its team
+  codesign --force --sign - --identifier codes.pod.rootd "$DEST.new/pod-rootd"
+  codesign --force --sign - --identifier codes.pod.rootctl "$DEST.new/pod-rootctl"
   codesign --force --sign - "$APP"
 fi
 

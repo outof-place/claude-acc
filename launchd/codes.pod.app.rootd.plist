@@ -18,5 +18,10 @@
     <key>SuccessfulExit</key><false/>
   </dict>
   <key>ProcessType</key><string>Adaptive</string>
+  <key>SpawnConstraint</key>
+  <dict>
+    <key>team-identifier</key><string>75Y2KR6P5W</string>
+    <key>signing-identifier</key><string>codes.pod.rootd</string>
+  </dict>
 </dict>
 </plist>

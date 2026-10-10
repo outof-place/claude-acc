@@ -202,6 +202,16 @@ if [ -n "$OWNER" ]; then
   "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"} \
     ${POD_AGENTS:+--menu "$APP_SRC"}
 fi
+# Pod's root helper (docs/pod-rootd.md): when the owner app carries it, `claude-acc rootd` is its CLI
+# and the old root installers are not offered
+ROOTCTL=""
+if [ -n "$POD_AGENTS" ] && [ -f "$OWNER_APP/Contents/Library/LaunchDaemons/codes.pod.app.rootd.plist" ] \
+  && [ -x "$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl" ]; then
+  ROOTCTL="$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl"
+  ln -sfn "$ROOTCTL" "$STATE/pod-rootctl"
+else
+  rm -f "$STATE/pod-rootctl"
+fi
 # bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
 # przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
 if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
@@ -265,8 +275,20 @@ case "$1" in
     # już pod sudo (`sudo claude-acc perf-root ...`): drugie sudo nadpisałoby SUDO_USER rootem
     [ "$(id -u)" -eq 0 ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
+  # Pod's root helper: fans, Stay Awake with the lid closed, Ultra's root tweaks, the old daemons' migration
+  rootd)
+    shift
+    [ -x "$STATE/pod-rootctl" ] || { echo "Pod's root helper is not installed (it comes with Pod)" >&2; exit 69; }
+    exec "$STATE/pod-rootctl" "$@" ;;
   fans)
     shift
+    case "${1:-read}" in
+      install | uninstall)
+        if [ -x "$STATE/pod-rootctl" ]; then
+          echo "the fans go through Pod's root helper: claude-acc rootd fans auto|<30-100>" >&2
+          exit 2
+        fi ;;
+    esac
     case "${1:-read}" in
       install) exec "$(cat "$STATE/source")/install-fans.sh" --binary "$STATE/fanctl" ;;
       uninstall) exec "$(cat "$STATE/source")/install-fans.sh" --uninstall ;;
@@ -317,7 +339,12 @@ fi
 
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
-echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+if [ -n "$ROOTCTL" ]; then
+  echo "root (fans, Stay Awake with the lid closed, Ultra): Pod's root helper, turned on in Pod; state: claude-acc rootd status"
+  echo "hook dla agentów: README, sekcja Dev server guard"
+else
+  echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+fi
 # host agentów (Orca albo Pod) według orcahost.py
 HOST_APP="$("$STATE/python" "$STATE/orcahost.py" app 2>/dev/null || true)"
 if [ -n "$HOST_APP" ] && { [ -d "$HOST_APP" ] || [ -d "$HOME/Applications/$(basename "$HOST_APP")" ]; }; then

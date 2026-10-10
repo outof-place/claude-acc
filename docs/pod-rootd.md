@@ -78,6 +78,33 @@ Token buckets per caller and verb class; a refusal says when to retry.
 | system | `sysctl.*`, `spotlight.*`, `launchd.*`, `logs.*`, `legacy.*`, `restoreDefaults` | 2 | 1 per 10 s |
 | read | `status` | 20 | 10 per s |
 
+## Tiers
+
+Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`, `VerbPolicy`):
+
+| Tier | Verbs | Pod Menu | `pod-rootctl` | Pod (Electron, `codes.pod.app`) |
+|---|---|---|---|---|
+| A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release` | yes | yes, no prompt | yes |
+| B: changes the system | `power.mode`, `sysctl.*`, `shaper.*`, `spotlight.*`, `fsguard.set`, `launchd.parkOrphans`, `logs.pruneDiagnostics`, `legacy.*`, `restoreDefaults` | yes, no prompt: the click is the consent | only approved | never |
+
+- Tier A can't do lasting harm: a fan setting keeps the 95 °C rule, a lid hold ends with its
+  session, at 24 h, at 10 % battery and when the Mac gets hot.
+- `pod-rootctl` is a confused deputy: anything running as the user can exec it, and it passes the
+  peer requirement. For tier B it sends an `Approval`, and the helper refuses it (`needsApproval`)
+  unless the approval is fresh. Fresh means the CLI's own LocalAuthentication prompt (Touch ID or the
+  password, `deviceOwnerAuthentication`) succeeded in this run, or the same parent did that less than
+  5 minutes ago. The parent is the CLI's session id, its parent pid with that process's start time,
+  and its terminal; a script started from the shell is another parent. The grace runs from the
+  approval, not from the last use. Only the CLI's signed code builds an `Approval`, and a modified CLI
+  fails the peer requirement, so the helper can trust what it says.
+- Pod's Electron process gets tier A only. Pod's terminal daemon runs `Pod Helper` with
+  `ELECTRON_RUN_AS_NODE=1`, so the RunAsNode fuse has to stay on, and fuses are app-wide: any process
+  can run Pod's signed binary as Node with its own JavaScript (`ELECTRON_RUN_AS_NODE=1
+  /Applications/Pod.app/Contents/MacOS/Pod -e ...`), and that passes the requirement for
+  `codes.pod.app`. Electron Pod reaches tier B only through Pod Menu or `pod-rootctl`.
+- PodNative (nt-lean's Swift shell, `codes.pod.native` while it is a second window) is not
+  admitted. Once it ships as `codes.pod.app` without Electron, it gets tier B like Pod Menu.
+
 ## What moves out of root
 
 - **Fan readings.** Reading the SMC needs no root (`SMC.swift` says so, and `fanctl read` works as
@@ -126,11 +153,7 @@ try ProcessCodeRequirement.allOf {
 - Inside the handler each message is classified with `XPCReceivedMessage.senderSatisfies(_:)`
   against one requirement per identifier: the caller (`app`, `menu`, `cli`) goes into the log line
   and into the per-verb policy, and a message no class matches is refused (defense in depth).
-- Per-verb policy: `status`, fans, lid, power, shaper and fsguard verbs are open to all three;
-  system verbs (`sysctl.*`, `spotlight.*`, `launchd.*`, `logs.*`, `legacy.*`, `restoreDefaults`)
-  only to Pod Menu and `pod-rootctl`. `pod-rootctl` asks for Touch ID (LocalAuthentication,
-  device owner) before a system verb, which keeps today's `sudo` prompt for those. The Electron main
-  process `codes.pod.app` is kept off system verbs until its fuses are confirmed off (see Signing).
+- What each caller may send is in [Tiers](#tiers).
 - Every verb is logged with `os_log` (subsystem `codes.pod.rootd`, category `verb`): caller class,
   verb with its parameters, the outcome.
 - Clients connect with `XPCSession(machService:options: .privileged, requirement:)`: `.privileged`
@@ -168,13 +191,15 @@ the Xcode 27 SDK interfaces for exact Swift signatures where the docs only had t
 Not found in the docs, so not relied on: an IOPMAssertion page (power assertions stay in Pod Menu,
 no root needed), a public API for `SleepDisabled` and `powermode` (`IOPMSetSystemPowerSetting` and
 `IOPMSetPMPreferences` are exported by IOKit.tbd but declared in no public header, so the helper runs
-`/usr/bin/pmset` with fixed arguments instead of calling SPI), the `SpawnConstraint` launchd key
-(a candidate hardening for the plist, to verify before use), and the `ifconfig tbr` ioctl
+`/usr/bin/pmset` with fixed arguments instead of calling SPI), and the `ifconfig tbr` ioctl
 (`SIOCSIFLINKPARAMS` is private; the helper runs `/sbin/ifconfig` with a validated interface and rate).
+`SpawnConstraint` was found later, see [A tampered helper](#a-tampered-helper).
 
 The helper executes only these Apple binaries, each with an argument vector built from enums and
 validated numbers through `posix_spawn` (no shell): `/usr/bin/pmset`, `/sbin/ifconfig`,
-`/usr/bin/mdutil`, `/bin/launchctl`. Everything else is a syscall or a framework call:
+`/usr/bin/mdutil`, `/bin/launchctl`, all on the sealed system volume. It never runs
+`/usr/bin/python3` (as root that is the xcrun shim, which can lead into a user-owned Xcode), Homebrew,
+anything under `$STATE` or in `/Applications`. Everything else is a syscall or a framework call:
 `sysctlbyname`, IOKit (SMC, `IOPMrootDomain`, IOPS), `proc_listallpids`/`proc_pid_rusage`, `kill`,
 `PropertyListSerialization`, `rename`/`unlink` with symlink checks.
 
@@ -201,6 +226,11 @@ identifier whoever signs them.
 <key>RunAtLoad</key><true/>
 <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 <key>ProcessType</key><string>Adaptive</string>
+<key>SpawnConstraint</key>
+<dict>
+  <key>team-identifier</key><string>75Y2KR6P5W</string>
+  <key>signing-identifier</key><string>codes.pod.rootd</string>
+</dict>
 ```
 
 - `RunAtLoad`: at boot the helper puts back what the kernel forgot (persisted sysctls, a fixed fan
@@ -271,12 +301,15 @@ sysctls cleared, fsguard off), each saved plist goes back to `/Library/LaunchDae
 
 ## Approval UX
 
+Registering is an explicit user gesture in Pod's own UI (an "Enable root helper" button next to
+the root features), never automatic and never from a URL scheme. Pod Menu and AccKit only say where
+to turn it on when the helper doesn't answer.
+
 1. Pod reads the status: `SMAppService.daemon(plistName: "codes.pod.app.rootd.plist").status`
    (native shell) or `app.getLoginItemSettings({type: 'daemonService', serviceName:
    'codes.pod.app.rootd.plist'})` (Electron).
-2. `.notRegistered`: when the user turns on something that needs root (fan control, lid-closed
-   awake, a root Ultra tweak, hotspot turbo) Pod calls `register()`. A daemon is not started until an
-   admin approves it, so the status becomes `.requiresApproval`.
+2. `.notRegistered`: on that click Pod calls `register()`. A daemon is not started until an admin
+   approves it, so the status becomes `.requiresApproval`.
 3. `.requiresApproval`: a card says what the helper does and that Pod lists it under Login Items >
    Allow in the Background, with one button: `SMAppService.openSystemSettingsLoginItems()`. While
    the card shows (and when Pod becomes active) Pod reads the status again every 2 s.
@@ -295,9 +328,49 @@ secure timestamp, no entitlements (the helper is not sandboxed; IOKit's AppleSMC
 sysctl, `posix_spawn` and the files it writes need none). Identifiers `codes.pod.rootd` and
 `codes.pod.rootctl`; pass `--identifier` explicitly when re-signing.
 
-For `codes.pod.app` to call verbs, Pod's Electron fuses `RunAsNode`, `EnableNodeOptionsEnvironmentVariable`
-and `EnableNodeCliInspectArguments` must be off: with any of them on, any process could run code
-under Pod's signature (`ELECTRON_RUN_AS_NODE=1`) and pass the peer requirement.
+Pod's Electron binary keeps RunAsNode on (its terminal daemon needs it), which is why
+`codes.pod.app` gets tier A only (see [Tiers](#tiers)).
+
+## A tampered helper
+
+`/Applications/Pod.app` belongs to the user when it was dragged there, so
+`Contents/Resources/claude-acc/pod-rootd` is writable without root. The question is whether launchd
+runs a swapped BundleProgram as root.
+
+Tested on macOS 27 in a scratch folder as the user (nothing registered, `scripts/rootd-tamper-kit.sh`
+and the commands in this section). Binaries were signed with an Apple Development certificate of team
+75Y2KR6P5W:
+
+| Case | Result |
+|---|---|
+| the signed binary | runs |
+| one byte changed in place | killed at exec, exit 137 (AMFI rejects the invalid page) |
+| replaced with another binary, ad hoc signed with the same identifier | runs as the user; `codesign --verify --deep --strict` on the app reports "a sealed resource is missing or invalid" |
+| the replaced binary spawned with a launch requirement (`Process.launchRequirement`, team 75Y2KR6P5W + identifier) | killed at spawn, signal 9; the genuine binary runs |
+| a binary signed with `--launch-constraint-self` holding `{team-identifier, signing-identifier}` that matches | runs; one that doesn't match is killed, exit 137 |
+
+So the kernel does not stop a swapped binary that carries a valid signature of its own, ad hoc
+included. A launch constraint does stop it. Apple documents the one for launchd jobs at
+developer.apple.com/documentation/security/applying-launch-environment-and-library-constraints:
+"Spawn constraints for launchd daemons and agents are not embedded in the code signature ... add
+the constraint to the `SpawnConstraint` key in the launchd property list". The macOS 27 SDK defines
+the key (`LAUNCH_JOBKEY_SPAWNCONSTRAINT` in `launch.h`), and `codesign` takes the same dictionary
+format. The helper's plist therefore carries `SpawnConstraint` = `{team-identifier: 75Y2KR6P5W,
+signing-identifier: codes.pod.rootd}`: a replaced pod-rootd is killed before it runs as root.
+
+The plist lives in the same writable bundle, and editing it breaks the app's seal. What isn't
+proven yet is whether launchd/BTM validates the bundle, or keeps its own copy of the plist from
+registration, before it honours `SpawnConstraint`. Proving it takes a registered daemon, which is
+the user's system. `scripts/rootd-tamper-kit.sh DIR IDENTITY` builds two throwaway apps, one
+daemon with the constraint and one without, and prints the steps (register, approve, kickstart,
+swap, kickstart, read the log, drop the constraint, reboot). Run them on a scratch Mac or VM. Until
+they pass, this is a cutover blocker. If the edited plist wins, the fallback is to install Pod.app
+root-owned (a `.pkg`), so a user-level process can't write the bundle at all.
+
+pod-rootd also checks its own signature at start (`anchor apple generic`, team 75Y2KR6P5W,
+identifier `codes.pod.rootd`) and exits without touching anything otherwise. That catches an ad hoc
+or unsigned build registered by mistake. It can't stop a replacement, which simply won't contain
+the check.
 
 ## Cutover
 
@@ -311,8 +384,11 @@ What has to land before it, or the migration leaves a feature without its daemon
   `fans-state.json`. Until then the old fans daemon is what follows `fans.json` and `awake.json`.
 - `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, `sudo` otherwise.
 - `hotspot.py` as the user with `pod-rootctl shaper follow`, then `hotspot` joins `Engine.migrating`.
-- Pod's payload carries `pod-rootd`, `pod-rootctl` and the plist; Pod registers the daemon as
-  `daemonService` and signs both binaries (see Signing).
+- Pod registers the daemon as `daemonService` and signs both binaries (see Signing). The payload
+  carries `pod-rootd`, `pod-rootctl` and `LaunchDaemons/codes.pod.app.rootd.plist`
+  (`scripts/payload.sh`). With `--pod-agents`, `setup.sh` links `$STATE/pod-rootctl` when the owner
+  app has the helper: `claude-acc rootd ...` runs it, and `claude-acc fans install` points there.
+- The tampered-helper steps above pass.
 
 ## Code
 
@@ -325,5 +401,6 @@ What has to land before it, or the migration leaves a feature without its daemon
 - `app/Sources/SMCKit`: the SMC and fan code, shared by `fanctl`, the helper and Pod Menu.
 - `app/Sources/pod-rootd`: the listener and the real backend.
 - `app/Sources/pod-rootctl`: the CLI for scripts (`status`, every verb, `shaper follow`).
-- `app/Tests/PodRootdTests`: validation, peer rejection, policy, idempotency, rate limits, leases,
-  restart, migration and restore against the fake backend.
+- `app/Tests/PodRootdTests`: validation, peer rejection, the tier table and the CLI's approval
+  grace, idempotency, rate limits, leases, restart, migration and restore against the fake backend.
+- `scripts/rootd-tamper-kit.sh`: the throwaway apps for the tampered-helper test.
