@@ -28,6 +28,13 @@ public final class PodRootdClient: Sendable {
 
     private init(session: XPCSession) { self.session = session }
 
+    /// libxpc crashes on the last release of an active session that wasn't cancelled
+    /// (`xpc/session.h`), so letting go of a client ends its session, and its leases, like
+    /// `close()`. A second cancel is harmless.
+    deinit {
+        session.cancel(reason: "client released")
+    }
+
     /// What a client asks of the service it reaches.
     public static func helperRequirement(team: String = PodRootd.teamIdentifier) throws -> XPCPeerRequirement {
         .codeRequirement(try ProcessCodeRequirement.allOf {
