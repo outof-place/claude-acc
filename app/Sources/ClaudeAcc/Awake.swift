@@ -212,6 +212,8 @@ final class Awake {
     private func requestLid() {
         guard !preview else { return }
         let until = manualActive && lidClosed ? manualUntil?.timeIntervalSince1970 ?? 0 : 0
+        // in Pod the root helper holds it on this app's session, once the old fans daemon is migrated
+        RootHelper.shared.wantLid(until: until > 0 ? Date(timeIntervalSince1970: until) : nil)
         guard until != lidRequested else { return }
         let request: [String: Any] = ["lid": until > 0, "until": until, "pid": Int(getpid())]
         guard let data = try? JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]),

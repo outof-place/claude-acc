@@ -28,7 +28,8 @@ let package = Package(
     targets: [
         // the menu bar app
         .executableTarget(
-            name: "ClaudeAcc", dependencies: ["DictationCore"], path: "Sources/ClaudeAcc", swiftSettings: settings),
+            name: "ClaudeAcc", dependencies: ["DictationCore", "PodRootdClient", "SMCKit"], path: "Sources/ClaudeAcc",
+            swiftSettings: settings),
         // dictation without AppKit: text rules, the AI Gateway client, audio math, the right ⌥ trigger
         .target(name: "DictationCore", path: "Sources/DictationCore", swiftSettings: core),
         .testTarget(
