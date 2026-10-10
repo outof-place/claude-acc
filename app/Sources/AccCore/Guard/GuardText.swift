@@ -36,10 +36,19 @@ public enum GuardText {
     }
 
     /// devguard_core.minutes
-    public static func minutes(_ seconds: Double) -> String { "\(Int((seconds / 60).rounded(.down))) min" }
+    public static func minutes(_ seconds: Double) -> String { "\(int((seconds / 60).rounded(.down))) min" }
 
     /// Python round(x) for a float: half to even, an int.
-    public static func round(_ x: Double) -> Int { Int(x.rounded(.toNearestOrEven)) }
+    public static func round(_ x: Double) -> Int { int(x.rounded(.toNearestOrEven)) }
+
+    /// int(x) for a float without trapping: NaN and the infinities (where Python raises and the tick
+    /// fails) read as 0, values beyond Int64 stop at its ends. A daemon must not die of a state value.
+    public static func int(_ x: Double) -> Int {
+        guard x.isFinite else { return 0 }
+        if x >= 9.223372036854775807e18 { return .max }
+        if x <= -9.223372036854775808e18 { return .min }
+        return Int(x)
+    }
 
     /// Python round(x, n) for a float, as close as a double gets (Python rounds the exact decimal).
     public static func round(_ x: Double, _ n: Int) -> Double {

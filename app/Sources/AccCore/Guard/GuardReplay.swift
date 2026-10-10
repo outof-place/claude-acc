@@ -106,6 +106,8 @@ public enum GuardReplay {
     public struct Outcome {
         public var differences: [String] = []
         public var missing: [String] = []
+        /// a devguard.json value of another type than the default: the engine hands such ticks over
+        public var configHandedOver = false
     }
 
     /// One fixture through the native tick; the differences from what Python decided.
@@ -115,6 +117,10 @@ public enum GuardReplay {
         var cfg = GuardConfig.defaults
         for (k, v) in fixture["cfg"]?.object ?? PyObject() { cfg[k] = v }
         let config = GuardConfig(raw: cfg)
+        if !config.mismatched.isEmpty {
+            out.configHandedOver = true
+            return out
+        }
         GuardPaths.fsguardState = fixture["fsguard"]?.string ?? GuardPaths.fsguardState
         let orca = OrcaView(fixture["orca_before"]?.object ?? PyObject())
         var state = fixture["state_before"]?.object ?? PyObject()
@@ -126,25 +132,26 @@ public enum GuardReplay {
         compare("orca", orca.dump(), expect["orca_after"] ?? .null, into: &out.differences, numbers: .lenient)
         let plans = PyJSON.array(result.plans.map { $0.summary(home: probes.home) })
         compare("plans", plans, expect["plans"] ?? .null, into: &out.differences)
-        let (act, brake) = verdictJSON(result.verdict)
-        let pyAct = expect["act"] ?? .null
+        // Python's recorder declines every plan, so its loop hands each one to execute() in order and
+        // then brakes as with nothing acted: the native list and brake flag must say the same
+        let calls = PyJSON.array(result.actable.map(callJSON))
+        if let pyCalls = expect["calls"] {
+            compare("calls", calls, pyCalls, into: &out.differences)
+        } else {
+            let act = result.actable.first.map(callJSON) ?? .null
+            if act != expect["act"] ?? .null { out.differences.append("act: native \(act.dumps()) python \((expect["act"] ?? .null).dumps())") }
+        }
+        let brake: PyJSON = result.brakeDue ? .int(result.world.pressure.stage) : .null
         let pyBrake = expect["brake"] ?? .null
-        // Python's recorder lets every plan through to a stub, so the brake shows even after an act
-        if act != pyAct { out.differences.append("act: native \(act.dumps()) python \(pyAct.dumps())") }
-        if act.isNull, brake != pyBrake { out.differences.append("brake: native \(brake.dumps()) python \(pyBrake.dumps())") }
+        if brake != pyBrake { out.differences.append("brake: native \(brake.dumps()) python \(pyBrake.dumps())") }
         let logs = PyJSON.array((GuardLog.capture ?? []).filter { $0.0 == "log" }.map { .string($0.1) })
         compare("log", logs, expect["log"] ?? .array([]), into: &out.differences)
         out.missing = probes.missing
         return out
     }
 
-    static func verdictJSON(_ v: GuardVerdict) -> (PyJSON, PyJSON) {
-        switch v {
-        case .quiet: (.null, .null)
-        case .act(let key, let action, let code):
-            (.object(PyObject([("unit", .string(key)), ("action", .string(action)), ("code", .string(code))])), .null)
-        case .brake(let stage): (.null, .int(stage))
-        }
+    static func callJSON(_ p: Plan) -> PyJSON {
+        .object(PyObject([("unit", .string(p.key)), ("action", .string(p.action)), ("code", .string(p.code))]))
     }
 
     /// Semantic JSON equality (key order aside), with floats equal to 1e-12 relative: Python walks a

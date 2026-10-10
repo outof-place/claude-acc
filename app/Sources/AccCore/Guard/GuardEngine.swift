@@ -3,8 +3,47 @@
 // memory pressure. Everything that acts stays Python's: a tick whose plan or brake is due is handed
 // to `acc.py devguard once` (which reads the Mac again and acts on its own reading), the caps to
 // `acc.py devguard caps`. In shadow mode nothing is handed over and the state goes to a file of its own.
+// A devguard.json value of a type the native tick would read differently hands every tick over.
 import Darwin
 import Dispatch
+
+/// Which tick goes to Python, and the waits after a handover. Python's loop runs on every tick
+/// without a process start; a handover costs a cold Python, so two kinds of handover wait:
+/// - a plan Python may decline on its own reading (`declinable`) that it did decline: `holdSeconds`,
+///   while the plans under it and the brake still go;
+/// - a brake, whatever its outcome (no victim, or a state Python couldn't save): brake()'s own gap
+///   (`emergency_cooldown_seconds` at stage 3, else `brake_cooldown_seconds`).
+/// Every other plan is tried again on the next tick: Python's reading may differ for a moment
+/// (pressure flickering), and it acts as soon as it agrees.
+public struct HandoverPolicy {
+    public static let holdSeconds = 60.0
+    public private(set) var heldUntil: [String: Double] = [:]
+    public private(set) var brakeHeldUntil = 0.0
+
+    public init() {}
+
+    public struct Handover {
+        public var plan: Plan?
+        public var brake: Bool
+        public var reason: String { plan.map { "\($0.action) \($0.key)" } ?? "brake" }
+    }
+
+    static func key(_ plan: Plan) -> String { plan.key + "|" + plan.action + "|" + plan.code }
+
+    /// The first actable plan that isn't held, and the brake when it's due and not waiting.
+    public func next(actable: [Plan], brakeDue: Bool, now: Double) -> Handover? {
+        let plan = actable.first { (heldUntil[Self.key($0)] ?? 0) <= now }
+        let brake = brakeDue && brakeHeldUntil <= now
+        return plan != nil || brake ? Handover(plan: plan, brake: brake) : nil
+    }
+
+    /// After Python's tick: `acted` when it stopped, restarted, shut down or warned something.
+    public mutating func record(_ handover: Handover, acted: Bool, brakeGap: Double, now: Double) {
+        heldUntil = heldUntil.filter { $0.value > now }
+        if let plan = handover.plan, !acted, declinable(plan) { heldUntil[Self.key(plan)] = now + Self.holdSeconds }
+        if handover.brake { brakeHeldUntil = now + brakeGap }
+    }
+}
 
 public final class GuardEngine: @unchecked Sendable {
     public struct Options: Sendable {
@@ -25,7 +64,8 @@ public final class GuardEngine: @unchecked Sendable {
     }
 
     let options: Options
-    let queue = DispatchQueue(label: "acc-cored.guard", qos: .utility)
+    // Python's guard runs as ProcessType Interactive: under a heavy load this queue must not starve
+    let queue = DispatchQueue(label: "acc-cored.guard", qos: .userInitiated)
     var timer: DispatchSourceTimer?
     var pressureSource: DispatchSourceMemoryPressure?
     var lockFd: Int32 = -1
@@ -33,11 +73,18 @@ public final class GuardEngine: @unchecked Sendable {
     var orca = OrcaView()
     var client: OrcaClient?
     var hostStamp = ""
+    /// orcahost.py failed (a timeout under load): when to ask again
+    var hostRetryAt = 0.0
     var shaper = QoSShaper()
     let procCache = ProcCache()
     var lastTick = 0.0
-    /// a handover that changed nothing (a hold Python judged): the same plan waits this long
-    var heldUntil: [String: Double] = [:]
+    public private(set) var policy = HandoverPolicy()
+    /// tests: the readings, Python's `once` and the caps run in place of the Mac's and the scripts'
+    var probesFactory: (() -> GuardProbes)?
+    var runner: (([String]) -> Int32)?
+    var capsRunner: (() -> Void)?
+    /// the devguard.json keys last found of the wrong type (logged when they change)
+    var mismatchLogged: [String] = []
     var capsRunning = false
     public private(set) var ticks = 0
     public private(set) var handovers = 0
@@ -58,7 +105,7 @@ public final class GuardEngine: @unchecked Sendable {
         if !options.shadow {
             Files.mkdirs(GuardPaths.state(options.home))
             lockFd = open(lockPath, O_WRONLY | O_CREAT | O_CLOEXEC, 0o644)
-            guard lockFd >= 0, flock(lockFd, LOCK_EX | LOCK_NB) == 0 else {
+            guard lockFd >= 0, Self.flockRetrying(lockFd, LOCK_EX | LOCK_NB) else {
                 if lockFd >= 0 { close(lockFd) }
                 lockFd = -1
                 return false
@@ -81,10 +128,18 @@ public final class GuardEngine: @unchecked Sendable {
             if !options.shadow { shaper.restoreAll() }
             GuardLog.write("koniec strażnika (acc-cored)")
             if lockFd >= 0 {
-                flock(lockFd, LOCK_UN)
+                _ = Self.flockRetrying(lockFd, LOCK_UN)
                 close(lockFd)
                 lockFd = -1
             }
+        }
+    }
+
+    /// flock through EINTR
+    static func flockRetrying(_ fd: Int32, _ op: Int32) -> Bool {
+        while true {
+            if flock(fd, op) == 0 { return true }
+            if errno != EINTR { return false }
         }
     }
 
@@ -109,25 +164,35 @@ public final class GuardEngine: @unchecked Sendable {
     func loop(reschedule: Bool = true) {
         let cfg = Profile.measure("config") { GuardConfig.load(path: configPath) }
         Profile.measure("merge") { mergeForeign() }
-        Profile.measure("host") { refreshHost() }
-        let probes = LiveProbes(home: options.home, orca: client, cache: procCache)
+        if probesFactory == nil { Profile.measure("host") { refreshHost() } }
+        let probes = probesFactory?() ?? LiveProbes(home: options.home, orca: client, cache: procCache)
         let enforce = !options.shadow && cfg["mode"] == .string("enforce")
+        let mismatched = cfg.mismatched
+        if mismatched != mismatchLogged {
+            mismatchLogged = mismatched
+            if !mismatched.isEmpty {
+                GuardLog.write("acc-cored: devguard.json ma wartości innego typu niż domyślne (\(mismatched.joined(separator: ", "))): każdy przebieg robi Python")
+            }
+        }
         var next = state
+        GuardLog.hold()
         let result = guardTick(cfg: cfg, state: &next, orca: orca, probes: probes, enforce: enforce, shaper: options.shadow ? nil : shaper)
         lastTick = probes.now
         ticks += 1
         // the first tick reads every process's arguments and asks every pattern once: not the loop's cost
         if ticks == 1, Profile.on { Profile.reset() }
-        switch result.verdict {
-        case .act(let key, let action, let code) where (heldUntil[key + action + code] ?? 0) <= probes.now:
-            handOver(reason: "\(action) \(key)", heldKey: key + action + code)
-        case .brake:
-            handOver(reason: "brake", heldKey: nil)
-        default:
+        let handover = options.shadow ? nil
+            : !mismatched.isEmpty ? HandoverPolicy.Handover(plan: nil, brake: false) : policy.next(actable: result.actable, brakeDue: result.brakeDue, now: probes.now)
+        if let handover {
+            GuardLog.release(write: false)  // Python's tick logs and notifies from its own reading
+            handOver(handover, result: result, cfg: cfg, configOnly: !mismatched.isEmpty)
+        } else {
+            GuardLog.release(write: true)
             state = next
             save()
-            if !options.shadow, capsDue(cfg, now: probes.now) { runCaps() }
         }
+        // check_caps runs in Python's loop on every enforcing tick (`enforce and qos`)
+        if enforce, capsDue(cfg, now: probes.now) { runCaps() }
         guard reschedule else { return }
         let stage = state["snapshot"]?["pressure"]?["stage"]?.int ?? 0
         let interval = cfg.number("interval_seconds")
@@ -136,18 +201,29 @@ public final class GuardEngine: @unchecked Sendable {
 
     /// The tick goes to Python: the state as it was before this tick, the lock let go, `devguard once`,
     /// then the state Python saved. Python's tick re-reads the Mac, decides and acts.
-    func handOver(reason: String, heldKey: String?) {
+    func handOver(_ handover: HandoverPolicy.Handover, result: GuardTickResult, cfg: GuardConfig, configOnly: Bool) {
         save()
-        let before = state["last_action"]?.double ?? 0
-        let eventsBefore = state["events"]?.array?.count ?? 0
-        if lockFd >= 0 { flock(lockFd, LOCK_UN) }
-        let rc = Spawn.run(options.python + ["devguard", "once"], log: nil)
-        if lockFd >= 0 { flock(lockFd, LOCK_EX) }
+        let before = actedStamp(state)
+        if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_UN) }
+        // a hung tick (an Orca call that never answers) must not stop the guard for good
+        let argv = options.python + ["devguard", "once"]
+        let rc = runner?(argv) ?? Spawn.run(argv, log: nil, timeout: Self.onceTimeout)
+        if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_EX) }
         handovers += 1
         state = Files.json(statePath, fallback: .object(state)).object ?? state
-        let acted = (state["last_action"]?.double ?? 0) != before || (state["events"]?.array?.count ?? 0) != eventsBefore
-        if !acted, let heldKey { heldUntil[heldKey] = Kernel.wall() + 60 }
+        let reason = configOnly ? "config" : handover.reason
         if rc != 0 { GuardLog.write("acc-cored: devguard once wyszedł z kodem \(rc) (\(reason))") }
+        guard !configOnly else { return }
+        let s = LastResort.settings(cfg)
+        let gap = (result.world.pressure.stage >= 3 ? s["emergency_cooldown_seconds"] : s["brake_cooldown_seconds"])?.double ?? 0
+        policy.record(handover, acted: actedStamp(state) != before, brakeGap: gap, now: result.world.now)
+    }
+
+    static let onceTimeout = 120.0
+
+    /// What changes when execute() acts: last_action (stop, restart, shutdown), the events, the warns.
+    func actedStamp(_ s: PyObject) -> String {
+        "\(s["last_action"]?.double ?? 0)|\(s["events"]?.array?.count ?? 0)|\(s["warned"].map { $0.dumps() } ?? "")"
     }
 
     /// save_state: writer and saved_at, then the file by rename.
@@ -192,9 +268,13 @@ public final class GuardEngine: @unchecked Sendable {
         let owner = Files.stamp(GuardPaths.state(options.home) + "/owner.json").map { "\($0)" } ?? "-"
         let running = procCache.hostApps
         let stamp = owner + "|" + running
-        guard stamp != hostStamp else { return }
+        let now = Kernel.wall()
+        // a failed resolve (a 20 s timeout under load) is asked again a minute later, not only when
+        // the host changes: without Orca there are no recycle plans
+        guard stamp != hostStamp || (client == nil && now >= hostRetryAt) else { return }
         hostStamp = stamp
         client = HostResolver.resolve(python: options.python, home: options.home)
+        if client == nil { hostRetryAt = now + 60 }
     }
 
     // MARK: caps
@@ -207,10 +287,14 @@ public final class GuardEngine: @unchecked Sendable {
     }
 
     func runCaps() {
+        if let capsRunner {
+            capsRunner()
+            return
+        }
         capsRunning = true
         let argv = options.python + ["devguard", "caps"]
         DispatchQueue.global(qos: .background).async { [weak self] in
-            _ = Spawn.run(argv, log: nil)
+            _ = Spawn.run(argv, log: nil, timeout: 1800)
             self?.capsFinished()
         }
     }
@@ -284,7 +368,9 @@ public enum HostResolver {
         var names = ["Orca", "Pod"]
         for key in ["CLAUDE_ACC_HOST_APP", "POD_APP_PATH"] {
             if let app = env[key], !app.isEmpty {
-                var name = basename(String(app.reversed().drop(while: { $0 == "/" }).reversed()))
+                var trimmed = app.utf8[...]
+                while trimmed.last == 0x2F { trimmed = trimmed.dropLast() }
+                var name = basename(String(Substring(trimmed)))
                 if name.pyEnds(".app") { name = String(name.unicodeScalars.dropLast(4).map(Character.init)) }
                 if !name.isEmpty, !names.contains(name) { names.append(name) }
             }
