@@ -29,6 +29,8 @@ O = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(O)
 
 GUARD = "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> \"$FAKE_LOG\"\nexit 0\n"
+# prawdziwy interpreter (nie shim /usr/bin/python3, który pod nazwą `python` woła instalator narzędzi)
+PYTHON = os.path.realpath(sys.executable)
 
 
 class OwnerFileTest(unittest.TestCase):
@@ -58,6 +60,16 @@ class OwnerFileTest(unittest.TestCase):
             self.assertIsNone(O.read(), text)
         with self.assertRaises(ValueError):
             O.write("someone", "1")
+
+    def test_menu_app_is_pods_when_it_runs_the_agents(self):
+        legacy = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self.dir))), "Applications", "Claude Acc.app")
+        self.assertEqual(O.menu_app(), legacy)  # brew: kopia setup.sh w ~/Applications
+        menu = os.path.join(self.dir, "Pod.app/Contents/Library/LoginItems/Pod Menu.app")
+        O.write("pod", "1.31.0", "/Applications/Pod.app", menu)
+        self.assertEqual(O.read()["menu"], menu)
+        self.assertEqual(O.menu_app(), legacy)  # Pod Menu.app jeszcze nie istnieje
+        os.makedirs(menu)
+        self.assertEqual(O.menu_app(), menu)
 
     def test_clear(self):
         O.write("pod", "1")
@@ -90,7 +102,7 @@ class SetupHarness(unittest.TestCase):
         env.update(extra)
         env = {k: v for k, v in env.items() if v is not None}
         done = subprocess.run(["/bin/bash", os.path.join(ROOT, "setup.sh"), *args], env=env,
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, timeout=240)
         return done.returncode, done.stdout + done.stderr
 
     def own(self):
@@ -192,13 +204,74 @@ class ForeignHomeTest(SetupHarness):
         self.assertEqual(self.calls(), "")
 
 
+class PodAgentsSetupTest(SetupHarness):
+    """setup.sh --pod-agents: automaty i aplikację paska menu prowadzi Pod (SMAppService), więc
+    instalacja zdejmuje stare com.filip.claude-acc.* i kopię Claude Acc.app, a niczego nie stawia."""
+
+    JOBS = ("com.filip.claude-acc", "com.filip.claude-acc.janitor", "com.filip.claude-acc.devguard",
+            "com.filip.claude-acc.perf", "com.filip.claude-acc.updates", "com.filip.claude-acc.jobs")
+
+    def setUp(self):
+        super().setUp()
+        self.agents = os.path.join(self.home, "Library/LaunchAgents")
+        os.makedirs(self.agents)
+        for job in self.JOBS:
+            with open(os.path.join(self.agents, job + ".plist"), "w") as f:
+                f.write("<plist/>\n")
+        self.legacy_app = os.path.join(self.home, "Applications/Claude Acc.app")
+        os.makedirs(os.path.join(self.legacy_app, "Contents/MacOS"))
+        self.pod = os.path.join(self.dir, "Pod.app")
+        self.menu = os.path.join(self.pod, "Contents/Library/LoginItems/Pod Menu.app")
+        os.makedirs(os.path.join(self.menu, "Contents/MacOS"))
+        import plistlib
+        with open(os.path.join(self.menu, "Contents/Info.plist"), "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": "com.filip.claude-acc.menubar", "CFBundleShortVersionString": "9.9.9"}, f)
+
+    def install(self, *extra):
+        return self.setup("--app", self.menu, "--owner", "pod", "--owner-app", self.pod, "--pod-agents",
+                          "--python", PYTHON, *extra, CLAUDE_ACC_NO_HOOKS="1")
+
+    def test_pod_agents_replace_the_legacy_jobs_and_app(self):
+        rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        calls = self.calls().splitlines()
+        uid = os.getuid()
+        for job in self.JOBS:
+            self.assertIn(f"launchctl bootout gui/{uid}/{job}", calls)
+        self.assertFalse([c for c in calls if c.startswith("launchctl bootstrap")], calls)
+        self.assertEqual(os.listdir(self.agents), [])
+        # stara kopia aplikacji: zamknięta po ścieżce (Pod Menu ma ten sam plik ClaudeAcc) i usunięta
+        self.assertIn(f"pkill -f {self.legacy_app}/Contents/MacOS/ClaudeAcc", calls)
+        self.assertFalse([c for c in calls if c.startswith(("pkill -x", "ditto", "open", "codesign"))], calls)
+        self.assertFalse(os.path.exists(self.legacy_app))
+        # interpreter aplikacji i ślad w owner.json, gdzie jest aplikacja paska menu
+        self.assertEqual(os.readlink(os.path.join(self.state, "python")), PYTHON)
+        with open(os.path.join(self.state, "owner.json")) as f:
+            owned = json.load(f)
+        self.assertEqual((owned["owner"], owned["app"], owned["menu"]), ("pod", self.pod, self.menu))
+        env = dict(os.environ, HOME=self.home)
+        menu = subprocess.run(["/usr/bin/python3", os.path.join(self.state, "owner.py"), "menu"], env=env,
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(menu, self.menu)
+        # komenda i skrypty jak w każdej instalacji
+        self.assertTrue(os.access(os.path.join(self.home, ".local/bin/claude-acc"), os.X_OK))
+        self.assertTrue(os.path.isfile(os.path.join(self.state, "acc.py")))
+
+    def test_pod_agents_need_the_pod_owner(self):
+        rc, out = self.setup("--app", self.menu, "--pod-agents")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("--pod-agents tylko z --owner pod", out)
+        self.assertEqual(self.calls(), "")
+        self.assertEqual(len(os.listdir(self.agents)), len(self.JOBS))
+
+
 class PayloadTest(unittest.TestCase):
     def test_payload_layout_version_and_tarball(self):
         work = os.path.realpath(tempfile.mkdtemp(prefix="payload-test-"))
         self.addCleanup(shutil.rmtree, work, True)
         products = os.path.join(work, "products")
         os.makedirs(products)
-        for name in ("ClaudeAcc", "fanctl", "claude-acc-hook", "claude-acc-pause", "claude-acc-desktop"):
+        for name in ("ClaudeAcc", "fanctl", "claude-acc-hook", "claude-acc-pause", "claude-acc-desktop", "pod-acc-run"):
             with open(os.path.join(products, name), "w") as f:
                 f.write(f"fake {name}\n")
         out = os.path.join(work, "out")
@@ -209,14 +282,26 @@ class PayloadTest(unittest.TestCase):
         payload = os.path.join(out, "claude-acc")
         names = set(os.listdir(payload))
         for expected in ("setup.sh", "accswitch.py", "owner.py", "awake.py", "orcaplugin.py", "launchd", "hooks",
-                         "orca-plugin", "Claude Acc.app", "fanctl", "claude-acc-hook", "claude-acc-pause",
-                         "claude-acc-desktop", "VERSION", "payload.json"):
+                         "orca-plugin", "Pod Menu.app", "fanctl", "claude-acc-hook", "claude-acc-pause",
+                         "claude-acc-desktop", "pod-acc-run", "LaunchAgents", "VERSION", "payload.json"):
             self.assertIn(expected, names)
+        self.assertNotIn("Claude Acc.app", names)  # układ 2: aplikację paska menu wozi Pod jako Pod Menu
         self.assertNotIn("test", os.listdir(os.path.join(payload, "orca-plugin")))
         self.assertFalse([p for p, _, _ in os.walk(payload) if p.endswith("__pycache__")])
         with open(os.path.join(payload, "VERSION")) as f:
             self.assertEqual(f.read().strip(), "9.9.9")
-        self.assertTrue(os.path.isfile(os.path.join(payload, "Claude Acc.app/Contents/MacOS/ClaudeAcc")))
+        menu = os.path.join(payload, "Pod Menu.app")
+        self.assertTrue(os.path.isfile(os.path.join(menu, "Contents/MacOS/ClaudeAcc")))
+        import plistlib
+        with open(os.path.join(menu, "Contents/Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+        # bundle id i plik wykonywalny zostają: na nich wiszą zgody TCC i `pgrep -x ClaudeAcc` Poda
+        self.assertEqual((info["CFBundleIdentifier"], info["CFBundleExecutable"]), ("com.filip.claude-acc.menubar", "ClaudeAcc"))
+        self.assertEqual((info["CFBundleName"], info["CFBundleDisplayName"]), ("Pod Menu", "Pod Menu"))
+        with open(os.path.join(payload, "payload.json")) as f:
+            self.assertEqual(json.load(f)["layout"], 2)
+        agents = sorted(os.listdir(os.path.join(payload, "LaunchAgents")))
+        self.assertEqual(agents, sorted(f"codes.pod.app.acc.{j}.plist" for j in ("tick", "janitor", "devguard", "perf", "updates", "jobs")))
         tarball = os.path.join(out, "claude-acc-payload-9.9.9.tar.gz")
         with open(tarball + ".sha256") as f:
             digest, name = f.read().split()

@@ -9,6 +9,11 @@
 #   --owner pod [--owner-app <Pod.app>]   instaluje aplikacja, która wozi claude-acc w sobie (paczka
 #                          z scripts/payload.sh); zapisuje $STATE/owner.json, po czym setup.sh bez
 #                          --owner pod (Homebrew, install.sh) odmawia z kodem 3 (owner.py)
+#   --pod-agents           (z --owner pod) automaty i aplikację paska menu prowadzi Pod: agenty
+#                          codes.pod.app.acc.* z SMAppService, --app to Pod Menu.app w jego
+#                          Contents/Library/LoginItems. Nic w ~/Library/LaunchAgents ani ~/Applications:
+#                          stare com.filip.claude-acc.* idą precz, kopia Claude Acc.app też
+#   --python <python3>     interpreter $STATE/python (Pod: wbudowany python-build-standalone) zamiast uv
 #
 # Woła go install.sh po zbudowaniu ze źródeł i `claude-acc-setup` z Homebrew, które podaje
 # swoją zbudowaną aplikację. Wiatraki (root) to osobny krok: install-fans.sh.
@@ -60,9 +65,13 @@ FANCTL=""
 HOOK=""
 DESKTOP=""
 ORCA_PLUGIN=""
+POD_AGENTS=""
+PYTHON_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --app) APP_SRC="$2"; shift 2 ;;
+    --pod-agents) POD_AGENTS=1; shift ;;
+    --python) PYTHON_ARG="$2"; shift 2 ;;
     --fanctl) FANCTL="$2"; shift 2 ;;
     --hook) HOOK="$2"; shift 2 ;;
     --desktop) DESKTOP="$2"; shift 2 ;;
@@ -103,8 +112,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -d "$APP_SRC" ] || { echo "brak aplikacji: --app \"<Claude Acc.app>\"" >&2; exit 2; }
+if [ -n "$POD_AGENTS" ] && [ "$OWNER" != pod ]; then
+  echo "--pod-agents tylko z --owner pod: automaty Pod rejestruje sam Pod" >&2
+  exit 2
+fi
 
-mkdir -p "$STATE" "$HOME/.local/bin" "$AGENTS" "$HOME/Applications"
+mkdir -p "$STATE" "$HOME/.local/bin"
+[ -n "$POD_AGENTS" ] || mkdir -p "$AGENTS" "$HOME/Applications"
 cp "$SRC"/*.py "$STATE/"
 # hooki Ultra (szybki npx dla hooków formatowania) leżą obok perf.py
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
@@ -138,10 +152,22 @@ PAUSE_BIN="$(dirname "${HOOK:-.}")/claude-acc-pause"
 PY=/usr/bin/python3
 UV="$(command -v uv || true)"
 [ -z "$UV" ] && [ -x /opt/homebrew/bin/uv ] && UV=/opt/homebrew/bin/uv
+if [ -n "$PYTHON_ARG" ] && [ -x "$PYTHON_ARG" ]; then
+  # interpreter aplikacji, która wozi claude-acc (Pod: python-build-standalone w Contents/Resources)
+  PY="$PYTHON_ARG"
+  UV=""
+elif [ -n "$PYTHON_ARG" ]; then
+  echo "uwaga: --python $PYTHON_ARG nie jest wykonywalny, biorę uv albo systemowy" >&2
+fi
 if [ -n "$UV" ]; then
   "$UV" python install 3.14 >/dev/null 2>&1 || true
   found="$("$UV" python find --managed-python 3.14 2>/dev/null || true)"
   [ -x "$found" ] && PY="$found"
+fi
+# /usr/bin/python3 to shim xcrun, który pod nazwą `python` (link $STATE/python) szuka narzędzia
+# `python` i woła instalator narzędzi wiersza poleceń: link idzie do interpretera, który shim uruchamia
+if [ "$PY" = /usr/bin/python3 ]; then
+  PY="$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.executable))' 2>/dev/null || echo /usr/bin/python3)"
 fi
 ln -sfn "$PY" "$STATE/python"
 # bytecode up front: acc.py runs every script from it, so no start compiles one
@@ -173,7 +199,8 @@ echo "$SRC" > "$STATE/source"
 # właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji
 if [ -n "$OWNER" ]; then
   version="$(cat "$SRC/VERSION" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_SRC/Contents/Info.plist")"
-  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"}
+  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"} \
+    ${POD_AGENTS:+--menu "$APP_SRC"}
 fi
 # bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
 # przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
@@ -256,8 +283,14 @@ chmod +x "$HOME/.local/bin/claude-acc"
 # automaty: tick kont co 2 minuty, porządki przy logowaniu i co 3 godziny, strażnik dev serwerów cały czas,
 # perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie), aktualizacje o 4:30 co 3 dni,
 # harmonogram blogów (jobs tick) co 2 minuty
+# Z --pod-agents te same automaty to agenty Pod (codes.pod.app.acc.*, SMAppService): stare zdejmujemy
 for job in $JOBS; do
   plist="$AGENTS/$job.plist"
+  if [ -n "$POD_AGENTS" ]; then
+    launchctl bootout "gui/$(id -u)/$job" 2>/dev/null || true
+    rm -f "$plist"
+    continue
+  fi
   sed "s|__HOME__|$HOME|g" "$SRC/launchd/$job.plist.template" > "$plist"
   launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$plist"
@@ -265,14 +298,22 @@ done
 
 # aplikacja w pasku menu
 APP="$HOME/Applications/Claude Acc.app"
-pkill -x ClaudeAcc 2>/dev/null || true
-rm -rf "$APP"
-ditto "$APP_SRC" "$APP"
-# podpis, który trzyma zgody macOS dyktowania (Mikrofon, Dostępność, Monitorowanie wejścia) przez
-# aktualizacje: certyfikat z Pęku kluczy albo ad hoc ze stałym designated requirement (sign-app.sh)
-[ -x "$SRC/sign-app.sh" ] && { "$SRC/sign-app.sh" "$APP" || echo "uwaga: podpis aplikacji nie wyszedł, zgody dyktowania mogą wymagać ponownego nadania" >&2; }
-# tuż po pkill LaunchServices potrafi odrzucić pierwsze open (-600)
-open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
+if [ -n "$POD_AGENTS" ]; then
+  # Pod Menu.app (ten sam plik ClaudeAcc) uruchamia Pod jako element logowania z własnego pakietu:
+  # zamykamy tylko starą kopię po ścieżce, nie `pkill -x ClaudeAcc`, i ją usuwamy (claude-acc
+  # handback stawia ją z powrotem)
+  pkill -f "$APP/Contents/MacOS/ClaudeAcc" 2>/dev/null || true
+  rm -rf "$APP"
+else
+  pkill -x ClaudeAcc 2>/dev/null || true
+  rm -rf "$APP"
+  ditto "$APP_SRC" "$APP"
+  # podpis, który trzyma zgody macOS dyktowania (Mikrofon, Dostępność, Monitorowanie wejścia) przez
+  # aktualizacje: certyfikat z Pęku kluczy albo ad hoc ze stałym designated requirement (sign-app.sh)
+  [ -x "$SRC/sign-app.sh" ] && { "$SRC/sign-app.sh" "$APP" || echo "uwaga: podpis aplikacji nie wyszedł, zgody dyktowania mogą wymagać ponownego nadania" >&2; }
+  # tuż po pkill LaunchServices potrafi odrzucić pierwsze open (-600)
+  open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
+fi
 
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"

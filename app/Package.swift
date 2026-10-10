@@ -47,6 +47,12 @@ let package = Package(
         .executableTarget(name: "claude-acc-pause", path: "Sources/pause"),
         // natywny pomocnik bramy pulpitu: CGEvent, ScreenCaptureKit, AX dla desktop.py
         .executableTarget(name: "claude-acc-desktop", path: "Sources/desktop", swiftSettings: settings),
+        // the program of Pod's launchd agents (SMAppService): HOME from the account, a log in $STATE, acc.py
+        .executableTarget(
+            name: "pod-acc-run", dependencies: ["PodAccRunCore"], path: "Sources/pod-acc-run", swiftSettings: core),
+        .target(name: "PodAccRunCore", path: "Sources/PodAccRunCore", swiftSettings: core),
+        .testTarget(
+            name: "PodAccRunTests", dependencies: ["PodAccRunCore"], path: "Tests/PodAccRunTests", swiftSettings: core),
         // pod-rootd, Pod's one root helper (docs/pod-rootd.md): the wire types, the client Pod and Pod Menu
         // link, the engine behind a backend protocol, the daemon, and the CLI the scripts call
         .target(name: "PodRootdProtocol", path: "Sources/PodRootdProtocol", swiftSettings: core),
