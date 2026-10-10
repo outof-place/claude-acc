@@ -141,7 +141,7 @@ def main():
                 if os.path.exists(sock):
                     break
                 time.sleep(0.05)
-            gated = replayed = same = answered = diff = 0
+            gated = replayed = same = answered = diff = reruns = 0
             t_cold, t_warm = [], []
             with open(corpus) as f:
                 for line in f:
@@ -173,6 +173,8 @@ def main():
                         t2 = time.monotonic()
                         if a == b:
                             break
+                        if attempt == 0:
+                            reruns += 1
                     t_cold.append((t1 - t0) * 1000)
                     t_warm.append((t2 - t1) * 1000)
                     if a == b:
@@ -188,7 +190,8 @@ def main():
     finally:
         shutil.rmtree(home, ignore_errors=True)
     print(
-        f"gated {gated}, replayed {replayed}: identical {same} (with an answer {answered}), different {diff}"
+        f"gated {gated}, replayed {replayed}: identical {same} (with an answer {answered}), different {diff}, "
+        f"pairs re-run after a first difference {reruns}"
     )
     print(f"exec   {quantiles(t_cold)}")
     print(f"socket {quantiles(t_warm)}")
