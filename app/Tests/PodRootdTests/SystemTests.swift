@@ -198,3 +198,25 @@ func userFileRename() throws {
     }
     #expect(FileManager.default.fileExists(atPath: elsewhere.appendingPathComponent("claude-acc/spotlight-exclusions.json").path))
 }
+
+@Test("staging opens without blocking: a FIFO is refused at once, and so is a file on a volume that isn't local",
+      .timeLimit(.minutes(1)))
+func stageFifoAndMount() throws {
+    let dir = try scratch()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let into = dir.appendingPathComponent("into")
+    try FileManager.default.createDirectory(at: into, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
+    let fifo = dir.appendingPathComponent("fifo").path
+    #expect(mkfifo(fifo, 0o600) == 0)
+    let started = Date.now
+    #expect(throws: BackendError.self) { try HelperFiles.stage(fifo, into: into.path, name: "h") }
+    #expect(Date.now.timeIntervalSince(started) < 1)
+    let real = dir.appendingPathComponent("real").path
+    FileManager.default.createFile(atPath: real, contents: Data("x".utf8))
+    #expect(throws: BackendError.self) { try HelperFiles.stage(real, into: into.path, name: "h", onLocalVolume: { _ in false }) }
+    #expect(try FileManager.default.contentsOfDirectory(atPath: into.path).isEmpty)
+    // the scratch folder is on the boot volume: APFS, local
+    let fd = open(real, O_RDONLY)
+    defer { close(fd) }
+    #expect(HelperFiles.onLocalVolume(fd))
+}

@@ -82,7 +82,7 @@ case "$what" in
     compress_args "$@" || exit 2
     out="$(/usr/bin/mktemp /var/tmp/claude-acc-compress.XXXXXX)"
     rc=0
-    "$PY" -I "$DIR/compressapps.py" run --afsctool "$DIR/afsctool" --json-out "$out" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
+    "$PY" -I -B "$DIR/compressapps.py" run --afsctool "$DIR/afsctool" --json-out "$out" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
     # wyniki dla janitora w ostatniej linii; plik tymczasowy jest roota i znika
     printf 'CLAUDE-ACC-RESULTS %s\n' "$(cat "$out" 2>/dev/null || echo '[]')"
     rm -f "$out"
