@@ -53,6 +53,9 @@ for dir in launchd hooks skills sdk dictation orca-plugin; do
 done
 rm -rf "$DEST.new/orca-plugin/test"
 find "$DEST.new" \( -name __pycache__ -o -name .DS_Store \) -prune -exec rm -rf {} +
+# plik (nie katalog) __pycache__ obok każdego .py: Python, czymkolwiek uruchomiony i bez -B, nie zapisze
+# tam bajtkodu (zapis cicho się nie udaje), a __pycache__ w podpisanej Pod.app łamie jej pieczęć
+find "$DEST.new" -name '*.py' -exec dirname {} + | sort -u | while IFS= read -r dir; do : > "$dir/__pycache__"; done
 
 # aplikacja paska menu pod nazwą Pod; bundle id i plik wykonywalny zostają, bo na nich wiszą zgody
 # TCC dyktowania i `pgrep -x ClaudeAcc` Poda

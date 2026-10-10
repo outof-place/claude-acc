@@ -14,6 +14,12 @@ import os
 import sys
 from importlib.machinery import SourceFileLoader
 
+# Bytecode never lands next to the scripts: a __pycache__ inside a signed bundle (Pod.app ships
+# claude-acc in Contents/Resources) breaks its seal, and macOS then calls the app damaged
+# (2026-10-10). Whatever acc.py runs caches under $STATE/pycache instead, wherever it lives.
+if sys.pycache_prefix is None and not sys.dont_write_bytecode:
+    sys.pycache_prefix = os.path.join(os.path.expanduser("~"), ".local", "share", "claude-acc", "pycache")
+
 SCRIPTS = ("accswitch", "admitchain", "awake", "browser", "credits", "desktop", "devguard", "hint", "hook", "hotspot", "janitor",
            "jobs", "mail", "mailhint", "mcpshare", "orcaplugin", "perf", "sched", "updates")
 # dawna nazwa skryptu, która może jeszcze stać we wpisie hooka w settings.json

@@ -96,7 +96,7 @@ def _probe(path):
     import subprocess
 
     try:
-        done = subprocess.run([path, "-I", "-S", "-c", _ASK], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([path, "-I", "-S", "-B", "-c", _ASK], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as err:
         return [], f"{path}: nie odpowiada ({err})"
     lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
