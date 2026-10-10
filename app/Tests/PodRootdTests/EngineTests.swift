@@ -71,7 +71,7 @@ func fansFailure() {
 
 // MARK: Lid
 
-@Test("a lid hold turns SleepDisabled on; releasing it, or the session ending, turns it off")
+@Test("a lid hold turns SleepDisabled on; a release turns it off at once, a session's end after a minute")
 func lidLease() {
     let rig = Rig()
     #expect(rig.changed(rig.send(.lidHold(seconds: hour))) == true)
@@ -79,10 +79,38 @@ func lidLease() {
     #expect(rig.changed(rig.send(.lidHold(seconds: hour))) == false)
     rig.send(.lidRelease)
     #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.lastRelease == "released")
     rig.send(.lidHold(seconds: hour), session: SessionID(7))
     rig.engine.sessionEnded(SessionID(7))
+    // a dropped session: kept for Pod Menu to hold it again
+    #expect(rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.reholdUntil == rig.clock.now + Engine.lidRehold)
+    rig.clock.advance(Engine.lidRehold + 1)
+    rig.engine.tick()
     #expect(!rig.backend.sleepIsDisabled)
     #expect(rig.engine.status().lid.lastRelease == "session ended")
+    #expect(rig.engine.status().lid.reholdUntil == nil)
+}
+
+@Test("a dropped session held again within the minute: SleepDisabled never goes off")
+func lidReheld() {
+    let rig = Rig()
+    rig.send(.lidHold(seconds: hour), session: SessionID(7))
+    rig.engine.sessionEnded(SessionID(7))
+    rig.clock.advance(5)
+    rig.engine.tick()
+    rig.send(.lidHold(seconds: hour), session: SessionID(8))
+    #expect(rig.engine.status().lid.reholdUntil == nil)
+    rig.clock.advance(Engine.lidRehold + 1)
+    rig.engine.tick()
+    #expect(rig.backend.sleepIsDisabled)
+    #expect(!rig.backend.calls.contains("setSleepDisabled false"))
+    // the window keeps a hold, it never takes one: low battery still ends it
+    rig.engine.sessionEnded(SessionID(8))
+    rig.backend.lowBattery = true
+    rig.engine.tick()
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.lastRelease == "battery")
 }
 
 @Test("two sessions holding the lid: it stays held until the last one goes")
@@ -92,7 +120,10 @@ func lidTwoSessions() {
     rig.send(.lidHold(seconds: hour), session: SessionID(2))
     rig.engine.sessionEnded(SessionID(1))
     #expect(rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.reholdUntil == nil)
     rig.engine.sessionEnded(SessionID(2))
+    rig.clock.advance(Engine.lidRehold + 1)
+    rig.engine.tick()
     #expect(!rig.backend.sleepIsDisabled)
 }
 
@@ -297,7 +328,7 @@ func fsguard() {
 
 // MARK: Restart and shutdown
 
-@Test("after a restart a fixed fan setting is applied again and a lid hold of ours is let go")
+@Test("after a restart a fixed fan setting is applied again; a lid hold of ours waits a minute for Pod Menu")
 func restart() {
     let rig = Rig()
     rig.send(.fansSet(mode: fan50))
@@ -306,8 +337,20 @@ func restart() {
     for i in rig.backend.fans.indices { rig.backend.fans[i].manual = false }
     let after = rig.restarted()
     #expect(after.engine.status().fans.applied == fan50)
+    #expect(rig.backend.sleepIsDisabled)
+    #expect(!after.engine.isIdle)
+    rig.clock.advance(Engine.lidRehold + 1)
+    after.engine.tick()
     #expect(!rig.backend.sleepIsDisabled)
     #expect(after.engine.status().lid.lastRelease == "helper restarted")
+
+    // held again in time, by the session Pod Menu opens after the restart
+    after.send(.lidHold(seconds: hour))
+    let again = after.restarted()
+    again.send(.lidHold(seconds: hour), session: SessionID(2))
+    rig.clock.advance(Engine.lidRehold + 1)
+    again.engine.tick()
+    #expect(rig.backend.sleepIsDisabled)
 }
 
 @Test("SIGTERM hands the fans back and lets go of the lid; the fan mode stays for the next start")
@@ -373,10 +416,15 @@ func legacyMigrate() {
     #expect(status.fans.mode == .fixed(FanPercent(60)!))
     #expect(status.sysctls.first { $0.key == .maxVnodes }?.persisted == 786_432)
     #expect(status.sysctls.first { $0.key == .gpuWiredLimitMB }?.persisted == 40_960)
+    // the old daemon's limit is not the original: undoing it after migration goes back to macOS's 0 now
+    #expect(status.sysctls.first { $0.key == .gpuWiredLimitMB }?.original == 0)
     #expect(status.fsguard.enabled)
     #expect(status.spotlight.appsOnly)
     #expect(status.legacy.allSatisfy { $0.daemon == .hotspot ? $0.installed && !$0.migrated : $0.migrated && !$0.installed })
     #expect(rig.changed(rig.send(.legacyMigrate)) == false)
+    // iogpu undo after the migration: macOS's default now, not at the next boot
+    rig.send(.sysctlReset(key: .gpuWiredLimitMB))
+    #expect(rig.backend.sysctls[.gpuWiredLimitMB] == 0)
 }
 
 @Test("rollback puts the plists back, starts them, and turns the helper's copies of their work off")

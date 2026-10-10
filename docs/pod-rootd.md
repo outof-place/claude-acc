@@ -84,11 +84,12 @@ Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`,
 
 | Tier | Verbs | Pod Menu | `pod-rootctl` | Pod (Electron, `codes.pod.app`) |
 |---|---|---|---|---|
-| A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release`; `shaper.set` scoped to the session at 6 Mb/s or more; `shaper.clear` of the caller's own session limit | yes | yes, no prompt | yes |
+| A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release`; `shaper.set` scoped to the session at 6 Mb/s or more; `shaper.clear` of the caller's own session limit | yes | yes, no prompt | yes, except `lid.hold` |
 | B: changes the system | `power.mode`, `sysctl.*`, `shaper.*`, `spotlight.*`, `fsguard.set`, `launchd.parkOrphans`, `logs.pruneDiagnostics`, `legacy.*`, `restoreDefaults` | yes, no prompt: the click is the consent | only approved | never |
 
 - Tier A can't do lasting harm. A fan setting keeps the 95 °C rule. A lid hold ends with its
-  session, at 24 h, at 10 % battery and when the Mac gets hot. A session's upload limit ends with
+  session (a minute later, see [Restart safety](#restart-safety)), at 24 h, at 10 % battery and
+  when the Mac gets hot. A session's upload limit ends with
   its session and can't go below 6 Mb/s (hotspot.py's floor), so the worst a forged call does is a
   temporary slowdown. That keeps the hotspot controller (`pod-rootctl shaper follow`, a background
   agent) free of prompts. Two cases stay tier B: a session limit on an interface that has a limit
@@ -106,7 +107,9 @@ Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`,
   `ELECTRON_RUN_AS_NODE=1`, so the RunAsNode fuse has to stay on, and fuses are app-wide: any process
   can run Pod's signed binary as Node with its own JavaScript (`ELECTRON_RUN_AS_NODE=1
   /Applications/Pod.app/Contents/MacOS/Pod -e ...`), and that passes the requirement for
-  `codes.pod.app`. Electron Pod reaches tier B only through Pod Menu or `pod-rootctl`.
+  `codes.pod.app`. Electron Pod reaches tier B only through Pod Menu or `pod-rootctl`. For the
+  same reason a lid hold from `codes.pod.app` is tier B: a closed-lid hold keeps a Mac awake in a
+  bag, and Stay Awake is Pod Menu's anyway.
 - PodNative (nt-lean's Swift shell, `codes.pod.native` while it is a second window) is not
   admitted. Once it ships as `codes.pod.app` without Electron, it gets tier B like Pod Menu.
 
@@ -253,8 +256,11 @@ The state file holds what was asked and what was there before:
 - `fans`: the mode; at start a fixed mode is applied again (the SMC forgets it over a restart).
 - `sysctls`: per key the original value (read before the first change, refreshed at each boot from
   the kernel default) and the persisted value; at start the persisted value is applied again.
-- `lid`: `heldByUs`. A lease never survives the helper: at start a `SleepDisabled` that we set is
-  turned off, and Pod Menu asks again when it reconnects.
+- `lid`: `heldByUs`. A lease never survives the helper or its session, but the hold does for a
+  minute (`Engine.lidRehold`): after a restart, or a session that ended without `lid.release`, a
+  `SleepDisabled` that we set stays on until Pod Menu holds it again or the minute passes. A Mac with
+  the lid closed doesn't sleep through a Pod update or a helper crash. The minute only keeps a hold
+  of ours, it never takes one. A release, SIGTERM, 10 % battery and heat end it at once.
 - `shaper`: interface, our rate, the rate before, the scope. Session scope is dropped at start;
   `untilReboot` is dropped when the boot time differs from the one recorded.
 - `spotlight`: the list before apps-only (only from the first apply), applied or not.
@@ -332,6 +338,23 @@ Both binaries: Developer ID Application, team 75Y2KR6P5W, hardened runtime (`--o
 secure timestamp, no entitlements (the helper is not sandboxed; IOKit's AppleSMC user client,
 sysctl, `posix_spawn` and the files it writes need none). Identifiers `codes.pod.rootd` and
 `codes.pod.rootctl`; pass `--identifier` explicitly when re-signing.
+
+The helper's peer requirement (`PeerPolicy.production`) checks more than team and identifier:
+
+| Caller | Required of the running process |
+|---|---|
+| all | team 75Y2KR6P5W, validation category Developer ID, `isHardenedRuntimeEnforced` |
+| Pod Menu, `pod-rootctl` | also `isLibraryValidationRequired` |
+
+So Pod signs Pod Menu and `pod-rootctl` with `--options runtime,library`, and without the
+`allow-dyld-environment-variables`, `disable-library-validation` and `get-task-allow`
+entitlements. An Apple Development copy (claude-acc's own `~/Applications/Claude Acc.app`) or a
+non-hardened build with the right team and identifier is turned away, so `DYLD_INSERT_LIBRARIES`
+into a tier B caller gets nothing. The flags are the process's own at run time. On macOS 27 a
+hardened process carries `CS_REQUIRE_LV` only when it is signed with `library` (measured: a
+team-signed `--options runtime` binary reports `0x62011311`, with `runtime,library` it reports
+`0x62013301`). Pod's Electron process loads native modules and gets tier A only, so it needs the
+hardened runtime, not library validation.
 
 Pod's Electron binary keeps RunAsNode on (its terminal daemon needs it), which is why
 `codes.pod.app` gets tier A only (see [Tiers](#tiers)).
