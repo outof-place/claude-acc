@@ -33,7 +33,7 @@ mkdir -p "$HOME/.local/share/claude-acc"
 # (sign-app.sh: certyfikat z Pęku kluczy) idzie do demona jako --team; aplikacja ad hoc, bez zespołu,
 # zostaje przy nazwie procesu
 # (Pod Menu.app w pakiecie Poda, gdy automaty prowadzi Pod: owner.py menu)
-MENU_APP="$(/usr/bin/python3 ./owner.py menu 2>/dev/null || echo "$HOME/Applications/Claude Acc.app")"
+MENU_APP="$(/usr/bin/python3 -B ./owner.py menu 2>/dev/null || echo "$HOME/Applications/Claude Acc.app")"
 TEAM="$(codesign -dv "$MENU_APP" 2>&1 | sed -n 's/^TeamIdentifier=\([A-Z0-9]*\)$/\1/p' || true)"
 TEAM_ARGS=""
 if [ -n "$TEAM" ]; then

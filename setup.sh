@@ -54,9 +54,10 @@ for ((i = 0; i < ${#ARGS[@]}; i++)); do
     --uninstall) UNINSTALL=1 ;;
   esac
 done
-# odinstalować wolno każdemu (`claude-acc uninstall`); instalować tylko właścicielowi
+# odinstalować wolno każdemu (`claude-acc uninstall`); instalować tylko właścicielowi. Python z $SRC
+# zawsze z -B: $SRC bywa wnętrzem podpisanej Pod.app, a __pycache__ w niej łamie jej pieczęć
 if [ -f "$SRC/owner.py" ] && [ -z "$UNINSTALL" ]; then
-  /usr/bin/python3 "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
+  /usr/bin/python3 -B "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
 fi
 
 STATE="$HOME/.local/share/claude-acc"
@@ -92,7 +93,7 @@ while [ $# -gt 0 ]; do
       # sesje budzimy, kasując jej plik
       for hook in "$STATE/hook.py" "$SRC/hook.py"; do
         if [ -f "$hook" ]; then
-          /usr/bin/python3 "$hook" uninstall "$CLAUDE_SETTINGS" || true
+          /usr/bin/python3 -B "$hook" uninstall "$CLAUDE_SETTINGS" || true
           break
         fi
       done
@@ -109,7 +110,7 @@ while [ $# -gt 0 ]; do
       [ -f "$STATE/orcaplugin.py" ] && /usr/bin/python3 "$STATE/orcaplugin.py" uninstall || true
       # claude-acc Poda: nagrobek "none" zamiast pliku, żeby Pod nie zainstalował go znowu przy
       # następnym starcie (bez owner.json robi pierwszą instalację), tylko zdjął swoje agenty i Pod Menu
-      [ -f "$SRC/owner.py" ] && { /usr/bin/python3 "$SRC/owner.py" uninstalled || true; }
+      [ -f "$SRC/owner.py" ] && { /usr/bin/python3 -B "$SRC/owner.py" uninstalled || true; }
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -129,6 +130,9 @@ cp "$SRC"/*.py "$STATE/"
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 # drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
 [ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
+# paczka Poda ma plik __pycache__ obok każdego .py (scripts/payload.sh), żeby nic nie pisało bajtkodu w
+# Pod.app; w $STATE bajtkod jest mile widziany, więc te pliki tu nie przechodzą
+find "$STATE/hooks" "$STATE/sdk" -name __pycache__ -type f -delete 2>/dev/null || true
 # wtyczka Orki (orcaplugin.py instaluje ją stąd w katalogu wtyczek Orki); bez testów
 if [ -d "$SRC/orca-plugin" ]; then
   rm -rf "$STATE/orca-plugin.new" && cp -R "$SRC/orca-plugin" "$STATE/orca-plugin.new" && rm -rf "$STATE/orca-plugin.new/test"
@@ -175,8 +179,9 @@ if [ "$PY" = /usr/bin/python3 ]; then
   PY="$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.executable))' 2>/dev/null || echo /usr/bin/python3)"
 fi
 ln -sfn "$PY" "$STATE/python"
-# bytecode up front: acc.py runs every script from it, so no start compiles one
-"$STATE/python" -m compileall -q "$STATE"/*.py >/dev/null 2>&1 || true
+# bytecode up front, under $STATE/pycache where acc.py looks for it (sys.pycache_prefix), so no start
+# compiles one and nothing is written next to a script
+"$STATE/python" -X pycache_prefix="$STATE/pycache" -m compileall -q "$STATE"/*.py >/dev/null 2>&1 || true
 # the hook's native front reads the words that send a command to Python from here
 "$STATE/python" "$STATE/acc.py" devguard words > "$STATE/hook-words.json.new" 2>/dev/null \
   && mv -f "$STATE/hook-words.json.new" "$STATE/hook-words.json" || rm -f "$STATE/hook-words.json.new"

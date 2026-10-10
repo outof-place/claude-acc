@@ -421,9 +421,12 @@ end
   1. The candidates are `Contents/Resources/claude-acc/pod-rootd` in the app the package was opened
      from (`/var/db/codes.pod.app.rootd/app`), then in `/Applications/Pod.app`. Nothing in a message
      names a path, and only a helper running as its installed program updates.
-  2. The helper copies a candidate, opened with `O_NOFOLLOW`, a regular file of at most 64 MB, into
-     `/Library/PrivilegedHelperTools/.codes.pod.app.rootd.new` (`HelperFiles.stage`). Nothing but
-     root can change that copy after the check.
+  2. The helper copies a candidate into `/Library/PrivilegedHelperTools/.codes.pod.app.rootd.new`
+     (`HelperFiles.stage`). Nothing but root can change that copy after the check. The candidate is
+     opened with `O_NOFOLLOW | O_NONBLOCK`, so a FIFO put in its place can't hold `open`. It must be a
+     regular file of at most 64 MB on a local APFS or HFS volume (`fstatfs`: `MNT_LOCAL`, which
+     macFUSE can set, plus the file system's name), so a network or FUSE mount can't stall the read.
+     Only then is `O_NONBLOCK` cleared for the copy.
   3. It checks the copy with `SecStaticCodeCheckValidityWithErrors` (`kSecCSStrictValidate`,
      `kSecCSCheckAllArchitectures`) against `anchor apple generic and certificate leaf[subject.OU] =
      "75Y2KR6P5W" and identifier "codes.pod.rootd" and notarized`. The `notarized` clause holds for a
@@ -435,6 +438,13 @@ end
      the two equal, so every release bump moves both.
   5. It renames the copy over its program, persists state and exits with `EX_TEMPFAIL`; `KeepAlive`
      starts the new binary. A lid hold stays on through the restart (see Restart safety).
+
+  Steps 2 to 4 run on their own queue (`UpdateRunner`) with a 10 s deadline. The main queue, which
+  serves XPC, the lid, heat, battery and SIGTERM, never waits for them. A look that misses the
+  deadline is skipped, and its copy is thrown away when it comes back; the next look is an hour
+  later. The `notarized` check may ask Apple's notary service. Offline, or for a build Apple hasn't
+  assessed yet, it fails: the update is skipped, the installed helper keeps running, and the next
+  look tries again. A cdhash the app's notarization doesn't cover fails the same way.
 
   The job's plist changes only with a new package. A release that needs a different plist has Pod
   offer "Update root helper", which opens the bundled package: one administrator prompt.

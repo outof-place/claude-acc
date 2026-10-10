@@ -82,18 +82,13 @@ public protocol Backend: AnyObject {
 
     /// The running helper's CFBundleVersion, as its signature binds it.
     var ownVersion: String? { get }
-    /// Copies of pod-rootd in Pod.app that may be newer: fixed places, never a path from a message.
+    /// Copies of pod-rootd in Pod.app that may be newer: fixed places, never a path from a message;
+    /// none when the helper doesn't run as the package's install.
     func updateCandidates() -> [String]
-    /// Copies a candidate (no symlink, a regular file, at most 64 MB) into the root-only directory
-    /// next to the installed helper; the copy's path. The check that follows reads this copy, which
-    /// nothing but root can change.
-    func stageUpdate(from candidate: String) throws -> String
-    /// The copy's CFBundleVersion when it is Pod's notarized helper (team, identifier, notarized,
-    /// every architecture valid); nil otherwise.
-    func verifiedVersion(ofStaged path: String) -> String?
+    /// The staging and the signature check, which run off the main queue (`UpdateRunner`).
+    var updateSource: any UpdateSource { get }
     /// Renames the checked copy over the installed helper.
     func installUpdate(_ staged: String) throws
-    func discardUpdate(_ staged: String)
     /// The job's plist, the program, the state files and the package receipt; the old daemons'
     /// backups stay.
     func removeInstall() throws

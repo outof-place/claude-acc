@@ -23,7 +23,7 @@ if [ "${1:-}" = "--uninstall" ]; then
   exit 0
 fi
 
-PYTHON="$(/usr/bin/python3 ./rootpy.py)" || { echo "nie instaluję strażnika" >&2; exit 1; }
+PYTHON="$(/usr/bin/python3 -B ./rootpy.py)" || { echo "nie instaluję strażnika" >&2; exit 1; }
 TMP="$(mktemp -t claude-acc-fsguard-plist)"
 sed "s|__PYTHON__|$PYTHON|" launchd/com.filip.claude-acc.fsguard.plist > "$TMP"
 sudo install -d -o root -g wheel -m 755 /usr/local/libexec

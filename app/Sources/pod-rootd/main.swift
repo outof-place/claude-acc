@@ -121,6 +121,8 @@ idler.setEventHandler {
     }
 }
 server.onActivity = { reschedule() }
+// a newer helper went in from the update's queue: exit non-zero, so KeepAlive starts it
+engine.onUpdateInstalled = { exit(EX_TEMPFAIL) }
 ticker.resume()
 idler.resume()
 reschedule()

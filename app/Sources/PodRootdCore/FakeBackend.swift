@@ -1,3 +1,4 @@
+import Foundation
 import PodRootdProtocol
 
 /// The whole machine in memory, for the engine's tests: every write is recorded in `calls`, and
@@ -37,7 +38,7 @@ public final class FakeBackend: Backend {
     public var savedSpotlightList: [String]?
     public var savedSpotlightAside: [String]?
     /// A pod-rootd binary in a candidate place, as the self-update sees it.
-    public struct Binary: Equatable, Sendable {
+    nonisolated public struct Binary: Equatable, Sendable {
         public var version: String
         /// Pod's team, `codes.pod.rootd`, notarized.
         public var genuine: Bool
@@ -51,8 +52,8 @@ public final class FakeBackend: Backend {
     }
 
     public var installedVersion: String? = "56"
-    public var candidates: [String: Binary] = [:]
-    public var staged: [String: Binary] = [:]
+    /// The candidates and what staging them does, on the update's queue.
+    public let updates = FakeUpdateSource()
     public var installed = true
     public var bootedOut = false
     public var failing: Set<String> = []
@@ -218,32 +219,17 @@ public final class FakeBackend: Backend {
 
     public var ownVersion: String? { installedVersion }
 
-    public func updateCandidates() -> [String] { candidates.keys.sorted() }
+    public func updateCandidates() -> [String] { updates.candidates.keys.sorted() }
 
-    public func stageUpdate(from candidate: String) throws -> String {
-        try record("stageUpdate \(candidate)")
-        guard let binary = candidates[candidate] else { throw BackendError("no such file") }
-        guard !binary.symlink else { throw BackendError("\(candidate) is a symlink") }
-        let path = "/staged/\(staged.count)"
-        staged[path] = binary
-        return path
-    }
+    /// A real-file source in place of `updates` (tests with a FIFO or a stubbed mount).
+    public var source: (any UpdateSource)?
 
-    public func verifiedVersion(ofStaged path: String) -> String? {
-        calls.append("verify \(path)")
-        guard let binary = staged[path], binary.genuine else { return nil }
-        return binary.version
-    }
+    public var updateSource: any UpdateSource { source ?? updates }
 
     public func installUpdate(_ staged: String) throws {
         try record("installUpdate \(staged)")
-        guard let binary = self.staged.removeValue(forKey: staged) else { throw BackendError("nothing staged") }
+        guard let binary = updates.take(staged) else { throw BackendError("nothing staged") }
         installedVersion = binary.version
-    }
-
-    public func discardUpdate(_ staged: String) {
-        calls.append("discardUpdate \(staged)")
-        self.staged[staged] = nil
     }
 
     public func removeInstall() throws {
@@ -254,5 +240,63 @@ public final class FakeBackend: Backend {
     public func bootoutSelf() {
         calls.append("bootoutSelf")
         bootedOut = true
+    }
+}
+
+/// The update's file side in memory, used from the update's queue: everything behind a lock.
+nonisolated public final class FakeUpdateSource: UpdateSource, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _candidates: [String: FakeBackend.Binary] = [:]
+    private var _staged: [String: FakeBackend.Binary] = [:]
+    private var _calls: [String] = []
+    private var _stall: Double = 0
+
+    public init() {}
+
+    public var candidates: [String: FakeBackend.Binary] {
+        get { lock.withLock { _candidates } }
+        set { lock.withLock { _candidates = newValue } }
+    }
+
+    public var staged: [String: FakeBackend.Binary] { lock.withLock { _staged } }
+    public var calls: [String] { lock.withLock { _calls } }
+    /// Seconds each stage takes, like a read that stalls on a slow mount.
+    public var stall: Double {
+        get { lock.withLock { _stall } }
+        set { lock.withLock { _stall = newValue } }
+    }
+
+    public func stage(_ candidate: String) throws -> String {
+        let stall = lock.withLock { () -> Double in
+            _calls.append("stage \(candidate)")
+            return _stall
+        }
+        if stall > 0 { Thread.sleep(forTimeInterval: stall) }
+        return try lock.withLock {
+            guard let binary = _candidates[candidate] else { throw BackendError("no such file") }
+            guard !binary.symlink else { throw BackendError("\(candidate) is a symlink") }
+            let path = "/staged/\(_staged.count)"
+            _staged[path] = binary
+            return path
+        }
+    }
+
+    public func verifiedVersion(ofStaged path: String) -> String? {
+        lock.withLock {
+            _calls.append("verify \(path)")
+            guard let binary = _staged[path], binary.genuine else { return nil }
+            return binary.version
+        }
+    }
+
+    public func discard(_ staged: String) {
+        lock.withLock {
+            _calls.append("discard \(staged)")
+            _staged[staged] = nil
+        }
+    }
+
+    func take(_ staged: String) -> FakeBackend.Binary? {
+        lock.withLock { _staged.removeValue(forKey: staged) }
     }
 }
