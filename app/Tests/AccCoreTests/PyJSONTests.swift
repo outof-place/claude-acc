@@ -91,3 +91,9 @@ func regexTranslate() {
     #expect(PyRegex.translate(#"[+--]"#) == nil)
     #expect(PyRegex.translate(#"(?<!x)(?<=y)(?:z)(?=w)(?!v)(?>u)"#) != nil)
 }
+
+@Test("dumps(indent: 1, ensureASCII: false): sched.py's state file bytes")
+func dumpsIndented() throws {
+    let value = try PyJSON.loads(#"{"a": 1, "b": [1, {"x": []}], "c": {}, "d": "ż\"\n"}"#)
+    #expect(value.dumps(indent: 1, ensureASCII: false) == "{\n \"a\": 1,\n \"b\": [\n  1,\n  {\n   \"x\": []\n  }\n ],\n \"c\": {},\n \"d\": \"ż\\\"\\n\"\n}")
+}
