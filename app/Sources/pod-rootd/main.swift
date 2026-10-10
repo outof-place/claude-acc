@@ -4,10 +4,11 @@ import PodRootdCore
 import PodRootdProtocol
 import Security
 
-// pod-rootd: Pod's one root helper (docs/pod-rootd.md). launchd starts it from
-// Contents/Library/LaunchDaemons/<app id>.rootd.plist: at boot (RunAtLoad, to put back persisted
-// sysctls and a fixed fan setting), on a connection to its Mach service, and after a crash. With
-// nothing to watch and no session for a minute it exits 0, and launchd starts it on demand again.
+// pod-rootd: Pod's one root helper (docs/pod-rootd.md). Pod's package installs it as
+// /Library/PrivilegedHelperTools/<app id>.rootd with /Library/LaunchDaemons/<app id>.rootd.plist, and
+// launchd starts it at boot (RunAtLoad, to put back persisted sysctls and a fixed fan setting), on a
+// connection to its Mach service, and after a crash or a self-update. With nothing to watch and no
+// session for a minute it exits 0, and launchd starts it on demand again.
 //
 //   pod-rootd             as launchd runs it
 //   pod-rootd --version   the protocol version
@@ -17,22 +18,12 @@ if CommandLine.arguments.dropFirst().first == "--version" {
     exit(0)
 }
 
-/// The bundle id of the Pod.app this binary sits in: the label and Mach service hang off it.
+/// Pod's bundle id, from the program's own name (`<app id>.rootd` in /Library/PrivilegedHelperTools):
+/// the job's label, Mach service and plist hang off it.
 func hostAppIdentifier() -> String {
-    var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
-    guard proc_pidpath(getpid(), &buffer, UInt32(buffer.count)) > 0 else { return PodRootd.appIdentifier }
-    var url = URL(fileURLWithPath: String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self))
-    while url.pathComponents.count > 1 {
-        url.deleteLastPathComponent()
-        guard url.pathExtension == "app" else { continue }
-        let info = url.appendingPathComponent("Contents/Info.plist")
-        if let data = try? Data(contentsOf: info),
-           let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-           let id = plist["CFBundleIdentifier"] as? String {
-            return id
-        }
-    }
-    return PodRootd.appIdentifier
+    let name = (SystemBackend.ownPath().map { ($0 as NSString).lastPathComponent }) ?? ""
+    let id = name.hasSuffix(".rootd") ? String(name.dropLast(".rootd".count)) : ""
+    return SystemBackend.validLabel(id) != nil && id.contains(".") ? id : PodRootd.appIdentifier
 }
 
 guard getuid() == 0 else {
@@ -46,8 +37,7 @@ guard getuid() == 0 else {
 func signedAsPods() -> Bool {
     var code: SecCode?
     var requirement: SecRequirement?
-    let text = "anchor apple generic and certificate leaf[subject.OU] = \"\(PodRootd.teamIdentifier)\"" +
-        " and identifier \"\(PodRootd.helperIdentifier)\""
+    let text = PodRootd.helperRequirementText()
     guard SecCodeCopySelf([], &code) == errSecSuccess, let code,
           SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess, let requirement
     else { return false }
@@ -60,9 +50,12 @@ guard signedAsPods() else {
     exit(0)  // a clean exit: KeepAlive restarts only after a crash
 }
 
-let service = PodRootd.serviceName(appIdentifier: hostAppIdentifier())
+let appIdentifier = hostAppIdentifier()
+let service = PodRootd.serviceName(appIdentifier: appIdentifier)
 let directory = "/var/db/" + service
-let engine = Engine(backend: SystemBackend(directory: directory), store: FileStateStore(path: directory + "/state.json"))
+let engine = Engine(
+    backend: SystemBackend(directory: directory, appIdentifier: appIdentifier),
+    store: FileStateStore(path: directory + "/state.json"))
 let server: Server
 do {
     server = Server(engine: engine, peers: try PeerPolicy.production())
@@ -115,6 +108,9 @@ func reschedule() {
 ticker.setEventHandler {
     MainActor.assumeIsolated {
         engine.tick()
+        // a newer helper is in place: exit non-zero, so KeepAlive starts it; a hold of the lid
+        // stays on through the restart (Engine.lidRehold)
+        if engine.restartForUpdate { exit(EX_TEMPFAIL) }
         reschedule()
     }
 }

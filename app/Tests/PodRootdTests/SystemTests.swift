@@ -101,3 +101,63 @@ func pruneOldFiles() throws {
     #expect(OldFiles.prune(root.appendingPathComponent("link").path, olderThanDays: 30, dryRun: false).files == 0)
     #expect(fm.fileExists(atPath: victim))
 }
+
+// MARK: The self-update's copy
+
+private func scratch() throws -> URL {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("pod-rootd-stage-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+    return dir
+}
+
+@Test("staging copies a regular file next to the helper as .<name>.new, 0755, and the rename puts it in place")
+func stageAndInstall() throws {
+    let dir = try scratch()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let source = dir.appendingPathComponent("candidate").path
+    FileManager.default.createFile(atPath: source, contents: Data("new helper".utf8))
+    let helpers = dir.appendingPathComponent("PrivilegedHelperTools")
+    try FileManager.default.createDirectory(at: helpers, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
+    let installed = helpers.appendingPathComponent("codes.pod.app.rootd").path
+    FileManager.default.createFile(atPath: installed, contents: Data("old helper".utf8))
+
+    let staged = try HelperFiles.stage(source, into: helpers.path, name: "codes.pod.app.rootd")
+    #expect(staged == helpers.path + "/.codes.pod.app.rootd.new")
+    #expect(FileManager.default.contents(atPath: staged) == Data("new helper".utf8))
+    #expect(try FileManager.default.attributesOfItem(atPath: staged)[.posixPermissions] as? Int == 0o755)
+    // the candidate changing after the copy changes nothing in it
+    FileManager.default.createFile(atPath: source, contents: Data("swapped".utf8))
+    #expect(FileManager.default.contents(atPath: staged) == Data("new helper".utf8))
+    // a leftover copy from an earlier try is replaced, not appended to
+    _ = try HelperFiles.stage(source, into: helpers.path, name: "codes.pod.app.rootd")
+    #expect(FileManager.default.contents(atPath: staged) == Data("swapped".utf8))
+    try HelperFiles.install(staged, as: installed)
+    #expect(FileManager.default.contents(atPath: installed) == Data("swapped".utf8))
+    #expect(!FileManager.default.fileExists(atPath: staged))
+}
+
+@Test("staging refuses a link, a folder, a file over the limit and a directory others can write")
+func stageRefuses() throws {
+    let dir = try scratch()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let real = dir.appendingPathComponent("real").path
+    FileManager.default.createFile(atPath: real, contents: Data(repeating: 1, count: 4096))
+    let link = dir.appendingPathComponent("link").path
+    try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: real)
+    let into = dir.appendingPathComponent("into")
+    try FileManager.default.createDirectory(at: into, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o755])
+
+    #expect(throws: BackendError.self) { try HelperFiles.stage(link, into: into.path, name: "h") }
+    #expect(throws: BackendError.self) { try HelperFiles.stage(dir.path, into: into.path, name: "h") }
+    #expect(throws: BackendError.self) { try HelperFiles.stage(real, into: into.path, name: "h", maxBytes: 4095) }
+    try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: into.path)
+    #expect(throws: BackendError.self) { try HelperFiles.stage(real, into: into.path, name: "h") }
+    #expect(try FileManager.default.contentsOfDirectory(atPath: into.path).isEmpty)
+    // a staged name that is a link (planted before the copy) is removed, never written through
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: into.path)
+    let decoy = dir.appendingPathComponent("decoy").path
+    FileManager.default.createFile(atPath: decoy, contents: Data("keep".utf8))
+    try FileManager.default.createSymbolicLink(atPath: into.path + "/.h.new", withDestinationPath: decoy)
+    _ = try HelperFiles.stage(real, into: into.path, name: "h")
+    #expect(FileManager.default.contents(atPath: decoy) == Data("keep".utf8))
+}

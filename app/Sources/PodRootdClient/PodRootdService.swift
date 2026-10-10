@@ -1,52 +1,47 @@
+import Foundation
 import PodRootdProtocol
 import ServiceManagement
 
-/// The helper as a launch daemon of Pod.app (docs/pod-rootd.md, "Approval UX"). Only Pod.app's own
-/// process can register it: `SMAppService.daemon(plistName:)` looks for the plist in the calling
-/// app's Contents/Library/LaunchDaemons.
+/// The helper as Pod's package installs it (docs/pod-rootd.md, "Installing and removing it"): a
+/// launchd job in /Library/LaunchDaemons that Login Items lists under Pod. Pod doesn't register
+/// anything; the user opens the signed package from Pod.app and an administrator authorizes it.
 public struct PodRootdService: Sendable {
-    public let plistName: String
+    public let plist: URL
 
     public init(appIdentifier: String = PodRootd.appIdentifier) {
-        plistName = PodRootd.plistName(appIdentifier: appIdentifier)
+        plist = URL(fileURLWithPath: PodRootd.installedPlist(appIdentifier: appIdentifier))
     }
 
     /// What the UI does next.
     public enum Step: Sendable, Equatable {
-        /// Not registered: register when the user turns on something that needs root.
-        case register
-        /// Registered, waiting for an admin's approval in Login Items (or the approval was revoked).
+        /// Not installed: offer the package when the user turns on something that needs root.
+        case install
+        /// Installed, but switched off in Login Items: offer System Settings.
         case approve
-        /// Running or ready to run: connect.
+        /// Installed and allowed: connect.
         case ready
-        /// The bundle has no such plist.
-        case damaged
     }
 
-    public var status: SMAppService.Status { SMAppService.daemon(plistName: plistName).status }
+    /// Apple's status for a helper outside the app bundle (`statusForLegacyPlist(at:)`).
+    public var status: SMAppService.Status { SMAppService.statusForLegacyPlist(at: plist) }
 
-    public var step: Step {
+    public var step: Step { Self.step(for: status) }
+
+    static func step(for status: SMAppService.Status) -> Step {
         switch status {
-        case .notRegistered: .register
-        case .requiresApproval: .approve
         case .enabled: .ready
-        case .notFound: .damaged
-        @unknown default: .damaged
+        case .requiresApproval: .approve
+        case .notRegistered, .notFound: .install
+        @unknown default: .install
         }
     }
 
-    /// Registers the daemon; the system starts it after an admin approves it, then at every boot.
-    public func register() throws {
-        try SMAppService.daemon(plistName: plistName).register()
+    /// The signed package inside a Pod.app, next to pod-rootd and pod-rootctl.
+    public static func package(in app: URL) -> URL {
+        app.appendingPathComponent(PodRootd.bundleDirectory).appendingPathComponent(PodRootd.packageName)
     }
 
-    /// Stops and unregisters it. Send `restoreDefaults` first: SIGTERM alone keeps sysctls until the
-    /// next boot and the Spotlight list and power mode for good.
-    public func unregister() throws {
-        try SMAppService.daemon(plistName: plistName).unregister()
-    }
-
-    /// System Settings at Login Items, where the user allows the helper.
+    /// System Settings at Login Items, where the user switches the helper back on.
     public static func openLoginItems() {
         SMAppService.openSystemSettingsLoginItems()
     }

@@ -36,11 +36,15 @@ public final class Engine {
     /// keeps `SleepDisabled` this long for Pod Menu to hold it again: a reconnect must not let a
     /// closed-lid Mac sleep. A release, SIGTERM, low battery or heat end it at once.
     public static let lidRehold: Double = 60
+    /// How often a session from Pod or Pod Menu may start a look for a newer helper in Pod.app.
+    public static let updateEvery: Double = 3600
 
     public let backend: Backend
     private let store: StateStore
     private let now: () -> Double
     private let policy: VerbPolicy
+    /// Looks for a newer helper in Pod.app (off in tests that don't test it).
+    private let updates: Bool
     private var limiter: RateLimiter
     public private(set) var state = HelperState()
     private var savedState: HelperState?
@@ -64,6 +68,14 @@ public final class Engine {
     /// Session-scoped upload limits and the session that owns each.
     private var shaperOwners: [String: SessionID] = [:]
 
+    // the package's install: a newer helper from Pod.app, and the uninstall
+    private var updateCheckedAt: Double?
+    private var updateDue = false
+    /// A newer helper is in place: the process exits non-zero and launchd starts the new one.
+    public private(set) var restartForUpdate = false
+    /// `helper.uninstall` went through: the next tick boots the job out.
+    public private(set) var uninstalling = false
+
     // fsguard
     private var fsguardCheckedAt: Double?
     private var footprintMB: Int64?
@@ -71,12 +83,14 @@ public final class Engine {
 
     public init(
         backend: Backend, store: StateStore, now: @escaping () -> Double = { Date.now.timeIntervalSince1970 },
-        policy: VerbPolicy = .standard, limits: [VerbKind: RateLimiter.Limit] = RateLimiter.standard
+        policy: VerbPolicy = .standard, limits: [VerbKind: RateLimiter.Limit] = RateLimiter.standard,
+        updates: Bool = true
     ) {
         self.backend = backend
         self.store = store
         self.now = now
         self.policy = policy
+        self.updates = updates
         limiter = RateLimiter(limits: limits)
     }
 
@@ -150,12 +164,14 @@ public final class Engine {
     /// Nothing to watch: the process may exit and let launchd start it on the next connection.
     public var isIdle: Bool {
         state.fans == .auto && leases.isEmpty && !state.lidHeldByUs && !state.fsguard.enabled && shaperOwners.isEmpty
+            && !updateDue && !uninstalling
     }
 
     /// Seconds until `tick` has work: 2 under a fixed fan setting (fanctl's tick), 5 while the lid is
     /// held, fsguard's minute; nil when nothing needs a clock.
     public var nextTickDelay: Double? {
         var delays: [Double] = []
+        if updateDue || uninstalling { delays.append(0) }
         if case .fixed = state.fans { delays.append(2) }
         if !leases.isEmpty || state.lidHeldByUs { delays.append(5) }
         if state.fsguard.enabled {
@@ -165,6 +181,8 @@ public final class Engine {
     }
 
     public func tick() {
+        if uninstalling { return backend.bootoutSelf() }
+        if updateDue { selfUpdate() }
         if case .fixed = state.fans { driveFans() }
         if !leases.isEmpty || state.lidHeldByUs { evaluateLid(because: "expired") }
         fsguardTick()
@@ -198,6 +216,7 @@ public final class Engine {
             Log.verb.error("refused session \(session.description, privacy: .public): sender matches no allowed signing identity")
             return Reply(.refused(.peerNotAllowed))
         }
+        if updates, caller != .cli, now() - (updateCheckedAt ?? -.infinity) >= Self.updateEvery { updateDue = true }
         guard let request else {
             Log.verb.error("\(caller.rawValue, privacy: .public): refused a request that did not decode")
             return Reply(.refused(.invalid("the request did not decode (unknown verb or a parameter out of range)")))
@@ -311,6 +330,8 @@ public final class Engine {
                 return try rollback()
             case .restoreDefaults:
                 return try restoreDefaults()
+            case .helperUninstall:
+                return try uninstall()
             }
         } catch let refusal as Refusal {
             return .refused(refusal)
@@ -743,10 +764,74 @@ public final class Engine {
         return done(changed)
     }
 
+    /// `restoreDefaults`, then the package's files: a restore that fails removes nothing. The old
+    /// daemons' backups stay for `legacy.rollback` by hand.
+    private func uninstall() throws -> Outcome {
+        _ = try restoreDefaults()
+        try backend.removeInstall()
+        let kept = state.legacy
+        state = HelperState()
+        uninstalling = true
+        Log.engine.notice("uninstall: defaults back, files removed; the job goes next")
+        let note = kept.isEmpty ? nil
+            : "the old daemons stay off; their plists are kept in the helper's directory: "
+            + kept.map(\.rawValue).joined(separator: ", ")
+        return .done(changed: true, note: note, report: nil)
+    }
+
+    // MARK: Updates
+
+    /// docs/pod-rootd.md, "Updates": a genuine copy in Pod.app with a higher version replaces the
+    /// installed helper. A copy no newer than this one, or one that fails the check, is thrown away.
+    private func selfUpdate() {
+        updateDue = false
+        updateCheckedAt = now()
+        guard let own = backend.ownVersion else { return }
+        for candidate in backend.updateCandidates() {
+            let staged: String
+            do {
+                staged = try backend.stageUpdate(from: candidate)
+            } catch {
+                Log.engine.error("update: \(candidate, privacy: .public): \(error, privacy: .public)")
+                continue
+            }
+            guard let version = backend.verifiedVersion(ofStaged: staged), Self.newer(version, than: own) else {
+                backend.discardUpdate(staged)
+                continue
+            }
+            do {
+                try backend.installUpdate(staged)
+            } catch {
+                backend.discardUpdate(staged)
+                Log.engine.error("update: install \(version, privacy: .public): \(error, privacy: .public)")
+                continue
+            }
+            restartForUpdate = true
+            Log.engine.notice("update: \(own, privacy: .public) -> \(version, privacy: .public) from \(candidate, privacy: .public)")
+            return
+        }
+    }
+
+    /// Dotted numbers, component by component; a version that isn't one is never newer.
+    static func newer(_ version: String, than other: String) -> Bool {
+        func parts(_ text: String) -> [Int]? {
+            let parts = text.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+            return parts.isEmpty || parts.contains(nil) ? nil : parts.compactMap { $0 }
+        }
+        guard let a = parts(version), let b = parts(other) else { return false }
+        for i in 0..<max(a.count, b.count) {
+            let x = i < a.count ? a[i] : 0
+            let y = i < b.count ? b[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
     // MARK: Status
 
     public func status() -> Status {
         var status = Status()
+        status.helperVersion = backend.ownVersion
         status.fans.mode = state.fans
         status.fans.applied = fansApplied
         status.fans.boosting = boosting
@@ -793,7 +878,8 @@ public final class Engine {
     // MARK: Persistence
 
     private func persist() {
-        guard state != savedState else { return }
+        // the state file went with the uninstall
+        guard state != savedState, !uninstalling else { return }
         do {
             try store.save(state)
             savedState = state

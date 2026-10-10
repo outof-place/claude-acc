@@ -17,6 +17,7 @@ private let tierB: [Verb] = [
     .shaperSet(interface: en0, kbps: UplinkKbps(20_000)!, scope: .untilReboot), .spotlightAppsOnly, .spotlightRestore,
     .fsguardSet(enabled: false, limitMB: .standard), .launchdParkOrphans(dryRun: true),
     .logsPruneDiagnostics(olderThanDays: .standard, dryRun: true), .legacyMigrate, .legacyRollback, .restoreDefaults,
+    .helperUninstall,
 ]
 
 private let shell = "sid=501 ppid=812@1791600000 tty=ttys003"
