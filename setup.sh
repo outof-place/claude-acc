@@ -199,6 +199,11 @@ if [ -f "$SRC/hook.py" ]; then
 else
   echo "brak hook.py w $SRC: pauza limitów bez hooków w sesjach Claude Code" >&2
 fi
+# hook admit obok łańcucha fasthooks (admitchain.py): łańcuch woła claude-acc-hook sam, więc nasz wpis
+# znika; łańcuch przestał działać, więc wpis wraca (to samo co 5 minut robi `perf keep`)
+if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ] && [ -f "$STATE/admitchain.py" ]; then
+  "$STATE/python" "$STATE/acc.py" admitchain heal "$CLAUDE_SETTINGS" || true
+fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
 # właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji
@@ -249,6 +254,8 @@ case "$1" in
     exec "$PY" "$RUN" janitor "$@" ;;
   clean) shift; exec "$PY" "$RUN" janitor sweep --force "$@" ;;
   guard) shift; exec "$PY" "$RUN" devguard "$@" ;;
+  # hook admit obok łańcucha fasthooks: status albo heal (to robi też `perf keep` co 5 minut)
+  admitchain) shift; exec "$PY" "$RUN" admitchain "$@" ;;
   perf) shift; exec "$PY" "$RUN" perf "$@" ;;
   sched) shift; exec "$PY" "$RUN" sched "$@" ;;
   # ciężka komenda spoza agentów (terminal, skrypt, automatyzacja Orki) przez scheduler pamięci
