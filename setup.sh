@@ -199,6 +199,11 @@ if [ -f "$SRC/hook.py" ]; then
 else
   echo "brak hook.py w $SRC: pauza limitów bez hooków w sesjach Claude Code" >&2
 fi
+# hook admit obok łańcucha fasthooks (admitchain.py): łańcuch woła claude-acc-hook sam, więc nasz wpis
+# znika; łańcuch przestał działać, więc wpis wraca (to samo co 5 minut robi `perf keep`)
+if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ] && [ -f "$STATE/admitchain.py" ]; then
+  "$STATE/python" "$STATE/acc.py" admitchain heal "$CLAUDE_SETTINGS" || true
+fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
 # właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji
@@ -264,6 +269,8 @@ case "$1" in
     exec "$PY" "$RUN" janitor "$@" ;;
   clean) shift; exec "$PY" "$RUN" janitor sweep --force "$@" ;;
   guard) shift; exec "$PY" "$RUN" devguard "$@" ;;
+  # hook admit obok łańcucha fasthooks: status albo heal (to robi też `perf keep` co 5 minut)
+  admitchain) shift; exec "$PY" "$RUN" admitchain "$@" ;;
   perf) shift; exec "$PY" "$RUN" perf "$@" ;;
   sched) shift; exec "$PY" "$RUN" sched "$@" ;;
   # ciężka komenda spoza agentów (terminal, skrypt, automatyzacja Orki) przez scheduler pamięci
@@ -283,6 +290,25 @@ case "$1" in
   desktop) shift; exec "$PY" "$RUN" desktop "$@" ;;
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
+  # strażnik fseventsd (demon roota): install|uninstall przez install-fsguard.sh (sudo, Touch ID), status bez roota
+  fsguard)
+    case "${2:-status}" in
+      install) exec "$(cat "$STATE/source")/install-fsguard.sh" ;;
+      uninstall) exec "$(cat "$STATE/source")/install-fsguard.sh" --uninstall ;;
+      *)
+        PLIST=/Library/LaunchDaemons/com.filip.claude-acc.fsguard.plist
+        if [ ! -f "$PLIST" ]; then echo "strażnik fseventsd: nie zainstalowany (claude-acc fsguard install)"; exit 0; fi
+        first="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null || true)"
+        flag="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:1" "$PLIST" 2>/dev/null || true)"
+        # dobry start to interpreter roota z -I (rootpy.py), nigdy zaślepka /usr/bin/python3: ta idzie
+        # do wybranego Xcode'a, a Xcode z DMG należy do użytkownika
+        if [ "$first" != /usr/bin/python3 ] && [ "$flag" = -I ] && [ "$(stat -f %u "$first" 2>/dev/null)" = 0 ]; then
+          echo "strażnik fseventsd: zainstalowany, startuje przez $first -I"
+        else
+          echo "strażnik fseventsd: startuje przez ${first:-?} (nie interpreter roota z -I); przeinstaluj: claude-acc fsguard install"
+        fi
+        exit 0 ;;
+    esac ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
   # biegi blogów bez człowieka: płatnik z puli, licznik, limity czuwania, zapis biegu (jobs.py)
   jobs) shift; exec "$PY" "$RUN" jobs "$@" ;;

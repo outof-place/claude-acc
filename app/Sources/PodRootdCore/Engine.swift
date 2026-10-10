@@ -662,9 +662,19 @@ public final class Engine {
             try backend.moveLegacyPlist(daemon, aside: true)
             if !state.legacy.contains(daemon) { state.legacy.append(daemon) }
         }
-        if state.spotlightSaved == nil, let list = backend.legacySpotlightList() {
-            state.spotlightSaved = list
-            state.spotlightApplied = true
+        if let list = backend.legacySpotlightList() {
+            if state.spotlightSaved == nil {
+                state.spotlightSaved = list
+                state.spotlightApplied = true
+            }
+            // the helper holds the list now: perf-root.sh's file goes aside, so after a restore neither
+            // the root copy nor rootroute.py takes it for the live one
+            do {
+                try backend.moveLegacySpotlightList(aside: true)
+                state.spotlightFromLegacy = true
+            } catch {
+                notes.append("spotlight-exclusions.json stays: \(error)")
+            }
         }
         // the same settings, now the helper's
         if let fans, case .refused(let why) = setFans(fans) { notes.append("fans: \(why)") }
@@ -712,6 +722,13 @@ public final class Engine {
             try backend.moveLegacyPlist(daemon, aside: false)
             try backend.bootstrap(daemon)
             state.legacy.removeAll { $0 == daemon }
+        }
+        if state.spotlightFromLegacy == true {
+            // perf-root.sh's list is the live one again, and the root copy's undo uses it
+            try backend.moveLegacySpotlightList(aside: false)
+            state.spotlightSaved = nil
+            state.spotlightApplied = false
+            state.spotlightFromLegacy = nil
         }
         return .done(changed: true, note: nil, report: .legacy(migrated))
     }

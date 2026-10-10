@@ -129,9 +129,19 @@ struct Account: Decodable, Identifiable {
     let subscriptionStatus: String?
     /// "2025-03-28": the day the subscription started, as the profile API reports it.
     let subscriptionSince: String?
+    /// "profile": an account added in the host app (its claude-profiles folder). It shows its usage
+    /// only: the host owns its login, so the panel never switches to it, signs it in or refreshes it.
+    /// Missing from scripts before 1.31.4 and on the script's own accounts.
+    let source: String?
+    /// A profile's last known numbers: its token expired or was refused, and only the host refreshes it.
+    let stale: Bool?
+    /// The profile the host runs its sessions in.
+    let hostSelected: Bool?
 
     /// An Orca entry can hold a different account than its label says.
     var mislabeled: Bool { realEmail.map { $0.lowercased() != email.lowercased() } ?? false }
+    var isProfile: Bool { source == "profile" }
+    var isStale: Bool { stale == true }
     /// The most used window: it is the one that stops work first.
     var worstUsed: Double? { [session?.used, weekly?.used].compactMap(\.self).max() }
 }
