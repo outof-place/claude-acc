@@ -84,11 +84,16 @@ Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`,
 
 | Tier | Verbs | Pod Menu | `pod-rootctl` | Pod (Electron, `codes.pod.app`) |
 |---|---|---|---|---|
-| A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release` | yes | yes, no prompt | yes |
+| A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release`; `shaper.set` scoped to the session at 6 Mb/s or more; `shaper.clear` of the caller's own session limit | yes | yes, no prompt | yes |
 | B: changes the system | `power.mode`, `sysctl.*`, `shaper.*`, `spotlight.*`, `fsguard.set`, `launchd.parkOrphans`, `logs.pruneDiagnostics`, `legacy.*`, `restoreDefaults` | yes, no prompt: the click is the consent | only approved | never |
 
-- Tier A can't do lasting harm: a fan setting keeps the 95 °C rule, a lid hold ends with its
-  session, at 24 h, at 10 % battery and when the Mac gets hot.
+- Tier A can't do lasting harm. A fan setting keeps the 95 °C rule. A lid hold ends with its
+  session, at 24 h, at 10 % battery and when the Mac gets hot. A session's upload limit ends with
+  its session and can't go below 6 Mb/s (hotspot.py's floor), so the worst a forged call does is a
+  temporary slowdown. That keeps the hotspot controller (`pod-rootctl shaper follow`, a background
+  agent) free of prompts. Two cases stay tier B: a session limit on an interface that has a limit
+  until reboot (its end would not bring that one back), and clearing a limit some other session or
+  a user set.
 - `pod-rootctl` is a confused deputy: anything running as the user can exec it, and it passes the
   peer requirement. For tier B it sends an `Approval`, and the helper refuses it (`needsApproval`)
   unless the approval is fresh. Fresh means the CLI's own LocalAuthentication prompt (Touch ID or the

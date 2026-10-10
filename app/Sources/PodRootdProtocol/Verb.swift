@@ -81,9 +81,16 @@ public enum Verb: Codable, Hashable, Sendable {
     public var tier: VerbTier {
         switch self {
         case .status, .fansSet, .lidHold, .lidRelease: .a
+        // the hotspot controller's limit: it ends with its session, and 6 Mb/s (hotspot.py's floor)
+        // is the slowest it can make the uplink; the helper also keeps it off an interface that has
+        // a limit until reboot
+        case .shaperSet(_, let kbps, .session) where kbps.value >= Self.sessionUplinkFloorKbps: .a
         default: .b
         }
     }
+
+    /// The lowest session-scoped upload limit that is still tier A.
+    public static let sessionUplinkFloorKbps: Int64 = 6000
 
     /// Every bounded parameter within its range. Decoding guarantees it; a verb built in code with
     /// `init(unchecked:)` might not.

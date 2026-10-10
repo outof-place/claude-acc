@@ -6,12 +6,15 @@ import PodRootdProtocol
 // caller without a prompt; B changes the system: Pod Menu on a click, pod-rootctl only with Touch ID
 // or within 5 minutes of it for the same parent, Pod's Electron process never.
 
-private let tierA: [Verb] = [.status, .fansSet(mode: .auto), .fansSet(mode: fan50), .lidHold(seconds: LidSeconds(600)!), .lidRelease]
+private let tierA: [Verb] = [
+    .status, .fansSet(mode: .auto), .fansSet(mode: fan50), .lidHold(seconds: LidSeconds(600)!), .lidRelease,
+    .shaperSet(interface: en0, kbps: UplinkKbps(6000)!, scope: .session),
+]
 
 private let tierB: [Verb] = [
     .powerMode(source: .ac, mode: .automatic), .sysctlSet(setting: .maxVnodes(MaxVnodes(786_432)!), persist: false),
-    .sysctlReset(key: .maxVnodes), .shaperSet(interface: en0, kbps: UplinkKbps(20_000)!, scope: .session),
-    .shaperClear(interface: en0), .spotlightAppsOnly, .spotlightRestore,
+    .sysctlReset(key: .maxVnodes), .shaperSet(interface: en0, kbps: UplinkKbps(5999)!, scope: .session),
+    .shaperSet(interface: en0, kbps: UplinkKbps(20_000)!, scope: .untilReboot), .spotlightAppsOnly, .spotlightRestore,
     .fsguardSet(enabled: false, limitMB: .standard), .launchdParkOrphans(dryRun: true),
     .logsPruneDiagnostics(olderThanDays: .standard, dryRun: true), .legacyMigrate, .legacyRollback, .restoreDefaults,
 ]
@@ -23,10 +26,41 @@ private func cli(_ rig: Rig, _ verb: Verb, authenticated: Bool = false, parent: 
     return rig.engine.handle(Request(verb, approval: approval), from: .cli, session: SessionID(9))
 }
 
-@Test("the tier table: status, fans and the lid are A, everything else is B")
+@Test("the tier table: status, fans, the lid and a session's limit of 6 Mb/s or more are A, everything else is B")
 func tierTable() {
-    for verb in tierA { #expect(verb.tier == .a, "\(verb.name)") }
-    for verb in tierB { #expect(verb.tier == .b, "\(verb.name)") }
+    for verb in tierA { #expect(verb.tier == .a, "\(verb.summary)") }
+    for verb in tierB { #expect(verb.tier == .b, "\(verb.summary)") }
+    #expect(Verb.shaperClear(interface: en0).tier == .b)
+}
+
+@Test("the hotspot controller through the CLI: its own session's limit and its clearing need no Touch ID")
+func sessionShaperWithoutPrompt() {
+    let rig = Rig()
+    rig.backend.limits["en8"] = nil
+    let en8 = InterfaceName("en8")!
+    #expect(cli(rig, .shaperClear(interface: en8), parent: nil).refusal == nil)  // nothing to clear yet
+    #expect(cli(rig, .shaperSet(interface: en8, kbps: UplinkKbps(30_000)!, scope: .session), parent: nil).refusal == nil)
+    #expect(cli(rig, .shaperSet(interface: en8, kbps: UplinkKbps(6000)!, scope: .session), parent: nil).refusal == nil)
+    #expect(cli(rig, .shaperSet(interface: en8, kbps: UplinkKbps(5000)!, scope: .session), parent: nil).refusal
+        == .needsApproval(verb: "shaper.set"))
+    #expect(cli(rig, .shaperClear(interface: en8), parent: nil).refusal == nil)  // its own session's
+    #expect(rig.backend.limits["en8"] == nil)
+}
+
+@Test("a session's limit may not cover one set until reboot, nor clear another session's, without approval")
+func sessionShaperBoundaries() {
+    let rig = Rig()
+    rig.send(.shaperSet(interface: en0, kbps: UplinkKbps(27_000)!, scope: .untilReboot), as: .menu)
+    #expect(cli(rig, .shaperSet(interface: en0, kbps: UplinkKbps(20_000)!, scope: .session), parent: nil).refusal
+        == .needsApproval(verb: "shaper.set"))
+    #expect(cli(rig, .shaperClear(interface: en0), parent: nil).refusal == .needsApproval(verb: "shaper.clear"))
+    #expect(rig.send(.shaperClear(interface: en0), as: .app).refusal == .verbNotAllowed(verb: "shaper.clear", caller: .app))
+    #expect(rig.backend.limits["en0"] == 27_000)
+    // Electron Pod: a session limit of 6 Mb/s or more on a free interface, nothing below
+    let en8 = InterfaceName("en8")!
+    #expect(rig.send(.shaperSet(interface: en8, kbps: UplinkKbps(6000)!, scope: .session), as: .app, session: SessionID(5)).refusal == nil)
+    #expect(rig.send(.shaperSet(interface: en8, kbps: UplinkKbps(1000)!, scope: .session), as: .app, session: SessionID(5)).refusal
+        == .verbNotAllowed(verb: "shaper.set", caller: .app))
 }
 
 @Test("Pod's Electron process: tier A goes through, every tier B verb is refused before it runs")
@@ -54,7 +88,8 @@ func cliNeedsApproval() {
         #expect(cli(rig, verb).refusal == .needsApproval(verb: verb.name), "\(verb.name)")
         #expect(cli(rig, verb, parent: nil).refusal == .needsApproval(verb: verb.name), "\(verb.name)")
     }
-    #expect(rig.backend.calls.filter { !$0.hasPrefix("applyFans") && !$0.hasPrefix("setSleepDisabled") }.isEmpty)
+    // only tier A reached the machine
+    #expect(rig.backend.calls.allSatisfy { ["applyFans", "setSleepDisabled", "setUplinkLimit en0 6000"].contains(where: $0.hasPrefix) })
     #expect(cli(rig, .spotlightAppsOnly, authenticated: true).refusal == nil)
 }
 
