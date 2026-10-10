@@ -126,6 +126,20 @@ func tiersByCaller() async throws {
     #expect(try await cli.client.send(.spotlightRestore, approval: approved).refusal == nil)
 }
 
+@Test("letting go of a client without close ends its session too, and doesn't crash the process")
+func releasedClientEndsSession() async throws {
+    let rig = Rig()
+    let server = Server(engine: rig.engine, peers: try admitting(as: .menu))
+    defer { server.cancel() }
+    var client: PodRootdClient? = try PodRootdClient(endpoint: server.listenAnonymously())
+    try await client?.run(.lidHold(seconds: LidSeconds(3600)!))
+    #expect(server.sessions == 1)
+    client = nil
+    await eventually { server.sessions == 0 }
+    #expect(server.sessions == 0)
+    #expect(rig.engine.status().lid.leaseUntil == nil)
+}
+
 @Test("closing the client ends its lid hold after the re-hold minute: a quit Pod Menu can't keep the Mac up")
 func leaseEndsWithSession() async throws {
     let wire = try Wire(peers: try admitting(as: .menu))
