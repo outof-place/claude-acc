@@ -21,7 +21,7 @@ MODULES="compressapps.py rootpy.py"
 find_afsctool() {
   local p
   for p in "$(command -v afsctool 2>/dev/null || true)" /opt/homebrew/bin/afsctool /usr/local/bin/afsctool; do
-    [ -n "$p" ] && [ -x "$p" ] && { /usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$p"; return 0; }
+    [ -n "$p" ] && [ -x "$p" ] && { /usr/bin/python3 -B -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$p"; return 0; }
   done
   return 1
 }
@@ -55,7 +55,7 @@ case "${1:-}" in
   *) echo "root-install.sh [--status|--uninstall]" >&2; exit 2 ;;
 esac
 
-PY="$(/usr/bin/python3 ./rootpy.py)" || { echo "nie instaluję kopii roota" >&2; exit 1; }
+PY="$(/usr/bin/python3 -B ./rootpy.py)" || { echo "nie instaluję kopii roota" >&2; exit 1; }
 TMP="$(mktemp -d -t claude-acc-root)"
 trap 'rm -rf "$TMP"' EXIT
 {
