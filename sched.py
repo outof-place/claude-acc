@@ -82,6 +82,15 @@ DEFAULTS = {
     "small_gb": 4.5,
     "small_wall_s": 120,
     "starve_s": 120,
+    # job, który się mieści, czeka za głową, której nie da się wpuścić, najwyżej tyle sekund
+    # (aging); potem startuje mimo rezerwy głowy. 2026-10-09 14 jobów czekało 28 min za `pnpm tc`
+    "aging_s": 300,
+    # job bez CPU i bez wyjścia przez tyle sekund stoi (stalled): status to mówi, rezerwa wraca do
+    # puli, a powiadomienie idzie raz. Nikt go nie zabija, chyba że class_timeout_s mówi inaczej
+    "stall_s": 600,
+    # twardy limit czasu biegu per klasa: {"prefiks klasy": sekundy}; po nim SIGTERM grupy procesów,
+    # po 10 s SIGKILL. Domyślnie pusto: nic nie ginie samo
+    "class_timeout_s": {},
     # głowa, której startu nie da się przewidzieć, przepuszcza tylko job, którego prognoza
     # × 2 + 10 s mieści się w tylu sekundach: o tyle najwyżej ją opóźni
     "head_delay_s": 60,
@@ -1176,6 +1185,9 @@ GENERIC_TOOLS = {
     "storybook": ("build", {"build"}),
     "just": ("script", None), "task": ("script", None), "make": ("script", None),
 }  # fmt: skip
+# podkomendy, które uruchamiają program albo zadanie z nazwy (`deno run main.ts`, `nx run app:serve`):
+# w kolejce tylko wtedy, gdy nazwa mówi o pracy (heavy_sig), jak skrypty
+RUNNER_VERBS = {"deno": ("run", "task"), "nx": ("run", "run-many", "affected"), "lerna": ("run",)}
 # `python -m X`: tylko moduły, które są pracą (testy, typecheck, budowanie paczki)
 PYTHON_MODULES = {"pytest": "test", "unittest": "test", "mypy": "typecheck", "pyright": "typecheck",
                   "tox": "test", "nox": "test", "build": "build"}  # fmt: skip
@@ -1246,6 +1258,8 @@ def generic_tool(words, here):
             kind = "test"
         elif tool == "nx" and first in ("test", "e2e", "lint"):
             kind = {"lint": "typecheck"}.get(first, first)
+        if first in RUNNER_VERBS.get(tool, ()) and not heavy_sig(":".join([tool] + positional[1:])):
+            return None
         sig = f"{tool}:{first}"
     elif kind == "script":
         # just/task/make: przepis, uczony z historii; bez celu to cel domyślny
@@ -1538,6 +1552,8 @@ def classify(command, cwd, argv=None):
                 job = parse_node(words, here)
         if job is None and generic_on and prog not in ("go", "golangci-lint", "govulncheck"):
             job = parse_generic(words, here)
+            if job and job["kind"] == "script" and not heavy_sig(job["sig"]):
+                job = None  # skrypt, program projektu albo cel make bez czasownika pracy: od razu
             if job:
                 job["lang"] = "generic"
         if job:
@@ -1549,7 +1565,8 @@ def classify(command, cwd, argv=None):
     for raw in found:
         lang = raw.get("lang")
         done = finishers.get(lang, finish_job)(raw)
-        if done is None and lang is None and raw["kind"] == "make" and generic_on and not GENERIC_NEVER.search(raw["target"]):
+        if (done is None and lang is None and raw["kind"] == "make" and generic_on and not GENERIC_NEVER.search(raw["target"])
+                and heavy_sig(f"make:{raw['target']}")):
             # make poza modułem Go: przepis jak każdy inny skrypt
             done = finish_generic(dict(raw, lang="generic", kind="script", tool="make", sig=f"make:{raw['target']}"))
         if done:
@@ -1558,6 +1575,8 @@ def classify(command, cwd, argv=None):
         return None
     main = max(jobs, key=lambda j: prior(j, 4)[0])
     main["multi"] = len(jobs) > 1
+    # pozostałe prace komendy złożonej: bez własnej historii prognoza bierze najcięższą z nich
+    main["parts"] = [j for j in jobs if j is not main]
     main["simple"] = len(jobs) == 1 and simple_command(segments)
     main["cmd"] = command
     return main
@@ -1818,11 +1837,88 @@ def percentile(values, q):
     return values[lo] + (values[hi] - values[lo]) * (pos - lo)
 
 
-def predict(job, p, history):
-    """(GB, s, źródło): p90 szczytu × 1,15 i mediana czasu z ostatnich lokalnych biegów tej klasy."""
+# czasowniki komend (skrypt pnpm, plik skryptu, narzędzie), które dzielą historię i prognozę: typecheck
+# pod każdą nazwą to ten sam tsc; przygotowanie środowiska i esbuild to praca na sekundy i setki MB
+# (2026-10-09: `ensure:electron-runtime` z prognozą 30 GB po `pnpm tc`, esbuild 11,9 GB przy 0,3)
+TYPECHECK_VERBS = ("tc", "tsc", "typecheck", "type-check", "check-types", "types", "vue-tsc")
+LIGHT_VERBS = ("ensure", "esbuild")
+LIGHT_PRIOR = (0.5, 30)
+HELP_FLAGS = ("--help", "-h", "--version", "-v", "-V", "help")
+
+
+# słowa w nazwie skryptu, celu make albo skryptu pnpm, które znaczą ciężką pracę; reszta (`./perm-guard`,
+# `commit-pliki.sh`, `make prepare-emails`, `pnpm run ensure:electron-runtime`) idzie od razu, bez
+# kolejki. 2026-10-09 binarka na 1 ms czekała 2m24s za `ensure:electron-runtime`
+HEAVY_WORDS = ("build", "test", "tests", "e2e", "spec", "typecheck", "tc", "tsc", "lint", "check", "verify",
+               "compile", "bundle", "bench", "benchmark", "coverage", "integration", "unit")  # fmt: skip
+
+
+def heavy_sig(sig):
+    """Czy podpis skryptu (pnpm, ścieżka, interpreter, make, just) nazywa ciężką pracę: build, test,
+    e2e, typecheck, lint, check... w którymkolwiek członie nazwy (`build:ghostty-terminal-macos`,
+    `scripts/run-tests.sh`, `stack.sh build`)."""
+    tool, _, rest = str(sig).partition(":")
+    for part in (rest or tool).split(":"):
+        head = os.path.splitext(os.path.basename(part))[0].lower()
+        if head in TYPECHECK_VERBS or any(w in HEAVY_WORDS for w in re.split(r"[^a-z0-9]+", head)):
+            return True
+    return False
+
+
+def sig_verb(sig):
+    """Czasownik z podpisu joba spoza Go i JS: "pnpm-script:tc:cli" -> "typecheck",
+    "script:node_modules/.bin/esbuild" -> "esbuild", "node:scripts/x.mjs" -> "x"."""
+    tool, _, rest = str(sig).partition(":")
+    head = rest.split(":")[0] if rest else tool
+    verb = os.path.splitext(os.path.basename(head))[0] or tool
+    return "typecheck" if verb in TYPECHECK_VERBS else verb
+
+
+def class_verb(cls):
+    """Czasownik z klasy `nazwa:rodzaj:podpis`."""
+    parts = str(cls).split(":", 2)
+    return sig_verb(parts[2]) if len(parts) == 3 else ""
+
+
+def generic_light(job):
+    """Komenda spoza Go i JS, która z kształtu nie jest pracą: przygotowanie, esbuild, --help."""
+    words = job.get("argv") or []
+    return sig_verb(job.get("scope_detail") or "") in LIGHT_VERBS or any(w in HELP_FLAGS for w in words[1:])
+
+
+def measured_prior(job):
+    """Czy tabela zna ten job z pomiarów (moduły Go z PRIORS, natywne buildy), a nie zgaduje."""
+    if job.get("lang") == "native":
+        return True
+    if job.get("lang"):
+        return False
+    return job["module_name"] in SMALL_MODULES or any(k[0] == job["module_name"] for k in PRIORS)
+
+
+def go_tree_scaled(job, gb, s):
+    """Cały moduł Go spoza tabeli: ogólne 6-12 GB to duży moduł, a mały (fasthooks, 5 pakietów,
+    0,3 GB przy prognozie 10) rośnie z liczbą pakietów."""
+    try:
+        n = len(go_packages(job["module_dir"]))
+    except (KeyError, OSError):
+        return gb, s
+    if not n:
+        return gb, s
+    return min(gb, 1.0 + 0.15 * n), min(s, 30 + 4 * n)
+
+
+def predict(job, p, history, small_gb=None):
+    """(GB, s, źródło): p90 szczytu × 1,15 i mediana czasu z ostatnich lokalnych biegów tej klasy.
+
+    Bez własnych biegów prognoza z tabeli, rodziny albo czasownika to zgadywanie, więc ma sufit
+    small_gb (poza pomiarami z tabeli i dolnymi granicami, jak Docker): po pierwszym biegu liczy się
+    już zmierzony szczyt. Biegi komend złożonych (`multi`: kilka prac w jednej komendzie, szczyt całości)
+    nie uczą klasy pojedynczej komendy i odwrotnie; złożona bez własnych biegów bierze najcięższą część."""
+    small_gb = DEFAULTS["small_gb"] if small_gb is None else small_gb
     rows = [
         r for r in history
         if r.get("where") == "local" and r.get("class") == job["class"] and r.get("peak_gb") and r.get("wall_s")
+        and bool(job.get("multi")) == bool(r.get("multi"))
     ]  # fmt: skip
     if p_sensitive(job):
         rows = [r for r in rows if r.get("p") == p]
@@ -1830,11 +1926,23 @@ def predict(job, p, history):
     base_gb, base_s = prior(job, p)
     src = "prior"
     if job.get("lang") == "generic":
-        family = family_estimate(job, history)
-        if family:
-            base_gb, base_s, src = family
+        if generic_light(job):
+            base_gb, base_s, src = LIGHT_PRIOR[0], LIGHT_PRIOR[1], "light"
+        else:
+            family = family_estimate(job, history)
+            if family:
+                base_gb, base_s, src = family
+    elif not job.get("lang") and job.get("scope") == "tree" and not measured_prior(job):
+        base_gb, base_s = go_tree_scaled(job, base_gb, base_s)
+    if not measured_prior(job):
+        base_gb = min(base_gb, small_gb)
     floor = job.get("floor_gb") or 0.0
     if not rows:
+        if job.get("multi"):
+            # komenda złożona bez własnych biegów: szczyt najcięższej części, czasy po kolei
+            for part in job.get("parts") or []:
+                part_gb, part_s, _ = predict(dict(part, multi=False, parts=None), p, history, small_gb)
+                base_gb, base_s = max(base_gb, part_gb), base_s + part_s
         return round(max(base_gb, floor), 2), round(base_s, 1), src
     gb = percentile([r["peak_gb"] for r in rows], 0.9) * 1.15
     s = percentile([r["wall_s"] for r in rows], 0.5)
@@ -1846,31 +1954,40 @@ def predict(job, p, history):
 
 
 def family_estimate(job, history):
-    """(GB, s, źródło) dla nieznanego jeszcze podpisu z rodziny (to samo repo, rodzaj i narzędzie):
-    nowy skrypt Pythona w repo, w którym skrypty Pythona biorą po 0,2 GB, nie czeka na 4 GB.
-    p90 × 1,5, bo w rodzinie bywa i skrypt z przeglądarką; None przy mniej niż 5 biegach."""
+    """(GB, s, źródło) dla nieznanego jeszcze podpisu z rodziny (to samo repo, rodzaj i narzędzie)
+    najpierw tego samego czasownika (`tc:cli` uczy się z `tc`, nie z e2e obok w rodzinie pnpm; od 3
+    biegów), potem całej rodziny (nowy skrypt Pythona w repo, w którym skrypty Pythona biorą po 0,2 GB,
+    nie czeka na 4 GB; od 5 biegów). p75 × 1,25, najmniej 0,5 GB: odporne na pojedyncze biegi komend
+    złożonych, a nie p90 × 1,5 po najcięższym rodzeństwie. None przy za małej historii."""
     fam = job.get("family")
+    verb = sig_verb(job.get("scope_detail") or "")
     rows = [
         r for r in history
         if r.get("where") == "local" and r.get("lang") == "generic" and r.get("peak_gb") and r.get("wall_s")
-        and ":".join(str(r.get("class", "")).split(":")[:3]) == fam
-    ][-40:]  # fmt: skip
-    if len(rows) < 5:
+        and ":".join(str(r.get("class", "")).split(":")[:3]) == fam and not r.get("multi")
+    ]  # fmt: skip
+    same = [r for r in rows if class_verb(r.get("class")) == verb][-40:]
+    if len(same) >= 3:
+        rows, src = same, f"family:{verb}:{len(same)}"
+    elif len(rows) >= 5:
+        rows = rows[-40:]
+        src = f"family:{len(rows)}"
+    else:
         return None
-    gb = max(1.0, percentile([r["peak_gb"] for r in rows], 0.9) * 1.5)
+    gb = max(0.5, percentile([r["peak_gb"] for r in rows], 0.75) * 1.25)
     s = percentile([r["wall_s"] for r in rows], 0.5) * 1.5
-    return round(gb, 2), round(s, 1), f"family:{len(rows)}"
+    return round(gb, 2), round(s, 1), src
 
 
-def choose_p(job, free_gb, history):
+def choose_p(job, free_gb, history, small_gb=None):
     """-p: od agenta, jeśli podał; dla całych modułów najszybsze z 2/4/6/8, które się mieści."""
     if job["p_explicit"]:
-        gb, s, src = predict(job, job["p_explicit"], history)
+        gb, s, src = predict(job, job["p_explicit"], history, small_gb)
         return job["p_explicit"], "agent", gb, s, src
     if not p_sensitive(job):
-        gb, s, src = predict(job, 4, history)
+        gb, s, src = predict(job, 4, history, small_gb)
         return None, "default", gb, s, src
-    options = [(p,) + predict(job, p, history) for p in (2, 4, 6, 8)]
+    options = [(p,) + predict(job, p, history, small_gb) for p in (2, 4, 6, 8)]
     fitting = [o for o in options if o[1] <= free_gb]
     if fitting:
         p, gb, s, src = min(fitting, key=lambda o: (o[2], o[1], abs(o[0] - 4)))
@@ -2388,16 +2505,48 @@ def reap(state):
     state["queue"] = [j for j in state["queue"] if alive(j.get("pid"))]
 
 
+# rezerwa po rozgrzewce: job, który przebiegł max(60 s, połowę prognozy czasu), najwyżej 300 s,
+# rezerwuje do min(prognoza, szczyt dotąd × 1,5 + 1 GB), a nie całą prognozę. 2026-10-09 e2e z
+# prognozą 14,8 GB trzymało 12,4 GB rezerwy przy 2,4 GB użytych, a do wpuszczenia zostawało 1,8 GB
+RESERVE_WARMUP = (60.0, 0.5, 300.0)
+RESERVE_GROWTH = (1.5, 1.0)
+
+
+def reserve_target(job, now):
+    """Do ilu GB lokalny job jeszcze urośnie według rezerwy (prognoza albo zmierzony szczyt)."""
+    predicted = job.get("mem_predicted_gb") or 0.0
+    if job.get("lang") == "native" or job.get("outside"):
+        return predicted  # pamięć poza drzewem procesów: zmierzony szczyt to tylko jej część
+    elapsed = now - (job.get("started_at") or now)
+    lo, share, hi = RESERVE_WARMUP
+    if elapsed < min(hi, max(lo, share * (job.get("predicted_wall_s") or 0))):
+        return predicted
+    seen = max(job.get("mem_peak_gb") or 0.0, job.get("mem_now_gb") or 0.0)
+    return min(predicted, seen * RESERVE_GROWTH[0] + RESERVE_GROWTH[1])
+
+
 def growth_left(job, now):
-    """O ile lokalny job jeszcze urośnie: prognoza minus teraz. Zero dla joba, który biegnie dużo
-    dłużej, niż miał (serwer albo watcher, który skrypt zostawił na pierwszym planie): jego pamięć
-    jest już w tym, co widzi jądro, a rezerwa na wzrost, który nie przyjdzie, blokowałaby kolejkę."""
-    if job.get("paused"):
+    """O ile lokalny job jeszcze urośnie: rezerwa (reserve_target) minus teraz. Zero dla joba, który
+    biegnie dużo dłużej, niż miał (serwer albo watcher, który skrypt zostawił na pierwszym planie):
+    jego pamięć jest już w tym, co widzi jądro, a rezerwa na wzrost, który nie przyjdzie, blokowałaby
+    kolejkę. Zero też dla wstrzymanego (SIGSTOP) i stojącego (stalled: bez CPU i wyjścia)."""
+    if job.get("paused") or job.get("stalled_s"):
         return 0.0
     elapsed = now - (job.get("started_at") or now)
     if elapsed > max(600.0, 3 * (job.get("predicted_wall_s") or 0)):
         return 0.0
-    return max(0.0, (job.get("mem_predicted_gb") or 0) - (job.get("mem_now_gb") or 0))
+    return max(0.0, reserve_target(job, now) - (job.get("mem_now_gb") or 0))
+
+
+def time_left(job, now):
+    """Ile lokalny job jeszcze pobiegnie: prognoza minus czas biegu, a po jej przekroczeniu połowa tego,
+    co już biegnie (kto przeciągnął, zwykle przeciąga dalej), najmniej 5 s. 2026-10-09 kolejka przez
+    20 minut pisała „about 5s” za rerun-failed.sh z prognozą 5 min. Przed końcem prognozy liczy się
+    ona sama: job w 1700. sekundzie z 1800 skończy się za 100 s, a nie za 850."""
+    wall = job.get("predicted_wall_s") or 60
+    elapsed = now - (job.get("started_at") or now)
+    left = wall - elapsed
+    return max(left, 5.0) if left >= 0 else max(0.5 * elapsed, 5.0)
 
 
 def refresh_memory(state, cfg, mem=None):
@@ -2650,6 +2799,14 @@ def plan(state, cfg, now):
         how = None
         if shade is not None and not native:
             how = backfill(job, free, now_free, shade, stuck, cfg)
+        # aging: job, który się mieści, nie czeka w nieskończoność za głową, której nic nie wpuszcza;
+        # po aging_s startuje mimo jej rezerwy (lekki także w pamięci dostępnej teraz)
+        aged = (
+            not native and not held and now - job["enqueued_at"] >= cfg["aging_s"]
+            and (need <= free or (need <= cfg["small_gb"] and need <= now_free))
+        )
+        if aged and not how:
+            how = "aged"
         if how or (job.get("small") and not held and (need <= free - reserve or quick)):
             admitted[job["id"]] = ("overtake", blocked["id"])
             free -= need
@@ -2695,9 +2852,15 @@ def backfill(job, free, now_free, shade, stuck, cfg):
     fits = need <= free
     fits_now = fits or (light and need <= now_free)
     slack = BACKFILL_SLACK[0] * (job.get("predicted_wall_s") or 0) + BACKFILL_SLACK[1]
+    # EASY: skończy się przed realnym startem głowy. Start niepewny tylko przez joby, które przeciągnęły
+    # (nie przez zgadniętą prognozę), ma z time_left sensowną dolną granicę: przed nim wchodzi lekki job,
+    # o ile to nie wyprzedzający trzymają głowie pamięć (`stuck`). Ciężki krótki (e2e na 5 GB) dalej
+    # nie: gdy sam się przeciągnie, trzyma głowie najwięcej
+    if shade["wait_s"] is not None and fits_now and slack <= shade["wait_s"] and (
+        shade["sure"] or (light and stuck and not shade.get("guessed"))
+    ):
+        return "ends"
     if shade["sure"]:
-        if fits_now and slack <= shade["wait_s"]:
-            return "ends"
         if fits and shade["spare_gb"] is not None and need <= shade["spare_gb"]:
             return "beside"
         return None
@@ -2724,17 +2887,24 @@ def shadow(state, need, free, now, ahead=(), lone=None):
     nie liczy się do "spare_gb". 2026-10-09 18:26 pytest (0,08 GB) biegnący 2 s dłużej, niż miał,
     robił z przewidywalnego startu e2e po końcu next build start „nie do przewidzenia”."""
     ends = []
+    # joby, których koniec to zgadywanie (prognoza bez własnej historii, stojące), a nie przeciągnięcie
+    guessed = set()
     for i, r in enumerate(state["running"]):
         if r["where"] != "local":
             continue
         wall = r.get("predicted_wall_s") or 60
-        left = wall - (now - r.get("started_at", now))
+        over = wall - (now - r.get("started_at", now)) < 0
         held = r.get("mem_now_gb") or 0.0
-        ends.append((max(5.0, left), i, r["id"], held + growth_left(r, now), held, measured(r) and left >= 0))
+        sure = measured(r) and not over and not r.get("stalled_s")
+        if not measured(r) or r.get("stalled_s"):
+            guessed.add(r["id"])
+        ends.append((time_left(r, now), i, r["id"], held + growth_left(r, now), held, sure))
     for k, (jid, gb, wall, sure) in enumerate(ahead):
+        if not sure:
+            guessed.add(jid)
         ends.append((max(5.0, wall or 60), len(state["running"]) + k, jid, gb, 0.0, sure and bool(wall)))
     ends.sort(key=lambda e: (e[0], e[1]))
-    out = {"wait_s": 0.0, "spare_gb": free - need, "after": [], "sure": True}
+    out = {"wait_s": 0.0, "spare_gb": free - need, "after": [], "sure": True, "guessed": False}
     if need <= free:
         return out
     released = 0.0
@@ -2751,11 +2921,11 @@ def shadow(state, need, free, now, ahead=(), lone=None):
                 out["after"] = [a for a in out["after"] if a not in unsure]
                 out.update(wait_s=left, spare_gb=free - need - idle)
             else:
-                out.update(wait_s=left, spare_gb=free - need, sure=False)
+                out.update(wait_s=left, spare_gb=free - need, sure=False, guessed=bool(guessed & set(unsure)))
             return out
     if lone is not None and ends and (lone[1] or need <= lone[0] + released):
         # sama na Macu czeka na koniec wszystkich
-        out.update(wait_s=ends[-1][0], spare_gb=None, sure=not unsure)
+        out.update(wait_s=ends[-1][0], spare_gb=None, sure=not unsure, guessed=bool(guessed & set(unsure)))
         return out
     out.update(wait_s=None, spare_gb=None, sure=False)
     return out
@@ -2878,6 +3048,12 @@ def update_queue_view(state, cfg):
     head_blocked = None
     owner = native_owner(state)
     native = mem.get("native") or {}
+    # stojące joby w powodzie czekania: kolejka mówi, dlaczego stoi, zanim ktoś zapyta
+    stuck_jobs = [j for j in state["running"] if j.get("stalled_s")]
+    stalled = "; ".join(
+        f"{j['label']} stalled {human_s(j['stalled_s'])} (no CPU, no output), its reservation released"
+        for j in stuck_jobs[:2]
+    )
     for pos, job in enumerate(queue_order(state), start=1):
         job["position"] = pos
         job["waited_s"] = round(now - job["enqueued_at"], 1)
@@ -2894,8 +3070,7 @@ def update_queue_view(state, cfg):
         elif job.get("exclusive") and (owner or native.get("outside")):
             waits_turn, code = True, "native"
             if owner:
-                left = (owner.get("predicted_wall_s") or 600) - (now - owner.get("started_at", now))
-                job["eta_start_s"] = round(max(5.0, left))
+                job["eta_start_s"] = round(time_left(dict(owner, predicted_wall_s=owner.get("predicted_wall_s") or 600), now))
                 after = [owner["id"]]
                 text = f"waiting: one native build at a time, {owner['label']} is building"
             else:
@@ -2934,6 +3109,8 @@ def update_queue_view(state, cfg):
                 text += f" · starts when {names} ends" + (
                     f", about {human_s(wait)}" if wait < 3600 else ""
                 )
+            if stalled:
+                text += f" · {stalled}"
         job["reason"] = {
             "code": code,
             "need_gb": job["mem_predicted_gb"],
@@ -3114,6 +3291,10 @@ def new_entry(job, command, argv, opts):
         "count1_dropped": False,
         "exclusive": bool(job.get("exclusive")),
         "native_tool": job.get("tool") if job.get("lang") == "native" else None,
+        # kilka prac w jednej komendzie: jej szczyt nie uczy klasy pojedynczej komendy (predict)
+        "multi": bool(job.get("multi")),
+        # pamięć poza drzewem procesów (natywny, Docker): rezerwa zostaje przy prognozie
+        "outside": bool(job.get("outside") or job.get("floor_gb")),
         "pid": os.getpid(),
         "via": opts.get("via", "cli"),
         "enqueued_at": time.time(),
@@ -3137,8 +3318,9 @@ def cmd_run(args):
     if job is None:
         return exec_plain(command, argv)
     if job.get("lang") == "generic":
-        # cache to tylko Go (testy, Depot); historia tylko tej rodziny
-        history = read_history(needle='"class": "' + job["family"])
+        # cache to tylko Go (testy, Depot); historia tylko tej rodziny, a dla komendy złożonej cała
+        # (jej części bywają z innych rodzin)
+        history = read_history(needle=None if job.get("multi") else '"class": "' + job["family"])
         return schedule(new_entry(job, command, argv, opts), job, command, argv, opts, cfg, history, {})
     history = read_history()
     cache = load_cache()
@@ -3178,7 +3360,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
         reap(state)
         refresh_memory(state, cfg)
         p, p_by, gb, wall, src = choose_p(
-            job, state["memory"]["free_for_admission_gb"], history
+            job, state["memory"]["free_for_admission_gb"], history, cfg["small_gb"]
         )
         entry.update(
             p=p,
@@ -3249,7 +3431,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                     if jid in admitted:
                         if me.get("p_by") == "scheduler":
                             p, _, gb, wall, src = choose_p(
-                                job, state["memory"]["free_for_admission_gb"], history
+                                job, state["memory"]["free_for_admission_gb"], history, cfg["small_gb"]
                             )
                             if gb <= max(
                                 state["memory"]["free_for_admission_gb"],
@@ -3398,6 +3580,7 @@ def run_local(entry, job, command, argv, cfg):
         signal.signal(sig, forward)
     started = time.time()
     peak, cpu_live, last_beat = 0.0, 0.0, 0.0
+    watch = StallWatch(cfg, job, jid)
     # natywny build: do pamięci joba dochodzą drzewa xcodebuild na Macu (jeden build naraz, więc
     # to jego) i symulator, który `portivo-mobile up` włączył; oba poza drzewem procesów joba
     native = job.get("lang") == "native" and job.get("exclusive")
@@ -3418,7 +3601,9 @@ def run_local(entry, job, command, argv, cfg):
         peak = max(peak, now_gb)
         if time.time() - last_beat >= 1.0:
             last_beat = time.time()
-            built = heartbeat(jid, cfg, now_gb, peak, cpu_live, started, native=pool) or built
+            stalled_s = watch.sample(last_beat, cpu_live, own)
+            built = heartbeat(jid, cfg, now_gb, peak, cpu_live, started, native=pool, stalled_s=stalled_s) or built
+            watch.enforce(last_beat - started, child.pid)
         # krótka komenda nie czeka ćwierć sekundy na własny koniec: gęsto na początku, potem rzadziej
         ran = time.time() - started
         time.sleep(0.01 if ran < 0.5 else 0.05 if ran < 3 else 0.25)
@@ -3428,8 +3613,95 @@ def run_local(entry, job, command, argv, cfg):
     return rc if rc >= 0 else 128 - rc
 
 
-def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None):
-    """Pomiar biegnącego joba do stanu; True, gdy natywny job skończył fazę buildu."""
+class StallWatch:
+    """Czy job stoi: grupa procesów bez CPU (mniej niż STALL_CPU_S od ostatniej oznaki życia), bez
+    nowych procesów i bez wyjścia (rozmiar stdout/stderr wrappera, gdy to pliki) przez stall_s. Stojący
+    job zwalnia rezerwę (growth_left), status i panel mówią dlaczego, powiadomienie idzie raz. Twardy
+    limit klasy (class_timeout_s) kończy job: SIGTERM grupy, po 10 s SIGKILL; bez wpisu nic nie ginie.
+    2026-10-09 trzy vitesty pod starym Bunem stały 18-27 min przy 0% CPU, każdy z rezerwą 4 GB."""
+
+    def __init__(self, cfg, job, jid):
+        self.stall_s = float(cfg.get("stall_s") or 0)
+        cls = job.get("class") or ""
+        limits = cfg.get("class_timeout_s") or {}
+        self.timeout = min((float(s) for k, s in limits.items() if cls.startswith(k)), default=0.0)
+        self.label = job.get("label") or cls
+        self.jid = jid
+        self.active_at = None
+        self.mark = None
+        self.notified = False
+        self.term_at = None
+
+    @staticmethod
+    def output_size():
+        size = 0
+        for fd in (1, 2):
+            try:
+                size += os.fstat(fd).st_size
+            except OSError:
+                pass
+        return size
+
+    def sample(self, now, cpu, pids):
+        """Sekundy postoju (od stall_s) albo None, gdy job pracuje."""
+        sig = (frozenset(pids), self.output_size())
+        if self.mark is None or cpu - self.mark[0] >= STALL_CPU_S or sig != self.mark[1]:
+            self.active_at, self.mark = now, (cpu, sig)
+            if self.notified:
+                log(f"{self.label} znowu pracuje")
+            self.notified = False
+            return None
+        idle = now - self.active_at
+        if not self.stall_s or idle < self.stall_s:
+            return None
+        if not self.notified:
+            self.notified = True
+            log(f"{self.label} stoi od {human_s(idle)}: bez CPU i bez wyjścia; rezerwa pamięci wraca do puli")
+            notify("claude-acc: job stoi", f"{self.label}: {human_s(idle)} bez CPU i wyjścia (claude-acc sched status)")
+        return idle
+
+    def enforce(self, elapsed, pgid):
+        """Twardy limit klasy: SIGTERM, a po 10 s SIGKILL grupy procesów joba."""
+        import signal
+
+        if not self.timeout or elapsed < self.timeout:
+            return
+        if self.term_at is None:
+            self.term_at = elapsed
+            log(f"{self.label}: limit klasy {human_s(self.timeout)} minął, SIGTERM (class_timeout_s)")
+            sig = signal.SIGTERM
+        elif elapsed - self.term_at >= 10:
+            sig = signal.SIGKILL
+        else:
+            return
+        for s in (signal.SIGCONT, sig):
+            try:
+                os.killpg(pgid, s)
+            except OSError:
+                pass
+
+
+# oznaka życia: tyle sekund CPU grupy procesów od ostatniej (0,5 s na 10 minut to ~0,1% rdzenia)
+STALL_CPU_S = 0.5
+
+
+def notify(title, text):
+    """Powiadomienie macOS; tekst i tytuł jako argumenty skryptu (AppleScript nie zna \u0105)."""
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            ["osascript", "-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+             "-e", "end run", "--", text, title],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )  # fmt: skip
+    except OSError:
+        pass
+
+
+def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None, stalled_s=None):
+    """Pomiar biegnącego joba do stanu; True, gdy natywny job skończył fazę buildu. `stalled_s`: jak
+    długo job stoi bez CPU i bez wyjścia (od stall_s; None, gdy pracuje)."""
     with Locked(block=False) as lk:
         if not lk.ok:
             return
@@ -3446,8 +3718,9 @@ def heartbeat(jid, cfg, now_gb, peak, cpu, started, native=None):
             mem_now_gb=round(now_gb, 2),
             mem_peak_gb=round(peak, 2),
             cpu_cores=round(cpu / elapsed, 1) if elapsed > 1 else None,
-            eta_s=round(max(0.0, wall - elapsed), 1),
+            eta_s=round(time_left(dict(me, predicted_wall_s=wall, started_at=started), time.time()), 1),
             progress=round(min(0.99, elapsed / wall), 2),
+            stalled_s=round(stalled_s) if stalled_s else None,
         )
         reap(state)
         refresh_memory(state, cfg)
@@ -3579,6 +3852,8 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
             "count1_dropped": me.get("count1_dropped", False),
             "lang": me.get("lang"),
             "cancelled": bool(me.get("cancelled")),
+            "multi": bool(me.get("multi")),
+            "stalled_s": me.get("stalled_s"),
         }
         if me.get("lang") == "native":
             row["native_built"] = bool(me.get("native_seen"))
@@ -4171,6 +4446,7 @@ def cmd_status(args):
             f"  biegnie  {j['label']}  [{j['module']}]  -p {j.get('p') or '-'}  "
             f"{human_s(j.get('elapsed_s'))} z ~{human_s(j['predicted_wall_s'])}  {extra}"
             + ("  PAUZA" if j.get("paused") else "")
+            + (f"  STOI {human_s(j['stalled_s'])} (bez CPU i wyjścia, rezerwa zwolniona)" if j.get("stalled_s") else "")
         )
     for j in queue_order(state):
         print(

@@ -141,6 +141,10 @@ class World(CreditsWorld):
         path = os.path.join(self.runenv, "avoid.json")
         return json.loads(read(path)) if os.path.exists(path) else {}
 
+    def avoid_orgs(self):
+        path = os.path.join(self.runenv, "avoid-orgs.json")
+        return json.loads(read(path)) if os.path.exists(path) else {}
+
     def run_entries(self):
         """Wpisy Pęku kluczy katalogów biegów (bazowy i klucze kredytów pomijamy)."""
         return [k for k in self.keychain() if k.startswith("Claude Code-credentials-")]
@@ -583,6 +587,160 @@ class Metering(unittest.TestCase):
             for entry in self.w.ledger():
                 self.assertGreater(entry["usd"], 0)  # żadnego cichego 0 USD
 
+    def test_resumed_rounds_of_a_session_are_not_new_sessions_so_metering_is_complete(self):
+        # outofplace 09.10, bieg 18: pisarz `claude -p`, potem rundy naprawcze `claude -p --resume <id>`
+        # z tą samą sesją; 4 starty to 2 sesje, a rachunek mówił "NIEPEŁNY, 2 z 4" i "niesprawdzony"
+        self.w.pool()
+        sid = "$(claude -p write | sed -E 's/.*\"session_id\": \"([^\"]+)\".*/\\1/')"
+        command = (f'sid={sid} && claude -p fix --resume "$sid" && claude -p fix1 --resume="$sid" '
+                   f'&& claude -r "$sid" -p fix2 && claude -p fix3 -c')
+        r, s = self.w.go(cmd=("sh", "-c", command))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len({c["session"] for c in self.w.calls()}), 1)  # atrapa naprawdę wznowiła jedną sesję
+        self.assertEqual((s["sessions_started"], s["sessions_seen"], s["requests"]), (1, 1, 5))
+        self.assertEqual(s["metering"], {"complete": True, "problems": []})
+        self.assertEqual(s["payer_check"], {"verdict": "ok", "problems": []})
+        self.assertAlmostEqual(s["cost_usd"], 0.005)  # rundy wznowione dalej się liczą do kosztu
+        self.assertAlmostEqual(sum(e["usd"] for e in self.w.ledger() if e.get("run") == s["run_id"]), 0.005)
+
+    def test_the_first_continue_of_a_run_is_a_new_session_because_its_config_dir_is_fresh(self):
+        # Claude Code 2.1.294: `-c` bez rozmowy w katalogu konfiguracji zaczyna nową sesję (nie kończy się
+        # błędem), a katalog biegu jest świeży, więc pierwszy -c biegu jest nową sesją, nie wznowieniem
+        self.w.pool()
+        r, s = self.w.go(cmd=("sh", "-c", "claude -p first -c && claude -p second -c"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len({c["session"] for c in self.w.calls()}), 1)  # drugi -c wznowił pierwszą
+        self.assertEqual((s["sessions_started"], s["sessions_seen"]), (1, 1))
+        # cicha nowa sesja z -c nie może się schować za inną sesją
+        r, s = self.w.go(cmd=("sh", "-c", "FAKE_CLAUDE_NO_OTEL=1 claude -p silent -c && claude -p other"))
+        self.assertEqual((s["sessions_started"], s["sessions_seen"]), (2, 1))
+        self.assertFalse(s["metering"]["complete"])
+        self.assertIn("1 z 2", " ".join(s["metering"]["problems"]))
+        self.assertEqual(s["payer_check"]["verdict"], "unverified")
+
+    def test_a_new_session_without_telemetry_is_still_incomplete_next_to_resumed_rounds(self):
+        self.w.pool()
+        sid = "$(claude -p write | sed -E 's/.*\"session_id\": \"([^\"]+)\".*/\\1/')"
+        cases = (
+            # nowa sesja obok wznowionej, bez zdarzeń: 2 nowe sesje, 1 widziana
+            f'sid={sid} && claude -p fix --resume "$sid" && FAKE_CLAUDE_NO_OTEL=1 claude -p other',
+            # --fork-session wznawia z nowym id, więc to nowa sesja, której licznik też ma zobaczyć
+            f'sid={sid} && claude -p fix -c && FAKE_CLAUDE_NO_OTEL=1 claude -p side --resume "$sid" --fork-session',
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                r, s = self.w.go(cmd=("sh", "-c", command))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual((s["sessions_started"], s["sessions_seen"]), (2, 1))
+                self.assertFalse(s["metering"]["complete"])
+                self.assertIn("1 z 2", " ".join(s["metering"]["problems"]))
+                self.assertEqual(s["payer_check"]["verdict"], "unverified")
+
+    def test_401_on_a_credit_org_makes_auto_and_credits_pick_another_org_until_the_entry_expires(self):
+        self.w.pool()  # a: 200 USD (20 dni), d: 200 USD (3 dni): bez omijania płaci d
+        r, s = self.w.go(FAKE_CLAUDE_ERROR="401")
+        self.assertEqual((r.returncode, s["payer"]["org_id"]), (1, "org-d"), r.stderr)
+        self.assertEqual([e["kind"] for e in s["errors"]], ["auth"])
+        entry = self.w.avoid_orgs()["org-d"]
+        self.assertEqual(entry["kind"], "auth")
+        # 401 na kluczu organizacji sam nie mija: doba od końca biegu, nie dłużej
+        self.assertAlmostEqual(entry["until"], s["ended_at"] + 24 * 3600, delta=60)
+        for mode in (None, "credits"):
+            r, s2 = self.w.go(mode=mode)
+            self.assertEqual((r.returncode, s2["payer"]["org_id"]), (0, "org-a"), (mode, r.stderr))
+        r, s3 = self.w.go(FAKE_CLAUDE_ERROR="401")  # a też odmawia: nie ma już innej organizacji
+        self.assertEqual(s3["payer"]["org_id"], "org-a")
+        r, s4 = self.w.go()
+        self.assertEqual((r.returncode, s4["mode"], s4["payer"]["email"]), (0, "subscription", TAIL), r.stderr)
+        r, _ = self.w.go(mode="credits")
+        self.assertEqual(r.returncode, 75)
+        self.assertIn("d@example.com: omijany do", r.stderr)
+        self.assertIn("poza omijanymi nie ma żadnej", r.stderr)
+        self.assertNotIn("pula jest pusta", r.stderr)
+        self.assertEqual([c["payer"] for c in self.w.calls()].count("key:org-d"), 1)  # d nie dostało już zapytania
+        data = self.w.avoid_orgs()
+        data["org-d"]["until"] = time.time() - 1  # wpis wygasł
+        write_json(os.path.join(self.w.runenv, "avoid-orgs.json"), data)
+        r, s5 = self.w.go()
+        self.assertEqual((r.returncode, s5["payer"]["org_id"]), (0, "org-d"), r.stderr)
+
+    def test_429_on_a_credit_org_avoids_it_for_three_hours_after_the_run_ends(self):
+        self.w.pool()
+        r, s = self.w.go(FAKE_CLAUDE_ERROR="429")
+        self.assertEqual((r.returncode, s["payer"]["org_id"]), (1, "org-d"), r.stderr)
+        entry = self.w.avoid_orgs()["org-d"]
+        self.assertEqual(entry["kind"], "limit")
+        self.assertAlmostEqual(entry["until"], s["ended_at"] + 3 * 3600, delta=60)
+        self.assertEqual(self.w.avoid(), {})  # konta subskrypcji to osobna lista
+        r, s2 = self.w.go()
+        self.assertEqual(s2["payer"]["org_id"], "org-a", r.stderr)
+
+    def test_the_avoid_entry_is_written_when_the_error_arrives_and_counted_again_from_the_end_of_the_run(self):
+        self.w.pool()
+        entry = os.path.join(self.w.runenv, "avoid-orgs.json")
+        mid = os.path.join(self.w.home, "mid-run.json")
+        # po błędzie bieg jeszcze 4 s żyje: wpis ma być już w trakcie (równoległy prepare go widzi), a po
+        # końcu `until` ma liczyć się od końca biegu, nie od chwili błędu
+        wait = (f"for i in $(seq 50); do [ -s {entry} ] && break; sleep 0.1; done; cp {entry} {mid}; sleep 4")
+        r, s = self.w.go(cmd=("sh", "-c", f"claude -p a; {wait}"), FAKE_CLAUDE_ERROR="401")
+        self.assertEqual(r.returncode, 0, r.stderr)  # kod komendy: sh kończy się po sleep
+        live = json.loads(read(mid))["org-d"]  # bez zapisu przy błędzie pliku w trakcie biegu nie ma
+        self.assertEqual(live["kind"], "auth")
+        final = self.w.avoid_orgs()["org-d"]
+        self.assertAlmostEqual(final["until"], s["ended_at"] + 24 * 3600, delta=1.5)  # < 4 s czekania
+        self.assertGreater(final["until"] - live["until"], 3)  # zapis końcowy przesunął wpis na koniec biegu
+
+    def test_a_longer_entry_wins_so_a_429_after_a_401_on_the_same_org_keeps_the_day(self):
+        self.w.pool()
+        r, s = self.w.go(cmd=("sh", "-c", "FAKE_CLAUDE_ERROR=401 claude -p a; FAKE_CLAUDE_ERROR=429 claude -p b; sleep 1"))
+        self.assertEqual(sorted(e["kind"] for e in s["errors"]), ["auth", "limit"], s["errors"])
+        entry = self.w.avoid_orgs()["org-d"]
+        self.assertEqual(entry["kind"], "auth")
+        self.assertAlmostEqual(entry["until"], s["ended_at"] + 24 * 3600, delta=1.5)
+
+    def test_a_corrupt_avoid_file_never_stops_a_run_or_its_bookkeeping(self):
+        self.w.pool()
+        path = os.path.join(self.w.runenv, "avoid-orgs.json")
+        broken = ([1], {"org-d": {"until": None}}, {"org-d": {"until": "tomorrow"}}, {"org-d": {"until": 1e12}},
+                  {"org-d": [], "org-a": "x"}, "text")
+        for content in broken:
+            with self.subTest(content=content):
+                write_json(path, content)
+                r, s = self.w.go()  # wybór płatnika nie wywraca się, a zepsuty wpis nie omija organizacji
+                self.assertEqual((r.returncode, s["payer"]["org_id"]), (0, "org-d"), r.stderr)
+                write_json(path, content)
+                before = len(self.w.ledger())
+                r, s = self.w.go(FAKE_CLAUDE_ERROR="401")  # settle: księgowanie mimo zepsutego pliku
+                self.assertEqual((r.returncode, s["payer"]["org_id"]), (1, "org-d"), r.stderr)
+                self.assertEqual(len(self.w.ledger()), before + 1)
+                self.assertEqual(self.w.ledger()[-1]["run"], s["run_id"])
+                history = [json.loads(x) for x in read(os.path.join(self.w.runenv, "history.jsonl")).splitlines()]
+                self.assertEqual(history[-1]["run_id"], s["run_id"])
+                self.assertEqual(self.w.runs_left(), [])
+                self.assertEqual(self.w.avoid_orgs()["org-d"]["kind"], "auth")  # plik naprawiony prawidłowym wpisem
+                os.remove(path)
+
+    def test_credits_add_lifts_the_avoid_entry_and_status_lists_it_until_then(self):
+        self.w.pool()
+        r, s = self.w.go(FAKE_CLAUDE_ERROR="401")
+        self.assertEqual(s["payer"]["org_id"], "org-d")
+        self.assertEqual(self.w.go(FAKE_CLAUDE_ERROR="429")[1]["payer"]["org_id"], "org-a")
+        r = self.w.run("status")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        until = self.w.avoid_orgs()["org-d"]["until"]
+        self.assertRegex(r.stdout, rf"d@example\.com \(org-d\): omijana do {time.strftime('%d.%m %H:%M', time.localtime(until))} "
+                                   rf"\(401 w biegu {s['run_id']}\)")
+        self.assertRegex(r.stdout, r"a@example\.com \(org-a\): omijana do .*\(429 w biegu ")
+        r = self.w.add("d@example.com", KEY_D, "--scope", "own", "--new-key")  # nowy klucz zdejmuje wpis tej organizacji
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(list(self.w.avoid_orgs()), ["org-a"])
+        self.assertNotIn("org-d", self.w.run("status").stdout.split("omijane przez biegi")[1])
+        self.w.stash("polid", "key@example.com", KEY_A)
+        r = self.w.run("add", "a@example.com", "--scope", "own", "--from-keychain", "polid/key@example.com")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.w.avoid_orgs(), {})
+        self.assertNotIn("omijane przez biegi", self.w.run("status").stdout)
+
     def test_429_on_a_subscription_account_makes_later_runs_avoid_it_and_401_marks_nothing(self):
         r, s = self.w.go(FAKE_CLAUDE_ERROR="401")
         self.assertEqual(r.returncode, 1, (r.stderr, s))
@@ -878,6 +1036,21 @@ class Isolation(unittest.TestCase):
         (entry,) = [e for e in self.w.ledger() if e.get("run") == info["run"]]
         self.assertAlmostEqual(entry["at"], asked, places=2)
         self.assertEqual(self.w.account("d@example.com")["remaining_usd"], 100.0)  # nie 99,50
+
+    def test_a_swept_run_avoids_its_credit_org_from_its_last_activity_not_from_the_sweep(self):
+        self.w.pool()
+        info = self.killed_owner(
+            "subprocess.run(['claude', '-p', 'a'], env=dict(run.env, FAKE_CLAUDE_ERROR='401'), capture_output=True)",
+            "while run.spent() < 0.001: time.sleep(0.05)",
+        )
+        died = time.time()
+        time.sleep(3)
+        sweep_began = time.time()
+        h = self.sweep()
+        self.assertEqual((h["run_id"], h["crashed"]), (info["run"], True))
+        until = self.w.avoid_orgs()["org-d"]["until"]
+        self.assertLess(until, sweep_began + 24 * 3600 - 2)  # okno liczone od końca aktywności biegu, nie od sprzątania
+        self.assertAlmostEqual(until, died + 24 * 3600, delta=2.5)
 
 
 class Version(unittest.TestCase):

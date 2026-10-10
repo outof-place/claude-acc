@@ -620,6 +620,16 @@ def cmd_status(args):
             f"{r['email']:<32}{r['scope']:<9}{money(r['granted_usd']):>10}{money(r['spent_usd']):>10}"
             f"{money(r['remaining_usd']):>10}  {reset:<12}{checked:<16}{r['state']}{plan}"
         )
+    try:
+        skipped = runenv().avoided_orgs()
+    except Exception as exc:  # status ma działać też wtedy, gdy lista omijanych nie da się odczytać
+        log(f"status: nie odczytałem listy omijanych: {exc}")
+        skipped = {}
+    if skipped:
+        print("\nomijane przez biegi (auto i credits; `credits add` zdejmuje wpis, `credits exec` go nie sprawdza):")
+        for org_id, item in sorted(skipped.items()):
+            who = item.get("email") or org_id
+            print(f"  {who} ({org_id}): omijana do {datetime.fromtimestamp(item['until']):%d.%m %H:%M} ({item.get('reason')})")
     print(
         "\nzostało = odczyt z Console minus wydatki zgłoszone później (bez odczytu: przyznane minus wydatki w cyklu)."
         "\nnowy odczyt: claude-acc credits balance <email> --remaining-usd KWOTA [--expires-at DATA]"
@@ -679,8 +689,15 @@ def cmd_add(args):
         save_registry(registry)
     origin = f", klucz ze wpisu {source[0]}/{source[1]}" if source else ""
     log(f"add: {email} -> {spec['org_id']} ({scope}, ${spec['granted_usd']:.0f}){origin}")
+    try:
+        lifted = runenv().lift_org_avoid(spec["org_id"])
+    except Exception as exc:  # lista omijanych to dodatek: nie cofa zapisanego konta
+        log(f"add: nie zdjąłem omijania {spec['org_id']}: {exc}")
+        lifted = False
     note = "" if found else f" (bez sprawdzenia w API: {problem})"
     print(f"połączone: {email}, organizacja {spec['org_id']}, {scope}, {money(spec['granted_usd'])} na cykl{note}")
+    if lifted:
+        print(f"organizacja {spec['org_id']} była omijana przez biegi po błędzie 401 albo 429; znów jest w wyborze")
     if source:
         print(f"klucz skopiowany do Pęku kluczy (usługa {KEYCHAIN_SERVICE}); wpis {source[0]}/{source[1]} zostaje, jak był")
     if not spec.get("resets_at") and email not in known_accounts():

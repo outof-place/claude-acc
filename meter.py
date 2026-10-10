@@ -169,8 +169,11 @@ def load_events(path):
 def report(events, mode, payer_email, started, payer_problems=(), metering_problems=()):
     """Rachunek biegu z jego zdarzeń.
 
-    started: ile sesji (`claude -p`) uruchomiono przez `claude` biegu. Licznik jest pełny, gdy
-    każda uruchomiona sesja przysłała zapytanie i każde zapytanie ma cost_usd. Werdykt płatnika:
+    started: ile nowych sesji (`claude -p` bez --resume, -r, --continue i -c, albo z --fork-session)
+    uruchomiono przez `claude` biegu. Wznowienie niesie session.id sesji, którą wznawia, więc nie
+    jest nową sesją do zobaczenia; jego zapytania liczą się do kosztu jak każde inne. Licznik jest
+    pełny, gdy zapytania przyszły z co najmniej tylu sesji, ile było nowych, i każde ma cost_usd.
+    Wznowienie nie dowodzi, że runda przed nim wysłała zdarzenia (to ta sama sesja). Werdykt płatnika:
     "mismatch", gdy cokolwiek zapłacił ktoś inny; "unverified", gdy licznik jest niepełny albo
     nie było żadnego zapytania (brak dowodu to nie dowód); "ok" w pozostałych przypadkach.
     """
@@ -188,7 +191,7 @@ def report(events, mode, payer_email, started, payer_problems=(), metering_probl
         models[model] = models.get(model, 0.0) + cost
     metering = list(metering_problems)
     if started > len(sessions):
-        metering.append(f"zapytania przyszły z {len(sessions)} z {started} uruchomionych sesji")
+        metering.append(f"zapytania przyszły z {len(sessions)} z {started} nowych sesji (bez wznowień)")
     if missing:
         metering.append(f"{missing} zapytań bez cost_usd")
     payer = []

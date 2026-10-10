@@ -991,7 +991,7 @@ class Banners(Base):
 
 
 class Payment(Base):
-    """Bramka A2b (S18, O7): job auto zostaje na auto; tylko kredyt z 401 albo limitem przełącza slot."""
+    """Bramka A2b (S18, O7) i A1fu: job auto zostaje na auto, także po 401 albo limicie na kredycie."""
 
     def test_subscription_429_in_auto_stays_auto_and_lands_on_another_account(self):
         w = self.world(waw(2026, 10, 11, 12))
@@ -1007,10 +1007,11 @@ class Payment(Base):
         self.assertEqual(got, [("BŁĄD", "7@example.com"), ("OPUBLIKOWANO", "9@example.com")])  # nie POMINIĘTO, nie 7@
         self.assertEqual(w.slots("matura")["2026-10-12/1"]["outcome"], "OPUBLIKOWANO")
 
-    def test_credits_401_moves_the_rest_of_the_slot_to_subscription_even_after_a_memory_skip(self):
+    def test_credits_401_stays_auto_and_the_next_attempt_takes_another_org_even_after_a_memory_skip(self):
+        # najpierw kredyt (plan, decyzja 1): po 401 na org-a następna próba bierze org-b, nie subskrypcję
         w = self.world(waw(2026, 10, 11, 12))
         w.add("matura", *EVERY2_ODD)
-        pool = {"credits": ["org-a"], "subscription": ["7@example.com"]}
+        pool = {"credits": ["org-a", "org-b"], "subscription": ["7@example.com"]}
         w.plan("matura", {"pool": pool, "outcome": "BŁĄD", "retryable": True, "override": "auth", "switch_payment": True,
                           "reason": "401 w liczniku: klucz organizacji"},
                {"outcome": "POMINIĘTO", "skip": "memory", "reason": "bramka pamięci nie wpuściła"},
@@ -1020,10 +1021,23 @@ class Payment(Base):
         w.every(waw(2026, 10, 12, 9, 16), waw(2026, 10, 12, 9, 30))  # pamięć: nic przed 20 min
         self.assertEqual(len(w.calls()), 2)
         w.every(waw(2026, 10, 12, 9, 32), waw(2026, 10, 12, 9, 34))
-        self.assertEqual([c["mode"] for c in w.calls()], [None, "subscription", "subscription"])
+        self.assertEqual([c["mode"] for c in w.calls()], [None, None, None])
+        got = [(r["outcome"], (r["payer"] or {}).get("org_id")) for r in w.history("matura")]
+        self.assertEqual(got, [("BŁĄD", "org-a"), ("POMINIĘTO", None), ("OPUBLIKOWANO", "org-b")])
+        self.assertEqual(w.slots("matura")["2026-10-12/1"]["attempts"], 2)  # POMINIĘTO memory nie zjada próby
+
+    def test_credits_limit_with_no_other_org_stays_auto_and_lands_on_a_subscription(self):
+        w = self.world(waw(2026, 10, 11, 12))
+        w.add("matura", *EVERY2_ODD)
+        pool = {"credits": ["org-a"], "subscription": ["7@example.com"]}
+        w.plan("matura", {"pool": pool, "outcome": "BŁĄD", "retryable": True, "override": "limit", "switch_payment": True,
+                          "reason": "429 w liczniku"},
+               {"pool": pool, "outcome": "OPUBLIKOWANO"})  # fmt: skip
+        w.every(waw(2026, 10, 12, 8, 10), waw(2026, 10, 12, 8, 12))
+        w.every(waw(2026, 10, 12, 9, 12), waw(2026, 10, 12, 9, 14))
+        self.assertEqual([c["mode"] for c in w.calls()], [None, None])
         last = w.history("matura")[-1]
         self.assertEqual((last["outcome"], last["payer"]["mode"], last["payer"]["email"]), ("OPUBLIKOWANO", "subscription", "7@example.com"))
-        self.assertEqual(w.slots("matura")["2026-10-12/1"]["attempts"], 2)  # POMINIĘTO memory nie zjada próby
 
 
 class OutsideRuns(Base):
