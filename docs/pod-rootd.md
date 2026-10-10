@@ -245,17 +245,21 @@ helper runs again.
 
 ## Migration from the five root daemons
 
-`legacy.migrate`, offered by Pod once the helper is enabled and any of the five plists exist:
+`legacy.migrate`, offered by Pod once the helper is enabled and any of the old plists exist. It
+takes over fans, fsguard, iogpu and vnodes; the hotspot daemon stays until `hotspot.py` runs its
+controller as the user and sets the limit through `shaper.set` (a follow-up), so hotspot turbo keeps
+working in between.
 
 1. reads what they hold: `kern.maxvnodes=N` and `iogpu.wired_limit_mb=N` from their
    `ProgramArguments`, the fan mode from the `fans.json` named by the fans plist (opened with
-   `O_NOFOLLOW`, 4 KB at most), fsguard present or not, hotspot present or not;
+   `O_NOFOLLOW`, 4 KB at most), fsguard present or not, and the Spotlight list `perf-root.sh` saved
+   before apps-only (so `spotlight.restore` still has it);
 2. `launchctl bootout system/<label>` for each (the fans daemon hands the fans back on SIGTERM and
-   drops its lid hold, the hotspot daemon drops its limit);
+   drops its lid hold);
 3. moves each plist to `/var/db/codes.pod.app.rootd/legacy/<label>.plist`; the binaries in
    `/usr/local/libexec` stay, for rollback;
 4. applies the same settings through its own verbs and persists them (fans mode, sysctls, fsguard
-   on). Hotspot needs nothing from the helper: the user-side controller reads `hotspot.json`.
+   on).
 
 The labels are a fixed list, nothing else in `/Library/LaunchDaemons` is touched. Running it again
 changes nothing.
@@ -299,6 +303,16 @@ under Pod's signature (`ELECTRON_RUN_AS_NODE=1`) and pass the peer requirement.
 
 Nothing in this branch registers or installs anything. The real cutover is a manual step with the
 user present (Login Items approval, Touch ID); the command list goes to the lead with the PR.
+
+What has to land before it, or the migration leaves a feature without its daemon:
+
+- Pod Menu talks to the helper: fan mode and the lid hold through `PodRootdClient` (one client
+  kept while Stay Awake with the lid closed is on), fan readings from `SMCKit` instead of
+  `fans-state.json`. Until then the old fans daemon is what follows `fans.json` and `awake.json`.
+- `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, `sudo` otherwise.
+- `hotspot.py` as the user with `pod-rootctl shaper follow`, then `hotspot` joins `Engine.migrating`.
+- Pod's payload carries `pod-rootd`, `pod-rootctl` and the plist; Pod registers the daemon as
+  `daemonService` and signs both binaries (see Signing).
 
 ## Code
 

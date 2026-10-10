@@ -1,0 +1,482 @@
+import Foundation
+import Testing
+@testable import PodRootdCore
+import PodRootdProtocol
+
+// The engine on the fake machine: each verb idempotent, the rules fanctl, Lid and fsguard.py had,
+// what survives a restart, the migration and the restore.
+
+private let hour = LidSeconds(3600)!
+
+// MARK: Fans
+
+@Test("a fixed fan setting goes to the SMC once; the same setting again changes nothing")
+func fansIdempotent() {
+    let rig = Rig()
+    #expect(rig.changed(rig.send(.fansSet(mode: fan50))) == true)
+    #expect(rig.changed(rig.send(.fansSet(mode: fan50))) == false)
+    rig.engine.tick()
+    #expect(rig.backend.calls == ["applyFans 50%"])
+    #expect(rig.changed(rig.send(.fansSet(mode: .auto))) == true)
+    #expect(rig.changed(rig.send(.fansSet(mode: .auto))) == false)
+    #expect(rig.backend.calls == ["applyFans 50%", "applyFans auto"])
+}
+
+@Test("95 °C under a fixed setting gives full speed, below 85 °C the setting comes back")
+func fansBoost() {
+    let rig = Rig()
+    rig.send(.fansSet(mode: fan50))
+    rig.backend.hottest = 96
+    rig.engine.tick()
+    #expect(rig.engine.status().fans.boosting)
+    #expect(rig.engine.status().fans.applied == .fixed(FanPercent(100)!))
+    rig.backend.hottest = 90
+    rig.engine.tick()
+    #expect(rig.engine.status().fans.applied == .fixed(FanPercent(100)!))
+    rig.backend.hottest = 80
+    rig.engine.tick()
+    #expect(!rig.engine.status().fans.boosting)
+    #expect(rig.backend.calls == ["applyFans 50%", "applyFans 100%", "applyFans 50%"])
+}
+
+@Test("a setting the SMC lost over sleep comes back; another app's setting is reported, not fought")
+func fansSleepAndConflict() {
+    let rig = Rig()
+    rig.send(.fansSet(mode: fan50))
+    for i in rig.backend.fans.indices { rig.backend.fans[i].manual = false }
+    rig.engine.tick()
+    #expect(rig.backend.calls == ["applyFans 50%", "applyFans 50%"])
+    rig.backend.fans[0].target = rig.backend.fans[0].max
+    rig.engine.tick()
+    rig.engine.tick()
+    #expect(rig.engine.status().fans.conflict)
+    #expect(rig.backend.calls.count == 2)
+    // picking a mode again takes the fans back
+    rig.send(.fansSet(mode: fan50))
+    #expect(!rig.engine.status().fans.conflict)
+    #expect(rig.backend.calls.count == 3)
+}
+
+@Test("an SMC write that fails hands the fans back to macOS and says why")
+func fansFailure() {
+    let rig = Rig()
+    rig.backend.failing = ["applyFans"]
+    let reply = rig.send(.fansSet(mode: fan50))
+    guard case .failed? = reply.refusal else {
+        Issue.record("expected a failure, got \(reply.outcome)")
+        return
+    }
+    #expect(reply.status?.fans.error != nil)
+}
+
+// MARK: Lid
+
+@Test("a lid hold turns SleepDisabled on; releasing it, or the session ending, turns it off")
+func lidLease() {
+    let rig = Rig()
+    #expect(rig.changed(rig.send(.lidHold(seconds: hour))) == true)
+    #expect(rig.backend.sleepIsDisabled)
+    #expect(rig.changed(rig.send(.lidHold(seconds: hour))) == false)
+    rig.send(.lidRelease)
+    #expect(!rig.backend.sleepIsDisabled)
+    rig.send(.lidHold(seconds: hour), session: SessionID(7))
+    rig.engine.sessionEnded(SessionID(7))
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.lastRelease == "session ended")
+}
+
+@Test("two sessions holding the lid: it stays held until the last one goes")
+func lidTwoSessions() {
+    let rig = Rig()
+    rig.send(.lidHold(seconds: hour), session: SessionID(1))
+    rig.send(.lidHold(seconds: hour), session: SessionID(2))
+    rig.engine.sessionEnded(SessionID(1))
+    #expect(rig.backend.sleepIsDisabled)
+    rig.engine.sessionEnded(SessionID(2))
+    #expect(!rig.backend.sleepIsDisabled)
+}
+
+@Test("the hold ends on time, at 10% battery, and when the Mac gets hot (then not again for 15 minutes)")
+func lidLetsGo() {
+    let rig = Rig()
+    rig.send(.lidHold(seconds: LidSeconds(60)!))
+    rig.clock.advance(61)
+    rig.engine.tick()
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.lastRelease == "expired")
+
+    rig.send(.lidHold(seconds: hour))
+    rig.backend.lowBattery = true
+    rig.engine.tick()
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.lastRelease == "battery")
+    rig.backend.lowBattery = false
+    rig.engine.tick()
+    #expect(rig.backend.sleepIsDisabled)
+
+    rig.backend.hot = true
+    rig.engine.tick()
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.lastRelease == "thermal")
+    rig.backend.hot = false
+    rig.clock.advance(14 * 60)
+    rig.engine.tick()
+    #expect(!rig.backend.sleepIsDisabled)
+    rig.clock.advance(2 * 60)
+    rig.engine.tick()
+    #expect(rig.backend.sleepIsDisabled)
+}
+
+@Test("someone else's SleepDisabled (Amphetamine, pmset by hand) is never turned off")
+func lidLeavesOthersAlone() {
+    let rig = Rig()
+    rig.backend.sleepIsDisabled = true
+    rig.send(.lidHold(seconds: hour))
+    #expect(!rig.engine.status().lid.heldByUs)
+    rig.send(.lidRelease)
+    #expect(rig.backend.sleepIsDisabled)
+    #expect(!rig.backend.calls.contains { $0.hasPrefix("setSleepDisabled") })
+}
+
+// MARK: Sysctls
+
+@Test("sysctl set keeps the value from before; reset puts it back; the same value twice changes nothing")
+func sysctlSetReset() {
+    let rig = Rig()
+    let vnodes = SysctlSetting.maxVnodes(MaxVnodes(786_432)!)
+    #expect(rig.changed(rig.send(.sysctlSet(setting: vnodes, persist: false))) == true)
+    #expect(rig.changed(rig.send(.sysctlSet(setting: vnodes, persist: false))) == false)
+    let status = rig.engine.status().sysctls.first { $0.key == .maxVnodes }
+    #expect(status?.current == 786_432)
+    #expect(status?.original == 263_168)
+    #expect(status?.persisted == nil)
+    #expect(rig.changed(rig.send(.sysctlReset(key: .maxVnodes))) == true)
+    #expect(rig.backend.sysctls[.maxVnodes] == 263_168)
+    #expect(rig.changed(rig.send(.sysctlReset(key: .maxVnodes))) == false)
+}
+
+@Test("a persisted sysctl comes back after a reboot, and the new boot's default becomes the original")
+func sysctlPersistAcrossBoot() {
+    let rig = Rig()
+    rig.send(.sysctlSet(setting: .gpuWiredLimit(.megabytes(GPUMegabytes(40_960)!)), persist: true))
+    rig.send(.sysctlSet(setting: .maxVnodes(MaxVnodes(786_432)!), persist: false))
+    // reboot: the kernel forgot both
+    rig.backend.bootTime += 86_400
+    rig.backend.sysctls = [.maxVnodes: 300_000, .gpuWiredLimitMB: 0]
+    let after = rig.restarted()
+    #expect(rig.backend.sysctls[.gpuWiredLimitMB] == 40_960)
+    #expect(rig.backend.sysctls[.maxVnodes] == 300_000)
+    let gpu = after.engine.status().sysctls.first { $0.key == .gpuWiredLimitMB }
+    #expect(gpu?.persisted == 40_960)
+    #expect(gpu?.original == 0)
+    #expect(after.engine.state.sysctls[SysctlKey.maxVnodes.rawValue] == nil)
+}
+
+@Test("a GPU limit that leaves the system under 4 GB is refused; a value the kernel won't take is undone")
+func sysctlRefusals() {
+    let rig = Rig()
+    let tooMuch = rig.send(.sysctlSet(setting: .gpuWiredLimit(.megabytes(GPUMegabytes(46_000)!)), persist: false))
+    guard case .invalid? = tooMuch.refusal else {
+        Issue.record("expected invalid, got \(tooMuch.outcome)")
+        return
+    }
+    rig.backend.stubbornSysctls = [.maxVnodes]
+    let stubborn = rig.send(.sysctlSet(setting: .maxVnodes(MaxVnodes(786_432)!), persist: true))
+    guard case .failed? = stubborn.refusal else {
+        Issue.record("expected failed, got \(stubborn.outcome)")
+        return
+    }
+    #expect(rig.engine.state.sysctls.isEmpty)
+}
+
+// MARK: Upload limit
+
+@Test("shaper set keeps the limit from before; clear puts it back; rounding by ifconfig is the same rate")
+func shaperSetClear() {
+    let rig = Rig()
+    rig.backend.limits["en0"] = 650_000
+    #expect(rig.changed(rig.send(.shaperSet(interface: en0, kbps: UplinkKbps(27_000)!, scope: .untilReboot))) == true)
+    rig.backend.limits["en0"] = 27_004  // ifconfig prints 27.00 Mbps
+    #expect(rig.changed(rig.send(.shaperSet(interface: en0, kbps: UplinkKbps(27_000)!, scope: .untilReboot))) == false)
+    rig.send(.shaperClear(interface: en0))
+    #expect(rig.backend.limits["en0"] == 650_000)
+    #expect(rig.engine.state.shapers.isEmpty)
+}
+
+@Test("a session's limit (the hotspot controller) goes when its session ends; a missing interface is refused")
+func shaperSession() {
+    let rig = Rig()
+    rig.send(.shaperSet(interface: InterfaceName("en8")!, kbps: UplinkKbps(30_000)!, scope: .session), session: SessionID(4))
+    rig.send(.shaperSet(interface: InterfaceName("en8")!, kbps: UplinkKbps(27_000)!, scope: .session), session: SessionID(4))
+    #expect(rig.backend.limits["en8"] == 27_000)
+    #expect(!rig.engine.isIdle)
+    rig.engine.sessionEnded(SessionID(4))
+    #expect(rig.backend.limits["en8"] == nil)
+    #expect(rig.engine.isIdle)
+    let missing = rig.send(.shaperSet(interface: InterfaceName("en5")!, kbps: UplinkKbps(1000)!, scope: .session))
+    #expect(missing.refusal == .unsupported("no interface en5"))
+}
+
+// MARK: Spotlight and power
+
+@Test("apps-only saves the Privacy list once; restore puts it back; both twice change nothing")
+func spotlight() {
+    let rig = Rig()
+    let before = rig.backend.exclusions
+    #expect(rig.changed(rig.send(.spotlightAppsOnly)) == true)
+    #expect(rig.changed(rig.send(.spotlightAppsOnly)) == false)
+    #expect(rig.backend.exclusions == rig.backend.appsOnly)
+    #expect(rig.backend.spotlightReloads == 1)
+    #expect(rig.engine.status().spotlight.savedEntries == before.count)
+    #expect(rig.changed(rig.send(.spotlightRestore)) == true)
+    #expect(rig.backend.exclusions == before)
+    #expect(rig.changed(rig.send(.spotlightRestore)) == false)
+}
+
+@Test("high power mode only where the Mac has it; the first change remembers the mode before")
+func powerMode() {
+    let rig = Rig()
+    rig.backend.highPowerCapable = false
+    #expect(rig.send(.powerMode(source: .ac, mode: .high)).refusal == .unsupported("this Mac has no high power mode"))
+    rig.backend.highPowerCapable = true
+    #expect(rig.changed(rig.send(.powerMode(source: .ac, mode: .high))) == true)
+    #expect(rig.changed(rig.send(.powerMode(source: .ac, mode: .high))) == false)
+    #expect(rig.engine.status().power.originalAC == .automatic)
+}
+
+// MARK: Rate limits
+
+@Test("fans: three changes at once, the fourth waits; a second later one more goes through")
+func rateLimit() {
+    let rig = Rig(limits: RateLimiter.standard)
+    for percent in [40, 50, 60] {
+        #expect(rig.send(.fansSet(mode: .fixed(FanPercent(percent)!))).refusal == nil)
+    }
+    guard case .rateLimited(let after)? = rig.send(.fansSet(mode: .fixed(FanPercent(70)!))).refusal else {
+        Issue.record("expected a rate limit")
+        return
+    }
+    #expect(after > 0 && after <= 2)
+    // another caller has its own bucket, and status is its own class
+    #expect(rig.send(.fansSet(mode: .fixed(FanPercent(70)!)), as: .cli).refusal == nil)
+    #expect(rig.send(.status).refusal == nil)
+    rig.clock.advance(2)
+    #expect(rig.send(.fansSet(mode: .fixed(FanPercent(70)!))).refusal == nil)
+}
+
+// MARK: fsguard
+
+@Test("fsguard restarts fseventsd after two readings over the limit, then waits 5 minutes")
+func fsguard() {
+    let rig = Rig()
+    rig.send(.fsguardSet(enabled: true, limitMB: .standard))
+    rig.engine.tick()
+    #expect(rig.engine.status().fsguard.footprintMB == 40)
+    rig.backend.footprints["fseventsd"]?.bytes = 5 << 30
+    rig.clock.advance(60)
+    rig.engine.tick()
+    #expect(rig.backend.terminated.isEmpty)
+    rig.clock.advance(60)
+    rig.engine.tick()
+    #expect(rig.backend.terminated == [321])
+    #expect(rig.engine.status().fsguard.generation == 1)
+    // still over: two more readings, but within 5 minutes of the restart
+    rig.clock.advance(60)
+    rig.engine.tick()
+    rig.clock.advance(60)
+    rig.engine.tick()
+    #expect(rig.backend.terminated.count == 1)
+    rig.clock.advance(240)
+    rig.engine.tick()
+    #expect(rig.backend.terminated.count == 2)
+    // between minutes a tick reads nothing
+    rig.clock.advance(10)
+    rig.engine.tick()
+    #expect(rig.backend.terminated.count == 2)
+}
+
+// MARK: Restart and shutdown
+
+@Test("after a restart a fixed fan setting is applied again and a lid hold of ours is let go")
+func restart() {
+    let rig = Rig()
+    rig.send(.fansSet(mode: fan50))
+    rig.send(.lidHold(seconds: hour))
+    // the helper dies; the SMC forgets the fans
+    for i in rig.backend.fans.indices { rig.backend.fans[i].manual = false }
+    let after = rig.restarted()
+    #expect(after.engine.status().fans.applied == fan50)
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(after.engine.status().lid.lastRelease == "helper restarted")
+}
+
+@Test("SIGTERM hands the fans back and lets go of the lid; the fan mode stays for the next start")
+func shutdown() {
+    let rig = Rig()
+    rig.send(.fansSet(mode: fan50))
+    rig.send(.lidHold(seconds: hour))
+    rig.send(.shaperSet(interface: en0, kbps: UplinkKbps(20_000)!, scope: .session))
+    rig.engine.shutdown()
+    #expect(rig.backend.fans.allSatisfy { !$0.manual })
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.backend.limits["en0"] == nil)
+    #expect(rig.store.saved?.fans == fan50)
+    #expect(rig.store.saved?.lidHeldByUs == false)
+}
+
+@Test("idle: nothing held, so the helper may exit and wait for launchd")
+func idle() {
+    let rig = Rig()
+    #expect(rig.engine.isIdle)
+    #expect(rig.engine.nextTickDelay == nil)
+    rig.send(.fansSet(mode: fan50))
+    #expect(!rig.engine.isIdle)
+    #expect(rig.engine.nextTickDelay == 2)
+    rig.send(.fansSet(mode: .auto))
+    rig.send(.fsguardSet(enabled: true, limitMB: .standard))
+    #expect(!rig.engine.isIdle)
+}
+
+// MARK: The five old daemons
+
+private func legacyMachine() -> FakeBackend {
+    let backend = FakeBackend()
+    let config = "/Users/x/.local/share/claude-acc/fans.json"
+    backend.legacyPlists = [
+        .fans: ["/usr/local/libexec/claude-acc-fanctl", "daemon", "--config", config, "--state", "/Users/x/s.json"],
+        .vnodes: ["/usr/sbin/sysctl", "-w", "kern.maxvnodes=786432"],
+        .iogpu: ["/usr/sbin/sysctl", "-w", "iogpu.wired_limit_mb=40960"],
+        .fsguard: ["/usr/local/libexec/claude-acc-fsguard"],
+        .hotspot: ["/usr/local/libexec/claude-acc-hotspot", "daemon"],
+    ]
+    backend.legacyBooted = Set(LegacyDaemon.allCases)
+    backend.fanConfigs = [config: .fixed(FanPercent(60)!)]
+    backend.sysctls = [.maxVnodes: 786_432, .gpuWiredLimitMB: 40_960]
+    backend.savedSpotlightList = ["/Users/x/Movies"]
+    return backend
+}
+
+@Test("migrate takes over what four of the old daemons did, moves their plists aside, and is a no-op the second time")
+func legacyMigrate() {
+    let rig = Rig(backend: legacyMachine())
+    let reply = rig.send(.legacyMigrate)
+    guard case .done(true, _, .legacy(let daemons)?) = reply.outcome else {
+        Issue.record("unexpected \(reply.outcome)")
+        return
+    }
+    #expect(Set(daemons) == [.fans, .fsguard, .iogpu, .vnodes])
+    // hotspot stays until its controller runs as the user
+    #expect(Array(rig.backend.legacyPlists.keys) == [.hotspot])
+    #expect(rig.backend.legacyAside.count == 4)
+    #expect(rig.backend.calls.filter { $0.hasPrefix("bootout") }.count == 4)
+    let status = rig.engine.status()
+    #expect(status.fans.mode == .fixed(FanPercent(60)!))
+    #expect(status.sysctls.first { $0.key == .maxVnodes }?.persisted == 786_432)
+    #expect(status.sysctls.first { $0.key == .gpuWiredLimitMB }?.persisted == 40_960)
+    #expect(status.fsguard.enabled)
+    #expect(status.spotlight.appsOnly)
+    #expect(status.legacy.allSatisfy { $0.daemon == .hotspot ? $0.installed && !$0.migrated : $0.migrated && !$0.installed })
+    #expect(rig.changed(rig.send(.legacyMigrate)) == false)
+}
+
+@Test("rollback puts the plists back, starts them, and turns the helper's copies of their work off")
+func legacyRollback() {
+    let rig = Rig(backend: legacyMachine())
+    rig.send(.legacyMigrate)
+    #expect(rig.changed(rig.send(.legacyRollback)) == true)
+    #expect(rig.backend.legacyPlists.count == 5)
+    #expect(rig.backend.legacyAside.isEmpty)
+    #expect(rig.backend.calls.filter { $0.hasPrefix("bootstrap") }.count == 4)
+    let status = rig.engine.status()
+    #expect(status.fans.mode == .auto)
+    #expect(status.sysctls.allSatisfy { $0.persisted == nil })
+    #expect(!status.fsguard.enabled)
+    #expect(status.legacy.allSatisfy { $0.installed && !$0.migrated })
+    #expect(rig.changed(rig.send(.legacyRollback)) == false)
+}
+
+@Test("migrate without the old daemons changes nothing")
+func legacyNothing() {
+    let rig = Rig()
+    #expect(rig.changed(rig.send(.legacyMigrate)) == false)
+    #expect(rig.backend.calls.isEmpty)
+}
+
+// MARK: Restore
+
+@Test("restoreDefaults: fans auto, sleep allowed, sysctls and limits and Spotlight and power back, nothing persisted")
+func restoreDefaults() {
+    let rig = Rig()
+    rig.backend.limits["en0"] = 650_000
+    rig.send(.fansSet(mode: fan50))
+    rig.send(.lidHold(seconds: hour))
+    rig.send(.sysctlSet(setting: .maxVnodes(MaxVnodes(786_432)!), persist: true))
+    rig.send(.sysctlSet(setting: .gpuWiredLimit(.megabytes(GPUMegabytes(40_960)!)), persist: true))
+    rig.send(.shaperSet(interface: en0, kbps: UplinkKbps(27_000)!, scope: .untilReboot))
+    rig.send(.spotlightAppsOnly)
+    rig.send(.powerMode(source: .ac, mode: .high))
+    rig.send(.fsguardSet(enabled: true, limitMB: .standard))
+    let before = rig.backend.calls.count
+    #expect(rig.changed(rig.send(.restoreDefaults)) == true)
+    #expect(rig.backend.fans.allSatisfy { !$0.manual })
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.backend.sysctls == [.maxVnodes: 263_168, .gpuWiredLimitMB: 0])
+    #expect(rig.backend.limits["en0"] == 650_000)
+    #expect(rig.backend.exclusions == ["/Users/x/Movies"])
+    #expect(rig.backend.powerModes[.ac] == .automatic)
+    let state = rig.store.saved
+    #expect(state?.fans == .auto)
+    #expect(state?.sysctls.isEmpty == true)
+    #expect(state?.shapers.isEmpty == true)
+    #expect(state?.spotlightApplied == false)
+    #expect(state?.powerOriginal.isEmpty == true)
+    #expect(state?.fsguard.enabled == false)
+    #expect(rig.engine.isIdle)
+    // and again: nothing left to do
+    let after = rig.backend.calls.count
+    #expect(after > before)
+    #expect(rig.changed(rig.send(.restoreDefaults)) == false)
+    #expect(rig.backend.calls.count == after)
+}
+
+@Test("a restore that partly fails reports what failed and still does the rest")
+func restorePartialFailure() {
+    let rig = Rig()
+    rig.send(.fansSet(mode: fan50))
+    rig.send(.sysctlSet(setting: .maxVnodes(MaxVnodes(786_432)!), persist: true))
+    rig.backend.failing = ["setSysctl"]
+    let reply = rig.send(.restoreDefaults)
+    guard case .failed(let why)? = reply.refusal else {
+        Issue.record("expected a failure, got \(reply.outcome)")
+        return
+    }
+    #expect(why.contains("kern.maxvnodes"))
+    #expect(rig.backend.fans.allSatisfy { !$0.manual })
+}
+
+// MARK: System verbs
+
+@Test("orphan launchd plists: a dry run only lists them, a real run parks them")
+func orphans() {
+    let rig = Rig()
+    let orphan = Orphan(label: "com.gone.helper", plist: "/Library/LaunchDaemons/com.gone.helper.plist",
+                        program: "/Library/PrivilegedHelperTools/com.gone.helper", domain: "system")
+    rig.backend.orphans = [orphan]
+    #expect(rig.send(.launchdParkOrphans(dryRun: true)).outcome == .done(changed: false, note: nil, report: .orphans([orphan], parked: false)))
+    #expect(rig.backend.parked.isEmpty)
+    #expect(rig.send(.launchdParkOrphans(dryRun: false)).outcome == .done(changed: true, note: nil, report: .orphans([orphan], parked: true)))
+    #expect(rig.backend.parked == [orphan])
+    #expect(rig.changed(rig.send(.launchdParkOrphans(dryRun: false))) == false)
+}
+
+@Test("every change goes to the state file; a status read doesn't write it")
+func persistence() {
+    let rig = Rig()
+    let saves = rig.store.saves
+    rig.send(.status)
+    rig.send(.status)
+    #expect(rig.store.saves == saves)
+    rig.send(.fansSet(mode: fan50))
+    #expect(rig.store.saves == saves + 1)
+    #expect(rig.store.saved?.fans == fan50)
+}

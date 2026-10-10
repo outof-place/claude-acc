@@ -14,6 +14,14 @@ let core: [SwiftSetting] = [
     .enableUpcomingFeature("InferIsolatedConformances"),
 ]
 
+// a bare executable's Info.plist in __TEXT,__info_plist: codesign takes the signing identifier from its
+// CFBundleIdentifier, so pod-rootd and pod-rootctl keep theirs whoever signs them (the helper's peer
+// requirement names them)
+func infoPlist(_ target: String) -> [LinkerSetting] {
+    let path = Context.packageDirectory + "/Sources/" + target + "/Info.plist"
+    return [.unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist", "-Xlinker", path])]
+}
+
 let package = Package(
     name: "ClaudeAcc",
     platforms: [.macOS("26.0")],
@@ -39,6 +47,24 @@ let package = Package(
         .executableTarget(name: "claude-acc-pause", path: "Sources/pause"),
         // natywny pomocnik bramy pulpitu: CGEvent, ScreenCaptureKit, AX dla desktop.py
         .executableTarget(name: "claude-acc-desktop", path: "Sources/desktop", swiftSettings: settings),
+        // pod-rootd, Pod's one root helper (docs/pod-rootd.md): the wire types, the client Pod and Pod Menu
+        // link, the engine behind a backend protocol, the daemon, and the CLI the scripts call
+        .target(name: "PodRootdProtocol", path: "Sources/PodRootdProtocol", swiftSettings: core),
+        .target(
+            name: "PodRootdClient", dependencies: ["PodRootdProtocol"], path: "Sources/PodRootdClient",
+            swiftSettings: core),
+        .target(
+            name: "PodRootdCore", dependencies: ["PodRootdProtocol"], path: "Sources/PodRootdCore",
+            swiftSettings: settings),
+        .executableTarget(
+            name: "pod-rootd", dependencies: ["PodRootdCore", "SMCKit"], path: "Sources/pod-rootd",
+            exclude: ["Info.plist"], swiftSettings: settings, linkerSettings: infoPlist("pod-rootd")),
+        .executableTarget(
+            name: "pod-rootctl", dependencies: ["PodRootdClient"], path: "Sources/pod-rootctl",
+            exclude: ["Info.plist"], swiftSettings: settings, linkerSettings: infoPlist("pod-rootctl")),
+        .testTarget(
+            name: "PodRootdTests", dependencies: ["PodRootdCore", "PodRootdClient"], path: "Tests/PodRootdTests",
+            swiftSettings: settings),
     ],
     swiftLanguageModes: [.v6]
 )
