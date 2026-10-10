@@ -28,7 +28,8 @@ let package = Package(
     targets: [
         // the menu bar app
         .executableTarget(
-            name: "ClaudeAcc", dependencies: ["DictationCore"], path: "Sources/ClaudeAcc", swiftSettings: settings),
+            name: "ClaudeAcc", dependencies: ["DictationCore", "PodRootdClient", "SMCKit"], path: "Sources/ClaudeAcc",
+            swiftSettings: settings),
         // dictation without AppKit: text rules, the AI Gateway client, audio math, the right ⌥ trigger
         .target(name: "DictationCore", path: "Sources/DictationCore", swiftSettings: core),
         .testTarget(
@@ -36,7 +37,8 @@ let package = Package(
             resources: [.copy("Fixtures")], swiftSettings: core),
         // the panel's own logic: what a state file or a script's answer means on screen
         .testTarget(
-            name: "ClaudeAccTests", dependencies: ["ClaudeAcc"], path: "Tests/ClaudeAccTests", swiftSettings: settings),
+            name: "ClaudeAccTests", dependencies: ["ClaudeAcc", "PodRootdCore"], path: "Tests/ClaudeAccTests",
+            swiftSettings: settings),
         // fan control through the SMC; runs as a root LaunchDaemon, see install-fans.sh
         .executableTarget(name: "fanctl", dependencies: ["SMCKit"], path: "Sources/fanctl", swiftSettings: settings),
         // the SMC and the fans, for fanctl, pod-rootd and the panel (reading needs no root)

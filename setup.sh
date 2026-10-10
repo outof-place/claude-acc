@@ -262,6 +262,12 @@ case "$1" in
     # porządki roota z kopii roota (claude-acc root install): nigdy skrypt z $STATE pod sudo
     if [ "${1:-}" = root-clean ]; then
       shift
+      # in Pod its root helper does it, without sudo (rootroute.py); 75 falls through to the root copy
+      if [ -x "$STATE/pod-rootctl" ]; then
+        "$PY" "$STATE/rootroute.py" janitor-root "$@"
+        rc=$?
+        [ "$rc" -eq 75 ] || exit "$rc"
+      fi
       [ -x /usr/local/libexec/claude-acc-root/root-run.sh ] || { echo "najpierw raz: claude-acc root install" >&2; exit 1; }
       exec sudo /usr/local/libexec/claude-acc-root/root-run.sh janitor-root "$@"
     fi
@@ -315,6 +321,13 @@ case "$1" in
   mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)
     shift
+    # in Pod its root helper does it, without sudo (rootroute.py); 75: Pod doesn't own claude-acc,
+    # the helper doesn't answer, or an old root daemon still owns the tweak, so the root copy below
+    if [ -x "$STATE/pod-rootctl" ]; then
+      "$PY" "$STATE/rootroute.py" perf-root "$@"
+      rc=$?
+      [ "$rc" -eq 75 ] || exit "$rc"
+    fi
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     # stan limitu GPU to tylko odczyt sysctl i plisty demona
