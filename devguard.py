@@ -43,6 +43,8 @@ Komendy:
   pins                  przypięcia, ich powody i terminy
   admit [--codex]       hook PreToolUse (Bash) dla Claude Code, z --codex dla Codeksa; zdarzenie
                         czyta z stdin
+  admitd                ciepły `admit` na gnieździe $STATE/admit.sock (admitd.py): pętla dla
+                        agenta Pod codes.pod.app.acc.admit, z którą claude-acc-hook nie startuje Pythona
   room [katalog]        kod 0, gdy pamięć wpuści nowy dev serwer (w tym katalogu), 1 z powodem;
                         warunek dla `claude-acc sched wait`, który odmowa podaje agentowi
   brake [--stage N] [--within PID] [--json]
@@ -425,6 +427,11 @@ def main(argv):
             return admit_codex(raw) if "--codex" in argv else admit(raw)
         except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
             return 0
+    if argv[:1] == ["admitd"]:
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import admitd
+
+        return admitd.serve()
     if argv[:1] == ["words"]:
         # jedno źródło list dla obu frontów: setup.sh zapisuje to do hook-words.json; bramka
         # jako lista, bo starszy claude-acc-hook czyta plik jako {klucz: [tekst]}

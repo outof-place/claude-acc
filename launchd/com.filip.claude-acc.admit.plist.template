@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- tylko dla Pod (POD_JOBS w setup.sh): agent z ~/Library/LaunchAgents to osobna tożsamość TCC,
+       a dzieci admitd wchodzą do katalogów agentów, także w ~/Documents -->
+  <key>Label</key><string>com.filip.claude-acc.admit</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/share/claude-acc/python</string>
+    <string>__HOME__/.local/share/claude-acc/acc.py</string>
+    <string>devguard</string>
+    <string>admitd</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <!-- Interactive: każda komenda Bash agenta, którą bramka przepuszcza, czeka na odpowiedź -->
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>__HOME__/.local/share/claude-acc/admit-launchd.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.local/share/claude-acc/admit-launchd.log</string>
+</dict>
+</plist>

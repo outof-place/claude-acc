@@ -71,6 +71,9 @@ STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates com.filip.claude-acc.jobs com.filip.claude-acc.hotspot-user"
+# automaty tylko dla Pod (scripts/pod_agents.py bierze je razem z JOBS): setup.sh nie kładzie ich w
+# ~/Library/LaunchAgents, bo taki agent to osobna tożsamość TCC, a admitd wchodzi do katalogów agentów
+POD_JOBS="com.filip.claude-acc.admit"
 
 APP_SRC=""
 FANCTL=""

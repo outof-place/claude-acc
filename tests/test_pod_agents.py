@@ -53,6 +53,20 @@ class PodAgentsTest(unittest.TestCase):
                 self.assertNotIn("__HOME__", text)
                 self.assertNotIn("/Users/", text)
 
+    def test_pod_only_jobs_are_bundled_but_never_installed_by_setup(self):
+        """admitd tylko jako agent Pod: setup.sh bootstrapuje wyłącznie JOBS."""
+        A.write(self.out)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "codes.pod.app.acc.admit.plist")))
+        with open(os.path.join(ROOT, "setup.sh"), encoding="utf-8") as f:
+            setup = f.read()
+        jobs_line = next(x for x in setup.splitlines() if x.startswith("JOBS="))
+        self.assertNotIn("com.filip.claude-acc.admit", jobs_line)
+        self.assertNotIn("$POD_JOBS", setup.replace('POD_JOBS="', ""))
+        with open(os.path.join(self.out, "codes.pod.app.acc.admit.plist"), "rb") as f:
+            agent = plistlib.load(f)
+        self.assertEqual(agent["ProgramArguments"], ["pod-acc-run", "--log", "admit-launchd.log", "devguard", "admitd"])
+        self.assertEqual(agent["ProcessType"], "Interactive")
+
     def test_the_tick_keeps_its_launchd_log(self):
         A.write(self.out)
         with open(os.path.join(self.out, "codes.pod.app.acc.tick.plist"), "rb") as f:
