@@ -200,6 +200,14 @@ class SudoUserTest(unittest.TestCase):
                 self.assertEqual(done.stdout, "")
                 self.assertIn("claude-acc root install", done.stderr)
 
+    def test_fsguard_status_reads_the_daemon_without_root(self):
+        """`claude-acc fsguard` (status) tylko czyta plistę demona: nic nie woła sudo ani instalatora."""
+        path, _ = self.wrapper()
+        done = subprocess.run(["/bin/sh", path, "fsguard"], env=self.env(uid=501), capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.count("\n"), 1, done.stdout)  # jedna linia, bez przejścia do accswitch
+        self.assertTrue(done.stdout.startswith("strażnik fseventsd:"), done.stdout)
+
     def test_root_outside_the_root_copy_is_refused(self):
         """perf-root.sh i janitor-root.sh z katalogu źródeł pod rootem: odmowa, zanim cokolwiek zmienią."""
         for script, args in (("perf-root.sh", ["spotlight", "apps-only"]), ("janitor-root.sh", [])):

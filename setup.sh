@@ -268,6 +268,21 @@ case "$1" in
   desktop) shift; exec "$PY" "$RUN" desktop "$@" ;;
   # demon roota czyta hotspot.json, więc on/off/status idą bez sudo; install pyta o Touch ID
   hotspot) shift; exec "$PY" "$RUN" hotspot "$@" ;;
+  # strażnik fseventsd (demon roota): install|uninstall przez install-fsguard.sh (sudo, Touch ID), status bez roota
+  fsguard)
+    case "${2:-status}" in
+      install) exec "$(cat "$STATE/source")/install-fsguard.sh" ;;
+      uninstall) exec "$(cat "$STATE/source")/install-fsguard.sh" --uninstall ;;
+      *)
+        PLIST=/Library/LaunchDaemons/com.filip.claude-acc.fsguard.plist
+        if [ ! -f "$PLIST" ]; then echo "strażnik fseventsd: nie zainstalowany (claude-acc fsguard install)"; exit 0; fi
+        first="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null || true)"
+        case "$first" in
+          */python3) echo "strażnik fseventsd: zainstalowany, startuje przez $first -I" ;;
+          *) echo "strażnik fseventsd: startuje przez /usr/bin/python3 (zaślepka do Xcode'a użytkownika); przeinstaluj: claude-acc fsguard install" ;;
+        esac
+        exit 0 ;;
+    esac ;;
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
   # biegi blogów bez człowieka: płatnik z puli, licznik, limity czuwania, zapis biegu (jobs.py)
   jobs) shift; exec "$PY" "$RUN" jobs "$@" ;;
