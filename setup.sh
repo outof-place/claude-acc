@@ -29,6 +29,13 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 # Pod z izolowanym HOME) podmieniłby automaty prawdziwego konta, a pkill zamknął jego aplikację
 real_dir() { [ -n "$1" ] && (cd "$1" 2>/dev/null && pwd -P); }
 faked() { case "$(command -v "$1" || true)" in "" | /bin/* | /sbin/* | /usr/bin/* | /usr/sbin/*) return 1 ;; esac; }
+# kopia aplikacji do usunięcia: ditto przenosi uprawnienia, więc kopia z pakietu po `chmod a-w` (hotfix
+# Pod.app 2026-10-10) ma katalogi tylko do odczytu, a samo rm -rf pada i set -e kończy setup w połowie
+remove_app() {
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  chmod -R u+w "$1" 2>/dev/null || true
+  rm -rf "$1"
+}
 ACCOUNT_HOME="$(id -P 2>/dev/null | cut -d: -f9)"
 HOME_NOW="$(real_dir "${HOME:-}" || true)"
 if [ -z "$HOME_NOW" ] || [ "$HOME_NOW" != "$(real_dir "$ACCOUNT_HOME" || true)" ]; then
@@ -54,9 +61,10 @@ for ((i = 0; i < ${#ARGS[@]}; i++)); do
     --uninstall) UNINSTALL=1 ;;
   esac
 done
-# odinstalować wolno każdemu (`claude-acc uninstall`); instalować tylko właścicielowi
+# odinstalować wolno każdemu (`claude-acc uninstall`); instalować tylko właścicielowi. Python z $SRC
+# zawsze z -B: $SRC bywa wnętrzem podpisanej Pod.app, a __pycache__ w niej łamie jej pieczęć
 if [ -f "$SRC/owner.py" ] && [ -z "$UNINSTALL" ]; then
-  /usr/bin/python3 "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
+  /usr/bin/python3 -B "$SRC/owner.py" check ${OWNER:+--as "$OWNER"} || exit $?
 fi
 
 STATE="$HOME/.local/share/claude-acc"
@@ -90,12 +98,13 @@ while [ $# -gt 0 ]; do
         rm -f "$AGENTS/$job.plist"
       done
       pkill -x ClaudeAcc 2>/dev/null || true
-      rm -rf "$HOME/Applications/Claude Acc.app" "$HOME/.local/bin/claude-acc"
+      remove_app "$HOME/Applications/Claude Acc.app"
+      rm -rf "$HOME/.local/bin/claude-acc"
       # hooki pauzy limitów; bez automatu nikt by już pauzy nie zdjął, więc wstrzymane
       # sesje budzimy, kasując jej plik
       for hook in "$STATE/hook.py" "$SRC/hook.py"; do
         if [ -f "$hook" ]; then
-          /usr/bin/python3 "$hook" uninstall "$CLAUDE_SETTINGS" || true
+          /usr/bin/python3 -B "$hook" uninstall "$CLAUDE_SETTINGS" || true
           break
         fi
       done
@@ -112,7 +121,7 @@ while [ $# -gt 0 ]; do
       [ -f "$STATE/orcaplugin.py" ] && /usr/bin/python3 "$STATE/orcaplugin.py" uninstall || true
       # claude-acc Poda: nagrobek "none" zamiast pliku, żeby Pod nie zainstalował go znowu przy
       # następnym starcie (bez owner.json robi pierwszą instalację), tylko zdjął swoje agenty i Pod Menu
-      [ -f "$SRC/owner.py" ] && { /usr/bin/python3 "$SRC/owner.py" uninstalled || true; }
+      [ -f "$SRC/owner.py" ] && { /usr/bin/python3 -B "$SRC/owner.py" uninstalled || true; }
       echo "usunięte: automaty, aplikacja, komenda claude-acc i hooki pauzy. Stan i konfiguracja zostają w $STATE"
       echo "wiatraki (root) zdejmuje osobno: install-fans.sh --uninstall; hook dla agentów usuń z ~/.claude/settings.json"
       exit 0 ;;
@@ -132,6 +141,9 @@ cp "$SRC"/*.py "$STATE/"
 rm -rf "$STATE/hooks.new" && cp -R "$SRC/hooks" "$STATE/hooks.new" && rm -rf "$STATE/hooks" && mv "$STATE/hooks.new" "$STATE/hooks"
 # drivery SDK bramki przeglądarki (Python i TypeScript) i `claude-acc browser run`
 [ -d "$SRC/sdk" ] && rm -rf "$STATE/sdk.new" && cp -R "$SRC/sdk" "$STATE/sdk.new" && rm -rf "$STATE/sdk" && mv "$STATE/sdk.new" "$STATE/sdk"
+# paczka Poda ma plik __pycache__ obok każdego .py (scripts/payload.sh), żeby nic nie pisało bajtkodu w
+# Pod.app; w $STATE bajtkod jest mile widziany, więc te pliki tu nie przechodzą
+find "$STATE/hooks" "$STATE/sdk" -name __pycache__ -type f -delete 2>/dev/null || true
 # wtyczka Orki (orcaplugin.py instaluje ją stąd w katalogu wtyczek Orki); bez testów
 if [ -d "$SRC/orca-plugin" ]; then
   rm -rf "$STATE/orca-plugin.new" && cp -R "$SRC/orca-plugin" "$STATE/orca-plugin.new" && rm -rf "$STATE/orca-plugin.new/test"
@@ -178,8 +190,9 @@ if [ "$PY" = /usr/bin/python3 ]; then
   PY="$(/usr/bin/python3 -c 'import os, sys; print(os.path.realpath(sys.executable))' 2>/dev/null || echo /usr/bin/python3)"
 fi
 ln -sfn "$PY" "$STATE/python"
-# bytecode up front: acc.py runs every script from it, so no start compiles one
-"$STATE/python" -m compileall -q "$STATE"/*.py >/dev/null 2>&1 || true
+# bytecode up front, under $STATE/pycache where acc.py looks for it (sys.pycache_prefix), so no start
+# compiles one and nothing is written next to a script
+"$STATE/python" -X pycache_prefix="$STATE/pycache" -m compileall -q "$STATE"/*.py >/dev/null 2>&1 || true
 # the hook's native front reads the words that send a command to Python from here
 "$STATE/python" "$STATE/acc.py" devguard words > "$STATE/hook-words.json.new" 2>/dev/null \
   && mv -f "$STATE/hook-words.json.new" "$STATE/hook-words.json" || rm -f "$STATE/hook-words.json.new"
@@ -209,11 +222,14 @@ if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ] && [ -f "$STATE/admitchain.py" ]; then
 fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
-# właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji
-if [ -n "$OWNER" ]; then
-  version="$(cat "$SRC/VERSION" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_SRC/Contents/Info.plist")"
-  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"} \
-    ${POD_AGENTS:+--menu "$APP_SRC"}
+# Pod's root helper (docs/pod-rootd.md): when the owner app carries it, `claude-acc rootd` is its CLI
+# and the old root installers are not offered
+ROOTCTL=""
+if [ -n "$POD_AGENTS" ] && [ -x "$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl" ]; then
+  ROOTCTL="$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl"
+  ln -sfn "$ROOTCTL" "$STATE/pod-rootctl"
+else
+  rm -f "$STATE/pod-rootctl"
 fi
 # bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
 # przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
@@ -251,6 +267,12 @@ case "$1" in
     # porządki roota z kopii roota (claude-acc root install): nigdy skrypt z $STATE pod sudo
     if [ "${1:-}" = root-clean ]; then
       shift
+      # in Pod its root helper does it, without sudo (rootroute.py); 75 falls through to the root copy
+      if [ -x "$STATE/pod-rootctl" ]; then
+        "$PY" "$STATE/rootroute.py" janitor-root "$@"
+        rc=$?
+        [ "$rc" -eq 75 ] || exit "$rc"
+      fi
       [ -x /usr/local/libexec/claude-acc-root/root-run.sh ] || { echo "najpierw raz: claude-acc root install" >&2; exit 1; }
       exec sudo /usr/local/libexec/claude-acc-root/root-run.sh janitor-root "$@"
     fi
@@ -304,6 +326,13 @@ case "$1" in
   mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)
     shift
+    # in Pod its root helper does it, without sudo (rootroute.py); 75: Pod doesn't own claude-acc,
+    # the helper doesn't answer, or an old root daemon still owns the tweak, so the root copy below
+    if [ -x "$STATE/pod-rootctl" ]; then
+      "$PY" "$STATE/rootroute.py" perf-root "$@"
+      rc=$?
+      [ "$rc" -eq 75 ] || exit "$rc"
+    fi
     # devtools to kliknięcie w Ustawieniach, nie root: skrypt tylko otwiera panel i czeka
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     # stan limitu GPU to tylko odczyt sysctl i plisty demona
@@ -322,8 +351,20 @@ case "$1" in
       uninstall) exec "$(cat "$STATE/source")/root-install.sh" --uninstall ;;
       *) exec "$(cat "$STATE/source")/root-install.sh" --status ;;
     esac ;;
+  # Pod's root helper: fans, Stay Awake with the lid closed, Ultra's root tweaks, the old daemons' migration
+  rootd)
+    shift
+    [ -x "$STATE/pod-rootctl" ] || { echo "brak pomocnika roota Poda (przychodzi razem z Podem)" >&2; exit 69; }
+    exec "$STATE/pod-rootctl" "$@" ;;
   fans)
     shift
+    case "${1:-read}" in
+      install | uninstall)
+        if [ -x "$STATE/pod-rootctl" ]; then
+          echo "wiatraki idą przez pomocnika roota Poda: claude-acc rootd fans auto|<30-100>" >&2
+          exit 2
+        fi ;;
+    esac
     case "${1:-read}" in
       install) exec "$(cat "$STATE/source")/install-fans.sh" --binary "$STATE/fanctl" ;;
       uninstall) exec "$(cat "$STATE/source")/install-fans.sh" --uninstall ;;
@@ -369,11 +410,13 @@ if [ -n "$POD_AGENTS" ]; then
   # zamykamy tylko starą kopię po ścieżce, nie `pkill -x ClaudeAcc`, i ją usuwamy (claude-acc
   # handback stawia ją z powrotem)
   pkill -f "$APP/Contents/MacOS/ClaudeAcc" 2>/dev/null || true
-  rm -rf "$APP"
+  remove_app "$APP"
 else
   pkill -x ClaudeAcc 2>/dev/null || true
-  rm -rf "$APP"
+  remove_app "$APP"
   ditto "$APP_SRC" "$APP"
+  # źródło tylko do odczytu daje taką samą kopię: podpis niżej i następny setup muszą w niej pisać
+  chmod -R u+w "$APP" 2>/dev/null || true
   # podpis, który trzyma zgody macOS dyktowania (Mikrofon, Dostępność, Monitorowanie wejścia) przez
   # aktualizacje: certyfikat z Pęku kluczy albo ad hoc ze stałym designated requirement (sign-app.sh)
   [ -x "$SRC/sign-app.sh" ] && { "$SRC/sign-app.sh" "$APP" || echo "uwaga: podpis aplikacji nie wyszedł, zgody dyktowania mogą wymagać ponownego nadania" >&2; }
@@ -381,9 +424,23 @@ else
   open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
 fi
 
+# właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji.
+# Na samym końcu, po wszystkich krokach: setup przerwany wcześniej (set -e) zostawia starą wersję,
+# więc Pod widzi zmianę wersji i uruchamia go znowu, zamiast uznać instalację za aktualną (2026-10-10)
+if [ -n "$OWNER" ]; then
+  version="$(cat "$SRC/VERSION" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_SRC/Contents/Info.plist")"
+  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"} \
+    ${POD_AGENTS:+--menu "$APP_SRC"}
+fi
+
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
-echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+if [ -n "$ROOTCTL" ]; then
+  echo "root (wiatraki, Stay Awake z zamkniętą klapą, Ultra): pomocnik roota Poda, włączany w Podzie; stan: claude-acc rootd status"
+  echo "hook dla agentów: README, sekcja Dev server guard"
+else
+  echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+fi
 # kopia roota (perf-root, porządki roota, kompresja aplikacji roota) sprzed tej wersji: root jej nie odświeży sam
 if [ -d /usr/local/libexec/claude-acc-root ] && ! "$SRC/root-install.sh" --status >/dev/null 2>&1; then
   echo "kopia roota starsza niż ta wersja: claude-acc root install (sudo, Touch ID)"

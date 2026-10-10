@@ -54,14 +54,20 @@ Komendy:
                         "gate": [wzorzec]} dla natywnego claude-acc-hook
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # Ten plik to tylko wejście. Hook `admit` idzie przy każdym poleceniu Bash każdego agenta, a
 # skrypt podany Pythonowi wprost kompiluje się przy każdym starcie (bajtkod z __pycache__
 # dostają tylko importowane moduły): przy 1900 liniach to było 7-10 ms na każdego Basha.
 # Strażnik (pomiar, decyzje, akcje) leży więc w devguard_core.py i ładuje się z cache, a tu
 # zostaje tylko to, czego hook potrzebuje dla komendy, która dev serwera nie stawia.
 
-import os
-import sys
 
 DEV_WORDS = ("dev", "vite", "expo", "serve", "react-native")
 # słowa, bez których komenda nie ma pracy dla schedulera (Go, JS i natywne buildy z symulatorami);

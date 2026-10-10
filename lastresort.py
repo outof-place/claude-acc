@@ -34,7 +34,15 @@ Nigdy: claude, codex, Orca, powłoki, launchd, przeglądarka użytkownika, aplik
 `stage` i `choose` są czyste (sygnały, tabela procesów, rozmiary i wiek wchodzą z zewnątrz),
 więc testują się na atrapach: tests/test_lastresort.py.
 """
+
 import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import re
 import shlex
 
