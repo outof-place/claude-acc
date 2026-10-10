@@ -26,7 +26,6 @@ jest zawsze tym z dysku. Agent tylko w Pod (POD_JOBS w setup.sh): agent z
 """
 
 import fcntl
-import io
 import json
 import os
 import signal
@@ -154,10 +153,13 @@ def request(data):
     if not isinstance(req, dict) or req.get("v") != 1 or req.get("argv") not in ARGVS:
         return None
     env, event, cwd = req.get("env"), req.get("event"), req.get("cwd")
+    # bez katalogu albo środowiska hooka nie ma czego odtworzyć: exec u klienta
     if (
         not isinstance(event, str)
         or not isinstance(cwd, str)
+        or not os.path.isabs(cwd)
         or not isinstance(env, dict)
+        or not env
     ):
         return None
     if not all(
@@ -173,18 +175,27 @@ def request(data):
 
 
 def run_event(conn, devguard, req):
-    """Dziecko po fork(): proces hooka, tyle że bez startu Pythona."""
+    """Dziecko po fork(): proces hooka, tyle że bez startu Pythona. Katalog, umask, środowisko i fd 0-2
+    jak u Pythona, którego claude-acc-hook uruchamia execem; katalog, do którego nie da się wejść,
+    kończy dziecko bez odpowiedzi (klient robi exec)."""
+    os.chdir(req["cwd"])
+    os.umask(0o022)
     os.environ.clear()
     os.environ.update(req["env"])
-    if req["cwd"]:
-        os.chdir(req["cwd"])
+    # zdarzenie na fd 0 jako odpięty plik tymczasowy, jak w handOver claude-acc-hook: widzi je też
+    # każdy, kto czyta fd 0 wprost albo dziedziczy go w podprocesie
+    event = tempfile.TemporaryFile()
+    event.write(req["event"].encode())
+    event.flush()
+    event.seek(0)
     # deskryptory 1 i 2 na pliki tymczasowe: print() i zapis wprost na fd łapią się tak samo jak w exec
     out, err = tempfile.TemporaryFile(), tempfile.TemporaryFile()
     sys.stdout.flush()
     sys.stderr.flush()
+    os.dup2(event.fileno(), 0)
     os.dup2(out.fileno(), 1)
     os.dup2(err.fileno(), 2)
-    sys.stdin = io.StringIO(req["event"])
+    sys.stdin = open(0, encoding="utf-8", closefd=False)  # noqa: SIM115
     sys.argv = [os.path.join(here(), "devguard.py"), *req["argv"]]
     code = 0
     try:
@@ -203,9 +214,32 @@ def run_event(conn, devguard, req):
     write_frame(conn, {"v": 1, "stdout": texts[0], "stderr": texts[1], "code": code})
 
 
+def fork_child(conn, devguard, listener=None):
+    """fork() dla jednego zdarzenia; rodzic dostaje pid."""
+    pid = os.fork()
+    if pid == 0:
+        # najpierw: dziecko woła podprocesy (ps, sched), a z dziedziczonym SIG_IGN albo handlerem
+        # rodzica ich kod wyjścia by ginął (waitpid daje ECHILD, subprocess zwraca 0)
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+        if listener is not None:
+            listener.close()
+        child(conn, devguard)
+    return pid
+
+
+def reap(signum, frame):
+    """Handler SIGCHLD rodzica: sprząta skończone dzieci, bez zombie."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
 def child(conn, devguard):
     try:
-        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
         signal.alarm(CHILD_LIMIT_S)
         conn.settimeout(READ_TIMEOUT_S)
         data = read_frame(conn)
@@ -245,8 +279,7 @@ def serve(state=None):
     devguard = load_devguard(state)
     files = watched(state)
     seen = stamps(files)
-    # dzieci sprząta jądro (SIGCHLD ignorowany: bez zombie)
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    signal.signal(signal.SIGCHLD, reap)
     sock = bind(path)
     uid = os.getuid()
     while True:
@@ -264,9 +297,7 @@ def serve(state=None):
                 os.execv(sys.executable, argv)
             sys.stdout.flush()
             sys.stderr.flush()
-            if os.fork() == 0:
-                sock.close()
-                child(conn, devguard)
+            fork_child(conn, devguard, sock)
         except OSError:
             pass
         finally:

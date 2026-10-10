@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -65,13 +66,16 @@ def ask(path, obj=None, raw=None, timeout=10):
 class ChildTest(unittest.TestCase):
     """Jedno zdarzenie w dziecku po fork(), z atrapą devguard."""
 
-    def run_child(self, req, main):
+    def run_child(self, req, main, sigchld=signal.SIG_IGN):
+        """Fork tak jak w serwerze (admitd.fork_child), z SIGCHLD rodzica ustawionym na `sigchld`:
+        SIG_IGN to najgorszy przypadek dla podprocesów dziecka."""
         fake = types.SimpleNamespace(main=main)
         a, b = socket.socketpair()
-        pid = os.fork()
-        if pid == 0:
-            a.close()
-            admitd.child(b, fake)
+        old = signal.signal(signal.SIGCHLD, sigchld)
+        try:
+            pid = admitd.fork_child(b, fake, a)
+        finally:
+            signal.signal(signal.SIGCHLD, old)
         b.close()
         with a:
             a.sendall(req if isinstance(req, bytes) else frame(req))
@@ -82,7 +86,10 @@ class ChildTest(unittest.TestCase):
                 if head is None
                 else json.loads(admitd.read_exact(a, struct.unpack(">I", head)[0]))
             )
-        os.waitpid(pid, 0)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass  # już posprzątane (SIG_IGN albo admitd.reap)
         return answer
 
     def request(self, **extra):
@@ -130,6 +137,34 @@ class ChildTest(unittest.TestCase):
         self.assertEqual(answer["stderr"], "raw stderr\n")
         self.assertNotIn("ONLY_HERE", os.environ)  # rodzic (ten test) bez zmian
 
+    def test_subprocesses_of_the_child_keep_their_exit_status(self):
+        """Pod SIG_IGN (albo handlerem rodzica) waitpid podprocesu dawałby ECHILD, a subprocess 0."""
+
+        def main(argv):
+            print(subprocess.run(["/usr/bin/false"]).returncode)
+            return 0
+
+        for disposition in (signal.SIG_IGN, admitd.reap):
+            with self.subTest(disposition=disposition):
+                self.assertEqual(
+                    self.run_child(self.request(), main, disposition)["stdout"], "1\n"
+                )
+
+    def test_fd_0_umask_like_the_exec(self):
+        def main(argv):
+            inherited = subprocess.run(
+                ["/bin/cat"], capture_output=True, text=True
+            ).stdout
+            print(json.dumps({"fd0": inherited, "umask": oct(os.umask(0o022))}))
+            return 0
+
+        req = self.request()
+        seen = json.loads(self.run_child(req, main)["stdout"])
+        self.assertEqual(
+            seen["fd0"], req["event"]
+        )  # podproces czyta zdarzenie z odziedziczonego fd 0
+        self.assertEqual(seen["umask"], "0o22")
+
     def test_codex_argv_exit_codes_and_exceptions(self):
         self.assertEqual(
             self.run_child(
@@ -161,6 +196,9 @@ class ChildTest(unittest.TestCase):
             self.request(env={"A=B": "1"}),
             self.request(event=None),
             self.request(cwd="/nonexistent/dir"),
+            self.request(cwd=""),
+            self.request(cwd="relative/dir"),
+            self.request(env={}),
         ):
             with self.subTest(bad=bad):
                 self.assertIsNone(self.run_child(bad, ok))
