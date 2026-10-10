@@ -1756,6 +1756,17 @@ class UltraTest(Isolated):
         self.assertEqual(perf.git_repos({}), [])
 
 
+def assert_out_of_background(test, now, normal):
+    """Po undo proces wyszedł z tła. `ps -o pri` zwykłego procesu to priorytet dynamiczny: pod
+    obciążeniem (load average powyżej liczby rdzeni) jądro przesuwa go o kilka punktów (31 zamiast
+    28 albo 30), więc wtedy wystarcza, że nie jest już priorytetem tła; dokładny powrót sprawdza
+    tylko spokojny Mac."""
+    test.assertNotEqual(now, perf.BACKGROUND_PRI)
+    test.assertGreater(now, perf.BACKGROUND_PRI)
+    if os.getloadavg()[0] <= (os.cpu_count() or 1):
+        test.assertEqual(now, normal)
+
+
 class UltraFakeHomeTest(unittest.TestCase):
     """Skrypt w osobnym $HOME: prawdziwe ścieżki pod HOME, prawdziwy proces-wydmuszka."""
 
@@ -1833,7 +1844,7 @@ class UltraFakeHomeTest(unittest.TestCase):
         self.assertEqual(data["applied"], perf.ULTRA)
         self.perf("ultra", "off")
         self.assertEqual(self.files(), self.originals)
-        self.assertEqual(self.priority(), normal)
+        assert_out_of_background(self, self.priority(), normal)
         data = json.loads(self.perf("ultra", "status", "--json"))
         self.assertFalse(data["on"])
 
@@ -1893,7 +1904,7 @@ class RealProcessTest(unittest.TestCase):
             procs = json.load(f)["applied"]["bg-helpers"]["procs"]
         self.assertEqual([p["pid"] for p in procs], [self.dummy.pid])
         self.perf("undo", "bg-helpers", launcher=True)
-        self.assertEqual(self.priority(), normal)
+        assert_out_of_background(self, self.priority(), normal)
 
     def test_apply_and_undo(self):
         time.sleep(0.2)
@@ -1908,7 +1919,7 @@ class RealProcessTest(unittest.TestCase):
         entry = next(t for t in status["tweaks"] if t["name"] == "bg-helpers")
         self.assertTrue(entry["applied"])
         self.perf("undo", "bg-helpers")
-        self.assertEqual(self.priority(), normal)
+        assert_out_of_background(self, self.priority(), normal)
         with open(self.state_path) as f:
             self.assertNotIn("bg-helpers", json.load(f)["applied"])
 
