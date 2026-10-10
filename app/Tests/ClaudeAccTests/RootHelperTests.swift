@@ -133,6 +133,16 @@ func rootHelperBacksOff() async throws {
     #expect(!helper.owns)
 }
 
+@Test("while Stay Awake wants the lid, retries never wait past 5 s, inside the helper's re-hold minute")
+func rootHelperBackoffWhileHolding() {
+    let now = Date(timeIntervalSince1970: 1_800_000_000)
+    let holding = now.addingTimeInterval(3600)
+    #expect((1...9).map { RootHelper.retryDelay(after: $0, lidWanted: holding, now: now) } == [0, 5, 5, 5, 5, 5, 5, 5, 5])
+    #expect(RootHelper.retryDelay(after: 9, lidWanted: nil, now: now) == 300)
+    // a hold that already ran out doesn't count
+    #expect(RootHelper.retryDelay(after: 9, lidWanted: now.addingTimeInterval(-1), now: now) == 300)
+}
+
 @Test("a fan pick that isn't auto or 30-100% is refused with a sentence, not sent as 100%")
 func rootHelperFanPickChecked() async throws {
     let machine = try Machine()

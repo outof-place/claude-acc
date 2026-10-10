@@ -93,6 +93,8 @@ final class RootHelper {
     func wantLid(until: Date?) {
         guard until != lidWanted else { return }
         lidWanted = until
+        // a hold asked for during a long backoff is tried at once
+        if until != nil { retryAt = -.infinity }
         Task { await syncLid() }
     }
 
@@ -131,7 +133,16 @@ final class RootHelper {
 
     private func failed() {
         failures += 1
-        retryAt = Date.now.timeIntervalSince1970 + Self.backoff(after: failures)
+        let now = Date.now
+        retryAt = now.timeIntervalSince1970 + Self.retryDelay(after: failures, lidWanted: lidWanted, now: now)
+    }
+
+    /// While Stay Awake wants the lid held, the wait never passes 5 s: the helper keeps a dropped
+    /// hold for a minute (Engine.lidRehold), and a longer wait could miss it.
+    static func retryDelay(after failures: Int, lidWanted: Date?, now: Date) -> TimeInterval {
+        let wait = backoff(after: failures)
+        guard let until = lidWanted, until > now else { return wait }
+        return min(wait, 5)
     }
 
     private func take(_ fresh: Status) {
