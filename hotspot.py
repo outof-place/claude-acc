@@ -32,6 +32,14 @@ a upload 2 MB nie zwolnił (p50 1,01 -> 0,90 s).
   hotspot.py run --iface en8 [--seconds N] [-v]   ręczny przebieg w terminalu (sudo)
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import argparse
 import collections
 import ctypes
@@ -39,14 +47,12 @@ import ctypes.util
 import hashlib
 import json
 import math
-import os
 import re
 import select
 import signal
 import socket
 import struct
 import subprocess
-import sys
 import time
 
 HOME = os.path.expanduser("~")

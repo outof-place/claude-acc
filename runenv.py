@@ -108,17 +108,23 @@ subscription] -- <komenda...>` (kody: komendy; 75 odmowa przed startem; 76 kredy
 w trakcie; 78 zapłacił ktoś inny niż wybrany płatnik).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import fcntl
 import hashlib
 import json
-import os
 import pwd
 import re
 import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from datetime import datetime

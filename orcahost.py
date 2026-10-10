@@ -32,10 +32,16 @@ it renames them.
     orcahost.py [field]     the resolved host as JSON, or one field (perf-root.sh asks for `app`)
 """
 
-import json
 import os
-import re
 import sys
+
+# bytecode only in $STATE: next to a script in Pod's bundle (Pod.app/Contents/Resources/claude-acc) a
+# __pycache__ breaks the app's seal, whatever starts this file and with whatever flags (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import json
+import re
 import time
 from collections import namedtuple
 

@@ -16,12 +16,18 @@ cofnięcia, starsze znikają. Ustawień Orki (profile-state.db) nie dotyka: syst
 paczce aplikacji i bez nich instaluje manifest bez nich (komendy, powiadomienia i karty działają).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import hashlib
 import json
-import os
 import shutil
 import struct
-import sys
 
 HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))

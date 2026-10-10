@@ -38,17 +38,23 @@ Komendy:
   list                                poprawki z opisem i zmierzonym efektem
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import ctypes
 import ctypes.util
 import glob
 import hashlib
 import json
-import os
 import re
 import shlex
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 
