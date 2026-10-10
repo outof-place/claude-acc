@@ -733,8 +733,10 @@ def helper():
 
 
 def agent_label():
-    """The user agent's launchd label: `<Pod's bundle id>.acc.hotspot-user` when Pod owns claude-acc
-    (scripts/pod_agents.py), setup.sh's otherwise."""
+    """The user agent's launchd label. Pod with its own agents (`setup.sh --pod-agents`: owner.json
+    has "menu") runs `<Pod's bundle id>.acc.hotspot-user` (scripts/pod_agents.py); Pod v1, Homebrew
+    and the source checkout run setup.sh's com.filip.claude-acc.hotspot-user. When launchd knows only
+    the other one, that one."""
     try:
         with open(os.path.join(STATE_DIR, "owner.json")) as f:
             owner = json.load(f)
@@ -753,7 +755,16 @@ def agent_label():
                 app_id = found
         except (OSError, ValueError, ImportError):
             pass
-    return "%s.acc.hotspot-user" % app_id
+    pod = "%s.acc.hotspot-user" % app_id
+    primary, other = (pod, AGENT) if owner.get("menu") else (AGENT, pod)
+    if not agent_loaded(primary) and agent_loaded(other):
+        return other
+    return primary
+
+
+def agent_loaded(label):
+    return subprocess.run([LAUNCHCTL, "print", "gui/%d/%s" % (os.getuid(), label)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
 def kickstart_agent():

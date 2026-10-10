@@ -447,40 +447,69 @@ class AgentLifecycleTest(unittest.TestCase):
         self.assertEqual([round(b - a) for a, b in zip(looks, looks[1:])], [60, 60])
         detect.assert_not_called()
 
-    def pod_owner(self, app_id="codes.pod.app"):
+    def pod_owner(self, app_id="codes.pod.app", agents=True):
+        """owner.json as setup.sh writes it: "menu" only with --pod-agents (layout 2)."""
         app = os.path.join(self.dir, "Pod.app")
-        os.makedirs(os.path.join(app, "Contents"))
+        os.makedirs(os.path.join(app, "Contents"), exist_ok=True)
         with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
             plistlib.dump({"CFBundleIdentifier": app_id}, f)
+        owner = {"owner": "pod", "app": app}
+        if agents:
+            owner["menu"] = os.path.join(app, "Contents/Library/LoginItems/Pod Menu.app")
         with open(os.path.join(self.dir, "owner.json"), "w") as f:
-            json.dump({"owner": "pod", "app": app}, f)
+            json.dump(owner, f)
 
-    def test_the_agent_label_follows_the_owner(self):
-        with mock.patch.object(hotspot, "STATE_DIR", self.dir):
-            self.assertEqual(hotspot.agent_label(), "com.filip.claude-acc.hotspot-user")
-            self.pod_owner("codes.pod.app")
-            self.assertEqual(hotspot.agent_label(), "codes.pod.app.acc.hotspot-user")
-            with open(os.path.join(self.dir, "Pod.app", "Contents", "Info.plist"), "wb") as f:
-                plistlib.dump({"CFBundleIdentifier": "bad id; rm"}, f)
-            self.assertEqual(hotspot.agent_label(), "codes.pod.app.acc.hotspot-user")
-
-    def test_hotspot_on_in_pod_kickstarts_the_agent(self):
-        calls = os.path.join(self.dir, "launchctl.log")
+    def fake_launchctl(self):
+        """`print` answers 0 for the labels in $KNOWN (all when unset); the rest is logged."""
+        self.calls = os.path.join(self.dir, "launchctl.log")
         launchctl = os.path.join(self.dir, "launchctl")
         with open(launchctl, "w") as f:
-            f.write('#!/bin/sh\necho "$*" >> "%s"\nexit "${FAIL:-0}"\n' % calls)
+            f.write('#!/bin/sh\n'
+                    'if [ "$1" = print ]; then\n'
+                    '  [ -z "${KNOWN+x}" ] && exit 0\n'
+                    '  for l in $KNOWN; do [ "$2" = "gui/$(id -u)/$l" ] && exit 0; done\n'
+                    '  exit 113\n'
+                    'fi\n'
+                    'echo "$*" >> "%s"\nexit "${FAIL:-0}"\n' % self.calls)
         os.chmod(launchctl, 0o755)
+        return mock.patch.object(hotspot, "LAUNCHCTL", launchctl)
+
+    def test_the_agent_label_follows_the_layout(self):
+        pod = "codes.pod.app.acc.hotspot-user"
+        legacy = "com.filip.claude-acc.hotspot-user"
+        with mock.patch.object(hotspot, "STATE_DIR", self.dir), self.fake_launchctl():
+            self.assertEqual(hotspot.agent_label(), legacy)  # Homebrew, the source checkout
+            self.pod_owner(agents=True)  # Pod with its own agents (layout 2)
+            self.assertEqual(hotspot.agent_label(), pod)
+            # Pod v1 (owner pod, no --pod-agents): setup.sh's LaunchAgents, as on this Mac today
+            self.pod_owner(agents=False)
+            self.assertEqual(hotspot.agent_label(), legacy)
+            with mock.patch.dict(os.environ, {"KNOWN": pod}):
+                self.assertEqual(hotspot.agent_label(), pod)  # launchd knows only Pod's
+            self.pod_owner(agents=True)
+            with mock.patch.dict(os.environ, {"KNOWN": legacy}):
+                self.assertEqual(hotspot.agent_label(), legacy)  # launchd knows only setup.sh's
+            with mock.patch.dict(os.environ, {"KNOWN": ""}):
+                self.assertEqual(hotspot.agent_label(), pod)  # neither: the layout decides
+            with open(os.path.join(self.dir, "Pod.app", "Contents", "Info.plist"), "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": "bad id; rm"}, f)
+            self.assertEqual(hotspot.agent_label(), pod)
+
+    def test_hotspot_on_in_pod_kickstarts_the_agent(self):
         self.pod_owner()
         args = argparse.Namespace(no_install=True, dry_run=False)
         with mock.patch.object(hotspot, "STATE_DIR", self.dir), mock.patch.object(hotspot, "ROOTCTL", self.rootctl), \
-                mock.patch.object(hotspot, "LAUNCHCTL", launchctl), mock.patch.object(hotspot, "set_enabled") as enabled, \
-                mock.patch("sys.stdout"):
+                self.fake_launchctl(), mock.patch.object(hotspot, "set_enabled") as enabled, mock.patch("sys.stdout"):
             self.assertEqual(hotspot.cmd_on(args), 0)
             enabled.assert_called_once_with(True)
             with mock.patch.dict(os.environ, {"FAIL": "113"}), mock.patch("sys.stderr"):
                 self.assertEqual(hotspot.cmd_on(args), 1)
-        with open(calls) as f:
-            self.assertEqual(f.read().splitlines(), ["kickstart gui/%d/codes.pod.app.acc.hotspot-user" % os.getuid()] * 2)
+            # Pod v1: the job that exists is setup.sh's
+            self.pod_owner(agents=False)
+            self.assertEqual(hotspot.cmd_on(args), 0)
+        with open(self.calls) as f:
+            self.assertEqual(f.read().splitlines(), ["kickstart gui/%d/codes.pod.app.acc.hotspot-user" % os.getuid()] * 2
+                             + ["kickstart gui/%d/com.filip.claude-acc.hotspot-user" % os.getuid()])
 
 
 if __name__ == "__main__":
