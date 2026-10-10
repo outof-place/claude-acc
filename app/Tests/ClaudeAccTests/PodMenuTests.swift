@@ -24,3 +24,15 @@ func panelRoute() throws {
     #expect(PanelRoute.section(of: try #require(URL(string: "claude-acc://panel/services"))) == "services")
     #expect(PanelRoute.section(of: try #require(URL(string: "claude-acc://awake/on"))) == nil)
 }
+
+@Test("Pod Menu shows Pod's mark only without quota data; the legacy app always draws the ring")
+func podMarkOnlyWithoutQuota() throws {
+    #expect(MenuLabelState(used: nil).showsPodMark(in: true))
+    #expect(!MenuLabelState(used: 42).showsPodMark(in: true))
+    #expect(!MenuLabelState(used: nil).showsPodMark(in: false))
+    let mark = try #require(PodMark.template)
+    #expect(mark.isTemplate)
+    #expect(mark.size == NSSize(width: 16, height: 16))
+    let badged = try #require(PodMark.make(badge: .systemOrange))
+    #expect(!badged.isTemplate)
+}

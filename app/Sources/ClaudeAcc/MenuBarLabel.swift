@@ -7,11 +7,18 @@ struct MenuBarLabel: View {
 
     var body: some View {
         let label = store.label
+        let badge: NSColor? = label.badge.map { $0 == .memory ? .systemRed : .systemOrange }
         HStack(spacing: 4) {
-            Image(nsImage: RingImage.make(
-                fraction: label.used.map { $0 / 100 },
-                color: Format.nsTint(label.used),
-                badge: label.badge.map { $0 == .memory ? .systemRed : .systemOrange }))
+            // Pod Menu without quota data (signed out, no accounts, loading): Pod's mark instead of
+            // an empty ring; with numbers the ring stays, it is the useful part. One item either way
+            if label.showsPodMark(in: PodMenu.active), let mark = PodMark.make(badge: badge) {
+                Image(nsImage: mark)
+            } else {
+                Image(nsImage: RingImage.make(
+                    fraction: label.used.map { $0 / 100 },
+                    color: Format.nsTint(label.used),
+                    badge: badge))
+            }
             Text(label.text)
                 .monospacedDigit()
             if store.awake.isOn {
@@ -38,6 +45,41 @@ struct MenuLabelState: Equatable {
     var text = "…"
     var badge: Badge?
     var hot: Int?
+
+    /// Pod's mark replaces the ring only in Pod Menu, and only while there is no usage to draw.
+    func showsPodMark(in podMenu: Bool) -> Bool {
+        podMenu && used == nil
+    }
+}
+
+/// Pod's menu bar template (resources/brand/native/Assets.xcassets/MenuBarIcon in outof-place/pod,
+/// branch pod/brand 625f2d5b61): one path, drawn by AppKit from the SVG.
+enum PodMark {
+    static let svg = ##"<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><path fill="#000" fill-rule="evenodd" d="M0 15.45C3.023 3.677 5.903 1.66 18 2.846 13.591 12.64 10.711 14.657 0 15.45ZM4.932 9.478A1.714 1.714 0 1 0 4.932 12.906A1.714 1.714 0 1 0 4.932 9.478ZM8.622 6.894A1.714 1.714 0 1 0 8.622 10.322A1.714 1.714 0 1 0 8.622 6.894ZM12.312 4.311A1.714 1.714 0 1 0 12.312 7.738A1.714 1.714 0 1 0 12.312 4.311Z"/></svg>"##
+
+    static let template: NSImage? = {
+        guard let image = NSImage(data: Data(svg.utf8)) else { return nil }
+        image.size = NSSize(width: 16, height: 16)
+        image.isTemplate = true
+        return image
+    }()
+
+    /// The template as is, or with the ring's badge dot: then tinted by hand in the label colour,
+    /// because a coloured dot can't live in a template image.
+    static func make(badge: NSColor?) -> NSImage? {
+        guard let base = template else { return nil }
+        guard let badge else { return base }
+        let image = NSImage(size: base.size, flipped: false) { rect in
+            base.draw(in: rect)
+            NSColor.labelColor.set()
+            rect.fill(using: .sourceAtop)
+            badge.setFill()
+            NSBezierPath(ovalIn: NSRect(x: rect.maxX - 6, y: rect.maxY - 6, width: 6, height: 6)).fill()
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
 }
 
 enum RingImage {
