@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.filip.claude-acc.hotspot-user</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/share/claude-acc/python</string>
+    <string>__HOME__/.local/share/claude-acc/acc.py</string>
+    <string>hotspot</string>
+    <string>daemon</string>
+    <string>--rootd</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <!-- Hotspot turbo as the user (docs/pod-rootd.md): in Pod the root helper sets the limit. With the
+       mode off it exits 0 and stays down until `claude-acc hotspot on` kickstarts it; without the
+       helper too, and the root daemon (claude-acc hotspot install) does it -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>__HOME__/.local/share/claude-acc/hotspot-user.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.local/share/claude-acc/hotspot-user.log</string>
+</dict>
+</plist>

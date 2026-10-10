@@ -250,7 +250,9 @@ final class Store {
             let enabled = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["enabled"] as? Bool ?? false
             if enabled != hotspotConfigEnabled { hotspotConfigEnabled = enabled }
         }
+        // in Pod the controller is the user's agent and the root helper sets the limit
         let installed = FileManager.default.fileExists(atPath: CLI.hotspotDaemon)
+            || (PodMenu.active && FileManager.default.isExecutableFile(atPath: CLI.directory + "/pod-rootctl"))
         if installed != hotspotInstalled { hotspotInstalled = installed }
         if let data = changedFile(CLI.schedState) {
             sched = Self.decode(SchedState.self, from: data)

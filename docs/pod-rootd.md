@@ -334,10 +334,11 @@ helper runs again.
 
 ## Migration from the five root daemons
 
-`legacy.migrate`, offered by Pod once the helper is enabled and any of the old plists exist. It
-takes over fans, fsguard, iogpu and vnodes; the hotspot daemon stays until `hotspot.py` runs its
-controller as the user and sets the limit through `shaper.set` (a follow-up), so hotspot turbo keeps
-working in between.
+`legacy.migrate`, offered by Pod once the helper is enabled and any of the old plists exist, takes
+over all five. Hotspot turbo's controller becomes the user's agent `codes.pod.app.acc.hotspot-user`
+(`hotspot.py daemon --rootd`): it sets the limit through `pod-rootctl shaper follow`, never below
+6 Mb/s, so no prompt. It waits while the root daemon's plist is still in /Library/LaunchDaemons and
+takes over once the migration moves it aside.
 
 1. reads what they hold: `kern.maxvnodes=N` and `iogpu.wired_limit_mb=N` from their
    `ProgramArguments`, the fan mode from the `fans.json` named by the fans plist (opened with
@@ -559,8 +560,8 @@ What has to land before it, or the migration leaves a feature without its daemon
   (the wrapper's `perf-root` and `mac root-clean` in Pod), ahead of 1.31.2's root copy
   (`root-run.sh`), which stays the path when the helper doesn't answer or an old daemon still owns
   the tweak (#113).
-- `hotspot.py` as the user with `pod-rootctl shaper follow`, and `hotspot` in `Engine.migrating`
-  (#116).
+- `hotspot.py` as the user with `pod-rootctl shaper follow` (the `hotspot-user` agent), and `hotspot`
+  in `Engine.migrating` (#116).
 - Pod: the "Enable root helper" button opens the package (b2); `release.sh` signs `pod-rootd` and
   `pod-rootctl` with `--options runtime,library`, builds the package with `rootd/rootd-pkg.sh`, signs
   it with the Developer ID Installer identity, notarizes and staples it, and ships it in
