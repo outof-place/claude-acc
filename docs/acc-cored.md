@@ -76,10 +76,25 @@ memory pressure (a Dispatch memory-pressure source).
   sums (CPython 3.12+ compensates `sum()` of floats), `round()`, `%.Nf`, `shlex.join`, `json.dumps`
   bytes and the regular expressions all follow Python. Python's `re` classes (`\s`, `\w`, `\b`, `.`,
   `$`) are spelled out for ICU in `PyRegex`.
-- **Handed to Python:** a tick whose first plan would act, or whose memory brake is due. acc-cored
-  saves the state as it was before that tick and releases `devguard.lock`. It then runs
-  `acc.py devguard once` and reloads the state Python saved. The caps run through
-  `acc.py devguard caps` every `caps_minutes`, as before.
+- **Handed to Python:** a tick with a plan Python's loop would hand to `execute()`, or whose memory
+  brake is due. acc-cored saves the state as it was before that tick and releases `devguard.lock`.
+  It then runs `acc.py devguard once` (killed after 120 s) and reloads the state Python saved. The
+  tick's own log lines and notifications are dropped then, since Python's tick writes its own. The
+  caps run through `acc.py devguard caps` every `caps_minutes` while enforcing, as before.
+- **Waits after a handover:** Python's loop runs every tick without starting a process, so two kinds
+  of handover wait (`HandoverPolicy`):
+  - Some plans Python can decline on its own reading: a pool simulator's shutdown, or a server whose
+    app is open in a Simulator that is in front. If Python declined one, it waits 60 s. The plans
+    under it and the brake still go in the meantime.
+  - After a brake handover, whatever its outcome, the brake waits its own gap:
+    `emergency_cooldown_seconds` at stage 3, `brake_cooldown_seconds` below. Without that wait, a
+    reap that finds no victim would start Python every 2 s.
+  - Every other plan is tried again on the next tick. Python's reading may disagree for a moment
+    (pressure flickering), and it acts as soon as it agrees.
+- **Config types:** a `devguard.json` value whose type differs from the default's is read
+  differently by the two sides. `"runtimes": "node"` still finds servers in Python, where `in`
+  works on a string, and finds none here. While such a value is set, every tick goes to Python, and
+  the log says so once.
 - **Kept between ticks:** process lines and their pattern answers (`ProcCache`, see
   [Readers](#readers)).
 
@@ -91,13 +106,22 @@ memory pressure (a Dispatch memory-pressure source).
 - `devguard_replay.py fuzz` builds synthetic Macs and runs them through the same tick. They include
   dev servers under launchers, shells and agents, duplicates, orphans, protected and pinned servers,
   simulators with leases, host tabs and terminals, memory pressure and histories.
-- `acc-cored guard-replay` runs the native tick on every fixture. The state, the Orca view, the plans
-  and the verdict must match.
+- `acc-cored guard-replay` runs the native tick on every fixture. The state, the Orca view, the plans,
+  every plan Python's loop hands to `execute()` (in order) and the brake must match. Python's
+  recorder declines every plan, so its loop tries them all.
+- Fuzzed configs sometimes carry a value of the wrong type. The replay checks that the native side
+  flags each of them; those ticks would go to Python.
+- A quarter of the fuzzed Macs pin a bloated server in a plain Orca terminal, for the `recycle
+  bloated` and `warn loop_watched` paths.
 - `tests/test_acc_cored.py` runs a short fuzz replay (200 fixtures) besides the readers' checks.
+- `GuardEngineTests` drives the engine over recorded readings with a stubbed `once`. It checks the
+  holds, the brake's wait, the caps' mode gate and the config handover.
 
-Results on 2026-10-10:
-- fuzz: 10,000 of 10,000 fixtures identical;
-- live: 26 of 26 recorded ticks identical, with two dev servers and real Orca reads.
+Results:
+- fuzz, 2026-10-10: 10,000 of 10,000 fixtures identical (first plan and brake only);
+- fuzz, 2026-10-11, every plan and the brake: 9,659 of 9,659 identical, and 165 configs of the wrong
+  type flagged (176 more fixtures were dropped because Python's tick raised on them);
+- live, 2026-10-10: 26 of 26 recorded ticks identical, with two dev servers and real Orca reads.
 
 ### Cost
 
