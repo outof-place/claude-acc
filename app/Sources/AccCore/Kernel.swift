@@ -1,6 +1,7 @@
 // The kernel readings acc-cored's loops are built on, without a subprocess: sysctl, mach time and
 // proc_pid_rusage. Each mirrors the reader devguard_core.py has used through ctypes, value for value,
-// so a reading here and there of the same moment agree (tests/parity_core.py checks that).
+// so a reading here and there of the same moment agree (tests/acc_cored/parity_probes.py checks the
+// tables built on them).
 import Darwin
 
 public enum Kernel {

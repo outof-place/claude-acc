@@ -14,6 +14,9 @@ enum Measure {
     }
 
     /// claude-acc's agents (legacy and Pod), the menu bar app and acc-cored itself, as loaded now.
+    /// Pod Menu keeps the menu bar app's bundle id, so it shows up as
+    /// `application.com.filip.claude-acc.menubar.<n>.<n>` when opened, or under the plain bundle id
+    /// as a login item; both start with one of these.
     static let prefixes = ["com.filip.claude-acc", "codes.pod.app.acc.", "application.com.filip.claude-acc.menubar"]
 
     static func run(labels: [String], seconds: Double, json: Bool) {
