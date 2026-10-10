@@ -338,12 +338,76 @@ class PodAgentsSetupTest(SetupHarness):
         done = subprocess.run([command, "rootd", "status"], env=env, capture_output=True, text=True)
         self.assertEqual(done.returncode, 69)
 
+    def test_a_read_only_old_app_is_removed(self):
+        # kopia, którą ditto zrobił z pakietu po `chmod a-w` (hotfix Pod.app 2026-10-10): rm -rf sam nie
+        # przechodzi, set -e kończył setup w połowie, a owner.json mówił już o nowej wersji
+        with open(os.path.join(self.legacy_app, "Contents/MacOS/ClaudeAcc"), "w") as f:
+            f.write("old\n")
+        read_only(self, self.legacy_app)
+        rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(os.path.lexists(self.legacy_app))
+        with open(os.path.join(self.state, "owner.json")) as f:
+            self.assertEqual(json.load(f)["version"], "9.9.9")
+
+    def test_a_failed_step_leaves_owner_json_as_it_was(self):
+        """owner.json powstaje na samym końcu: setup przerwany wcześniej zostawia starą wersję (albo brak
+        pliku), więc Pod widzi zmianę wersji i uruchamia go znowu, zamiast uznać instalację za aktualną."""
+        # plik, którego nie usunie nawet właściciel (uchg): krok paska menu pada pod set -e
+        locked = os.path.join(self.legacy_app, "Contents/MacOS/ClaudeAcc")
+        with open(locked, "w") as f:
+            f.write("old\n")
+        subprocess.run(["chflags", "uchg", locked], check=True)
+        self.addCleanup(subprocess.run, ["chflags", "nouchg", locked], capture_output=True)
+        rc, out = self.install()
+        self.assertNotEqual(rc, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "owner.json")))
+        self.own()
+        rc, out = self.install()
+        self.assertNotEqual(rc, 0, out)
+        with open(os.path.join(self.state, "owner.json")) as f:
+            self.assertEqual(json.load(f), {"owner": "pod", "version": "1.26.0", "app": "/Applications/Pod.app"})
+
     def test_pod_agents_need_the_pod_owner(self):
         rc, out = self.setup("--app", self.menu, "--pod-agents")
         self.assertEqual(rc, 2, out)
         self.assertIn("--pod-agents tylko z --owner pod", out)
         self.assertEqual(self.calls(), "")
         self.assertEqual(len(os.listdir(self.agents)), len(self.JOBS))
+
+
+def read_only(test, top):
+    """Każdy katalog pod `top` r-x, jak w kopii pakietu po `chmod a-w`; sprzątanie oddaje zapis."""
+    for folder, _, _ in os.walk(top, topdown=False):
+        os.chmod(folder, 0o555)
+    test.addCleanup(subprocess.run, ["chmod", "-R", "u+w", top], capture_output=True)
+
+
+class ReadOnlyAppCopyTest(SetupHarness):
+    """setup.sh z Homebrew albo install.sh: stara kopia ~/Applications/Claude Acc.app tylko do odczytu
+    zostaje zastąpiona nową, a nowa (ditto ze źródła tylko do odczytu) da się podpisać i usunąć."""
+
+    def test_the_app_is_replaced_and_started(self):
+        os.remove(os.path.join(self.bin, "ditto"))  # prawdziwe ditto: kopia ma być naprawdę
+        source = os.path.join(self.dir, "src/Claude Acc.app")
+        os.makedirs(os.path.join(source, "Contents/MacOS"))
+        with open(os.path.join(source, "Contents/MacOS/ClaudeAcc"), "w") as f:
+            f.write("new\n")
+        read_only(self, source)
+        app = os.path.join(self.home, "Applications/Claude Acc.app")
+        os.makedirs(os.path.join(app, "Contents/MacOS"))
+        with open(os.path.join(app, "Contents/MacOS/ClaudeAcc"), "w") as f:
+            f.write("old\n")
+        read_only(self, app)
+        rc, out = self.setup("--app", source, "--python", PYTHON, CLAUDE_ACC_NO_HOOKS="1", CLAUDE_ACC_SIGN_ID="-")
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(app, "Contents/MacOS/ClaudeAcc")) as f:
+            self.assertEqual(f.read(), "new\n")
+        self.assertTrue(all(os.access(folder, os.W_OK) for folder, _, _ in os.walk(app)))
+        calls = self.calls().splitlines()
+        self.assertIn("pkill -x ClaudeAcc", calls)
+        self.assertIn(f"open {app}", calls)
+        self.assertTrue([c for c in calls if c.startswith("codesign --force") and c.endswith(app)], calls)
 
 
 class PayloadTest(unittest.TestCase):
