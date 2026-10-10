@@ -16,19 +16,22 @@ struct Rig {
     let clock: Clock
     let engine: Engine
 
+    let updates: Bool
+
     init(
         backend: FakeBackend = FakeBackend(), store: MemoryStateStore = MemoryStateStore(), clock: Clock = Clock(),
-        limits: [VerbKind: RateLimiter.Limit] = [:]
+        limits: [VerbKind: RateLimiter.Limit] = [:], updates: Bool = false
     ) {
         self.backend = backend
         self.store = store
         self.clock = clock
-        engine = Engine(backend: backend, store: store, now: { clock.now }, limits: limits)
+        self.updates = updates
+        engine = Engine(backend: backend, store: store, now: { clock.now }, limits: limits, updates: updates)
         engine.start()
     }
 
-    /// The same machine and state file after the helper restarted (a crash, an idle exit).
-    func restarted() -> Rig { Rig(backend: backend, store: store, clock: clock) }
+    /// The same machine and state file after the helper restarted (a crash, an idle exit, an update).
+    func restarted() -> Rig { Rig(backend: backend, store: store, clock: clock, updates: updates) }
 
     @discardableResult
     func send(_ verb: Verb, as caller: Caller = .menu, session: SessionID = SessionID(1)) -> Reply {

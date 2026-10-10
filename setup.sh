@@ -210,8 +210,7 @@ fi
 # Pod's root helper (docs/pod-rootd.md): when the owner app carries it, `claude-acc rootd` is its CLI
 # and the old root installers are not offered
 ROOTCTL=""
-if [ -n "$POD_AGENTS" ] && [ -f "$OWNER_APP/Contents/Library/LaunchDaemons/codes.pod.app.rootd.plist" ] \
-  && [ -x "$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl" ]; then
+if [ -n "$POD_AGENTS" ] && [ -x "$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl" ]; then
   ROOTCTL="$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl"
   ln -sfn "$ROOTCTL" "$STATE/pod-rootctl"
 else

@@ -528,3 +528,107 @@ func persistence() {
     #expect(rig.store.saves == saves + 1)
     #expect(rig.store.saved?.fans == fan50)
 }
+
+// MARK: The package's install
+
+private let podApp = "/Applications/Pod.app/Contents/Resources/claude-acc/pod-rootd"
+private let openedFrom = "/Users/x/Downloads/Pod.app/Contents/Resources/claude-acc/pod-rootd"
+
+@Test("a session from Pod or Pod Menu looks for a newer helper in Pod.app at most once an hour; the CLI's never")
+func updateLooksHourly() {
+    let rig = Rig(updates: true)
+    rig.backend.candidates = [podApp: .init(version: "57")]
+    rig.send(.status, as: .cli)
+    #expect(rig.engine.nextTickDelay == nil)
+    rig.send(.status, as: .menu)
+    #expect(rig.engine.nextTickDelay == 0)
+    #expect(!rig.engine.isIdle)
+    rig.engine.tick()
+    #expect(rig.engine.restartForUpdate)
+    #expect(rig.backend.installedVersion == "57")
+
+    let after = rig.restarted()
+    after.backend.candidates = [podApp: .init(version: "58")]
+    after.send(.status, as: .app)
+    after.engine.tick()
+    #expect(after.backend.installedVersion == "58")
+    let again = after.restarted()
+    again.send(.status, as: .app)
+    again.engine.tick()
+    again.send(.status, as: .app)
+    #expect(again.engine.nextTickDelay == nil)  // the hour hasn't passed for this process
+}
+
+@Test("only a genuine, higher version replaces the helper; the check reads the staged copy, never the candidate")
+func updateTakesOnlyNewerGenuine() {
+    let rig = Rig(updates: true)
+    rig.backend.candidates = [
+        openedFrom: .init(version: "56"),  // the same build
+        podApp: .init(version: "60", genuine: false),  // a re-signed or ad hoc copy
+    ]
+    rig.send(.status, as: .menu)
+    rig.engine.tick()
+    #expect(!rig.engine.restartForUpdate)
+    #expect(rig.backend.installedVersion == "56")
+    #expect(rig.backend.staged.isEmpty)
+    let checks = rig.backend.calls.filter { $0.hasPrefix("verify") }
+    #expect(checks.allSatisfy { $0.hasPrefix("verify /staged/") })
+    #expect(checks.count == 2)
+    #expect(!rig.backend.calls.contains { $0.hasPrefix("installUpdate") })
+}
+
+@Test("an older genuine build, a symlinked candidate or a version that isn't a number never goes in")
+func updateRefusesDowngradesAndLinks() {
+    let rig = Rig(updates: true)
+    rig.backend.candidates = [
+        openedFrom: .init(version: "55"),
+        podApp: .init(version: "99", symlink: true),
+    ]
+    rig.send(.status, as: .menu)
+    rig.engine.tick()
+    #expect(rig.backend.installedVersion == "56")
+    #expect(!rig.backend.calls.contains("verify /staged/1"))
+    #expect(Engine.newer("57", than: "56"))
+    #expect(Engine.newer("1.31.10", than: "1.31.9"))
+    #expect(!Engine.newer("56", than: "56"))
+    #expect(!Engine.newer("55", than: "56"))
+    #expect(!Engine.newer("57-beta", than: "56"))
+    #expect(!Engine.newer("", than: "56"))
+}
+
+@Test("helper.uninstall restores the defaults, removes the package's files and then boots the job out")
+func uninstallRestoresThenRemoves() {
+    let rig = Rig()
+    rig.send(.fansSet(mode: fan50))
+    rig.send(.sysctlSet(setting: .maxVnodes(MaxVnodes(786_432)!), persist: true))
+    let reply = rig.send(.helperUninstall)
+    #expect(rig.changed(reply) == true)
+    #expect(rig.backend.fans.allSatisfy { !$0.manual })
+    #expect(rig.backend.sysctls[.maxVnodes] == 263_168)
+    #expect(!rig.backend.installed)
+    #expect(!rig.backend.bootedOut)  // the reply goes out first
+    #expect(rig.engine.nextTickDelay == 0)
+    let saves = rig.store.saves
+    rig.engine.tick()
+    #expect(rig.backend.bootedOut)
+    #expect(rig.store.saves == saves)  // the state file went with the uninstall
+    // the Electron process can't, the CLI only approved
+    let other = Rig()
+    #expect(other.send(.helperUninstall, as: .app).refusal == .verbNotAllowed(verb: "helper.uninstall", caller: .app))
+    #expect(other.engine.handle(Request(.helperUninstall), from: .cli, session: SessionID(3)).refusal
+        == .needsApproval(verb: "helper.uninstall"))
+    #expect(other.backend.installed)
+}
+
+@Test("an uninstall whose restore fails removes nothing")
+func uninstallKeepsFilesWhenRestoreFails() {
+    let rig = Rig()
+    rig.send(.fansSet(mode: fan50))
+    rig.backend.failing = ["applyFans"]
+    guard case .refused(.failed) = rig.send(.helperUninstall).outcome else {
+        Issue.record("expected a failure")
+        return
+    }
+    #expect(rig.backend.installed)
+    #expect(!rig.engine.uninstalling)
+}

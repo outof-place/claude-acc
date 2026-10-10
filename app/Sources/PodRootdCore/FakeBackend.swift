@@ -35,6 +35,25 @@ public final class FakeBackend: Backend {
     public var legacyBooted: Set<LegacyDaemon> = []
     public var fanConfigs: [String: FanMode] = [:]
     public var savedSpotlightList: [String]?
+    /// A pod-rootd binary in a candidate place, as the self-update sees it.
+    public struct Binary: Equatable, Sendable {
+        public var version: String
+        /// Pod's team, `codes.pod.rootd`, notarized.
+        public var genuine: Bool
+        public var symlink: Bool
+
+        public init(version: String, genuine: Bool = true, symlink: Bool = false) {
+            self.version = version
+            self.genuine = genuine
+            self.symlink = symlink
+        }
+    }
+
+    public var installedVersion: String? = "56"
+    public var candidates: [String: Binary] = [:]
+    public var staged: [String: Binary] = [:]
+    public var installed = true
+    public var bootedOut = false
     public var failing: Set<String> = []
     public private(set) var calls: [String] = []
 
@@ -181,5 +200,47 @@ public final class FakeBackend: Backend {
     public func bootstrap(_ daemon: LegacyDaemon) throws {
         try record("bootstrap \(daemon.rawValue)")
         legacyBooted.insert(daemon)
+    }
+
+    // MARK: The package's install
+
+    public var ownVersion: String? { installedVersion }
+
+    public func updateCandidates() -> [String] { candidates.keys.sorted() }
+
+    public func stageUpdate(from candidate: String) throws -> String {
+        try record("stageUpdate \(candidate)")
+        guard let binary = candidates[candidate] else { throw BackendError("no such file") }
+        guard !binary.symlink else { throw BackendError("\(candidate) is a symlink") }
+        let path = "/staged/\(staged.count)"
+        staged[path] = binary
+        return path
+    }
+
+    public func verifiedVersion(ofStaged path: String) -> String? {
+        calls.append("verify \(path)")
+        guard let binary = staged[path], binary.genuine else { return nil }
+        return binary.version
+    }
+
+    public func installUpdate(_ staged: String) throws {
+        try record("installUpdate \(staged)")
+        guard let binary = self.staged.removeValue(forKey: staged) else { throw BackendError("nothing staged") }
+        installedVersion = binary.version
+    }
+
+    public func discardUpdate(_ staged: String) {
+        calls.append("discardUpdate \(staged)")
+        self.staged[staged] = nil
+    }
+
+    public func removeInstall() throws {
+        try record("removeInstall")
+        installed = false
+    }
+
+    public func bootoutSelf() {
+        calls.append("bootoutSelf")
+        bootedOut = true
     }
 }
