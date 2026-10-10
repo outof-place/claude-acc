@@ -38,7 +38,9 @@ import ctypes
 import ctypes.util
 import hashlib
 import json
+import math
 import os
+import re
 import select
 import signal
 import socket
@@ -182,8 +184,28 @@ class Prober:
         return out
 
 
+# nazwa interfejsu z jądra (en8, bridge100): litery i cyfry, nic, co ifconfig wziąłby za opcję
+IFACE_RE = re.compile(r"^[a-z]{1,15}[0-9]{1,4}$")
+TBR_MAX_KBPS = 10_000_000
+
+
+def valid_iface(iface):
+    """Interfejs, który istnieje teraz w jądrze i ma zwykłą nazwę: tylko taki trafia do ifconfig."""
+    if not isinstance(iface, str) or not IFACE_RE.match(iface):
+        return False
+    try:
+        return iface in {name for _, name in socket.if_nameindex()}
+    except OSError:
+        return False
+
+
 def set_tbr(iface, kbps):
-    arg = "%dKbps" % int(kbps) if kbps else "0"
+    """`ifconfig <if> tbr <N>Kbps` (0 zdejmuje limit). Argumenty tylko z liczby i sprawdzonej nazwy."""
+    if not valid_iface(iface):
+        log("tbr: pomijam interfejs %r, nie ma go w jądrze albo ma dziwną nazwę" % (iface,))
+        return
+    rate = max(0, min(int(kbps or 0), TBR_MAX_KBPS))
+    arg = "%dKbps" % rate if rate else "0"
     subprocess.run(["/sbin/ifconfig", iface, "tbr", arg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -363,23 +385,43 @@ def detect(run=_run, ports=None):
     return None
 
 
+# jedyne klucze hotspot.json; plik pisze użytkownik, a czyta root
+CONFIG_KEYS = ("enabled", "min_mbps", "max_mbps")
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _clamp_mbps(value, low, high):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if not _number(value):
         return None
     return int(min(high, max(low, value)) * 1000)
 
 
 def read_config(path=CONFIG):
-    """Konfiguracja z katalogu użytkownika; root czyta ją bez podążania za dowiązaniem."""
+    """Konfiguracja z katalogu użytkownika; root czyta ją bez podążania za dowiązaniem. Nieznany klucz,
+    `enabled`, które nie jest true/false, albo limit, który nie jest skończoną liczbą: cały plik się nie
+    liczy, zostają bezpieczne domyślne (tryb wyłączony), a "problem" mówi dlaczego (demon to loguje)."""
     cfg = {"enabled": False, "min_kbps": MIN_KBPS, "max_kbps": MAX_KBPS}
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as f:
             raw = json.loads(f.read(4096) or b"{}")
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return cfg
+    except (OSError, ValueError) as err:
+        return dict(cfg, problem="hotspot.json nie do odczytu: %s" % (err,))
     if not isinstance(raw, dict):
-        return cfg
+        return dict(cfg, problem="hotspot.json to nie obiekt JSON")
+    unknown = sorted(str(k) for k in raw if k not in CONFIG_KEYS)
+    if unknown:
+        return dict(cfg, problem="hotspot.json: nieznane klucze %s" % ", ".join(unknown)[:200])
+    if "enabled" in raw and not isinstance(raw["enabled"], bool):
+        return dict(cfg, problem="hotspot.json: enabled to nie true/false")
+    bad = [k for k in ("min_mbps", "max_mbps") if k in raw and not _number(raw[k])]
+    if bad:
+        return dict(cfg, problem="hotspot.json: %s to nie liczba" % ", ".join(bad))
     cfg["enabled"] = raw.get("enabled") is True
     cfg["min_kbps"] = _clamp_mbps(raw.get("min_mbps"), 1, 1000) or MIN_KBPS
     cfg["max_kbps"] = _clamp_mbps(raw.get("max_mbps"), 5, 2000) or MAX_KBPS
@@ -417,6 +459,31 @@ def log(line):
     print("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), line), file=sys.stderr, flush=True)
 
 
+def interpreter_problem(paths=None):
+    """Pierwsza ścieżka interpretera tego procesu, która nie należy do roota albo jest zapisywalna dla
+    grupy lub świata (plik, prawdziwa ścieżka, biblioteka standardowa i ich katalogi nadrzędne), albo
+    None. Ta sama reguła co rootpy.unsafe_reason przy instalacji: demon sprawdza ją jeszcze raz przy
+    każdym starcie, bo interpreter mógł się zmienić od instalacji. `paths` podstawiają testy."""
+    if paths is None:
+        import sysconfig
+
+        paths = [sys.executable, os.path.realpath(sys.executable), sysconfig.get_paths()["stdlib"]]
+    for path in paths:
+        step = os.path.abspath(path)
+        while True:
+            try:
+                info = os.lstat(step)
+            except OSError:
+                return step
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return step
+            parent = os.path.dirname(step)
+            if parent == step:
+                break
+            step = parent
+    return None
+
+
 def daemon(config_path, state_path):
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
@@ -426,10 +493,23 @@ def daemon(config_path, state_path):
     remembered = {}  # interfejs -> (bezpieczny limit, kiedy)
     ports, ports_at = set(), float("-inf")
     last_summary = time.monotonic()
+    if os.geteuid() == 0:
+        bad = interpreter_problem()
+        if bad:
+            # launchd (KeepAlive) uruchomi go znowu; pięć minut przerwy, żeby log nie puchł
+            log("odmawiam startu: %s nie należy do roota albo jest zapisywalny dla innych; "
+                "przeinstaluj demona (claude-acc hotspot install)" % bad)
+            time.sleep(300)
+            return 78
     log("start")
+    problem = None
     try:
         while not stop:
             cfg = read_config(config_path)
+            if cfg.get("problem") != problem:
+                problem = cfg.get("problem")
+                if problem:
+                    log("konfiguracja odrzucona, tryb wyłączony: %s" % problem)
             if time.monotonic() - ports_at > 60:
                 ports, ports_at = iphone_ports(), time.monotonic()
             target = detect(ports=ports) if cfg["enabled"] else None
@@ -607,6 +687,8 @@ def set_enabled(on, path=CONFIG):
         pass
     if not isinstance(cfg, dict):
         cfg = {}
+    # tylko znane klucze: z nieznanym demon odrzuciłby cały plik
+    cfg = {k: v for k, v in cfg.items() if k in CONFIG_KEYS}
     cfg["enabled"] = on
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_json(path, cfg)
@@ -639,7 +721,8 @@ def status(config_path=CONFIG, state_path=STATE, now=None):
            "active": running and bool(state.get("active")),
            "current": file_hash(os.path.realpath(__file__)) == file_hash(BIN) if installed() else None,
            # plista sprzed 1.31.1 startowała demona przez shebang `#!/usr/bin/python3`
-           "legacy_launch": bool(launch) and os.path.basename(launch[0]) not in ("python3", "python")}
+           "legacy_launch": bool(launch) and os.path.basename(launch[0]) not in ("python3", "python"),
+           "config_problem": cfg.get("problem")}
     if out["active"]:
         for key in ("iface", "via", "rate_kbps", "safe_kbps", "cuts", "tx_kbps", "rx_kbps", "delay_p50_ms",
                     "delay_p90_ms", "baseline_ms", "shaping", "lost", "answered", "since"):
@@ -653,6 +736,8 @@ def cmd_status(args):
         print(json.dumps(s, sort_keys=True))
         return 0
     print("tryb hotspot: %s" % ("włączony" if s["enabled"] else "wyłączony"))
+    if s.get("config_problem"):
+        print("konfiguracja odrzucona: %s (claude-acc hotspot on|off zapisze ją od nowa)" % s["config_problem"])
     if not s["installed"]:
         print("demon: nie zainstalowany (claude-acc hotspot install)")
     elif not s["running"]:
@@ -693,8 +778,7 @@ def main(argv=None):
     p.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "daemon":
-        daemon(args.config, args.state)
-        return 0
+        return daemon(args.config, args.state) or 0
     if args.cmd == "run":
         run_foreground(args.iface, args.seconds, args.verbose)
         return 0
