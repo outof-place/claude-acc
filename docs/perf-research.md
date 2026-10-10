@@ -1193,10 +1193,12 @@ perf.py list                                                 # poprawki z grupą
 perf.py apply <nazwa> | --all [--dry-run]
 perf.py undo <nazwa> | --all
 perf.py keep                                                 # pilnowanie poprawek (launchd)
-sudo ./perf-root.sh vnodes trial [--value 786432] [--keep]   # cache vnode: pomiar przed i po
-sudo ./perf-root.sh vnodes apply|undo
-sudo ./perf-root.sh trial [--rate 27Mbps] [--keep]           # ogranicznik: pomiar przed i po
-sudo ./perf-root.sh shaper apply|undo                        # ./perf-root.sh shaper status bez sudo
+# pod rootem tylko z kopii roota (claude-acc root install, raz): claude-acc perf-root woła
+# sudo /usr/local/libexec/claude-acc-root/root-run.sh perf-root ...
+claude-acc perf-root vnodes trial [--value 786432] [--keep]   # cache vnode: pomiar przed i po
+claude-acc perf-root vnodes apply|undo
+claude-acc perf-root trial [--rate 27Mbps] [--keep]           # ogranicznik: pomiar przed i po
+claude-acc perf-root shaper apply|undo                        # ./perf-root.sh shaper status bez sudo
 ./perf-root.sh devtools add|undo|status [--app <ścieżka do .app>; domyślnie host z orcahost.py]   # bez sudo, w Terminalu; "+" w Ustawieniach
 ```
 

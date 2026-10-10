@@ -200,6 +200,41 @@ class ConfigTest(unittest.TestCase):
         hotspot.set_enabled(True, self.path)
         with open(self.path) as f:
             self.assertEqual(json.load(f), {"enabled": True, "max_mbps": 40})
+        # nieznany klucz wypada przy zapisie: z nim demon odrzuciłby cały plik
+        self.write('{"max_mbps": 40, "iface": "en0; reboot"}')
+        hotspot.set_enabled(True, self.path)
+        with open(self.path) as f:
+            self.assertEqual(json.load(f), {"enabled": True, "max_mbps": 40})
+
+    def test_malformed_config_means_safe_defaults_and_a_reason(self):
+        """Plik pisze użytkownik, czyta root: wszystko spoza trzech kluczy i ich typów to domyślne."""
+        defaults = (False, hotspot.MIN_KBPS, hotspot.MAX_KBPS)
+        for text in ('{"enabled": true, "iface": "en0"}', '{"enabled": 1}', '{"enabled": true, "max_mbps": "40"}',
+                     '{"enabled": true, "min_mbps": NaN}', '{"enabled": true, "max_mbps": Infinity}',
+                     '{"enabled": true, "max_mbps": true}', "[1]", "{nie json"):
+            with self.subTest(text=text):
+                self.write(text)
+                cfg = hotspot.read_config(self.path)
+                self.assertEqual((cfg["enabled"], cfg["min_kbps"], cfg["max_kbps"]), defaults)
+                self.assertTrue(cfg.get("problem"), text)
+        # brak pliku to zwykłe "wyłączony", nie problem
+        self.assertNotIn("problem", hotspot.read_config(os.path.join(self.dir, "nie-ma.json")))
+        self.write('{"enabled": true, "min_mbps": 10, "max_mbps": 40}')
+        self.assertNotIn("problem", hotspot.read_config(self.path))
+
+    def test_tbr_only_on_a_real_interface_with_a_plain_name(self):
+        names = {name for _, name in hotspot.socket.if_nameindex()}
+        real = "lo0" if "lo0" in names else sorted(names)[0]
+        self.assertTrue(hotspot.valid_iface(real))
+        for bad in ("en99999", "-x", "en0 tbr 0", "lo0;id", "", None, 7, "../lo0"):
+            self.assertFalse(hotspot.valid_iface(bad), bad)
+        with mock.patch.object(hotspot.subprocess, "run") as run, mock.patch("sys.stderr"):
+            hotspot.set_tbr("-tbr", 5000)
+            run.assert_not_called()
+            hotspot.set_tbr(real, 10 ** 12)
+            self.assertEqual(run.call_args.args[0], ["/sbin/ifconfig", real, "tbr", "%dKbps" % hotspot.TBR_MAX_KBPS])
+            hotspot.set_tbr(real, 0)
+            self.assertEqual(run.call_args.args[0][-1], "0")
 
     def test_write_json_replaces_a_planted_symlink(self):
         victim = os.path.join(self.dir, "victim")
@@ -259,6 +294,22 @@ class RootLaunchTest(unittest.TestCase):
                 with mock.patch.object(hotspot, "PLIST", path), mock.patch.object(hotspot, "BIN", __file__):
                     s = hotspot.status(os.path.join(self.plist([]), "..", "none.json"), "/nie/ma/state.json")
                 self.assertEqual(s["legacy_launch"], legacy)
+
+    def test_interpreter_check_at_run_time(self):
+        """Demon sprawdza przy starcie interpreter jeszcze raz: ścieżka użytkownika to odmowa."""
+        self.assertEqual(hotspot.interpreter_problem(["/usr/bin/true"]), None)
+        mine = tempfile.mkdtemp(prefix="hotspot-py-")
+        self.assertEqual(hotspot.interpreter_problem(["/usr/bin/true", os.path.join(mine, "python3")]),
+                         os.path.join(mine, "python3"))  # plik, którego nie ma, też się nie liczy
+        open(os.path.join(mine, "python3"), "w").close()
+        self.assertEqual(hotspot.interpreter_problem([os.path.join(mine, "python3")]), os.path.join(mine, "python3"))
+
+    def test_daemon_refuses_a_user_owned_interpreter(self):
+        with mock.patch.object(hotspot.os, "geteuid", return_value=0), \
+             mock.patch.object(hotspot, "interpreter_problem", return_value="/Applications/Xcode.app"), \
+             mock.patch.object(hotspot.time, "sleep") as sleep, mock.patch("sys.stderr"):
+            self.assertEqual(hotspot.daemon("/nie/ma.json", "/nie/ma-state.json"), 78)
+        sleep.assert_called_once_with(300)
 
     def test_install_refuses_without_a_root_owned_interpreter(self):
         args = argparse.Namespace(dry_run=True)

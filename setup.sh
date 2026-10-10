@@ -238,7 +238,15 @@ PY="$STATE/python"
 [ -x "$PY" ] || PY=/usr/bin/python3
 RUN="$STATE/acc.py"
 case "$1" in
-  mac) shift; exec "$PY" "$RUN" janitor "$@" ;;
+  mac)
+    shift
+    # porządki roota z kopii roota (claude-acc root install): nigdy skrypt z $STATE pod sudo
+    if [ "${1:-}" = root-clean ]; then
+      shift
+      [ -x /usr/local/libexec/claude-acc-root/root-run.sh ] || { echo "najpierw raz: claude-acc root install" >&2; exit 1; }
+      exec sudo /usr/local/libexec/claude-acc-root/root-run.sh janitor-root "$@"
+    fi
+    exec "$PY" "$RUN" janitor "$@" ;;
   clean) shift; exec "$PY" "$RUN" janitor sweep --force "$@" ;;
   guard) shift; exec "$PY" "$RUN" devguard "$@" ;;
   perf) shift; exec "$PY" "$RUN" perf "$@" ;;
@@ -271,9 +279,20 @@ case "$1" in
     [ "${1:-}" = devtools ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
     # stan limitu GPU to tylko odczyt sysctl i plisty demona
     case "${1:-} ${2:-}" in "iogpu status" | "iogpu ") exec "$(cat "$STATE/source")/perf-root.sh" "$@" ;; esac
+    # pod rootem tylko kopia roota (claude-acc root install): `source` wskazuje libexec Homebrew albo
+    # Pod.app, które może zmienić każdy na tym koncie, a sudo nie sprawdza podpisów
+    ROOTRUN=/usr/local/libexec/claude-acc-root/root-run.sh
+    [ -x "$ROOTRUN" ] || { echo "najpierw raz: claude-acc root install" >&2; exit 1; }
     # już pod sudo (`sudo claude-acc perf-root ...`): drugie sudo nadpisałoby SUDO_USER rootem
-    [ "$(id -u)" -eq 0 ] && exec "$(cat "$STATE/source")/perf-root.sh" "$@"
-    exec sudo "$(cat "$STATE/source")/perf-root.sh" "$@" ;;
+    [ "$(id -u)" -eq 0 ] && exec "$ROOTRUN" perf-root "$@"
+    exec sudo "$ROOTRUN" perf-root "$@" ;;
+  # kopia roota: install (sudo, Touch ID), status, uninstall
+  root)
+    case "${2:-status}" in
+      install) exec "$(cat "$STATE/source")/root-install.sh" ;;
+      uninstall) exec "$(cat "$STATE/source")/root-install.sh" --uninstall ;;
+      *) exec "$(cat "$STATE/source")/root-install.sh" --status ;;
+    esac ;;
   fans)
     shift
     case "${1:-read}" in
@@ -336,6 +355,10 @@ fi
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
 echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+# kopia roota (perf-root, porządki roota, kompresja aplikacji roota) sprzed tej wersji: root jej nie odświeży sam
+if [ -d /usr/local/libexec/claude-acc-root ] && ! "$SRC/root-install.sh" --status >/dev/null 2>&1; then
+  echo "kopia roota starsza niż ta wersja: claude-acc root install (sudo, Touch ID)"
+fi
 # host agentów (Orca albo Pod) według orcahost.py
 HOST_APP="$("$STATE/python" "$STATE/orcahost.py" app 2>/dev/null || true)"
 if [ -n "$HOST_APP" ] && { [ -d "$HOST_APP" ] || [ -d "$HOME/Applications/$(basename "$HOST_APP")" ]; }; then
