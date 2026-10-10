@@ -26,12 +26,18 @@ Co robi strażnik (launchd uruchamia go jako root co minutę):
 --target i --fsmonitor-match są dla testów: atrapa procesu zamiast prawdziwego demona.
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import ctypes
 import json
-import os
 import signal
 import subprocess
-import sys
 import time
 
 LIMIT_MB = 4096  # 100 razy więcej niż zwykle, 10 razy mniej niż w noc awarii

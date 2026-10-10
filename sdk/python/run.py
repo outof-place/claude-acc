@@ -8,10 +8,16 @@ Klucz API: ANTHROPIC_API_KEY albo Pęk kluczy (usługa claude-acc-browser, konto
 
 from __future__ import annotations
 
-import argparse
 import os
-import subprocess
 import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import argparse
+import subprocess
 
 from anthropic import Anthropic
 from claude_acc_browser import ClaudeAccBrowser
