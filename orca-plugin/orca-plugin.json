@@ -25,7 +25,8 @@
       { "id": "claude-acc.update", "title": "Claude Acc: Update tools now" },
       { "id": "claude-acc.ultra-toggle", "title": "Claude Acc: Toggle Ultra" },
       { "id": "claude-acc.dictate", "title": "Claude Acc: Toggle dictation" },
-      { "id": "claude-acc.awake-toggle", "title": "Claude Acc: Toggle Stay Awake" }
+      { "id": "claude-acc.awake-toggle", "title": "Claude Acc: Toggle Stay Awake" },
+      { "id": "claude-acc.settings", "title": "Claude Acc: Open settings…" }
     ],
     "events": [{ "on": "agent.status.changed" }, { "on": "worktree.created" }, { "on": "worktree.removed" }]
   },
