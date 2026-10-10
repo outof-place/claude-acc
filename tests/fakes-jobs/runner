@@ -10,9 +10,11 @@ final); pola specjalne wpisu planu:
   "exit": kod bez zapisu (64 albo 73, jak odmowa runnera), "gate": true (czeka, póki istnieje
   $HOME/fake/gate-<job>), "payer": {...} (current.json i zapis), "die": true (SIGKILL dla siebie po
   current.json, bez zapisu, jak hamulec), "pool": {"credits": [org], "subscription": [email]}
-  (wybór płatnika jak runenv.prepare: auto bierze pierwszą organizację z kredytem, bez niej
-  pierwszą subskrypcję spoza runenv/avoid.json; --mode credits albo subscription tylko to źródło;
-  nikt nie zapłaci: POMINIĘTO payer bez płatnika zamiast wyniku z planu).
+  (wybór płatnika jak runenv.prepare: auto bierze pierwszą organizację z kredytem spoza listy
+  omijanych organizacji runenv, bez niej pierwszą subskrypcję spoza runenv/avoid.json; --mode
+  credits albo subscription tylko to źródło; nikt nie zapłaci: POMINIĘTO payer bez płatnika zamiast
+  wyniku z planu). Próba na kredycie z override auth albo limit dopisuje organizację do listy
+  omijanych prawdziwym runenv.avoid_org, jak licznik runenv przy 401 albo 429.
 Każde wywołanie trafia do $HOME/fake/runner-calls.jsonl: {job, slot, mode, pid, ppid, pgid, sid}.
 """
 import fcntl
@@ -21,6 +23,9 @@ import os
 import signal
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+import runenv  # noqa: E402  (lista omijanych organizacji: ta sama, którą czyta i pisze prawdziwy runenv)
 
 HOME = os.environ["HOME"]
 FAKE = os.path.join(HOME, "fake")
@@ -42,8 +47,11 @@ def pick(pool, mode):
             avoided = {e for e, v in json.load(f).items() if float(v.get("until", 0)) > time.time()}
     except (OSError, ValueError, AttributeError):
         avoided = set()
-    if mode in ("auto", "credits") and pool.get("credits"):
-        return {"mode": "credits", "email": "1@example.com", "org_id": pool["credits"][0], "verdict": "ok"}
+    if mode in ("auto", "credits"):
+        orgs = runenv.avoided(runenv.AVOID_ORGS_PATH)
+        for org in pool.get("credits") or []:
+            if org not in orgs:
+                return {"mode": "credits", "email": "1@example.com", "org_id": org, "verdict": "ok"}
     if mode in ("auto", "subscription"):
         for email in pool.get("subscription") or []:
             if email.lower() not in avoided:
@@ -109,6 +117,8 @@ def main():
            "stopped": None, "facts": [], "override": step.get("override"), "retryable": not final,
            "final": final, "switch_payment": step.get("switch_payment", False), "skip": step.get("skip"),
            "banner": step.get("banner"), "live_check": None, "log": "", "pid": os.getpid(), "slot": slot}
+    if (payer or {}).get("mode") == "credits" and step.get("override") in ("auth", "limit"):
+        runenv.avoid_org(payer["org_id"], payer["email"], step["override"], f"atrapa runnera, próba {rid}")
     with open(os.path.join(folder, "history.jsonl"), "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     os.unlink(os.path.join(folder, "current.json"))

@@ -146,8 +146,8 @@ Komendy:
   jobs tick [--json]                    jeden obrót harmonogramu (launchd co 2 min; patrz niżej)
   jobs list [--json]                    joby, ostatni wynik, bieg w toku, wstrzymanie
   jobs run NAZWA [--slot S] [--mode M] [--json]
-                                        jedna próba; --mode jednorazowo zamiast mode joba (tik:
-                                        przełączenie płatności po switch_payment)
+                                        jedna próba; --mode jednorazowo zamiast mode joba (ręcznie;
+                                        tik go nie podaje, next_mode)
   jobs enable NAZWA / jobs disable NAZWA
   jobs log NAZWA [-n 5] [--json]        ostatnie próby i ogon logu
   jobs add NAZWA --cwd KATALOG --entry 'KOMENDA' --budget-usd N [--precheck 'KOMENDA']
@@ -207,13 +207,12 @@ czekania, ostatni tik, próba właśnie wypuszczona). Od pierwszego pasującego:
 Liczona próba: każdy zapis slotu poza POMINIĘTO z skip heavy, hold, memory (bramki tiku i pamięć
 nie zjadają prób; pamięć ponawia co 20 min). Backoff po liczonej próbie: 1 h, potem 3 h; po
 POMINIĘTO payer (nikt nie zapłaci) 2 h, potem 4 h (okna sesji subskrypcji wracają co 5 h).
-Płatność: job auto zostaje na auto, bo runenv sam omija złe źródło: kredyt z billing oznacza
-wyczerpany, 429 na subskrypcji trafia do avoid.json, a 401 na subskrypcji tik dopisuje tam sam
-(runenv.avoid na 5 h, przy starcie następnej próby). Wyjątek: próba, która płaciła kredytem i
-skończyła się 401 albo limitem (switch_payment, override auth albo limit), przełącza resztę slotu
-na --mode subscription: runenv nie ma listy omijanych organizacji i wybrałby tę samą znowu.
-Decyduje ostatni zapis slotu z płatnikiem kredytowym, nie ostatni zapis (POMINIĘTO bez płatnika
-nie gubi przełączenia). Job z mode credits albo subscription nie dostaje --mode.
+Płatność: job auto zostaje na auto, bez wyjątków, bo runenv sam omija złe źródło: kredyt z billing
+oznacza wyczerpany, organizację kredytu po 401 albo limicie omija (avoid-orgs.json: doba po 401,
+3 h po 429, od końca biegu), więc następna próba bierze najpierw inną organizację, a dopiero bez
+niej subskrypcję; 429 na subskrypcji trafia do avoid.json, a 401 na subskrypcji tik dopisuje tam
+sam (runenv.avoid na 5 h, przy starcie następnej próby). Job z mode credits albo subscription nie
+dostaje --mode.
 Banery (osascript; tekst jako argumenty skryptu, on run argv): zapis z BŁĄD ostatecznym,
 ZAPARKOWANO albo PILNE ze slotem (tiku albo obcym) i każde PILNE, także ręczne, najwyżej 8 dni po
 końcu zapisu; limit prób; slot zastąpiony bez wyniku (BRAK BIEGU, BEZ WYNIKU); o 20:00 (pierwszy
@@ -334,7 +333,6 @@ BANNER_DAYS = 8  # zapis próby woła banerem najwyżej tyle dni po końcu (kluc
 NOT_COUNTED = ("heavy", "hold", "memory")  # POMINIĘTO, które nie zjada próby
 SLOT_RE = re.compile(r"(\d{4}-\d{2}-\d{2})/(\d+)")  # id slotu tiku; inne teksty z --slot to biegi spoza tiku
 CLOSES_BY_HAND = ("OPUBLIKOWANO", "ZAPARKOWANO", "BEZ WPISU", "PILNE")  # bieg spoza tiku, który zamyka slot
-SWITCH_FROM_CREDITS = ("auth", "limit")  # kredyt z 401 albo limitem: reszta slotu płaci subskrypcją
 # baner: tekst i tytuł idą jako argumenty skryptu, nie w jego treści (AppleScript nie zna \uXXXX z json.dumps)
 NOTIFY_SCRIPT = ("on run argv", "display notification (item 1 of argv) with title (item 2 of argv)", "end run")
 HINT_REFRESH_S = 15 * 60
@@ -1630,18 +1628,13 @@ def slot_key(slot_id):
 
 
 def next_mode(job, recs):
-    """--mode dla następnej próby slotu (recs: jego zapisy) albo None (mode joba). Job auto zostaje
-    na auto: runenv sam omija wyczerpany kredyt (billing) i konta z avoid.json (429 zapisuje runenv,
-    401 na subskrypcji dopisuje tik w spawn()). Wyjątek: ostatnia próba slotu, która płaciła kredytem,
-    skończyła się 401 albo limitem; runenv nie ma listy omijanych organizacji i w auto wybrałby tę
-    samą organizację znowu, więc reszta slotu płaci subskrypcją. Liczy się ostatni zapis z płatnikiem
-    kredytowym, nie ostatni zapis: POMINIĘTO bez płatnika (pamięć, inny ciężki bieg) i próba na
-    subskrypcji, która padła z innego powodu, nie gubią przełączenia."""
-    if job["mode"] != "auto":
-        return None
-    paid = next((r for r in reversed(recs) if (r.get("payer") or {}).get("mode") == "credits"), None)
-    if paid and paid.get("switch_payment") and paid.get("override") in SWITCH_FROM_CREDITS:
-        return "subscription"
+    """--mode dla następnej próby slotu (recs: jego zapisy) albo None (mode joba). Zawsze None: job
+    auto zostaje na auto, bo runenv sam omija złe źródło płatności: wyczerpany kredyt (billing),
+    organizację kredytu po 401 albo limicie (avoid-orgs.json, pisze licznik runenv) i konta
+    subskrypcji z avoid.json (429 pisze runenv, 401 dopisuje tik w spawn()). Wymuszone dawniej
+    --mode subscription po 401 albo limicie na kredycie pomijało też organizacje, które kredyt
+    jeszcze mają (wbrew "najpierw kredyt"), a po liście omijanych organizacji nie ma przypadku, w
+    którym auto wybrałoby tę samą organizację znowu."""
     return None
 
 
@@ -2363,7 +2356,7 @@ def cmd_run(args):
     if mode is not None:
         if mode not in runenv.MODES:
             raise credits.UsageError("--mode: auto, credits albo subscription")
-        job = dict(job, mode=mode)  # jednorazowo: tik przełącza źródło płatności po switch_payment
+        job = dict(job, mode=mode)  # jednorazowo, z ręki (tik zostawia mode joba, next_mode)
     swept = runenv.sweep()
     recover(swept)
     lock = try_lock(os.path.join(job_dir(name), "lock"))
