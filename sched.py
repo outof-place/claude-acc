@@ -92,6 +92,10 @@ DEFAULTS = {
     # twardy limit czasu biegu per klasa: {"prefiks klasy": sekundy}; po nim SIGTERM grupy procesów,
     # po 10 s SIGKILL. Domyślnie pusto: nic nie ginie samo
     "class_timeout_s": {},
+    # klasa QoS jobów: null zostawia tę, z którą przyszła komenda; "utility" albo "background"
+    # uruchamia joba przez `taskpolicy -c <klasa>`, a ten limit dziedziczy całe drzewo. Domyślnie
+    # wyłączone (2026-10-10): utility woli rdzenie E, a buildy mają iść na rdzeniach P
+    "job_qos": None,
     # głowa, której startu nie da się przewidzieć, przepuszcza tylko job, którego prognoza
     # × 2 + 10 s mieści się w tylu sekundach: o tyle najwyżej ją opóźni
     "head_delay_s": 60,
@@ -3535,6 +3539,18 @@ def start_depot(state, entry, target):
     state["running"].append(entry)
 
 
+JOB_QOS = ("utility", "background")
+TASKPOLICY = "/usr/sbin/taskpolicy"
+
+
+def job_argv(argv, cfg):
+    """argv joba z `job_qos`: `taskpolicy -c utility|background` przed komendą, inaczej bez zmian."""
+    qos = cfg.get("job_qos")
+    if qos in JOB_QOS and os.access(TASKPOLICY, os.X_OK):
+        return [TASKPOLICY, "-c", qos, *argv]
+    return list(argv)
+
+
 def run_local(entry, job, command, argv, cfg):
     import signal
     import subprocess
@@ -3554,7 +3570,7 @@ def run_local(entry, job, command, argv, cfg):
     ours_p = entry.get("p") if entry.get("p_by") == "scheduler" else None
     if ours_p or extra:
         env["GOFLAGS"] = goflags_with(ours_p, extra)
-    target = shell_argv(command) if command is not None else argv
+    target = job_argv(shell_argv(command) if command is not None else argv, cfg)
     env[NESTED_ENV] = entry["id"]
     try:
         child = subprocess.Popen(target, env=env, preexec_fn=os.setpgrp)
