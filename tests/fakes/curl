@@ -16,6 +16,10 @@ for line in sys.stdin.read().splitlines():
 url = conf.get("url", "")
 server = _store.load("server.json", {})
 server.setdefault("log", []).append(url)
+# który token poszedł do którego adresu: testy profili Pod sprawdzają, że ich token czyta tylko limity
+os.makedirs(_store.ROOT, exist_ok=True)
+with open(os.path.join(_store.ROOT, "curl-auth.log"), "a") as log:
+    log.write(json.dumps([url, headers.get("Authorization", "").replace("Bearer ", "")]) + "\n")
 
 
 def reply(code, obj):
