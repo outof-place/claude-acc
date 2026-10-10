@@ -1,3 +1,4 @@
+import AccKit
 import Foundation
 import Observation
 import PodRootdClient
@@ -77,6 +78,34 @@ final class RootHelper {
         Task { await syncLid() }
     }
 
+    /// One verb for AccKit's views (PodMenuRootHelper): the reply's status taken, a refusal thrown.
+    func send(_ verb: Verb) async throws(AccRootError) {
+        guard let client = connect() else { throw .unreachable(Self.unreachable) }
+        let reply: Reply
+        do {
+            reply = try await client.send(verb)
+        } catch {
+            dropped()
+            throw .unreachable("\(Self.unreachable): \(error.localizedDescription)")
+        }
+        if let status = reply.status { take(status) }
+        if let refusal = reply.refusal { throw Self.accError(refusal) }
+    }
+
+    /// AccKit's lid hold, nil releasing it: the same hold Awake asks for, sent now. While the old
+    /// fans daemon is installed it drives the lid, so the views are told to migrate first.
+    func holdLid(until: Date?) async throws(AccRootError) {
+        guard connect() != nil else { throw .unreachable(Self.unreachable) }
+        if !owns { await refreshStatus() }
+        guard client != nil else { throw .unreachable(Self.unreachable) }
+        guard owns else {
+            if until == nil { lidWanted = nil; return }
+            throw .refused("the old fans daemon still drives the lid: run pod-rootctl legacy migrate first", retryAfter: nil)
+        }
+        lidWanted = until
+        if let problem = await syncLid() { throw problem }
+    }
+
     // MARK: Loop
 
     private func tick() async {
@@ -132,26 +161,36 @@ final class RootHelper {
         set(owns: false)
     }
 
-    /// The hold renews before it runs out, and again after a reconnect; nil releases it.
-    private func syncLid() async {
-        guard owns, let client = connect() else { return }
+    /// The hold renews before it runs out, and again after a reconnect; nil releases it. A refused
+    /// hold (a rate limit) is tried again at the next tick.
+    @discardableResult
+    private func syncLid() async -> AccRootError? {
+        guard owns, let client = connect() else { return nil }
         let now = Date.now
         if let until = lidWanted, until > now {
             let fresh = lidSentFor == until && lidSentAt.map { now.timeIntervalSince($0) < Self.lidRenew } == true
             let leased = status?.lid.leaseUntil != nil
-            guard !fresh || !leased else { return }
+            guard !fresh || !leased else { return nil }
             let seconds = Int64(min(max(until.timeIntervalSince(now), 60), 86_400))
             guard let reply = try? await client.send(.lidHold(seconds: LidSeconds(seconds) ?? LidSeconds(unchecked: 60))) else {
-                return dropped()
+                dropped()
+                return .unreachable(Self.unreachable)
             }
+            if let status = reply.status { take(status) }
+            if let refusal = reply.refusal { return Self.accError(refusal) }
             lidSentAt = now
             lidSentFor = until
-            if let status = reply.status { take(status) }
         } else if lidSentAt != nil || status?.lid.leaseUntil != nil {
-            if let reply = try? await client.send(.lidRelease), let status = reply.status { take(status) }
+            guard let reply = try? await client.send(.lidRelease) else {
+                dropped()
+                return .unreachable(Self.unreachable)
+            }
+            if let status = reply.status { take(status) }
+            if let refusal = reply.refusal { return Self.accError(refusal) }
             lidSentAt = nil
             lidSentFor = nil
         }
+        return nil
     }
 
     /// One reading of the fans and the hottest sensors, plus fanctl's 20-minute history.
