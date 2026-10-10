@@ -3,7 +3,7 @@
 import Darwin
 
 /// One row of the table: what `ps -axo pid=,ppid=,command=` prints, plus the terminal it sorts by.
-public struct ProcRow: Equatable, Sendable {
+public struct ProcRow: Equatable {
     public var pid: pid_t
     public var ppid: pid_t
     public var command: String
@@ -22,7 +22,7 @@ public struct ProcRow: Equatable, Sendable {
     }
 
     public static func == (a: ProcRow, b: ProcRow) -> Bool {
-        a.pid == b.pid && a.ppid == b.ppid && a.command == b.command && a.tdev == b.tdev && a.uid == b.uid
+        a.pid == b.pid && a.ppid == b.ppid && a.command.pyEq(b.command) && a.tdev == b.tdev && a.uid == b.uid
     }
 }
 
@@ -94,13 +94,14 @@ public enum Proc {
         return Usage.of(pid)?.start == start
     }
 
-    /// Direct children of `pid` (proc_listchildpids).
+    /// Direct children of `pid` (proc_listchildpids: the size goes in as bytes, the answer comes back
+    /// as a count of pids).
     public static func children(of pid: pid_t) -> [pid_t] {
         var buffer = [pid_t](repeating: 0, count: 256)
         while true {
-            let bytes = buffer.withUnsafeMutableBytes { proc_listchildpids(pid, $0.baseAddress, Int32($0.count)) }
-            guard bytes > 0 else { return [] }
-            let count = Int(bytes) / MemoryLayout<pid_t>.size
+            let n = buffer.withUnsafeMutableBytes { proc_listchildpids(pid, $0.baseAddress, Int32($0.count)) }
+            guard n > 0 else { return [] }
+            let count = Int(n)
             if count < buffer.count { return Array(buffer.prefix(count).filter { $0 > 0 }) }
             buffer = [pid_t](repeating: 0, count: buffer.count * 2)
         }

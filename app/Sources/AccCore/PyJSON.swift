@@ -1,6 +1,7 @@
 // JSON the way claude-acc's Python reads and writes it: objects keep their key order, 1 and 1.0 stay
 // an int and a float, and `dumps` gives json.dumps's bytes (", " and ": ", ensure_ascii, float repr).
 // acc-cored shares state files with the scripts, so a file it rewrites must read back the same there.
+// Strings compare by code point, as Python's do (Swift's String == treats "é" and "e\u{301}" as one).
 
 public enum PyJSON: Equatable, Sendable {
     case null
@@ -10,6 +11,23 @@ public enum PyJSON: Equatable, Sendable {
     case string(String)
     case array([PyJSON])
     case object(PyObject)
+    /// a value Swift can't hold as Python does, kept as its JSON text and written back unchanged: an
+    /// int beyond Int64, or a string with a lone surrogate (what os.fsdecode makes of invalid UTF-8)
+    case raw(String)
+
+    public static func == (a: PyJSON, b: PyJSON) -> Bool {
+        switch (a, b) {
+        case (.null, .null): true
+        case let (.bool(x), .bool(y)): x == y
+        case let (.int(x), .int(y)): x == y
+        case let (.double(x), .double(y)): x == y
+        case let (.string(x), .string(y)): x.pyEq(y)
+        case let (.array(x), .array(y)): x == y
+        case let (.object(x), .object(y)): x == y
+        case let (.raw(x), .raw(y)): x.pyEq(y)
+        default: false
+        }
+    }
 
     public subscript(key: String) -> PyJSON? {
         get { if case .object(let o) = self { return o[key] } else { return nil } }
@@ -25,6 +43,7 @@ public enum PyJSON: Equatable, Sendable {
         case .int(let i): Double(i)
         case .double(let d): d
         case .bool(let b): b ? 1 : 0
+        case .raw(let text): text.hasPrefix("\"") ? nil : Double(text)
         default: nil
         }
     }
@@ -37,7 +56,14 @@ public enum PyJSON: Equatable, Sendable {
         }
     }
 
-    public var string: String? { if case .string(let s) = self { s } else { nil } }
+    public var string: String? {
+        switch self {
+        case .string(let s): s
+        // the lone surrogates read as U+FFFD
+        case .raw(let text) where text.hasPrefix("\""): (try? PyJSON.loads(text, exact: false))?.string
+        default: nil
+        }
+    }
     public var array: [PyJSON]? { if case .array(let a) = self { a } else { nil } }
     public var object: PyObject? { if case .object(let o) = self { o } else { nil } }
     public var isNull: Bool { self == .null }
@@ -52,14 +78,29 @@ public enum PyJSON: Equatable, Sendable {
         case .string(let s): !s.isEmpty
         case .array(let a): !a.isEmpty
         case .object(let o): !o.isEmpty
+        case .raw: true  // a big int isn't 0, a string with a surrogate isn't empty
         }
     }
 }
 
-/// A dict with insertion order, as Python's.
+extension String {
+    /// Python's str ==: the same code points (String's == is canonical equivalence).
+    public func pyEq(_ other: String) -> Bool { utf8.elementsEqual(other.utf8) }
+}
+
+/// A dict with insertion order, as Python's, keyed by code points.
 public struct PyObject: Equatable, Sendable, Sequence {
     public private(set) var keys: [String] = []
-    private var values: [String: PyJSON] = [:]
+    private var values: [Key: PyJSON] = [:]
+
+    struct Key: Hashable, Sendable {
+        let s: String
+        static func == (a: Key, b: Key) -> Bool { a.s.pyEq(b.s) }
+        func hash(into h: inout Hasher) {
+            var s = s
+            s.withUTF8 { h.combine(bytes: UnsafeRawBufferPointer($0)) }
+        }
+    }
 
     public init() {}
     public init(_ pairs: [(String, PyJSON)]) {
@@ -70,12 +111,12 @@ public struct PyObject: Equatable, Sendable, Sequence {
     public var count: Int { keys.count }
 
     public subscript(key: String) -> PyJSON? {
-        get { values[key] }
+        get { values[Key(s: key)] }
         set {
             if let newValue {
-                if values.updateValue(newValue, forKey: key) == nil { keys.append(key) }
-            } else if values.removeValue(forKey: key) != nil {
-                keys.removeAll { $0 == key }
+                if values.updateValue(newValue, forKey: Key(s: key)) == nil { keys.append(key) }
+            } else if values.removeValue(forKey: Key(s: key)) != nil {
+                keys.removeAll { $0.pyEq(key) }
             }
         }
     }
@@ -85,11 +126,13 @@ public struct PyObject: Equatable, Sendable, Sequence {
         return AnyIterator {
             guard i < keys.count else { return nil }
             defer { i += 1 }
-            return (keys[i], values[keys[i]]!)
+            return (keys[i], values[Key(s: keys[i])]!)
         }
     }
 
-    public static func == (a: PyObject, b: PyObject) -> Bool { a.keys == b.keys && a.values == b.values }
+    public static func == (a: PyObject, b: PyObject) -> Bool {
+        a.keys.count == b.keys.count && zip(a.keys, b.keys).allSatisfy { $0.pyEq($1) } && a.values == b.values
+    }
 }
 
 extension PyJSON: ExpressibleByBooleanLiteral, ExpressibleByIntegerLiteral,
@@ -121,6 +164,7 @@ extension PyJSON {
         case .int(let i): out += String(i)
         case .double(let d): out += Self.repr(d)
         case .string(let s): Self.quote(s, into: &out)
+        case .raw(let text): out += text
         case .array(let a):
             out += "["
             for (i, v) in a.enumerated() {
@@ -202,17 +246,18 @@ extension PyJSON {
 extension PyJSON {
     public struct ParseError: Error, Equatable { public let offset: Int }
 
-    /// json.loads: ints stay ints, anything with a fraction or exponent is a float.
-    public static func loads(_ text: String) throws -> PyJSON {
-        var parser = Parser(bytes: Array(text.utf8))
+    /// json.loads: ints stay ints, anything with a fraction or exponent is a float. A value Swift
+    /// can't hold exactly comes back as `.raw` (`exact: false` reads it lossily instead).
+    public static func loads(_ text: String, exact: Bool = true) throws -> PyJSON {
+        var parser = Parser(bytes: Array(text.utf8), exact: exact)
         let value = try parser.value()
         parser.space()
         guard parser.i == parser.bytes.count else { throw ParseError(offset: parser.i) }
         return value
     }
 
-    public static func loads(bytes: [UInt8]) throws -> PyJSON {
-        var parser = Parser(bytes: bytes)
+    public static func loads(bytes: [UInt8], exact: Bool = true) throws -> PyJSON {
+        var parser = Parser(bytes: bytes, exact: exact)
         let value = try parser.value()
         parser.space()
         guard parser.i == parser.bytes.count else { throw ParseError(offset: parser.i) }
@@ -221,6 +266,7 @@ extension PyJSON {
 
     struct Parser {
         let bytes: [UInt8]
+        var exact = true
         var i = 0
 
         mutating func space() {
@@ -239,7 +285,7 @@ extension PyJSON {
                 while true {
                     space()
                     guard i < bytes.count, bytes[i] == UInt8(ascii: "\"") else { throw ParseError(offset: i) }
-                    let k = try string()
+                    let k = try string().0  // a key with a lone surrogate reads as U+FFFD
                     space()
                     guard i < bytes.count, bytes[i] == UInt8(ascii: ":") else { throw ParseError(offset: i) }
                     i += 1
@@ -263,7 +309,10 @@ extension PyJSON {
                     if bytes[i] == UInt8(ascii: "]") { i += 1; return .array(a) }
                     throw ParseError(offset: i)
                 }
-            case UInt8(ascii: "\""): return .string(try string())
+            case UInt8(ascii: "\""):
+                let start = i
+                let (s, lossless) = try string()
+                return lossless || !exact ? .string(s) : .raw(String(decoding: bytes[start..<i], as: UTF8.self))
             case UInt8(ascii: "t"): try literal("true"); return .bool(true)
             case UInt8(ascii: "f"): try literal("false"); return .bool(false)
             case UInt8(ascii: "n"): try literal("null"); return .null
@@ -299,12 +348,16 @@ extension PyJSON {
             }
             let text = String(decoding: bytes[start..<i], as: UTF8.self)
             if !float, let n = Int(text) { return .int(n) }
+            let digits = text.hasPrefix("-") ? text.utf8.dropFirst() : text.utf8[...]
+            if !float, exact, !digits.isEmpty, digits.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) { return .raw(text) }
             guard let d = Double(text) else { throw ParseError(offset: start) }
             return .double(d)
         }
 
-        mutating func string() throws -> String {
+        /// The string and whether it is the one Python reads (false for lone surrogates)
+        mutating func string() throws -> (String, Bool) {
             i += 1  // the opening quote
+            var lossless = true
             var units: [UInt16] = []
             var run = i
             var out = ""
@@ -314,7 +367,7 @@ extension PyJSON {
                 if c == UInt8(ascii: "\"") {
                     flush(i)
                     i += 1
-                    return out
+                    return (out, lossless)
                 }
                 if c == UInt8(ascii: "\\") {
                     flush(i)
@@ -341,6 +394,7 @@ extension PyJSON {
                             units.append(low)
                             i += 6
                         }
+                        if units.count == 1, u >= 0xD800, u < 0xE000 { lossless = false }
                         out += String(decoding: units, as: UTF16.self)
                     default: out.unicodeScalars.append(Unicode.Scalar(e))
                     }

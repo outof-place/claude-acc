@@ -76,7 +76,8 @@ public enum UnixLineClient {
 
 public enum Spawn {
     /// Runs argv (PATH lookup like execvp), stdin from /dev/null, stderr dropped; its stdout, or nil
-    /// when it can't start or outlives `timeout` (then it's killed).
+    /// when it can't start or outlives `timeout` (then its process group is killed). The child leads
+    /// a group of its own, so that kill reaches what it started too.
     public static func output(_ argv: [String], env: [String: String]? = nil, timeout: Double) -> [UInt8]? {
         var pipe: [Int32] = [0, 0]
         guard Darwin.pipe(&pipe) == 0 else { return nil }
@@ -91,7 +92,8 @@ public enum Spawn {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF))
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP))
+        posix_spawnattr_setpgroup(&attr, 0)
         var all = sigset_t()
         sigfillset(&all)
         posix_spawnattr_setsigdefault(&attr, &all)
@@ -123,14 +125,47 @@ public enum Spawn {
             out += chunk[..<n]
         }
         close(pipe[0])
-        if timedOut { kill(pid, SIGKILL) }
-        var status: Int32 = 0
-        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
-        return timedOut ? nil : out
+        // a child that closed its stdout may still run: it gets what is left of the deadline
+        let status = reap(pid, deadline: timedOut ? Kernel.wall() : deadline)
+        return timedOut || status == nil ? nil : out
     }
 
-    /// Runs argv to its end (no deadline) with stdout/stderr appended to `log`; the exit code.
-    public static func run(_ argv: [String], env: [String: String]? = nil, log: String? = nil) -> Int32 {
+    /// Waits for `pid` until `deadline` (kqueue NOTE_EXIT), then kills its group and waits for it;
+    /// its wait status, or nil when it had to be killed.
+    static func reap(_ pid: pid_t, deadline: Double) -> Int32? {
+        var status: Int32 = 0
+        let kq = kqueue()
+        defer { close(kq) }
+        var change = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT), fflags: NOTE_EXIT, data: 0, udata: nil)
+        var event = kevent()
+        // ESRCH: it has already ended, and waitpid below answers at once
+        if kevent(kq, &change, 1, nil, 0, nil) == 0 {
+            while true {
+                let left = deadline - Kernel.wall()
+                if left <= 0 { break }
+                let n: Int32
+                if left > 1e9 {
+                    n = kevent(kq, nil, 0, &event, 1, nil)  // no deadline
+                } else {
+                    var wait = timespec(tv_sec: Int(left), tv_nsec: Int((left - left.rounded(.down)) * 1e9))
+                    n = kevent(kq, nil, 0, &event, 1, &wait)
+                }
+                if n < 0 && errno == EINTR { continue }
+                break
+            }
+        }
+        var r: pid_t
+        repeat { r = waitpid(pid, &status, WNOHANG) } while r < 0 && errno == EINTR
+        if r == pid { return status }
+        killpg(pid, SIGKILL)
+        kill(pid, SIGKILL)
+        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+        return nil
+    }
+
+    /// Runs argv to its end with stdout/stderr appended to `log`; the exit code, or 124 when it
+    /// outlives `timeout` (its group is killed, as `timeout(1)` answers).
+    public static func run(_ argv: [String], env: [String: String]? = nil, log: String? = nil, timeout: Double = .infinity) -> Int32 {
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         defer { posix_spawn_file_actions_destroy(&actions) }
@@ -141,7 +176,8 @@ public enum Spawn {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF))
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP))
+        posix_spawnattr_setpgroup(&attr, 0)
         var all = sigset_t()
         sigfillset(&all)
         posix_spawnattr_setsigdefault(&attr, &all)
@@ -151,8 +187,7 @@ public enum Spawn {
         defer { environment.forEach { free($0) } }
         var pid: pid_t = 0
         guard posix_spawnp(&pid, argv[0], &actions, &attr, cargs, environment) == 0 else { return 127 }
-        var status: Int32 = 0
-        while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
+        guard let status = reap(pid, deadline: Kernel.wall() + timeout) else { return 124 }
         if status & 0x7f == 0 { return (status >> 8) & 0xff }
         return 128 + (status & 0x7f)
     }
