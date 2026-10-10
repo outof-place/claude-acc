@@ -13,8 +13,28 @@
 # Woła go install.sh po zbudowaniu ze źródeł i `claude-acc-setup` z Homebrew, które podaje
 # swoją zbudowaną aplikację. Wiatraki (root) to osobny krok: install-fans.sh.
 # CLAUDE_ACC_NO_HOOKS=1 pomija hooki pauzy limitów w settings.json Claude Code.
+# HOME inny niż katalog domowy konta (izolowany HOME aplikacji albo testu): odmowa z kodem 4, zanim
+# cokolwiek dotknie launchd, aplikacji czy $STATE. Testy claude-acc przechodzą ją przez
+# CLAUDE_ACC_ALLOW_FOREIGN_HOME=1, ważne tylko z atrapami launchctl i pkill na początku PATH.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
+
+# launchd i pasek menu są jedne na sesję konta, a nie na HOME: bootstrap z obcego HOME (2026-10-10
+# Pod z izolowanym HOME) podmieniłby automaty prawdziwego konta, a pkill zamknął jego aplikację
+real_dir() { [ -n "$1" ] && (cd "$1" 2>/dev/null && pwd -P); }
+faked() { case "$(command -v "$1" || true)" in "" | /bin/* | /sbin/* | /usr/bin/* | /usr/sbin/*) return 1 ;; esac; }
+ACCOUNT_HOME="$(id -P 2>/dev/null | cut -d: -f9)"
+HOME_NOW="$(real_dir "${HOME:-}" || true)"
+if [ -z "$HOME_NOW" ] || [ "$HOME_NOW" != "$(real_dir "$ACCOUNT_HOME" || true)" ]; then
+  if [ "${CLAUDE_ACC_ALLOW_FOREIGN_HOME:-}" = 1 ] && faked launchctl && faked pkill; then
+    :  # testy claude-acc: osobny HOME, launchctl i pkill to atrapy
+  else
+    echo "setup.sh: HOME=${HOME:-} to nie katalog domowy konta $(id -un) (${ACCOUNT_HOME:-nieznany})." >&2
+    echo "Odmawiam: automaty w launchd i aplikacja należą do konta, nie do HOME, więc podmieniłbym te prawdziwe." >&2
+    echo "Uruchom z prawdziwym HOME. Testy claude-acc: CLAUDE_ACC_ALLOW_FOREIGN_HOME=1 z atrapami launchctl i pkill na PATH." >&2
+    exit 4
+  fi
+fi
 
 # kto jest właścicielem instalacji: z owner.json w $STATE; obcy setup nie nadpisuje skryptów i hooków Pod
 OWNER=""
