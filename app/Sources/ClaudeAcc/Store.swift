@@ -407,7 +407,8 @@ final class Store {
         panel?.browsers.contains { $0.installed && $0.state == "connecting" } == true
     }
 
-    /// The bundle ids browser.py drives (its config's `bundle`, lowercase there).
+    /// The bundle ids browser.py drives: `BROWSERS[...]["bundle"]` in browser.py, lowercase there.
+    /// The panel JSON doesn't carry them; a browser added there has to be added here too.
     nonisolated static let browserBundles: Set<String> = ["com.google.chrome", "com.brave.browser"]
 
     /// The daemon rewrites the browser file on every change; a browser started, quit or switched
