@@ -90,15 +90,26 @@ func readExactly(_ fd: Int32, _ n: Int, until end: Int64) -> Data? {
     return Data(buf)
 }
 
+/// How long the warm admit may take: socket p99 is ~25 ms, the exec's ~60 ms.
+let admitDeadlineMs: Int64 = 1000
+/// A live admitd that doesn't answer (stopped, hung, a fork stalled under memory pressure) still
+/// takes connections: the kernel queues them without accept(). The client that waited out the
+/// deadline touches this file, and for a minute after it every event goes straight to the exec.
+let admitSlow = state + "/admit.slow"
+let admitSlowSeconds = 60
+
 /// The warm admit (`devguard.py admitd` on $STATE/admit.sock, Pod's agent codes.pod.app.acc.admit):
 /// the answer the exec below would print, without starting Python. Protocol v1 (admitd.py): a u32
 /// big-endian length and JSON both ways, with the hook's whole environment and working directory.
-/// Anything else (no daemon, a foreign peer, no answer within 3 s, another version, an event that
-/// isn't UTF-8) returns and the exec runs as before; admit writes nothing, so nothing runs twice.
-/// CLAUDE_ACC_ADMIT_SOCK=0 skips it (pod-hookd sets it after its own try failed).
+/// Anything else (no daemon, a foreign peer, no answer within 1 s, another version, an event that
+/// isn't UTF-8, admit.slow younger than a minute) returns and the exec runs as before; admit writes
+/// nothing, so nothing runs twice. CLAUDE_ACC_ADMIT_SOCK=0 skips it (pod-hookd sets it after its own
+/// try failed).
 func askAdmitd(codex: Bool) {
     let env = ProcessInfo.processInfo.environment
     guard env["CLAUDE_ACC_ADMIT_SOCK"] != "0", let text = String(data: event, encoding: .utf8) else { return }
+    var slow = stat()
+    if stat(admitSlow, &slow) == 0, time(nil) - slow.st_mtimespec.tv_sec < admitSlowSeconds { return }
     var addr = sockaddr_un()
     let path = Array((state + "/admit.sock").utf8)
     guard path.count < MemoryLayout.size(ofValue: addr.sun_path) else { return }
@@ -128,12 +139,18 @@ func askAdmitd(codex: Bool) {
                                   "cwd": FileManager.default.currentDirectoryPath, "env": env]
     guard let body = try? JSONSerialization.data(withJSONObject: request), body.count <= 8 << 20 else { return }
     var length = UInt32(body.count).bigEndian
-    let end = millis() + 3000
+    let end = millis() + admitDeadlineMs
+    // the deadline ran out (not a closed connection, which is admitd's "ask the exec"): trip the breaker
+    func late() {
+        guard millis() >= end else { return }
+        let marker = open(admitSlow, O_WRONLY | O_CREAT, 0o600)
+        if marker >= 0 { futimes(marker, nil); close(marker) }
+    }
     guard writeAll(fd, Data(bytes: &length, count: 4) + body, until: end),
-          let head = readExactly(fd, 4, until: end) else { return }
+          let head = readExactly(fd, 4, until: end) else { late(); return }
     let n = head.reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
-    guard n <= 8 << 20, let data = readExactly(fd, Int(n), until: end),
-          let answer = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+    guard n <= 8 << 20, let data = readExactly(fd, Int(n), until: end) else { late(); return }
+    guard let answer = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           answer["v"] as? Int == 1, let out = answer["stdout"] as? String, let code = answer["code"] as? Int
     else { return }
     FileHandle.standardError.write(Data((answer["stderr"] as? String ?? "").utf8))

@@ -25,13 +25,19 @@ jest zawsze tym z dysku. Agent tylko w Pod (POD_JOBS w setup.sh): agent z
 ~/Documents (zmierzone 2026-10-10 na pod-hookd).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import fcntl
 import json
-import os
 import signal
 import socket
 import struct
-import sys
 import tempfile
 import traceback
 
@@ -41,7 +47,7 @@ SOL_LOCAL = 0
 LOCAL_PEERCRED = 0x001
 XUCRED_SIZE = 76
 READ_TIMEOUT_S = 10
-# zawieszone dziecko kończy SIGALRM; klient i tak robi exec po 3 s
+# zawieszone dziecko kończy SIGALRM; klient i tak robi exec po 1 s
 CHILD_LIMIT_S = 30
 ARGVS = (["admit"], ["admit", "--codex"])
 
@@ -167,6 +173,7 @@ def request(data):
         and isinstance(v, str)
         and k
         and "=" not in k
+        and "\0" not in k
         and "\0" not in v
         for k, v in env.items()
     ):

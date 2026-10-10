@@ -364,12 +364,9 @@ class ServerTest(unittest.TestCase):
         )
         self.assertEqual(oct(os.stat(self.sock).st_mode & 0o777), "0o600")
 
-    @unittest.skipUnless(
-        os.access(BUILT_HOOK, os.X_OK), "brak app/.build/release/claude-acc-hook"
-    )
-    def test_native_front_asks_the_daemon_first(self):
-        """claude-acc-hook z działającym admitd: odpowiedź z gniazda, bez startu Pythona (atrapa
-        $STATE/python mówi "python"); z CLAUDE_ACC_ADMIT_SOCK=0 albo bez serwera: exec jak dotąd."""
+    def native_front(self):
+        """claude-acc-hook nad tym $STATE: front(komenda) daje jego stdout; atrapa $STATE/python
+        mówi "python", więc widać, kiedy poszedł exec."""
         with open(os.path.join(self.state, "hook-words.json"), "w") as f:
             f.write(
                 subprocess.run(
@@ -395,6 +392,15 @@ class ServerTest(unittest.TestCase):
                 timeout=30,
             ).stdout
 
+        return front
+
+    @unittest.skipUnless(
+        os.access(BUILT_HOOK, os.X_OK), "brak app/.build/release/claude-acc-hook"
+    )
+    def test_native_front_asks_the_daemon_first(self):
+        """claude-acc-hook z działającym admitd: odpowiedź z gniazda, bez startu Pythona (atrapa
+        $STATE/python mówi "python"); z CLAUDE_ACC_ADMIT_SOCK=0 albo bez serwera: exec jak dotąd."""
+        front = self.native_front()
         for command in COMMANDS:
             with self.subTest(command=command):
                 cold = self.exec_admit(self.event(command))["stdout"]
@@ -406,6 +412,36 @@ class ServerTest(unittest.TestCase):
         self.server.kill()
         self.server.wait()
         self.assertEqual(front("pnpm test").strip(), "python")  # martwe gniazdo: exec
+
+    @unittest.skipUnless(
+        os.access(BUILT_HOOK, os.X_OK), "brak app/.build/release/claude-acc-hook"
+    )
+    def test_a_hung_daemon_costs_one_deadline_then_a_minute_of_exec(self):
+        """Żywy, ale zawieszony admitd i tak dostaje połączenie: jądro kolejkuje je bez accept().
+        Pierwsze zdarzenie czeka termin (1 s), robi exec i zostawia admit.slow; przez minutę
+        kolejne idą do exec bez łączenia, potem front znowu pyta gniazdo."""
+        front = self.native_front()
+        self.server.kill()
+        self.server.wait()
+        os.unlink(self.sock)
+        hung = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(hung.close)
+        hung.bind(self.sock)
+        hung.listen(8)
+        hung.settimeout(0.5)
+        slow = os.path.join(self.state, "admit.slow")
+        started = time.monotonic()
+        self.assertEqual(front("pnpm test").strip(), "python")
+        self.assertGreaterEqual(time.monotonic() - started, 0.9)
+        self.assertTrue(os.path.exists(slow))
+        hung.accept()[0].close()  # to połączenie czekało w kolejce
+        self.assertEqual(front("pnpm test").strip(), "python")
+        with self.assertRaises(socket.timeout):
+            hung.accept()
+        # minuta minęła: znowu gniazdo
+        os.utime(slow, (time.time() - 120, time.time() - 120))
+        self.assertEqual(front("pnpm test").strip(), "python")
+        hung.accept()[0].close()
 
 
 if __name__ == "__main__":
