@@ -138,24 +138,25 @@ public enum Spawn {
         defer { close(kq) }
         var change = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT), fflags: NOTE_EXIT, data: 0, udata: nil)
         var event = kevent()
-        // ESRCH: it has already ended, and waitpid below answers at once
-        if kevent(kq, &change, 1, nil, 0, nil) == 0 {
-            while true {
-                let left = deadline - Kernel.wall()
-                if left <= 0 { break }
-                let n: Int32
-                if left > 1e9 {
-                    n = kevent(kq, nil, 0, &event, 1, nil)  // no deadline
-                } else {
-                    var wait = timespec(tv_sec: Int(left), tv_nsec: Int((left - left.rounded(.down)) * 1e9))
-                    n = kevent(kq, nil, 0, &event, 1, &wait)
-                }
-                if n < 0 && errno == EINTR { continue }
-                break
+        // ESRCH: it has already ended (or is ending); NOTE_EXIT comes while it exits, a moment
+        // before waitpid can reap it, so both wait for it rather than ask once
+        var exited = kevent(kq, &change, 1, nil, 0, nil) != 0
+        while !exited {
+            let left = deadline - Kernel.wall()
+            if left <= 0 { break }
+            let n: Int32
+            if left > 1e9 {
+                n = kevent(kq, nil, 0, &event, 1, nil)  // no deadline
+            } else {
+                var wait = timespec(tv_sec: Int(left), tv_nsec: Int((left - left.rounded(.down)) * 1e9))
+                n = kevent(kq, nil, 0, &event, 1, &wait)
             }
+            if n < 0 && errno == EINTR { continue }
+            exited = n > 0
+            break
         }
         var r: pid_t
-        repeat { r = waitpid(pid, &status, WNOHANG) } while r < 0 && errno == EINTR
+        repeat { r = waitpid(pid, &status, exited ? 0 : WNOHANG) } while r < 0 && errno == EINTR
         if r == pid { return status }
         killpg(pid, SIGKILL)
         kill(pid, SIGKILL)
