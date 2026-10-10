@@ -117,7 +117,8 @@ final class Awake {
         switch url.lastPathComponent {
         case "on": lidClosed = true
         case "off": lidClosed = false
-        default: lidClosed.toggle()
+        // an unknown or empty verb never changes whether a closed Mac stays up
+        default: return
         }
     }
 
