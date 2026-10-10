@@ -342,7 +342,10 @@ working in between.
 1. reads what they hold: `kern.maxvnodes=N` and `iogpu.wired_limit_mb=N` from their
    `ProgramArguments`, the fan mode from the `fans.json` named by the fans plist (opened with
    `O_NOFOLLOW`, 4 KB at most), fsguard present or not, and the Spotlight list `perf-root.sh` saved
-   before apps-only (so `spotlight.restore` still has it);
+   before apps-only (so `spotlight.restore` still has it). That file is then renamed to
+   `spotlight-exclusions.json.migrated` in its folder, every folder from the home opened without
+   following a link (`UserFiles.rename`), so after a restore neither the root copy nor `rootroute.py`
+   takes it for the live list;
 2. `launchctl bootout system/<label>` for each (the fans daemon hands the fans back on SIGTERM and
    drops its lid hold);
 3. moves each plist to `/var/db/codes.pod.app.rootd/legacy/<label>.plist`; the binaries in
@@ -354,8 +357,9 @@ The labels are a fixed list, nothing else in `/Library/LaunchDaemons` is touched
 changes nothing.
 
 `legacy.rollback` undoes it: helper features the migration turned on go off (fans auto, persisted
-sysctls cleared, fsguard off), each saved plist goes back to `/Library/LaunchDaemons` as root:wheel
-0644 and `launchctl bootstrap system` starts it. A later cleanup (after a few releases) can remove
+sysctls cleared, fsguard off, the helper's copy of the Spotlight list dropped and the file renamed
+back), each saved plist goes back to `/Library/LaunchDaemons` as root:wheel 0644 and `launchctl
+bootstrap system` starts it. A later cleanup (after a few releases) can remove
 `/usr/local/libexec/claude-acc-{fanctl,fsguard,hotspot}` and the backups.
 
 ## Installing and removing it
@@ -464,6 +468,15 @@ hardened process carries `CS_REQUIRE_LV` only when it is signed with `library` (
 team-signed `--options runtime` binary reports `0x62011311`, with `runtime,library` it reports
 `0x62013301`). Pod's Electron process loads native modules and gets tier A only, so it needs the
 hardened runtime, not library validation.
+
+A debuggable caller is refused too, whatever it is signed as: a build with
+`com.apple.security.get-task-allow` (`CS_GET_TASK_ALLOW`) or a process a debugger is attached to
+(`CS_DEBUGGED`). Pod's terminals have Developer Tools access (Ultra's `devtools` tweak), so anything
+they run could take over such a process with `task_for_pid`. Lightweight code requirements have no
+"not", so each message is tested against `isDebuggable` and `isDebugged` (`PeerPolicy.refused`) and
+refused when it matches. Measured: a binary with the entitlement runs with csflags `0x22011315`, one
+without with `0x22011311`, and only the first launches under a launch requirement of `isDebuggable`.
+SwiftPM's test runner is debuggable, and the PeerTests see it refused.
 
 Pod's Electron binary keeps RunAsNode on (its terminal daemon needs it), which is why
 `codes.pod.app` gets tier A only (see [Tiers](#tiers)).
