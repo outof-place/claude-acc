@@ -12,8 +12,9 @@
     <string>--rootd</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <!-- Hotspot turbo as the user (docs/pod-rootd.md): in Pod the root helper sets the limit. Without
-       the helper it exits 0 and stays down; the root daemon (claude-acc hotspot install) does it -->
+  <!-- Hotspot turbo as the user (docs/pod-rootd.md): in Pod the root helper sets the limit. With the
+       mode off it exits 0 and stays down until `claude-acc hotspot on` kickstarts it; without the
+       helper too, and the root daemon (claude-acc hotspot install) does it -->
   <key>KeepAlive</key>
   <dict>
     <key>SuccessfulExit</key><false/>

@@ -402,5 +402,86 @@ class FollowShaperTest(unittest.TestCase):
         self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
 
 
+class AgentLifecycleTest(unittest.TestCase):
+    """The agent is in JOBS (every install), the mode is opt-in: off means down, on starts it."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="hotspot-agent-")
+        self.rootctl = os.path.join(self.dir, "pod-rootctl")
+        with open(self.rootctl, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(self.rootctl, 0o755)
+        self.config = os.path.join(self.dir, "hotspot.json")
+        self.state = os.path.join(self.dir, "state.json")
+
+    def quiet(self):
+        return mock.patch.object(hotspot, "log", lambda line: None)
+
+    def test_the_agent_exits_0_while_the_mode_is_off(self):
+        hotspot.write_json(self.config, {"enabled": False})
+        with mock.patch.object(hotspot, "ROOTCTL", self.rootctl), mock.patch.object(hotspot, "installed", lambda: False), \
+                mock.patch.object(hotspot, "detect") as detect, self.quiet():
+            self.assertEqual(hotspot.daemon(self.config, self.state, rootd=True), 0)
+        detect.assert_not_called()
+
+    def test_waiting_for_migrate_looks_once_a_minute_and_detects_nothing(self):
+        hotspot.write_json(self.config, {"enabled": True})
+        clock = [1000.0]
+        looks = []
+
+        def installed():
+            looks.append(clock[0])
+            if len(looks) == 3:
+                hotspot.write_json(self.config, {"enabled": False})  # `hotspot off`: the agent then exits
+            return True
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(hotspot, "ROOTCTL", self.rootctl), mock.patch.object(hotspot, "installed", installed), \
+                mock.patch.object(hotspot, "detect") as detect, mock.patch.object(hotspot, "iphone_ports", lambda: set()), \
+                mock.patch.object(hotspot.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(hotspot.time, "sleep", sleep), self.quiet():
+            self.assertEqual(hotspot.daemon(self.config, self.state, rootd=True), 0)
+        self.assertEqual(len(looks), 3)
+        self.assertEqual([round(b - a) for a, b in zip(looks, looks[1:])], [60, 60])
+        detect.assert_not_called()
+
+    def pod_owner(self, app_id="codes.pod.app"):
+        app = os.path.join(self.dir, "Pod.app")
+        os.makedirs(os.path.join(app, "Contents"))
+        with open(os.path.join(app, "Contents", "Info.plist"), "wb") as f:
+            plistlib.dump({"CFBundleIdentifier": app_id}, f)
+        with open(os.path.join(self.dir, "owner.json"), "w") as f:
+            json.dump({"owner": "pod", "app": app}, f)
+
+    def test_the_agent_label_follows_the_owner(self):
+        with mock.patch.object(hotspot, "STATE_DIR", self.dir):
+            self.assertEqual(hotspot.agent_label(), "com.filip.claude-acc.hotspot-user")
+            self.pod_owner("codes.pod.app")
+            self.assertEqual(hotspot.agent_label(), "codes.pod.app.acc.hotspot-user")
+            with open(os.path.join(self.dir, "Pod.app", "Contents", "Info.plist"), "wb") as f:
+                plistlib.dump({"CFBundleIdentifier": "bad id; rm"}, f)
+            self.assertEqual(hotspot.agent_label(), "codes.pod.app.acc.hotspot-user")
+
+    def test_hotspot_on_in_pod_kickstarts_the_agent(self):
+        calls = os.path.join(self.dir, "launchctl.log")
+        launchctl = os.path.join(self.dir, "launchctl")
+        with open(launchctl, "w") as f:
+            f.write('#!/bin/sh\necho "$*" >> "%s"\nexit "${FAIL:-0}"\n' % calls)
+        os.chmod(launchctl, 0o755)
+        self.pod_owner()
+        args = argparse.Namespace(no_install=True, dry_run=False)
+        with mock.patch.object(hotspot, "STATE_DIR", self.dir), mock.patch.object(hotspot, "ROOTCTL", self.rootctl), \
+                mock.patch.object(hotspot, "LAUNCHCTL", launchctl), mock.patch.object(hotspot, "set_enabled") as enabled, \
+                mock.patch("sys.stdout"):
+            self.assertEqual(hotspot.cmd_on(args), 0)
+            enabled.assert_called_once_with(True)
+            with mock.patch.dict(os.environ, {"FAIL": "113"}), mock.patch("sys.stderr"):
+                self.assertEqual(hotspot.cmd_on(args), 1)
+        with open(calls) as f:
+            self.assertEqual(f.read().splitlines(), ["kickstart gui/%d/codes.pod.app.acc.hotspot-user" % os.getuid()] * 2)
+
+
 if __name__ == "__main__":
     unittest.main()
