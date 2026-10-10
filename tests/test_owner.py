@@ -350,7 +350,9 @@ class PayloadTest(unittest.TestCase):
         with open(os.path.join(payload, "payload.json")) as f:
             self.assertEqual(json.load(f)["layout"], 2)
         agents = sorted(os.listdir(os.path.join(payload, "LaunchAgents")))
-        self.assertEqual(agents, sorted(f"codes.pod.app.acc.{j}.plist" for j in ("tick", "janitor", "devguard", "perf", "updates", "jobs")))
+        # JOBS z setup.sh i admit z POD_JOBS (tylko agent Pod)
+        jobs = ("tick", "janitor", "devguard", "perf", "updates", "jobs", "admit")
+        self.assertEqual(agents, sorted(f"codes.pod.app.acc.{j}.plist" for j in jobs))
         tarball = os.path.join(out, "claude-acc-payload-9.9.9.tar.gz")
         with open(tarball + ".sha256") as f:
             digest, name = f.read().split()
