@@ -332,7 +332,7 @@ class PodAgentsSetupTest(SetupHarness):
         # perf-root and mac root-clean go to rootroute.py first, not to sudo
         done = subprocess.run([command, "mac", "root-clean", "--bogus"], env=env, capture_output=True, text=True)
         self.assertEqual(done.returncode, 2)
-        self.assertIn("unknown option: --bogus", done.stderr)
+        self.assertIn("nieznana opcja: --bogus", done.stderr)
         # without the helper in the app: the old installers again
         os.remove(plist)
         rc, out = self.install()

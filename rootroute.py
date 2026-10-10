@@ -5,7 +5,8 @@ In Pod, `claude-acc perf-root ...` and `claude-acc mac root-clean ...` come here
 copy (root-run.sh under sudo): the same commands, done by `pod-rootctl` as the user. Its tier B
 verbs ask for Touch ID once, then 5 minutes for this process. The benches and perf.py's record of
 root tweaks run as the user, as perf-root.sh ran them through `sudo -u`. Exit 75 when Pod doesn't
-own claude-acc or the helper doesn't answer: the wrapper then goes on to the root copy.
+own claude-acc, the helper doesn't answer, or a tweak still belongs to an old root daemon: the
+wrapper then goes on to the root copy.
 
   rootroute.py perf-root [--dry-run] <perf-root.sh command>
   rootroute.py janitor-root [--dry-run] [--high-power]
@@ -20,10 +21,14 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(os.path.expanduser("~"), ".local", "share", "claude-acc")
 ROOTCTL = os.path.join(STATE, "pod-rootctl")
+# what perf-root.sh saved before apps-only; while it is there without the helper's copy, the root
+# copy owns the Spotlight tweak
+SPOTLIGHT_SAVED = os.path.join(STATE, "spotlight-exclusions.json")
 VNODES = 786432
 DIAGNOSTIC_DAYS = 30
 # the wrapper's cue to go on to root-run.sh (EX_TEMPFAIL)
 FALLBACK = 75
+STATUS_TIMEOUT = 30
 
 
 class Route:
@@ -42,13 +47,18 @@ class Route:
             reply = {}
         if done.returncode != 0 or "done" not in reply.get("outcome", {}):
             return None
+        # where the helper explains itself, e.g. that no list from before apps-only was saved
+        note = reply["outcome"]["done"].get("note")
+        if note:
+            print("  pomocnik: %s" % note)
         return reply
 
     def status(self):
-        done = subprocess.run([ROOTCTL, "status", "--json"], stdout=subprocess.PIPE, text=True)
         try:
+            done = subprocess.run([ROOTCTL, "status", "--json"], stdout=subprocess.PIPE, text=True,
+                                  timeout=STATUS_TIMEOUT)
             return json.loads(done.stdout).get("status") if done.returncode == 0 else None
-        except ValueError:
+        except (OSError, subprocess.SubprocessError, ValueError):
             return None
 
     def perf(self, *args, capture=False):
@@ -121,6 +131,27 @@ def applied(route, name):
     return next((t.get("detail") for t in tweaks if t.get("name") == name and t.get("applied")), None)
 
 
+def legacy_owner(status, command):
+    """What still owns this tweak outside the helper (an old root daemon, perf-root.sh's saved
+    Spotlight list), or None. Until `legacy migrate` the helper has no record of those, so an undo
+    through it would change nothing while perf.py forgot the tweak."""
+    status = status or {}
+    legacy = {entry.get("daemon"): entry for entry in status.get("legacy", [])}
+
+    def holds(label):
+        entry = legacy.get(label) or {}
+        return bool(entry.get("installed")) and not entry.get("migrated")
+
+    if command[0] == "vnodes" and holds("com.filip.claude-acc.vnodes"):
+        return "com.filip.claude-acc.vnodes"
+    if command[0] == "iogpu" and command[1] in ("set", "undo") and holds("com.filip.claude-acc.iogpu"):
+        return "com.filip.claude-acc.iogpu"
+    if command[0] == "spotlight" and os.path.exists(SPOTLIGHT_SAVED) \
+            and not (status.get("spotlight") or {}).get("savedEntries"):
+        return "~/.local/share/claude-acc/spotlight-exclusions.json"
+    return None
+
+
 # --- perf-root ------------------------------------------------------------------------------------
 
 def shaper_apply(route, iface, rate):
@@ -132,13 +163,13 @@ def shaper_apply(route, iface, rate):
         elif rate:
             iface = iface or default_interface()
         else:
-            print("give --rate, or measure the network first: perf.py bench network", file=sys.stderr)
+            print("podaj --rate albo zmierz sieć: perf.py bench network", file=sys.stderr)
             return 1
     limit = kbps(rate)
     if limit is None:
-        print("the rate is like 27Mbps, not: %s" % rate, file=sys.stderr)
+        print("tempo zapisuje się jak 27Mbps, nie: %s" % rate, file=sys.stderr)
         return 2
-    print("upload limit: %s %s" % (iface, rate))
+    print("ogranicznik wysyłania: %s %s" % (iface, rate))
     reply = route.rootctl("shaper", "set", iface, str(limit))
     if reply is None:
         return 1
@@ -150,7 +181,7 @@ def shaper_apply(route, iface, rate):
 def shaper_undo(route):
     detail = applied(route, "shaper")
     iface = detail.split()[0] if detail else default_interface()
-    print("upload limit off on %s" % iface)
+    print("zdejmuję ogranicznik z %s" % iface)
     if route.rootctl("shaper", "clear", iface) is None:
         return 1
     route.perf("record", "shaper", "--forget")
@@ -173,25 +204,30 @@ def bench(route, kind):
 
 
 def trial(route, iface, rate, keep):
-    print("1/3 a measurement without the limit")
+    print("1/3 pomiar bez ogranicznika")
     before = bench(route, "network")
-    print("2/3 the limit")
+    print("2/3 ogranicznik")
     rc = shaper_apply(route, iface, rate)
     if rc:
         return rc
+    undone = 0
     try:
-        print("3/3 a measurement with the limit")
+        print("3/3 pomiar z ogranicznikiem")
         after = bench(route, "network")
     finally:
         if not keep:
-            shaper_undo(route)
+            undone = shaper_undo(route)
     if keep:
-        print("the limit stays; to take it off: claude-acc perf-root shaper undo")
-    summary(before, after, [("download Mb/s", "down_mbps"), ("upload Mb/s", "up_mbps"), ("idle ms", "idle_ms"),
-                            ("network while downloading p90 ms", "down_net_p90_ms"),
-                            ("network while uploading p90 ms", "up_net_p90_ms"),
-                            ("responsiveness downloading ms", "down_loaded_ms"),
-                            ("responsiveness uploading ms", "up_loaded_ms")], "network", ("without", "limited"))
+        print("ogranicznik zostaje; cofnięcie: claude-acc perf-root shaper undo")
+    summary(before, after, [("pobieranie Mb/s", "down_mbps"), ("wysyłanie Mb/s", "up_mbps"),
+                            ("bez obciążenia ms", "idle_ms"),
+                            ("sieć przy pobieraniu p90 ms", "down_net_p90_ms"),
+                            ("sieć przy wysyłaniu p90 ms", "up_net_p90_ms"),
+                            ("responsiveness przy pobieraniu ms", "down_loaded_ms"),
+                            ("responsiveness przy wysyłaniu ms", "up_loaded_ms")], "network", ("bez", "z limitem"))
+    if undone:
+        print("ogranicznik nie zszedł; cofnięcie: claude-acc perf-root shaper undo", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -206,8 +242,8 @@ def vnodes_apply(route, value, persist):
 
 
 def vnodes_undo(route):
-    print("kern.maxvnodes back to the value from before")
-    print("  (the kernel doesn't give vnodes back: the memory returns only with a restart)")
+    print("kern.maxvnodes: %s -> wartość sprzed zmiany" % sysctl("kern.maxvnodes"))
+    print("  (jądro nie zwalnia już zajętych vnode: pamięć wraca dopiero po restarcie)")
     if route.rootctl("sysctl", "reset", "maxvnodes") is None:
         return 1
     route.perf("record", "vnodes", "--forget")
@@ -215,38 +251,46 @@ def vnodes_undo(route):
 
 
 def vnodes_trial(route, value, persist, keep):
-    print("1/3 lstat of the module tree with the cache as it is")
+    print("1/3 lstat drzewa modułów przy obecnym cache")
     before = bench(route, "fs")
     previous = sysctl("kern.maxvnodes")
-    print("2/3 a bigger vnode cache")
+    print("2/3 większy cache vnode")
     rc = vnodes_apply(route, value, persist)
     if rc:
         return rc
+    undone = 0
     try:
-        print("3/3 lstat of the module tree with the bigger cache")
+        print("3/3 lstat drzewa modułów z większym cache")
         after = bench(route, "fs")
     finally:
         if not keep:
-            vnodes_undo(route)
+            undone = vnodes_undo(route)
     if keep and not route.dry:
         warm = (before.get("fs", {}).get("warm_s"), after.get("fs", {}).get("warm_s"))
         if None not in warm:
             route.perf("record", "vnodes", str(value), "prev=" + previous, "--result", str(warm[0]), str(warm[1]))
-    summary(before, after, [("second lstat pass s", "warm_s"), ("recycled vnodes", "warm_recycled"),
-                            ("kern.maxvnodes", "maxvnodes")], "fs", ("before", "after"))
+    if keep:
+        print("nowa wartość zostaje, także po restarcie; cofnięcie: claude-acc perf-root vnodes undo" if persist
+              else "nowa wartość zostaje do restartu (--persist: na stałe); cofnięcie: claude-acc perf-root vnodes undo")
+    summary(before, after, [("drugi przebieg lstat s", "warm_s"), ("vnode z odzysku", "warm_recycled"),
+                            ("kern.maxvnodes", "maxvnodes")], "fs", ("przed", "po"))
+    if undone:
+        print("kern.maxvnodes nie wróciło; cofnięcie: claude-acc perf-root vnodes undo", file=sys.stderr)
+        return 1
     return 0
 
 
 def iogpu_set(route, value):
     mb = value if value is not None else (route.perf("iogpu-default", capture=True) or "").strip()
     if not mb.isdigit():
-        print("the limit is a number of MB, not: %s" % mb, file=sys.stderr)
+        print("limit to liczba MB, nie: %s" % mb, file=sys.stderr)
         return 2
     if int(mb) == 0:
-        print("with this much RAM the macOS default is best; nothing changes")
+        print("przy tej ilości RAM domyślny limit macOS jest najlepszy; nic nie zmieniam")
         return 0
     before = sysctl("iogpu.wired_limit_mb")
-    print("iogpu.wired_limit_mb: %s -> %s (also after a restart)" % (before, mb))
+    print("iogpu.wired_limit_mb: %s -> %s" % (before, mb))
+    print("przy starcie systemu: iogpu.wired_limit_mb=%s (pomocnik roota Poda)" % mb)
     if route.rootctl("sysctl", "set", "gpu-wired-limit-mb", mb, "--persist") is None:
         return 1
     route.perf("record", "iogpu", mb, "prev=" + before)
@@ -254,7 +298,7 @@ def iogpu_set(route, value):
 
 
 def iogpu_undo(route):
-    print("iogpu.wired_limit_mb back to the macOS default")
+    print("iogpu.wired_limit_mb: %s -> 0 (domyślne macOS)" % sysctl("iogpu.wired_limit_mb"))
     if route.rootctl("sysctl", "reset", "gpu-wired-limit-mb") is None:
         return 1
     route.perf("record", "iogpu", "--forget")
@@ -265,14 +309,14 @@ def iogpu_status(route):
     status = route.status() or {}
     gpu = next((s for s in status.get("sysctls", []) if s.get("key") == "iogpu.wired_limit_mb"), {})
     now = gpu.get("current", sysctl("iogpu.wired_limit_mb"))
-    print("iogpu.wired_limit_mb: %s" % ("0 (the macOS default, about 2/3 of RAM)" if str(now) == "0" else "%s MB" % now))
+    print("iogpu.wired_limit_mb: %s" % ("0 (domyślne macOS, około 2/3 RAM)" if str(now) == "0" else "%s MB" % now))
     persisted = gpu.get("persisted")
-    print("after a restart: %s" % ("%s MB (Pod's root helper)" % persisted if persisted else "the default"))
+    print("przy starcie systemu: %s" % ("%s MB (pomocnik roota Poda)" % persisted if persisted else "domyślne"))
     want = (route.perf("iogpu-default", capture=True) or "0").strip()
     if want.isdigit() and int(want) > 0:
-        print("for this Mac: %s MB (claude-acc perf-root iogpu set)" % want)
+        print("propozycja dla tego Maca: %s MB (claude-acc perf-root iogpu set)" % want)
     else:
-        print("for this Mac: keep the default (with this much RAM there is nothing to raise)")
+        print("propozycja: zostaw domyślne (przy tej ilości RAM nie ma czego podnosić)")
     return 0
 
 
@@ -281,30 +325,35 @@ def spotlight(route, mode):
         if route.rootctl("spotlight", "apps-only") is None:
             return 1
         route.perf("record", "spotlight", "apps-only")
-        print("Spotlight indexes only applications; to undo: claude-acc perf-root spotlight undo")
+        print("Spotlight indeksuje tylko aplikacje; cofnięcie: claude-acc perf-root spotlight undo")
     else:
         if route.rootctl("spotlight", "restore") is None:
             return 1
         route.perf("record", "spotlight", "--forget")
-        print("the Spotlight Privacy list from before is back")
+        print("przywrócona poprzednia lista Prywatności Spotlight")
     return 0
 
 
 def perf_root(args):
+    original = list(args)
     route = Route(dry=flag(args, "--dry-run"))
     keep = flag(args, "--keep")
     persist = flag(args, "--persist")
     rate = option(args, "--rate")
     iface = option(args, "--if")
     value = option(args, "--value")
-    if value is not None and not value.isdigit():
-        print("--value is a number", file=sys.stderr)
-        return 2
-    vnodes = int(value) if value is not None else VNODES
     command = (args + ["", ""])[:2]
     if command[0] in ("devtools", "user") or command == ["shaper", "status"] or command == ["shaper", ""]:
-        # nothing here needs root: perf-root.sh as it is, without sudo
-        os.execv("/bin/bash", ["/bin/bash", os.path.join(source(), "perf-root.sh")] + args)
+        # nothing here needs root: perf-root.sh as it is, without sudo, with every option it was given
+        os.execv("/bin/bash", ["/bin/bash", os.path.join(source(), "perf-root.sh")] + original)
+    unknown = next((a for a in args if a.startswith("-")), None)
+    if unknown:
+        print("nieznana opcja: %s" % unknown, file=sys.stderr)
+        return 2
+    if value is not None and not value.isdigit():
+        print("--value to liczba", file=sys.stderr)
+        return 2
+    vnodes = int(value) if value is not None else VNODES
     handlers = {
         ("shaper", "apply"): lambda: shaper_apply(route, iface, rate),
         ("shaper", "undo"): lambda: shaper_undo(route),
@@ -323,6 +372,11 @@ def perf_root(args):
     if handler is None:
         print(__doc__.strip(), file=sys.stderr)
         return 2
+    owner = legacy_owner(route.status(), command)
+    if owner:
+        print("to jeszcze należy do %s: przez kopię roota (po claude-acc rootd legacy migrate przejmie to "
+              "pomocnik)" % owner, file=sys.stderr)
+        return FALLBACK
     return handler()
 
 
@@ -332,7 +386,7 @@ def janitor_root(args):
     route = Route(dry=flag(args, "--dry-run"))
     high_power = flag(args, "--high-power")
     if args:
-        print("unknown option: %s" % args[0], file=sys.stderr)
+        print("nieznana opcja: %s" % args[0], file=sys.stderr)
         return 2
     dry = ["--dry-run"] if route.dry else []
     rc = 0
@@ -342,7 +396,7 @@ def janitor_root(args):
         rc = 1
     else:
         for orphan in (reply["outcome"]["done"].get("report") or {}).get("orphans", {}).get("_0", []):
-            print("plist without its program: %s -> %s" % (orphan.get("plist"), orphan.get("program")))
+            print("wpis bez programu: %s -> %s" % (orphan.get("plist"), orphan.get("program")))
     # crash and hang reports older than a month
     reply = route.rootctl("logs", "prune", "--days", str(DIAGNOSTIC_DAYS), *dry)
     if reply is None:
@@ -350,17 +404,17 @@ def janitor_root(args):
     else:
         pruned = (reply["outcome"]["done"].get("report") or {}).get("pruned", {})
         if pruned.get("files"):
-            print("old reports in /Library/Logs/DiagnosticReports: %d" % pruned["files"])
+            print("stare raporty w /Library/Logs/DiagnosticReports: %d" % pruned["files"])
     # high power mode only on the charger: on battery it stays automatic
     if high_power:
         status = route.status() or {}
         if status.get("power", {}).get("highPowerCapable"):
-            print("power mode on the charger: high")
+            print("tryb zasilania na zasilaczu: wysoka wydajność")
             if route.rootctl("power", "ac", "high") is None:
                 rc = 1
         else:
-            print("this Mac has no high power mode")
-    print("done" if rc == 0 else "done, with errors above")
+            print("ten Mac nie ma trybu wysokiej wydajności")
+    print("gotowe" if rc == 0 else "gotowe, z błędami powyżej")
     return rc
 
 
@@ -373,10 +427,10 @@ def pod_owns():
 
 
 def answers():
-    """The helper is registered, approved and reachable (pod-rootctl exits 69 when it isn't)."""
+    """The helper is installed, allowed and reachable (pod-rootctl exits 69 when it isn't)."""
     try:
         return subprocess.run([ROOTCTL, "status", "--json"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=30).returncode == 0
+                              timeout=STATUS_TIMEOUT).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -385,8 +439,7 @@ def main(argv):
     if not os.access(ROOTCTL, os.X_OK) or not pod_owns():
         return FALLBACK
     if argv[:1] in (["perf-root"], ["janitor-root"]) and not answers():
-        print("Pod's root helper doesn't answer (turn it on in Pod and allow it in Login Items); "
-              "the root copy instead", file=sys.stderr)
+        print("pomocnik roota Poda nie odpowiada (włącz go w Podzie); zamiast tego kopia roota", file=sys.stderr)
         return FALLBACK
     if argv[:1] == ["perf-root"]:
         return perf_root(argv[1:])

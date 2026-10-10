@@ -291,8 +291,8 @@ case "$1" in
   mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)
     shift
-    # in Pod its root helper does it, without sudo (rootroute.py); 75: Pod doesn't own claude-acc or
-    # the helper doesn't answer, so the root copy below
+    # in Pod its root helper does it, without sudo (rootroute.py); 75: Pod doesn't own claude-acc,
+    # the helper doesn't answer, or an old root daemon still owns the tweak, so the root copy below
     if [ -x "$STATE/pod-rootctl" ]; then
       "$PY" "$STATE/rootroute.py" perf-root "$@"
       rc=$?
