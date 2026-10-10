@@ -70,7 +70,7 @@ fi
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates com.filip.claude-acc.jobs"
+JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates com.filip.claude-acc.jobs com.filip.claude-acc.hotspot-user"
 # automaty tylko dla Pod (scripts/pod_agents.py bierze je razem z JOBS): setup.sh nie kładzie ich w
 # ~/Library/LaunchAgents, bo taki agent to osobna tożsamość TCC, a admitd wchodzi do katalogów agentów
 POD_JOBS="com.filip.claude-acc.admit"
@@ -293,7 +293,7 @@ case "$1" in
   dictate) exec open -g "claude-acc://dictate/${2:-toggle}" ;;
   # panel aplikacji paska menu (claude-acc://panel[/sekcja]), jak komenda Poda "claude-acc settings…"
   panel) exec open -g "claude-acc://panel${2:+/$2}" ;;
-  # Stay Awake aplikacji: on [--for 2h], off, toggle, status [--json]; przez claude-acc://awake
+  # Stay Awake aplikacji: on [--for 2h], off, toggle, lid on|off, status [--json]; przez claude-acc://awake
   awake) shift; exec "$PY" "$RUN" awake "$@" ;;
   # wtyczka claude-acc w Orce: install, uninstall, status
   orca) shift; exec "$PY" "$RUN" orcaplugin "$@" ;;
