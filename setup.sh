@@ -29,6 +29,13 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 # Pod z izolowanym HOME) podmieniłby automaty prawdziwego konta, a pkill zamknął jego aplikację
 real_dir() { [ -n "$1" ] && (cd "$1" 2>/dev/null && pwd -P); }
 faked() { case "$(command -v "$1" || true)" in "" | /bin/* | /sbin/* | /usr/bin/* | /usr/sbin/*) return 1 ;; esac; }
+# kopia aplikacji do usunięcia: ditto przenosi uprawnienia, więc kopia z pakietu po `chmod a-w` (hotfix
+# Pod.app 2026-10-10) ma katalogi tylko do odczytu, a samo rm -rf pada i set -e kończy setup w połowie
+remove_app() {
+  [ -e "$1" ] || [ -L "$1" ] || return 0
+  chmod -R u+w "$1" 2>/dev/null || true
+  rm -rf "$1"
+}
 ACCOUNT_HOME="$(id -P 2>/dev/null | cut -d: -f9)"
 HOME_NOW="$(real_dir "${HOME:-}" || true)"
 if [ -z "$HOME_NOW" ] || [ "$HOME_NOW" != "$(real_dir "$ACCOUNT_HOME" || true)" ]; then
@@ -88,7 +95,8 @@ while [ $# -gt 0 ]; do
         rm -f "$AGENTS/$job.plist"
       done
       pkill -x ClaudeAcc 2>/dev/null || true
-      rm -rf "$HOME/Applications/Claude Acc.app" "$HOME/.local/bin/claude-acc"
+      remove_app "$HOME/Applications/Claude Acc.app"
+      rm -rf "$HOME/.local/bin/claude-acc"
       # hooki pauzy limitów; bez automatu nikt by już pauzy nie zdjął, więc wstrzymane
       # sesje budzimy, kasując jej plik
       for hook in "$STATE/hook.py" "$SRC/hook.py"; do
@@ -211,12 +219,6 @@ if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ] && [ -f "$STATE/admitchain.py" ]; then
 fi
 # skąd instalowano: `claude-acc fans install` bierze stamtąd install-fans.sh
 echo "$SRC" > "$STATE/source"
-# właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji
-if [ -n "$OWNER" ]; then
-  version="$(cat "$SRC/VERSION" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_SRC/Contents/Info.plist")"
-  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"} \
-    ${POD_AGENTS:+--menu "$APP_SRC"}
-fi
 # Pod's root helper (docs/pod-rootd.md): when the owner app carries it, `claude-acc rootd` is its CLI
 # and the old root installers are not offered
 ROOTCTL=""
@@ -405,16 +407,27 @@ if [ -n "$POD_AGENTS" ]; then
   # zamykamy tylko starą kopię po ścieżce, nie `pkill -x ClaudeAcc`, i ją usuwamy (claude-acc
   # handback stawia ją z powrotem)
   pkill -f "$APP/Contents/MacOS/ClaudeAcc" 2>/dev/null || true
-  rm -rf "$APP"
+  remove_app "$APP"
 else
   pkill -x ClaudeAcc 2>/dev/null || true
-  rm -rf "$APP"
+  remove_app "$APP"
   ditto "$APP_SRC" "$APP"
+  # źródło tylko do odczytu daje taką samą kopię: podpis niżej i następny setup muszą w niej pisać
+  chmod -R u+w "$APP" 2>/dev/null || true
   # podpis, który trzyma zgody macOS dyktowania (Mikrofon, Dostępność, Monitorowanie wejścia) przez
   # aktualizacje: certyfikat z Pęku kluczy albo ad hoc ze stałym designated requirement (sign-app.sh)
   [ -x "$SRC/sign-app.sh" ] && { "$SRC/sign-app.sh" "$APP" || echo "uwaga: podpis aplikacji nie wyszedł, zgody dyktowania mogą wymagać ponownego nadania" >&2; }
   # tuż po pkill LaunchServices potrafi odrzucić pierwsze open (-600)
   open "$APP" 2>/dev/null || { sleep 2; open "$APP"; }
+fi
+
+# właściciel (Pod): od teraz brew i install.sh odmawiają; wersja z VERSION paczki albo z aplikacji.
+# Na samym końcu, po wszystkich krokach: setup przerwany wcześniej (set -e) zostawia starą wersję,
+# więc Pod widzi zmianę wersji i uruchamia go znowu, zamiast uznać instalację za aktualną (2026-10-10)
+if [ -n "$OWNER" ]; then
+  version="$(cat "$SRC/VERSION" 2>/dev/null || /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_SRC/Contents/Info.plist")"
+  "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"} \
+    ${POD_AGENTS:+--menu "$APP_SRC"}
 fi
 
 echo
