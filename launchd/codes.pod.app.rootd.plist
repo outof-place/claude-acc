@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>codes.pod.app.rootd</string>
+  <!-- Pod's package installs this as /Library/LaunchDaemons/codes.pod.app.rootd.plist, root:wheel 0644,
+       and the program next to it in root-only /Library/PrivilegedHelperTools (docs/pod-rootd.md) -->
+  <key>Program</key><string>/Library/PrivilegedHelperTools/codes.pod.app.rootd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>codes.pod.app.rootd</string>
+  </array>
+  <!-- Login Items lists it under Pod; the program's team must be Pod's -->
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>codes.pod.app</string>
+  </array>
+  <key>MachServices</key>
+  <dict>
+    <key>codes.pod.app.rootd</key><true/>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ProcessType</key><string>Adaptive</string>
+  <key>SpawnConstraint</key>
+  <dict>
+    <key>team-identifier</key><string>75Y2KR6P5W</string>
+    <key>signing-identifier</key><string>codes.pod.rootd</string>
+  </dict>
+</dict>
+</plist>

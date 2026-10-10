@@ -217,6 +217,15 @@ if [ -n "$OWNER" ]; then
   "$STATE/python" "$STATE/owner.py" write --owner "$OWNER" --version "$version" ${OWNER_APP:+--app "$OWNER_APP"} \
     ${POD_AGENTS:+--menu "$APP_SRC"}
 fi
+# Pod's root helper (docs/pod-rootd.md): when the owner app carries it, `claude-acc rootd` is its CLI
+# and the old root installers are not offered
+ROOTCTL=""
+if [ -n "$POD_AGENTS" ] && [ -x "$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl" ]; then
+  ROOTCTL="$OWNER_APP/Contents/Resources/claude-acc/pod-rootctl"
+  ln -sfn "$ROOTCTL" "$STATE/pod-rootctl"
+else
+  rm -f "$STATE/pod-rootctl"
+fi
 # bramki agentów: poczta (MCP `mail`, odświeżana tylko przy skonfigurowanych skrzynkach) i
 # przeglądarka (MCP `browser`, tylko gdy już raz zainstalowana); wspólny hook podpowiedzi
 if [ -z "${CLAUDE_ACC_NO_HOOKS:-}" ]; then
@@ -324,8 +333,20 @@ case "$1" in
       uninstall) exec "$(cat "$STATE/source")/root-install.sh" --uninstall ;;
       *) exec "$(cat "$STATE/source")/root-install.sh" --status ;;
     esac ;;
+  # Pod's root helper: fans, Stay Awake with the lid closed, Ultra's root tweaks, the old daemons' migration
+  rootd)
+    shift
+    [ -x "$STATE/pod-rootctl" ] || { echo "brak pomocnika roota Poda (przychodzi razem z Podem)" >&2; exit 69; }
+    exec "$STATE/pod-rootctl" "$@" ;;
   fans)
     shift
+    case "${1:-read}" in
+      install | uninstall)
+        if [ -x "$STATE/pod-rootctl" ]; then
+          echo "wiatraki idą przez pomocnika roota Poda: claude-acc rootd fans auto|<30-100>" >&2
+          exit 2
+        fi ;;
+    esac
     case "${1:-read}" in
       install) exec "$(cat "$STATE/source")/install-fans.sh" --binary "$STATE/fanctl" ;;
       uninstall) exec "$(cat "$STATE/source")/install-fans.sh" --uninstall ;;
@@ -385,7 +406,12 @@ fi
 
 echo
 echo "gotowe. Sprawdź: claude-acc status, claude-acc mac status, claude-acc guard status"
-echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+if [ -n "$ROOTCTL" ]; then
+  echo "root (wiatraki, Stay Awake z zamkniętą klapą, Ultra): pomocnik roota Poda, włączany w Podzie; stan: claude-acc rootd status"
+  echo "hook dla agentów: README, sekcja Dev server guard"
+else
+  echo "wiatraki (root, Touch ID): claude-acc fans install; hook dla agentów: README, sekcja Dev server guard"
+fi
 # kopia roota (perf-root, porządki roota, kompresja aplikacji roota) sprzed tej wersji: root jej nie odświeży sam
 if [ -d /usr/local/libexec/claude-acc-root ] && ! "$SRC/root-install.sh" --status >/dev/null 2>&1; then
   echo "kopia roota starsza niż ta wersja: claude-acc root install (sudo, Touch ID)"

@@ -23,7 +23,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUARD = "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> \"$FAKE_LOG\"\nexit 0\n"
 # prawdziwy interpreter (nie shim /usr/bin/python3, który pod nazwą `python` woła instalator narzędzi)
 PYTHON = os.path.realpath(sys.executable)
-PRODUCTS = ("ClaudeAcc", "fanctl", "claude-acc-hook", "claude-acc-pause", "claude-acc-desktop", "pod-acc-run")
+PRODUCTS = ("ClaudeAcc", "fanctl", "claude-acc-hook", "claude-acc-pause", "claude-acc-desktop", "pod-acc-run",
+            "pod-rootd", "pod-rootctl")
 
 
 def plain_python():
