@@ -4011,14 +4011,97 @@ GIT_GREP = re.compile(
 GREP_BINARY_FLAG = re.compile(r"(^|\s)(-a|--text|--binary-files\S*|-I|-[A-Za-z]*I[A-Za-z]*)(?=\s|$)")
 
 
+HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
+
+
+def shell_code(command):
+    """[bool] dla każdego znaku: czy powłoka czyta go jako kod. Nie: w '...', w "..." (poza $(...)
+    w środku), w treści heredoca i w komentarzu. Wystarczy, żeby -I nie trafiło w tekst, który
+    agent pisze do pliku (2026-10-11: heredoc z `git grep` w treści dostał -I w zapisanym pliku)."""
+    code = [True] * len(command)
+    stack, depth, pending, i, n = ["n"], [0], [], 0, len(command)
+    while i < n:
+        ch, ctx = command[i], stack[-1]
+        if ctx == "s":
+            code[i] = False
+            if ch == "'":
+                stack.pop()
+            i += 1
+            continue
+        if ctx == "d":
+            code[i] = False
+            if ch == "\\" and i + 1 < n:
+                code[i + 1] = False
+                i += 2
+                continue
+            if ch == '"':
+                stack.pop()
+            elif command.startswith("$(", i):
+                stack.append("n")
+                depth.append(0)
+                i += 2
+                continue
+            i += 1
+            continue
+        # kod: na wierzchu albo w $(...) wewnątrz "..."
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'":
+            code[i] = False
+            stack.append("s")
+        elif ch == '"':
+            code[i] = False
+            stack.append("d")
+        elif ch == "(" and len(stack) > 1:
+            depth[-1] += 1
+        elif ch == ")" and len(stack) > 1:
+            if depth[-1] == 0:
+                stack.pop()
+                depth.pop()
+            else:
+                depth[-1] -= 1
+        elif ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|("):
+            while i < n and command[i] != "\n":
+                code[i] = False
+                i += 1
+            continue
+        elif command.startswith("<<", i) and not command.startswith("<<<", i):
+            m = HEREDOC.match(command, i)
+            if m:
+                pending.append((m.group(3), m.group(1) == "-"))
+                i = m.end()
+                continue
+        elif ch == "\n" and pending:
+            i += 1
+            for word, tabs in pending:
+                while i < n:
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line = command[i:end]
+                    for k in range(i, min(end + 1, n)):
+                        code[k] = False
+                    i = end + 1
+                    if (line.lstrip("\t") if tabs else line) == word:
+                        break
+            pending = []
+            continue
+        i += 1
+    return code
+
+
 def git_grep_text_only(command):
     """`git grep` bez flagi o plikach binarnych dostaje -I (pomija binarki).
 
     2026-10-08 `git grep -nE ... <commit>` agenta w repo z 368 MB filmów i obrazów w historii
     urósł do 10 GB w 2 sekundy: wyrażenie -E idzie przez regex macOS, a binarka to jedna linia
-    długości megabajtów. Z -I ta sama komenda ma szczyt 270 MB, a agent i tak nie szuka w mp4."""
-    out, pos = [], 0
+    długości megabajtów. Z -I ta sama komenda ma szczyt 270 MB, a agent i tak nie szuka w mp4.
+    Tylko w kodzie (shell_code): `git grep` w cudzysłowie, heredocu czy komentarzu to tekst."""
+    out, pos, code = [], 0, None
     for m in GIT_GREP.finditer(command):
+        code = code or shell_code(command)
+        if not code[m.end() - 1]:
+            continue
         rest = command[m.end() :]
         stop = re.search(r"[;&|\n]", rest)
         segment = rest[: stop.start()] if stop else rest

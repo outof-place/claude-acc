@@ -2987,6 +2987,28 @@ class GitGrepTest(unittest.TestCase):
             self.assertEqual(S.git_grep_text_only(command), command, command)
 
 
+    def test_text_the_shell_does_not_run_stays(self):
+        """2026-10-11: the hook put -I into a heredoc an agent wrote to a file."""
+        G = "git" + " " + "grep"
+        for command in (
+            f"echo '{G} foo'",
+            f"cat > notes.md <<EOF\nuse `{G} x` here\nEOF",
+            f"python3 - <<'PY'\ns = \"`{G} <p> <tree>`\"\nPY",
+            f"cat <<-EOF\n\t{G} q\n\tEOF",
+            f"# {G} x",
+        ):
+            self.assertEqual(S.git_grep_text_only(command), command, command)
+        # code next to text still gets it
+        cases = {
+            f"cat > f <<EOF\n{G} x\nEOF\n{G} y": f"cat > f <<EOF\n{G} x\nEOF\n{G} -I y",
+            f'echo "$({G} foo)"': f'echo "$({G} -I foo)"',
+            f"# {G} x\n{G} z": f"# {G} x\n{G} -I z",
+            f"cat <<<'{G} a' && {G} b": f"cat <<<'{G} a' && {G} -I b",
+        }
+        for command, want in cases.items():
+            self.assertEqual(S.git_grep_text_only(command), want, command)
+
+
 class RtkExcludesTest(unittest.TestCase):
     """Hook rtk i hook schedulera nie mogą przepisywać tej samej komendy (wynik losowy): rtk
     zostawia to, co owija scheduler, i nic więcej. Sprawdza samo rtk, bo ono normalizuje komendy
