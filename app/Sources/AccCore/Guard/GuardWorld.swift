@@ -53,8 +53,7 @@ public struct ProcTable {
     public func ppid(_ pid: pid_t) -> pid_t { rows[pid]?.ppid ?? 0 }
     public func command(_ pid: pid_t) -> String { rows[pid]?.command ?? "" }
     /// facts of the pid's line ("" for a pid not in the table)
-    public func facts(_ pid: pid_t) -> CommandFacts { rows[pid]?.facts ?? Self.empty }
-    static let empty = CommandFacts("")
+    public func facts(_ pid: pid_t) -> CommandFacts { rows[pid]?.facts ?? CommandFacts("") }
 
     /// {ppid: [pid, ...]} in table order
     public func children() -> [pid_t: [pid_t]] {
@@ -327,7 +326,7 @@ public final class Simulator {
         let pid: Int
         switch owner["pid"] {
         case .int(let i)?: pid = i
-        case .double(let d)? where d.isFinite: pid = Int(d)
+        case .double(let d)? where d.isFinite: pid = GuardText.int(d)
         case .string(let s)?: guard let i = Int(s.trimmingPySpace()) else { return false }; pid = i
         case .bool(let b)?: pid = b ? 1 : 0
         default: return false
@@ -444,10 +443,12 @@ public struct Pressure {
         }
         history.append(.array([.double(now), .int(swapUsed), swapoutsNow.map { .int($0) } ?? .null]))
         state["swap_history"] = .array(history)
-        let first = history[0].array!
-        swapGrowth = swapUsed - (first[1].int ?? Int(first[1].double ?? 0))
-        if let s = swapoutsNow, let f = first[2].int {
-            swapouts = s - f
+        // an entry someone else wrote may be short: what it lacks reads as no growth
+        let first = history[0].array ?? []
+        let base = first.count > 1 ? (first[1].int ?? GuardText.int(first[1].double ?? 0)) : swapUsed
+        swapGrowth = swapUsed &- base
+        if let s = swapoutsNow, first.count > 2, let f = first[2].int {
+            swapouts = s &- f
         } else {
             swapouts = 0
         }

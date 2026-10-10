@@ -301,7 +301,8 @@ func cfgText(_ v: PyJSON) -> String { pyStr(v) }
 /// cfg[key] * factor with Python's types (an int config stays an int)
 func scaled(_ v: PyJSON, _ factor: Int) -> PyNum {
     switch v {
-    case .int(let i): .int(i * factor)
+    // an int Python would grow past Int64 (a "limit off" of 10**12 GB): a float here, not a trap
+    case .int(let i): i.multipliedReportingOverflow(by: factor).overflow ? .double(Double(i) * Double(factor)) : .int(i * factor)
     case .bool(let b): .int((b ? 1 : 0) * factor)
     default: .double((v.double ?? 0) * Double(factor))
     }
@@ -353,7 +354,7 @@ public func decide(_ cfg: GuardConfig, _ world: GuardWorld, _ state: PyObject) -
         if !unit.watched && unit.quiet >= idle && now - unit.lastWatched.value >= idle {
             plans.append(Plan(
                 .unit(unit), "stop", 40, "nikt go nie ogląda i nic nie robi od \(GuardText.minutes(unit.quiet))", "idle",
-                [("minutes", .int(Int((unit.quiet / MINUTE).rounded(.down))))]))
+                [("minutes", .int(GuardText.int((unit.quiet / MINUTE).rounded(.down))))]))
         }
         if Double(unit.biggest) >= maxFp.value {
             let needed = cfg.number("quiet_seconds") * (unit.attended ? 10 : 1)
@@ -476,14 +477,14 @@ func simulatorPlans(_ cfg: GuardConfig, _ sims: [Simulator], _ pressure: Pressur
     let safe = sims.filter { !$0.inUse && !$0.protected && $0.age >= grace }
     var plans = safe.filter { $0.quiet >= idle }.map { s in
         Plan(.simulator(s), "shutdown", 45, "nikt go nie używa od \(GuardText.minutes(s.quiet))", "simulator_idle",
-             [("minutes", .int(Int((s.quiet / MINUTE).rounded(.down))))])
+             [("minutes", .int(GuardText.int((s.quiet / MINUTE).rounded(.down))))])
     }
     let over = cap.truthy && Double(sims.count) > (cap.double ?? 0)
     if !(over || pressure.level != 0) { return plans }
     let ready = safe.filter { $0.quiet >= cfg.number("simulator_quiet_minutes") * MINUTE }
     if let top = pyMax(ready, by: { Key2(a: $0.quiet, b: Double($0.footprint)) }) {
         let unused = "nieużywany od \(GuardText.minutes(top.quiet))"
-        var data: [(String, PyJSON)] = [("minutes", .int(Int((top.quiet / MINUTE).rounded(.down))))]
+        var data: [(String, PyJSON)] = [("minutes", .int(GuardText.int((top.quiet / MINUTE).rounded(.down))))]
         let why: String
         let code: String
         if over {
@@ -565,24 +566,20 @@ public func inventory(_ world: GuardWorld, probes: GuardProbes) -> PyJSON {
 
 // MARK: - tick
 
-/// What a tick decided to do. `.act` and `.brake` hand the tick to Python, which re-reads the Mac
-/// and acts on its own reading (`acc.py devguard once`); the native tick then keeps nothing of its own.
-public enum GuardVerdict: Equatable {
-    case quiet
-    case act(key: String, action: String, code: String)
-    case brake(stage: Int)
-}
-
+/// What a tick would hand to Python's actions. Python's loop gives every plan to execute() in order
+/// until one acts, then brakes if none did; `actable` is the plans it would try (enforcing, past the
+/// cooldown, a warn at most hourly) and `brakeDue` whether brake() would look for a victim with
+/// nothing acted. Which of them goes to `acc.py devguard once` is GuardEngine's call (HandoverPolicy).
 public struct GuardTickResult {
     public var world: GuardWorld
     public var plans: [Plan]
-    public var verdict: GuardVerdict
+    public var actable: [Plan]
+    public var brakeDue: Bool
 }
 
 /// tick(cfg, state, orca, qos) up to the actions: the state is updated the way Python's tick updates
-/// it when nothing acts. With `enforce`, a plan past the cooldown or a due brake is the verdict.
-/// With `shaper` (the resident loop, enforcing) the servers you don't look at go to background QoS
-/// before the snapshot records it, as shape() does in Python's loop.
+/// it when nothing acts. With `shaper` (the resident loop, enforcing) the servers you don't look at
+/// go to background QoS before the snapshot records it, as shape() does in Python's loop.
 public func guardTick(
     cfg: GuardConfig, state: inout PyObject, orca: OrcaView, probes: GuardProbes, enforce: Bool, shaper: QoSShaper? = nil
 ) -> GuardTickResult {
@@ -591,18 +588,16 @@ public func guardTick(
     let world = GuardWorld(cfg: cfg, state: &state, orca: orca, probes: probes, useOrca: previous < 3)
     checkPending(world, &state, probes: probes)
     let plans = Profile.measure("decide") { decide(cfg, world, state) }
-    var verdict = GuardVerdict.quiet
+    var actable: [Plan] = []
     if !plans.isEmpty && enforce && now - (state["last_action"]?.double ?? 0) >= cfg.number("cooldown_seconds") {
-        if let plan = plans.first(where: { wouldAct($0, state: state, now: now) }) {
-            verdict = .act(key: plan.key, action: plan.action, code: plan.code)
-        }
+        actable = plans.filter { wouldAct($0, state: state, now: now) }
     }
     let stage = world.pressure.stage
     let inv = state["inventory"]?.object
     if !world.table.order.isEmpty && (stage >= 1 || now - (inv?["at"]?.double ?? 0) >= 30) {
         state["inventory"] = Profile.measure("inventory") { inventory(world, probes: probes) }
     }
-    if verdict == .quiet, enforce, brakeDue(cfg, world, state, now: now) { verdict = .brake(stage: stage) }
+    let brake = enforce && brakeDue(cfg, world, state, now: now)
     var history = state["history"]?.array ?? []
     if history.isEmpty || now - (history.last?.array?.first?.double ?? 0) >= 30 {
         let p = world.pressure
@@ -612,12 +607,12 @@ public func guardTick(
     state["history"] = .array(history)
     if enforce, let shaper { shaper.shape(cfg, world, probes: probes) }
     state["snapshot"] = Profile.measure("snapshot") { snapshot(cfg, world, plans, state: state) }
-    return GuardTickResult(world: world, plans: plans, verdict: verdict)
+    return GuardTickResult(world: world, plans: plans, actable: actable, brakeDue: brake)
 }
 
 /// Whether execute() would do something rather than return False: a warn repeats at most hourly.
 /// Holds that depend on the screen or a lease (Simulator in front, a session taking a simulator) are
-/// Python's to judge; the caller backs off after a handover that changed nothing.
+/// Python's to judge (`declinable`); the caller backs off after a handover that changed nothing.
 func wouldAct(_ plan: Plan, state: PyObject, now: Double) -> Bool {
     if plan.action == "warn" {
         let warned = state["warned"]?[plan.appKey]?.double ?? 0
@@ -626,7 +621,17 @@ func wouldAct(_ plan: Plan, state: PyObject, now: Double) -> Bool {
     return true
 }
 
-/// brake(): whether lastresort.reap would be asked for a victim this tick.
+/// Whether Python's execute() may return False for the plan on its own reading: a pool shutdown
+/// (shutdown_simulator checks leases and the screen) and a server with an app open in a Simulator
+/// while Simulator is in front. Every other plan acts once it reaches execute().
+func declinable(_ plan: Plan) -> Bool {
+    if plan.action == "shutdown" { return true }
+    if plan.action == "warn" { return false }
+    if case .unit(let unit) = plan.target { return !unit.idleSimClients.isEmpty }
+    return false
+}
+
+/// brake(): whether lastresort.reap would be asked for a victim this tick, with no plan acted.
 func brakeDue(_ cfg: GuardConfig, _ world: GuardWorld, _ state: PyObject, now: Double) -> Bool {
     guard cfg.raw["last_resort"].map({ $0.truthy }) ?? true else { return false }
     let p = world.pressure

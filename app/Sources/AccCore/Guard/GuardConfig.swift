@@ -55,6 +55,27 @@ public struct GuardConfig: Sendable {
         return GuardConfig(raw: cfg)
     }
 
+    /// The keys whose value the native tick would read differently from Python: a number where a
+    /// number belongs (an int, a float or a bool), a string for a string, a list of strings for a
+    /// list. `"runtimes": "node"` still finds servers in Python (`in` on a string) and none here.
+    /// Flags are read by truthiness on both sides, so any type passes.
+    public var mismatched: [String] {
+        var out: [String] = []
+        for (key, def) in Self.defaults {
+            guard let value = raw[key] else { continue }
+            let ok: Bool
+            switch def {
+            case .int, .double: ok = value.double != nil && value.string == nil
+            case .bool: ok = true
+            case .string: ok = value.string != nil && !value.isRaw
+            case .array: ok = value.array.map { $0.allSatisfy { $0.string != nil && !$0.isRaw } } ?? false
+            default: ok = true
+            }
+            if !ok { out.append(key) }
+        }
+        return out
+    }
+
     public subscript(key: String) -> PyJSON { raw[key] ?? .null }
     public func number(_ key: String) -> Double { self[key].double ?? 0 }
     public func flag(_ key: String) -> Bool { self[key].truthy }
