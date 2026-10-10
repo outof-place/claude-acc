@@ -12,11 +12,17 @@ wrapper then goes on to the root copy.
   rootroute.py janitor-root [--dry-run] [--high-power]
 """
 
-import json
 import os
+import sys
+
+# bytecode only in $STATE: next to a script in Pod's bundle (Pod.app/Contents/Resources/claude-acc) a
+# __pycache__ breaks the app's seal, whatever starts this file and with whatever flags (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import json
 import re
 import subprocess
-import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(os.path.expanduser("~"), ".local", "share", "claude-acc")
