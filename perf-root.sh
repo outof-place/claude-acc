@@ -99,9 +99,31 @@ if [ -z "$USER_NAME" ] || [ "$USER_NAME" = root ]; then
   fi
 fi
 if [ -z "$USER_NAME" ] || [ "$USER_NAME" = root ] || [ "$(eval echo "~$USER_NAME")" = /var/root ]; then
-  echo "nie wiem, czyj jest stan claude-acc (SUDO_USER pusty albo root, przy konsoli nikogo); uruchom jako użytkownik: sudo $0 ..." >&2
+  echo "nie wiem, czyj jest stan claude-acc (SUDO_USER pusty albo root, przy konsoli nikogo); uruchom jako użytkownik: claude-acc perf-root ..." >&2
   exit 1
 fi
+# Pod rootem tylko z kopii roota (root-install.sh: root-run.sh sprawdził ją i jej interpreter przed
+# startem). Ten plik w $STATE, w libexec Homebrew albo w Pod.app może zmienić każdy na tym koncie
+# (`user` tylko mówi, czyj stan by zmienił, więc wolno mu zawsze)
+if [ "$(id -u)" -eq 0 ] && [ ! -f "$HERE/root-python" ] && [ "$CMD" != user ]; then
+  echo "perf-root.sh pod rootem biegnie tylko z kopii roota: claude-acc root install (raz), potem claude-acc perf-root ..." >&2
+  exit 1
+fi
+# perf.py i orcahost.py biegną jako użytkownik, z jego $STATE: kopia roota ich nie wozi
+ACC_STATE="$(eval echo "~$USER_NAME")/.local/share/claude-acc"
+[ -f "$PERF" ] || PERF="$ACC_STATE/perf.py"
+HOST_PY="$HERE/orcahost.py"
+[ -f "$HOST_PY" ] || HOST_PY="$ACC_STATE/orcahost.py"
+
+# Python po stronie roota (JSON stanu, plista Spotlight): interpreter z root-python kopii, z -I.
+# Nigdy /usr/bin/python3: pod rootem to zaślepka, która idzie do wybranego Xcode'a (rootpy.py)
+pyroot() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$(head -n 1 "$HERE/root-python")" -I "$@"
+  else
+    /usr/bin/python3 "$@"
+  fi
+}
 as_user() {
   if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != root ]; then
     sudo -u "$USER_NAME" -H /usr/bin/python3 "$PERF" "$@"
@@ -113,9 +135,9 @@ as_user() {
 # host agentów (Orca albo Pod) według orcahost.py, czytany jako użytkownik: jego HOME i ~/Applications
 host_app() {
   if [ "$(id -u)" -eq 0 ] && [ "$USER_NAME" != root ]; then
-    sudo -u "$USER_NAME" -H /usr/bin/python3 "$HERE/orcahost.py" app
+    sudo -u "$USER_NAME" -H /usr/bin/python3 "$HOST_PY" app
   else
-    /usr/bin/python3 "$HERE/orcahost.py" app
+    /usr/bin/python3 "$HOST_PY" app
   fi
 }
 
@@ -125,7 +147,7 @@ do_it() {
 
 need_root() {
   if [ "$(id -u)" -ne 0 ] && [ "$DRY" -eq 0 ]; then
-    echo "uruchom przez sudo: sudo $0 $*" >&2
+    echo "uruchom przez kopię roota: claude-acc perf-root $*" >&2
     exit 1
   fi
 }
@@ -170,7 +192,7 @@ shaper_apply() {
 shaper_undo() {
   need_root shaper undo
   local detail iface prev
-  detail="$(as_user status --json | /usr/bin/python3 -c 'import json,sys
+  detail="$(as_user status --json | pyroot -c 'import json,sys
 for t in json.load(sys.stdin)["tweaks"]:
     if t["name"] == "shaper" and t["applied"]:
         print(t["detail"])')"
@@ -201,7 +223,7 @@ shaper_status() {
 }
 
 summary() {
-  /usr/bin/python3 -c 'import json,sys
+  pyroot -c 'import json,sys
 a, b = (json.load(open(p))["network"] for p in sys.argv[1:3])
 rows = [("pobieranie Mb/s", "down_mbps"), ("wysyłanie Mb/s", "up_mbps"),
         ("bez obciążenia ms", "idle_ms"),
@@ -287,7 +309,7 @@ vnodes_apply() {
 vnodes_undo() {
   need_root vnodes undo
   local prev
-  prev="$(as_user status --json | /usr/bin/python3 -c 'import json,sys
+  prev="$(as_user status --json | pyroot -c 'import json,sys
 for t in json.load(sys.stdin)["tweaks"]:
     if t["name"] == "vnodes" and t["applied"]:
         print(t["detail"].split("prev=")[-1])')"
@@ -399,7 +421,7 @@ SPOTLIGHT_CONFIG=/System/Volumes/Data/.Spotlight-V100/VolumeConfiguration.plist
 spotlight_exclusions() {
   # $1: "apps-only" albo plik z listą do przywrócenia; wypisuje poprzednią listę.
   # $2 (opcjonalnie): katalog aplikacji, domyślnie /Applications; inny tylko w testach.
-  /usr/bin/python3 - "$SPOTLIGHT_CONFIG" "$1" "$(eval echo "~$USER_NAME")" "${2:-/Applications}" <<'PY'
+  pyroot - "$SPOTLIGHT_CONFIG" "$1" "$(eval echo "~$USER_NAME")" "${2:-/Applications}" <<'PY'
 import json, os, plistlib, sys
 path, mode, home, apps = sys.argv[1:5]
 raw = open(path, "rb").read()
@@ -514,15 +536,15 @@ vnodes_trial() {
   else
     # zmierzony efekt trafia do stanu, żeby panel pokazał przed i po
     [ "$DRY" -eq 1 ] || as_user record vnodes "$VNODES" "prev=$PREV_VNODES" --result \
-      "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fs"]["warm_s"])' "$tmp/before.json")" \
-      "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fs"]["warm_s"])' "$tmp/after.json")"
+      "$(pyroot -c 'import json,sys; print(json.load(open(sys.argv[1]))["fs"]["warm_s"])' "$tmp/before.json")" \
+      "$(pyroot -c 'import json,sys; print(json.load(open(sys.argv[1]))["fs"]["warm_s"])' "$tmp/after.json")"
     if [ "$PERSIST" -eq 1 ]; then
       echo "nowa wartość zostaje, także po restarcie; cofnięcie: sudo $0 vnodes undo"
     else
       echo "nowa wartość zostaje do restartu (--persist: na stałe); cofnięcie: sudo $0 vnodes undo"
     fi
   fi
-  [ "$DRY" -eq 1 ] || /usr/bin/python3 -c 'import json,sys
+  [ "$DRY" -eq 1 ] || pyroot -c 'import json,sys
 a, b = (json.load(open(p))["fs"] for p in sys.argv[1:3])
 print("%-34s %10s %10s" % ("", "przed", "po"))
 for label, key in (("drugi przebieg lstat s", "warm_s"), ("vnode z odzysku", "warm_recycled"), ("kern.maxvnodes", "maxvnodes")):
@@ -607,7 +629,7 @@ devtools_apply() {
 
 devtools_undo() {
   local detail bundle prev name
-  detail="$(as_user status --json | /usr/bin/python3 -c 'import json,sys
+  detail="$(as_user status --json | pyroot -c 'import json,sys
 for t in json.load(sys.stdin)["tweaks"]:
     if t["name"] == "devtools" and t["applied"]:
         print(t["detail"])')"

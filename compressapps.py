@@ -16,11 +16,11 @@ zapisać. Ten skrypt robi je przez sudo, aplikacja po aplikacji:
 Aktualizacje Office (Microsoft AutoUpdate) i Creative Cloud wgrywają nowe, nieskompresowane
 pakiety, więc komenda jest do powtarzania: drugi przebieg bierze tylko to, co doszło.
 
-Wywołanie przez `claude-acc mac compress-apps [--apps Word,Excel] [--threads N]`: od 1.31.1 samo
-`plan`. Janitor nie uruchamia już trybu `run` przez sudo, bo pod rootem trzeba by uruchomić i ten
-skrypt (z $STATE), i afsctool (z /opt/homebrew) z miejsc zapisywalnych bez roota, a to oddaje roota
-każdemu, kto ma to konto. Tryb `run` zostaje do ręcznego biegu z własną, zaufaną kopią obu i wróci
-przez pomocnika roota (pod-rootd) z afsctool przypiętym w jego pakiecie. Skrypt nie importuje nic
+Wywołanie przez `claude-acc mac compress-apps [--dry-run] [--apps Word,Excel] [--threads N]`. Plan
+liczy janitor bez roota; tryb `run` biegnie pod rootem tylko z kopii roota (`claude-acc root install`):
+`sudo /usr/local/libexec/claude-acc-root/root-run.sh compress-apps ...` uruchamia tam ten plik
+interpreterem z rootpy.py, z -I, i przypiętą tam kopią afsctool. Ten plik w $STATE i afsctool z
+/opt/homebrew może zmienić każdy na tym koncie, więc pod sudo nie biegną. Skrypt nie importuje nic
 z repo, żeby tryb -I (bez katalogu skryptu i PYTHONPATH w sys.path) działał pod rootem.
 """
 
