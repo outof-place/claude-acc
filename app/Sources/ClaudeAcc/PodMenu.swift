@@ -31,3 +31,12 @@ enum PodMenu {
         }
     }
 }
+
+/// claude-acc://panel[/<section>]: the panel from outside, e.g. Pod's "claude-acc settings…" command.
+enum PanelRoute {
+    /// "services" for claude-acc://panel/services, nil for claude-acc://panel or claude-acc://panel/.
+    static func section(of url: URL) -> String? {
+        guard url.host() == "panel" else { return nil }
+        return url.pathComponents.first { $0 != "/" && !$0.isEmpty }
+    }
+}

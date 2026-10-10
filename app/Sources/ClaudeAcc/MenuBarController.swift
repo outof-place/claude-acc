@@ -44,6 +44,13 @@ final class MenuBarController: NSObject {
         panel.isOpen ? close() : open()
     }
 
+    /// Opens the panel from a URL (claude-acc://panel): already open, it stays as it is. `section`
+    /// names the part to bring into view; the panel has no sections to scroll to yet, so for now
+    /// every one opens the panel as it is (`services` waits for the services view).
+    func showPanel(section: String?) {
+        if !panel.isOpen { open() }
+    }
+
     @objc private func dictationStarted() {
         close()
     }
