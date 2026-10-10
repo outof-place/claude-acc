@@ -70,6 +70,9 @@ public protocol Backend: AnyObject {
     func legacyFanMode(configPath: String) -> FanMode?
     /// The Spotlight list perf-root.sh saved before apps-only.
     func legacySpotlightList() -> [String]?
+    /// Renames that saved list to `spotlight-exclusions.json.migrated` beside it once the helper holds
+    /// it, or back at a rollback, so only one side takes it for the live one.
+    func moveLegacySpotlightList(aside: Bool) throws
     func bootout(_ daemon: LegacyDaemon) throws
     /// Moves the plist aside into the helper's directory, or back to /Library/LaunchDaemons.
     func moveLegacyPlist(_ daemon: LegacyDaemon, aside: Bool) throws
@@ -79,18 +82,13 @@ public protocol Backend: AnyObject {
 
     /// The running helper's CFBundleVersion, as its signature binds it.
     var ownVersion: String? { get }
-    /// Copies of pod-rootd in Pod.app that may be newer: fixed places, never a path from a message.
+    /// Copies of pod-rootd in Pod.app that may be newer: fixed places, never a path from a message;
+    /// none when the helper doesn't run as the package's install.
     func updateCandidates() -> [String]
-    /// Copies a candidate (no symlink, a regular file, at most 64 MB) into the root-only directory
-    /// next to the installed helper; the copy's path. The check that follows reads this copy, which
-    /// nothing but root can change.
-    func stageUpdate(from candidate: String) throws -> String
-    /// The copy's CFBundleVersion when it is Pod's notarized helper (team, identifier, notarized,
-    /// every architecture valid); nil otherwise.
-    func verifiedVersion(ofStaged path: String) -> String?
+    /// The staging and the signature check, which run off the main queue (`UpdateRunner`).
+    var updateSource: any UpdateSource { get }
     /// Renames the checked copy over the installed helper.
     func installUpdate(_ staged: String) throws
-    func discardUpdate(_ staged: String)
     /// The job's plist, the program, the state files and the package receipt; the old daemons'
     /// backups stay.
     func removeInstall() throws

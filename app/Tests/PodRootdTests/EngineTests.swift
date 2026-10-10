@@ -420,6 +420,9 @@ func legacyMigrate() {
     #expect(status.sysctls.first { $0.key == .gpuWiredLimitMB }?.original == 0)
     #expect(status.fsguard.enabled)
     #expect(status.spotlight.appsOnly)
+    // perf-root.sh's saved list went aside: after a restore apps-only stays the helper's
+    #expect(rig.backend.savedSpotlightList == nil)
+    #expect(rig.backend.savedSpotlightAside == ["/Users/x/Movies"])
     #expect(status.legacy.allSatisfy { $0.daemon == .hotspot ? $0.installed && !$0.migrated : $0.migrated && !$0.installed })
     #expect(rig.changed(rig.send(.legacyMigrate)) == false)
     // iogpu undo after the migration: macOS's default now, not at the next boot
@@ -440,6 +443,10 @@ func legacyRollback() {
     #expect(status.sysctls.allSatisfy { $0.persisted == nil })
     #expect(!status.fsguard.enabled)
     #expect(status.legacy.allSatisfy { $0.installed && !$0.migrated })
+    // the root copy's list is back where perf-root.sh keeps it, and the helper lets go of its copy
+    #expect(rig.backend.savedSpotlightList == ["/Users/x/Movies"])
+    #expect(rig.backend.savedSpotlightAside == nil)
+    #expect(status.spotlight.savedEntries == nil && !status.spotlight.appsOnly)
     #expect(rig.changed(rig.send(.legacyRollback)) == false)
 }
 
@@ -535,65 +542,155 @@ private let podApp = "/Applications/Pod.app/Contents/Resources/claude-acc/pod-ro
 private let openedFrom = "/Users/x/Downloads/Pod.app/Contents/Resources/claude-acc/pod-rootd"
 
 @Test("a session from Pod or Pod Menu looks for a newer helper in Pod.app at most once an hour; the CLI's never")
-func updateLooksHourly() {
+func updateLooksHourly() async {
     let rig = Rig(updates: true)
-    rig.backend.candidates = [podApp: .init(version: "57")]
+    rig.backend.updates.candidates = [podApp: .init(version: "57")]
     rig.send(.status, as: .cli)
     #expect(rig.engine.nextTickDelay == nil)
     rig.send(.status, as: .menu)
     #expect(rig.engine.nextTickDelay == 0)
     #expect(!rig.engine.isIdle)
+    var restarted = false
+    rig.engine.onUpdateInstalled = { restarted = true }
     rig.engine.tick()
-    #expect(rig.engine.restartForUpdate)
+    #expect(rig.engine.updating)  // the look runs on its own queue
+    #expect(!rig.engine.isIdle)
+    await settled { !rig.engine.updating }
+    #expect(rig.engine.restartForUpdate && restarted)
     #expect(rig.backend.installedVersion == "57")
 
     let after = rig.restarted()
-    after.backend.candidates = [podApp: .init(version: "58")]
+    after.backend.updates.candidates = [podApp: .init(version: "58")]
     after.send(.status, as: .app)
     after.engine.tick()
+    await settled { !after.engine.updating }
     #expect(after.backend.installedVersion == "58")
     let again = after.restarted()
     again.send(.status, as: .app)
     again.engine.tick()
+    await settled { !again.engine.updating }
     again.send(.status, as: .app)
     #expect(again.engine.nextTickDelay == nil)  // the hour hasn't passed for this process
 }
 
 @Test("only a genuine, higher version replaces the helper; the check reads the staged copy, never the candidate")
-func updateTakesOnlyNewerGenuine() {
+func updateTakesOnlyNewerGenuine() async {
     let rig = Rig(updates: true)
-    rig.backend.candidates = [
+    rig.backend.updates.candidates = [
         openedFrom: .init(version: "56"),  // the same build
         podApp: .init(version: "60", genuine: false),  // a re-signed or ad hoc copy
     ]
     rig.send(.status, as: .menu)
     rig.engine.tick()
+    await settled { !rig.engine.updating }
     #expect(!rig.engine.restartForUpdate)
     #expect(rig.backend.installedVersion == "56")
-    #expect(rig.backend.staged.isEmpty)
-    let checks = rig.backend.calls.filter { $0.hasPrefix("verify") }
+    #expect(rig.backend.updates.staged.isEmpty)
+    let checks = rig.backend.updates.calls.filter { $0.hasPrefix("verify") }
     #expect(checks.allSatisfy { $0.hasPrefix("verify /staged/") })
     #expect(checks.count == 2)
     #expect(!rig.backend.calls.contains { $0.hasPrefix("installUpdate") })
 }
 
 @Test("an older genuine build, a symlinked candidate or a version that isn't a number never goes in")
-func updateRefusesDowngradesAndLinks() {
+func updateRefusesDowngradesAndLinks() async {
     let rig = Rig(updates: true)
-    rig.backend.candidates = [
+    rig.backend.updates.candidates = [
         openedFrom: .init(version: "55"),
         podApp: .init(version: "99", symlink: true),
     ]
     rig.send(.status, as: .menu)
     rig.engine.tick()
+    await settled { !rig.engine.updating }
     #expect(rig.backend.installedVersion == "56")
-    #expect(!rig.backend.calls.contains("verify /staged/1"))
+    #expect(!rig.backend.updates.calls.contains("verify /staged/1"))
     #expect(Engine.newer("57", than: "56"))
     #expect(Engine.newer("1.31.10", than: "1.31.9"))
     #expect(!Engine.newer("56", than: "56"))
     #expect(!Engine.newer("55", than: "56"))
     #expect(!Engine.newer("57-beta", than: "56"))
     #expect(!Engine.newer("", than: "56"))
+}
+
+/// The lid held, then the Mac gets hot while a look is still out: the main queue must let go now.
+private func heatWhileLooking(_ rig: Rig) {
+    #expect(rig.engine.updating)
+    #expect(rig.backend.sleepIsDisabled)
+    rig.backend.hot = true
+    rig.engine.tick()
+    #expect(!rig.backend.sleepIsDisabled)
+    #expect(rig.engine.status().lid.lastRelease == "thermal")
+}
+
+@Test("a look that stalls (a slow mount) is given up at the deadline; the lid and heat rules run meanwhile")
+func updateStallHitsTheDeadline() async {
+    let rig = Rig(updates: true, updateRunner: UpdateRunner(deadline: 0.3))
+    rig.backend.updates.candidates = [podApp: .init(version: "57")]
+    rig.backend.updates.stall = 1.5
+    rig.send(.lidHold(seconds: hour))
+    rig.engine.tick()
+    heatWhileLooking(rig)
+    await settled { !rig.engine.updating }
+    #expect(!rig.engine.updating)
+    #expect(!rig.engine.restartForUpdate)
+    // the late answer's copy is thrown away: a timeout means skip
+    await settled { rig.backend.updates.calls.contains { $0.hasPrefix("discard") } }
+    #expect(rig.backend.updates.staged.isEmpty)
+    #expect(rig.backend.installedVersion == "56")
+}
+
+/// Real files: HelperFiles.stage into a scratch PrivilegedHelperTools; any copy counts as version 99.
+nonisolated private struct ScratchSource: UpdateSource {
+    let directory: String
+    var local: Bool = true
+
+    func stage(_ candidate: String) throws -> String {
+        try HelperFiles.stage(candidate, into: directory, name: "codes.pod.app.rootd", onLocalVolume: { _ in local })
+    }
+
+    func verifiedVersion(ofStaged path: String) -> String? { "99" }
+
+    func discard(_ staged: String) { unlink(staged) }
+}
+
+@Test("a FIFO in place of the candidate can't block the look, and the lid and heat rules run meanwhile",
+      .timeLimit(.minutes(1)))
+func updateFifoCandidate() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("pod-rootd-fifo-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let fifo = dir.appendingPathComponent("pod-rootd").path
+    #expect(mkfifo(fifo, 0o600) == 0)
+    let backend = FakeBackend()
+    backend.source = ScratchSource(directory: dir.path)
+    backend.updates.candidates = [fifo: .init(version: "99")]
+    let rig = Rig(backend: backend, updates: true)
+    rig.send(.lidHold(seconds: hour))
+    rig.engine.tick()
+    heatWhileLooking(rig)
+    await settled { !rig.engine.updating }
+    #expect(!rig.engine.restartForUpdate)
+    #expect(rig.backend.installedVersion == "56")
+    #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path) == ["pod-rootd"])
+}
+
+@Test("a candidate on a volume that isn't local APFS or HFS (network, FUSE) is passed over")
+func updateNonLocalCandidate() async throws {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("pod-rootd-mount-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let candidate = dir.appendingPathComponent("pod-rootd").path
+    FileManager.default.createFile(atPath: candidate, contents: Data("new helper".utf8))
+    let backend = FakeBackend()
+    backend.source = ScratchSource(directory: dir.path, local: false)
+    backend.updates.candidates = [candidate: .init(version: "99")]
+    let rig = Rig(backend: backend, updates: true)
+    rig.send(.lidHold(seconds: hour))
+    rig.engine.tick()
+    heatWhileLooking(rig)
+    await settled { !rig.engine.updating }
+    #expect(!rig.engine.restartForUpdate)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: dir.path) == ["pod-rootd"])
 }
 
 @Test("helper.uninstall restores the defaults, removes the package's files and then boots the job out")

@@ -14,10 +14,16 @@ każdy katalog nadrzędny należą do roota i nie są zapisywalne dla grupy ani 
 uruchamiają go z `-I`: bez katalogu skryptu i PYTHONPATH w `sys.path`.
 """
 
-import json
 import os
-import stat
 import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import json
+import stat
 
 # kolejność preferencji: narzędzia wiersza poleceń Apple (pakiet .pkg, właściciel root), potem
 # framework systemowy, gdyby wrócił. `/usr/bin/python3` celowo nie jest kandydatem: to zaślepka
@@ -96,7 +102,7 @@ def _probe(path):
     import subprocess
 
     try:
-        done = subprocess.run([path, "-I", "-S", "-c", _ASK], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([path, "-I", "-S", "-B", "-c", _ASK], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError) as err:
         return [], f"{path}: nie odpowiada ({err})"
     lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]

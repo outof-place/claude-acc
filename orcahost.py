@@ -1,7 +1,7 @@
 """The IDE that hosts claude-acc: Orca, or Pod (outofplace's downstream of Orca), in one place.
 
 Everything claude-acc knows about the host app lives here, so the rest asks this module instead of
-spelling Orca's paths: the userData folder (claude-accounts, orca-data.json, orca-runtime.json), the app
+spelling Orca's paths: the userData folder (claude-accounts, claude-profiles, orca-data.json, orca-runtime.json), the app
 bundle and its main process, its CLI, the Keychain service of its Claude accounts and the folder of its
 agent hooks. The env keys the host sets in its terminals come with the host's prefix: Orca's ORCA_PANE_KEY,
 ORCA_TERMINAL_HANDLE, ..., Pod's POD_* since it cut its runtime ties to Orca (2026-10-10); env() reads
@@ -32,10 +32,16 @@ it renames them.
     orcahost.py [field]     the resolved host as JSON, or one field (perf-root.sh asks for `app`)
 """
 
-import json
 import os
-import re
 import sys
+
+# bytecode only in $STATE: next to a script in Pod's bundle (Pod.app/Contents/Resources/claude-acc) a
+# __pycache__ breaks the app's seal, whatever starts this file and with whatever flags (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import json
+import re
 import time
 from collections import namedtuple
 
@@ -373,6 +379,49 @@ def cli_path(h=None, which=None):
 
 def keychain_services(env=None, home=None):
     return list(dict.fromkeys(h.keychain_service for h in known(env, home)))
+
+
+# A host's Claude profiles (upstream #26801, in Pod since 5.1): <userData>/claude-profiles/<id>/home is
+# the CLAUDE_CONFIG_DIR of one signed-in account, profile.json beside it the marker the host writes
+# when its setup finished, and selected-host the home launches run in ("" for System default)
+PROFILES_DIR = "claude-profiles"
+PROFILE_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def claude_profiles(h=None):
+    """[(id, home)] of the host's profiles on this Mac's disk, by id: a finished setup (the marker
+    names the same id, runtime "host") and a home that is a folder, not a link. A WSL profile's home
+    lives on the guest's disk, so it isn't one."""
+    h = h or resolve()
+    root = os.path.join(h.user_data, PROFILES_DIR)
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not PROFILE_ID.fullmatch(name):
+            continue
+        try:
+            with open(os.path.join(root, name, "profile.json")) as f:
+                marker = json.load(f)
+        except (OSError, ValueError):
+            continue
+        home = os.path.join(root, name, "home")
+        if (isinstance(marker, dict) and marker.get("accountId") == name and marker.get("runtime") == "host"
+                and os.path.isdir(home) and not os.path.islink(home)):
+            found.append((name, home))
+    return found
+
+
+def selected_profile_home(h=None):
+    """The home of the profile the host routes its launches to, or None for System default."""
+    h = h or resolve()
+    try:
+        with open(os.path.join(h.user_data, PROFILES_DIR, "selected-host")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
 
 
 def hook_hosts(hosts=None):

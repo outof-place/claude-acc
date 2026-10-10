@@ -12,11 +12,17 @@ proces, więc stan bez żywego pid aplikacji to "wyłączone". Komenda czeka do 
 w pliku stanu.
 """
 
-import json
 import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import json
 import re
 import subprocess
-import sys
 import time
 
 STATE_DIR = os.path.join(os.path.expanduser("~"), ".local/share/claude-acc")

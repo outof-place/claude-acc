@@ -43,8 +43,9 @@ public final class Engine {
     private let store: StateStore
     private let now: () -> Double
     private let policy: VerbPolicy
-    /// Looks for a newer helper in Pod.app (off in tests that don't test it).
+    /// Looks for a newer helper in Pod.app (off in tests that don't test it), off the main queue.
     private let updates: Bool
+    private let updateRunner: UpdateRunner
     private var limiter: RateLimiter
     public private(set) var state = HelperState()
     private var savedState: HelperState?
@@ -71,8 +72,12 @@ public final class Engine {
     // the package's install: a newer helper from Pod.app, and the uninstall
     private var updateCheckedAt: Double?
     private var updateDue = false
+    /// A look into Pod.app is running on its own queue.
+    public private(set) var updating = false
     /// A newer helper is in place: the process exits non-zero and launchd starts the new one.
     public private(set) var restartForUpdate = false
+    /// Called on the main queue once a newer helper is in place and the state is saved.
+    public var onUpdateInstalled: (() -> Void)?
     /// `helper.uninstall` went through: the next tick boots the job out.
     public private(set) var uninstalling = false
 
@@ -84,8 +89,9 @@ public final class Engine {
     public init(
         backend: Backend, store: StateStore, now: @escaping () -> Double = { Date.now.timeIntervalSince1970 },
         policy: VerbPolicy = .standard, limits: [VerbKind: RateLimiter.Limit] = RateLimiter.standard,
-        updates: Bool = true
+        updates: Bool = true, updateRunner: UpdateRunner = .standard
     ) {
+        self.updateRunner = updateRunner
         self.backend = backend
         self.store = store
         self.now = now
@@ -164,7 +170,7 @@ public final class Engine {
     /// Nothing to watch: the process may exit and let launchd start it on the next connection.
     public var isIdle: Bool {
         state.fans == .auto && leases.isEmpty && !state.lidHeldByUs && !state.fsguard.enabled && shaperOwners.isEmpty
-            && !updateDue && !uninstalling
+            && !updateDue && !updating && !uninstalling
     }
 
     /// Seconds until `tick` has work: 2 under a fixed fan setting (fanctl's tick), 5 while the lid is
@@ -662,9 +668,19 @@ public final class Engine {
             try backend.moveLegacyPlist(daemon, aside: true)
             if !state.legacy.contains(daemon) { state.legacy.append(daemon) }
         }
-        if state.spotlightSaved == nil, let list = backend.legacySpotlightList() {
-            state.spotlightSaved = list
-            state.spotlightApplied = true
+        if let list = backend.legacySpotlightList() {
+            if state.spotlightSaved == nil {
+                state.spotlightSaved = list
+                state.spotlightApplied = true
+            }
+            // the helper holds the list now: perf-root.sh's file goes aside, so after a restore neither
+            // the root copy nor rootroute.py takes it for the live one
+            do {
+                try backend.moveLegacySpotlightList(aside: true)
+                state.spotlightFromLegacy = true
+            } catch {
+                notes.append("spotlight-exclusions.json stays: \(error)")
+            }
         }
         // the same settings, now the helper's
         if let fans, case .refused(let why) = setFans(fans) { notes.append("fans: \(why)") }
@@ -712,6 +728,13 @@ public final class Engine {
             try backend.moveLegacyPlist(daemon, aside: false)
             try backend.bootstrap(daemon)
             state.legacy.removeAll { $0 == daemon }
+        }
+        if state.spotlightFromLegacy == true {
+            // perf-root.sh's list is the live one again, and the root copy's undo uses it
+            try backend.moveLegacySpotlightList(aside: false)
+            state.spotlightSaved = nil
+            state.spotlightApplied = false
+            state.spotlightFromLegacy = nil
         }
         return .done(changed: true, note: nil, report: .legacy(migrated))
     }
@@ -783,37 +806,45 @@ public final class Engine {
 
     /// docs/pod-rootd.md, "Updates": a genuine copy in Pod.app with a higher version replaces the
     /// installed helper. A copy no newer than this one, or one that fails the check, is thrown away.
+    /// The look runs on its own queue with a deadline; this queue goes on serving meanwhile.
     private func selfUpdate() {
         updateDue = false
         updateCheckedAt = now()
-        guard let own = backend.ownVersion else { return }
-        for candidate in backend.updateCandidates() {
-            let staged: String
-            do {
-                staged = try backend.stageUpdate(from: candidate)
-            } catch {
-                Log.engine.error("update: \(candidate, privacy: .public): \(error, privacy: .public)")
-                continue
-            }
-            guard let version = backend.verifiedVersion(ofStaged: staged), Self.newer(version, than: own) else {
-                backend.discardUpdate(staged)
-                continue
-            }
-            do {
-                try backend.installUpdate(staged)
-            } catch {
-                backend.discardUpdate(staged)
-                Log.engine.error("update: install \(version, privacy: .public): \(error, privacy: .public)")
-                continue
-            }
-            restartForUpdate = true
-            Log.engine.notice("update: \(own, privacy: .public) -> \(version, privacy: .public) from \(candidate, privacy: .public)")
-            return
+        let candidates = backend.updateCandidates()
+        guard !updating, !candidates.isEmpty, let own = backend.ownVersion else { return }
+        updating = true
+        let source = backend.updateSource
+        updateRunner.look(candidates, newerThan: own, in: source) { [weak self] look in
+            self?.finishUpdate(look, own: own, source: source)
         }
     }
 
+    private func finishUpdate(_ look: UpdateLook?, own: String, source: any UpdateSource) {
+        updating = false
+        guard let look else {
+            Log.engine.error("update: no answer within \(self.updateRunner.deadline) s, skipped until the next look")
+            return
+        }
+        for problem in look.problems { Log.engine.error("update: \(problem, privacy: .public)") }
+        guard let found = look.found, !uninstalling else {
+            if let found = look.found { source.discard(found.staged) }
+            return
+        }
+        do {
+            try backend.installUpdate(found.staged)
+        } catch {
+            source.discard(found.staged)
+            Log.engine.error("update: install \(found.version, privacy: .public): \(error, privacy: .public)")
+            return
+        }
+        restartForUpdate = true
+        Log.engine.notice("update: \(own, privacy: .public) -> \(found.version, privacy: .public) from \(found.candidate, privacy: .public)")
+        persist()
+        onUpdateInstalled?()
+    }
+
     /// Dotted numbers, component by component; a version that isn't one is never newer.
-    static func newer(_ version: String, than other: String) -> Bool {
+    nonisolated static func newer(_ version: String, than other: String) -> Bool {
         func parts(_ text: String) -> [Int]? {
             let parts = text.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
             return parts.isEmpty || parts.contains(nil) ? nil : parts.compactMap { $0 }
