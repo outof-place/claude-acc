@@ -62,7 +62,7 @@ fi
 STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
-JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates com.filip.claude-acc.jobs"
+JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates com.filip.claude-acc.jobs com.filip.claude-acc.hotspot-user"
 
 APP_SRC=""
 FANCTL=""

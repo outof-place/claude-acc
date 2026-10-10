@@ -384,7 +384,7 @@ class PayloadTest(unittest.TestCase):
         with open(os.path.join(payload, "payload.json")) as f:
             self.assertEqual(json.load(f)["layout"], 2)
         agents = sorted(os.listdir(os.path.join(payload, "LaunchAgents")))
-        self.assertEqual(agents, sorted(f"codes.pod.app.acc.{j}.plist" for j in ("tick", "janitor", "devguard", "perf", "updates", "jobs")))
+        self.assertEqual(agents, sorted(f"codes.pod.app.acc.{j}.plist" for j in ("tick", "janitor", "devguard", "perf", "updates", "jobs", "hotspot-user")))
         # Pod's root helper: its plist goes to Contents/Library/LaunchDaemons, BundleProgram next to pod-acc-run
         self.assertEqual(os.listdir(os.path.join(payload, "LaunchDaemons")), ["codes.pod.app.rootd.plist"])
         with open(os.path.join(payload, "LaunchDaemons/codes.pod.app.rootd.plist"), "rb") as f:

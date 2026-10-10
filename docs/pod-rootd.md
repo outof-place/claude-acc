@@ -280,10 +280,11 @@ helper runs again.
 
 ## Migration from the five root daemons
 
-`legacy.migrate`, offered by Pod once the helper is enabled and any of the old plists exist. It
-takes over fans, fsguard, iogpu and vnodes; the hotspot daemon stays until `hotspot.py` runs its
-controller as the user and sets the limit through `shaper.set` (a follow-up), so hotspot turbo keeps
-working in between.
+`legacy.migrate`, offered by Pod once the helper is enabled and any of the old plists exist, takes
+over all five. Hotspot turbo's controller becomes the user's agent `codes.pod.app.acc.hotspot-user`
+(`hotspot.py daemon --rootd`): it sets the limit through `pod-rootctl shaper follow`, never below
+6 Mb/s, so no prompt. It waits while the root daemon's plist is still in /Library/LaunchDaemons and
+takes over once the migration moves it aside.
 
 1. reads what they hold: `kern.maxvnodes=N` and `iogpu.wired_limit_mb=N` from their
    `ProgramArguments`, the fan mode from the `fans.json` named by the fans plist (opened with
@@ -388,7 +389,8 @@ What has to land before it, or the migration leaves a feature without its daemon
   kept while Stay Awake with the lid closed is on), fan readings from `SMCKit` instead of
   `fans-state.json`. Until then the old fans daemon is what follows `fans.json` and `awake.json`.
 - `perf-root.sh` and `janitor-root.sh` call `pod-rootctl` when the helper is there, `sudo` otherwise.
-- `hotspot.py` as the user with `pod-rootctl shaper follow`, then `hotspot` joins `Engine.migrating`.
+- `hotspot.py` as the user with `pod-rootctl shaper follow` (the `hotspot-user` agent);
+  `hotspot` is in `Engine.migrating`.
 - Pod registers the daemon as `daemonService` and signs both binaries (see Signing). The payload
   carries `pod-rootd`, `pod-rootctl` and `LaunchDaemons/codes.pod.app.rootd.plist`
   (`scripts/payload.sh`). With `--pod-agents`, `setup.sh` links `$STATE/pod-rootctl` when the owner

@@ -57,6 +57,13 @@ BIN = "/usr/local/libexec/claude-acc-hotspot"
 LABEL = "com.filip.claude-acc.hotspot"
 PLIST = "/Library/LaunchDaemons/%s.plist" % LABEL
 LOG = "/var/log/claude-acc-hotspot.log"
+# In Pod the controller runs as the user (`daemon --rootd`, a LaunchAgent) and Pod's root helper sets
+# the limit (docs/pod-rootd.md): `pod-rootctl shaper follow`, one session per interface, so the limit
+# goes with this process. A session's limit of 6 Mb/s or more needs no Touch ID; below it, it would.
+ROOTCTL = os.path.join(STATE_DIR, "pod-rootctl")
+ROOTD_FLOOR_KBPS = 6000
+ROOTD_RETRY_S = 30.0
+SHAPER = None  # FollowShaper while the daemon runs with --rootd
 
 IPHONE_GATEWAY = "172.20.10.1"  # Personal Hotspot zawsze daje 172.20.10.0/28, też po Wi-Fi
 IPHONE_PORT = "iPhone USB"
@@ -205,8 +212,62 @@ def set_tbr(iface, kbps):
         log("tbr: pomijam interfejs %r, nie ma go w jądrze albo ma dziwną nazwę" % (iface,))
         return
     rate = max(0, min(int(kbps or 0), TBR_MAX_KBPS))
+    if SHAPER is not None:
+        SHAPER.set(iface, rate)
+        return
     arg = "%dKbps" % rate if rate else "0"
     subprocess.run(["/sbin/ifconfig", iface, "tbr", arg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class FollowShaper:
+    """The limit through Pod's root helper: a `pod-rootctl shaper follow <if>` per interface, fed a
+    line per change (kb/s or "off"). The session is the process, so the helper drops the limit when
+    it ends, also when this daemon dies. Never below ROOTD_FLOOR_KBPS; a follow that died is not
+    started again for ROOTD_RETRY_S, so a helper that doesn't answer doesn't get a spawn per probe."""
+
+    def __init__(self, rootctl=ROOTCTL, now=time.monotonic):
+        self.rootctl = rootctl
+        self.now = now
+        self.procs = {}
+        self.retry_at = {}
+
+    def _proc(self, iface):
+        proc = self.procs.get(iface)
+        if proc is not None and proc.poll() is None:
+            return proc
+        if proc is not None:
+            self.procs.pop(iface)
+            self.retry_at[iface] = self.now() + ROOTD_RETRY_S
+            log("tbr: pod-rootctl shaper follow %s ended (%s); again in %d s" % (iface, proc.returncode, ROOTD_RETRY_S))
+        if self.now() < self.retry_at.get(iface, float("-inf")):
+            return None
+        proc = subprocess.Popen([self.rootctl, "shaper", "follow", iface], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, text=True, bufsize=1)
+        self.procs[iface] = proc
+        return proc
+
+    def set(self, iface, kbps):
+        line = "%d\n" % max(ROOTD_FLOOR_KBPS, kbps) if kbps else "off\n"
+        proc = self._proc(iface)
+        if proc is None:
+            return
+        try:
+            proc.stdin.write(line)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass  # it ended: the next set notices and waits before a new one
+
+    def close(self, iface=None):
+        """Ends the follow (its session, and the limit with it)."""
+        for name in [iface] if iface else list(self.procs):
+            proc = self.procs.pop(name, None)
+            if proc is None:
+                continue
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                proc.terminate()
 
 
 # --- sterownik ---------------------------------------------------------------------------------
@@ -334,6 +395,8 @@ class Session:
     def close(self):
         self.ctl.release()
         self.prober.close()
+        if SHAPER is not None:
+            SHAPER.close(self.ctl.iface)
 
     def snapshot(self):
         snap = self.ctl.snapshot()
@@ -484,7 +547,15 @@ def interpreter_problem(paths=None):
     return None
 
 
-def daemon(config_path, state_path):
+def daemon(config_path, state_path, rootd=False):
+    global SHAPER
+    if rootd:
+        # the user's agent in Pod: without the helper (Homebrew, the source checkout) the root daemon
+        # does this; exit 0, so launchd doesn't start it again
+        if not os.access(ROOTCTL, os.X_OK):
+            log("no Pod root helper (%s): the root daemon does this, if installed" % ROOTCTL)
+            return 0
+        SHAPER = FollowShaper()
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
@@ -501,8 +572,9 @@ def daemon(config_path, state_path):
                 "przeinstaluj demona (claude-acc hotspot install)" % bad)
             time.sleep(300)
             return 78
-    log("start")
+    log("start" + (" (as the user, through Pod's root helper)" if rootd else ""))
     problem = None
+    waiting_for_migration = False
     try:
         while not stop:
             cfg = read_config(config_path)
@@ -513,6 +585,14 @@ def daemon(config_path, state_path):
             if time.monotonic() - ports_at > 60:
                 ports, ports_at = iphone_ports(), time.monotonic()
             target = detect(ports=ports) if cfg["enabled"] else None
+            # the root daemon still runs until `pod-rootctl legacy migrate`: one controller at a time
+            if rootd and installed():
+                if not waiting_for_migration:
+                    log("the root daemon still runs; this takes over after: claude-acc rootd legacy migrate")
+                waiting_for_migration = True
+                target = None
+            else:
+                waiting_for_migration = False
             if session and (not target or target[0] != session.ctl.iface or if_bytes(session.ctl.iface) is None):
                 snap = session.snapshot()
                 remembered[snap["iface"]] = (snap["safe_kbps"], time.time())
@@ -550,6 +630,8 @@ def daemon(config_path, state_path):
     finally:
         if session:
             session.close()
+        if SHAPER is not None:
+            SHAPER.close()
         log("stop")
 
 
@@ -635,7 +717,15 @@ def root_python():
     return rootpy.find()
 
 
+def helper():
+    """Pod's root helper is there: in Pod the limit goes through it, no root daemon to install."""
+    return os.access(ROOTCTL, os.X_OK)
+
+
 def cmd_install(args):
+    if helper():
+        print("in Pod the root helper sets the limit; nothing to install (claude-acc hotspot on)")
+        return 0
     # demon chodzi jako root, więc nie wolno mu startować przez /usr/bin/python3: to zaślepka, która
     # idzie do wybranego Xcode'a, a Xcode z DMG należy do użytkownika (rootpy.py)
     python, why = root_python()
@@ -696,7 +786,7 @@ def set_enabled(on, path=CONFIG):
 
 def cmd_on(args):
     set_enabled(True)
-    if not installed():
+    if not installed() and not helper():
         if sys.stdin.isatty() and not args.no_install:
             return cmd_install(args)
         print("włączone, ale demon nie jest zainstalowany: claude-acc hotspot install")
@@ -717,7 +807,7 @@ def status(config_path=CONFIG, state_path=STATE, now=None):
     state = read_state(state_path) or {}
     running = bool(state) and now - state.get("at", 0) < 15
     launch = launched_with()
-    out = {"enabled": cfg["enabled"], "installed": installed(), "running": running,
+    out = {"enabled": cfg["enabled"], "installed": installed() or helper(), "helper": helper(), "running": running,
            "active": running and bool(state.get("active")),
            "current": file_hash(os.path.realpath(__file__)) == file_hash(BIN) if installed() else None,
            # plista sprzed 1.31.1 startowała demona przez shebang `#!/usr/bin/python3`
@@ -740,6 +830,8 @@ def cmd_status(args):
         print("konfiguracja odrzucona: %s (claude-acc hotspot on|off zapisze ją od nowa)" % s["config_problem"])
     if not s["installed"]:
         print("demon: nie zainstalowany (claude-acc hotspot install)")
+    elif not s["running"] and s["helper"]:
+        print("agent: not answering (launchctl kickstart -k gui/%d/codes.pod.app.acc.hotspot-user)" % os.getuid())
     elif not s["running"]:
         print("demon: nie odpowiada (sudo launchctl kickstart -k system/%s, log %s)" % (LABEL, LOG))
     elif s["current"] is False:
@@ -772,13 +864,14 @@ def main(argv=None):
     p = sub.add_parser("daemon")
     p.add_argument("--config", default=CONFIG)
     p.add_argument("--state", default=STATE)
+    p.add_argument("--rootd", action="store_true", help="as the user, the limit through Pod's root helper")
     p = sub.add_parser("run")
     p.add_argument("--iface", required=True)
     p.add_argument("--seconds", type=float)
     p.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "daemon":
-        return daemon(args.config, args.state) or 0
+        return daemon(args.config, args.state, rootd=args.rootd) or 0
     if args.cmd == "run":
         run_foreground(args.iface, args.seconds, args.verbose)
         return 0

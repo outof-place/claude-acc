@@ -356,7 +356,7 @@ private func legacyMachine() -> FakeBackend {
     return backend
 }
 
-@Test("migrate takes over what four of the old daemons did, moves their plists aside, and is a no-op the second time")
+@Test("migrate takes over what the five old daemons did, moves their plists aside, and is a no-op the second time")
 func legacyMigrate() {
     let rig = Rig(backend: legacyMachine())
     let reply = rig.send(.legacyMigrate)
@@ -364,18 +364,17 @@ func legacyMigrate() {
         Issue.record("unexpected \(reply.outcome)")
         return
     }
-    #expect(Set(daemons) == [.fans, .fsguard, .iogpu, .vnodes])
-    // hotspot stays until its controller runs as the user
-    #expect(Array(rig.backend.legacyPlists.keys) == [.hotspot])
-    #expect(rig.backend.legacyAside.count == 4)
-    #expect(rig.backend.calls.filter { $0.hasPrefix("bootout") }.count == 4)
+    #expect(Set(daemons) == Set(LegacyDaemon.allCases))
+    #expect(rig.backend.legacyPlists.isEmpty)
+    #expect(rig.backend.legacyAside.count == 5)
+    #expect(rig.backend.calls.filter { $0.hasPrefix("bootout") }.count == 5)
     let status = rig.engine.status()
     #expect(status.fans.mode == .fixed(FanPercent(60)!))
     #expect(status.sysctls.first { $0.key == .maxVnodes }?.persisted == 786_432)
     #expect(status.sysctls.first { $0.key == .gpuWiredLimitMB }?.persisted == 40_960)
     #expect(status.fsguard.enabled)
     #expect(status.spotlight.appsOnly)
-    #expect(status.legacy.allSatisfy { $0.daemon == .hotspot ? $0.installed && !$0.migrated : $0.migrated && !$0.installed })
+    #expect(status.legacy.allSatisfy { $0.migrated && !$0.installed })
     #expect(rig.changed(rig.send(.legacyMigrate)) == false)
 }
 
@@ -386,7 +385,7 @@ func legacyRollback() {
     #expect(rig.changed(rig.send(.legacyRollback)) == true)
     #expect(rig.backend.legacyPlists.count == 5)
     #expect(rig.backend.legacyAside.isEmpty)
-    #expect(rig.backend.calls.filter { $0.hasPrefix("bootstrap") }.count == 4)
+    #expect(rig.backend.calls.filter { $0.hasPrefix("bootstrap") }.count == 5)
     let status = rig.engine.status()
     #expect(status.fans.mode == .auto)
     #expect(status.sysctls.allSatisfy { $0.persisted == nil })

@@ -320,5 +320,87 @@ class RootLaunchTest(unittest.TestCase):
         self.assertEqual(hotspot.root_python()[0], R.find()[0])
 
 
+FAKE_FOLLOW = """#!/bin/sh
+# pod-rootctl stand-in: its arguments, then every line it gets, into the log named next to it
+log="$(dirname "$0")/follow.log"
+echo "args $*" >> "$log"
+while IFS= read -r line; do echo "line $line" >> "$log"; done
+echo "eof" >> "$log"
+"""
+
+
+class FollowShaperTest(unittest.TestCase):
+    """In Pod (`daemon --rootd`) the limit goes through `pod-rootctl shaper follow`, as the user."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="hotspot-follow-")
+        self.rootctl = os.path.join(self.dir, "pod-rootctl")
+        with open(self.rootctl, "w") as f:
+            f.write(FAKE_FOLLOW)
+        os.chmod(self.rootctl, 0o755)
+        self.log = os.path.join(self.dir, "follow.log")
+
+    def lines(self):
+        with open(self.log) as f:
+            return f.read().splitlines()
+
+    def test_a_line_per_change_never_below_the_floor_off_and_eof_at_the_end(self):
+        shaper = hotspot.FollowShaper(self.rootctl)
+        shaper.set("en8", 30000)
+        shaper.set("en8", 3000)  # under the helper's tier A floor: 6 Mb/s
+        shaper.set("en8", 0)
+        shaper.close()
+        self.assertEqual(self.lines(), ["args shaper follow en8", "line 30000", "line 6000", "line off", "eof"])
+
+    def test_set_tbr_goes_to_the_follow_while_the_daemon_runs_with_rootd(self):
+        recorded = []
+
+        class Recorder:
+            def set(self, iface, kbps):
+                recorded.append((iface, kbps))
+
+        real = [i for _, i in __import__("socket").if_nameindex() if i.startswith("lo")][0]
+        with mock.patch.object(hotspot, "SHAPER", Recorder()), mock.patch.object(hotspot.subprocess, "run") as run:
+            hotspot.set_tbr(real, 27000)
+            hotspot.set_tbr(real, 10 ** 12)
+        self.assertEqual(recorded, [(real, 27000), (real, hotspot.TBR_MAX_KBPS)])
+        run.assert_not_called()  # no ifconfig
+
+    def test_a_follow_that_dies_is_not_started_again_at_once(self):
+        with open(self.rootctl, "w") as f:
+            f.write('#!/bin/sh\necho "args $*" >> "$(dirname "$0")/follow.log"\nexit 69\n')
+        clock = [100.0]
+        shaper = hotspot.FollowShaper(self.rootctl, now=lambda: clock[0])
+        shaper.set("en8", 30000)
+        shaper.procs["en8"].wait(timeout=5)
+        for _ in range(5):
+            shaper.set("en8", 31000)
+        self.assertEqual(self.lines().count("args shaper follow en8"), 1)
+        clock[0] += hotspot.ROOTD_RETRY_S + 1
+        shaper.set("en8", 31000)
+        shaper.procs["en8"].wait(timeout=5)
+        self.assertEqual(self.lines().count("args shaper follow en8"), 2)
+
+    def test_without_the_helper_the_user_agent_exits_at_once(self):
+        with mock.patch.object(hotspot, "ROOTCTL", os.path.join(self.dir, "missing")):
+            self.assertEqual(hotspot.daemon(os.path.join(self.dir, "c.json"), os.path.join(self.dir, "s.json"),
+                                            rootd=True), 0)
+
+    def test_status_in_pod_counts_the_helper_as_installed(self):
+        cfg = os.path.join(self.dir, "hotspot.json")
+        hotspot.write_json(cfg, {"enabled": True})
+        with mock.patch.object(hotspot, "ROOTCTL", self.rootctl), mock.patch.object(hotspot, "installed", lambda: False):
+            s = hotspot.status(cfg, os.path.join(self.dir, "none.json"))
+        self.assertTrue(s["installed"] and s["helper"])
+        with mock.patch.object(hotspot, "ROOTCTL", self.rootctl):
+            self.assertEqual(hotspot.cmd_install(argparse.Namespace(dry_run=False)), 0)
+
+    def test_the_agent_plist_runs_daemon_rootd_and_stays_down_on_exit_0(self):
+        with open(os.path.join(os.path.dirname(HERE), "launchd", "com.filip.claude-acc.hotspot-user.plist.template"), "rb") as f:
+            plist = plistlib.loads(f.read().replace(b"__HOME__", b"/Users/x"))
+        self.assertEqual(plist["ProgramArguments"][2:], ["hotspot", "daemon", "--rootd"])
+        self.assertEqual(plist["KeepAlive"], {"SuccessfulExit": False})
+
+
 if __name__ == "__main__":
     unittest.main()
