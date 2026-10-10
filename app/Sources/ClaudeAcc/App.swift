@@ -115,8 +115,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var store: Store?
     /// URLs that arrive before the store exists: `open -g` that starts the app delivers its URL early.
     private var early: [URL] = []
+    private var termination: TerminationSignal?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        termination = TerminationSignal { MainActor.assumeIsolated { NSApp.terminate(nil) } }
         // `claude-acc dictate` opens claude-acc://dictate/<toggle|start|stop|cancel> in the background
         NSAppleEventManager.shared().setEventHandler(
             self, andSelector: #selector(openURL(_:reply:)),
