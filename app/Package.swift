@@ -30,7 +30,9 @@ let package = Package(
         .testTarget(
             name: "ClaudeAccTests", dependencies: ["ClaudeAcc"], path: "Tests/ClaudeAccTests", swiftSettings: settings),
         // fan control through the SMC; runs as a root LaunchDaemon, see install-fans.sh
-        .executableTarget(name: "fanctl", path: "Sources/fanctl", swiftSettings: settings),
+        .executableTarget(name: "fanctl", dependencies: ["SMCKit"], path: "Sources/fanctl", swiftSettings: settings),
+        // the SMC and the fans, for fanctl, pod-rootd and the panel (reading needs no root)
+        .target(name: "SMCKit", path: "Sources/SMCKit", swiftSettings: settings),
         // the PreToolUse hook's native front: answers most Bash commands without starting Python
         .executableTarget(name: "claude-acc-hook", path: "Sources/hook", swiftSettings: settings),
         // the limit pause hooks after every tool call; plain C, so it starts without a runtime
