@@ -1408,10 +1408,16 @@ def depot_bin(cfg):
     return next((p for p in ("/opt/homebrew/bin/depot", "/usr/local/bin/depot") if os.path.exists(p)), None)
 
 
-def depot_push(depot, token):
-    r = subprocess.run([depot, "claude", "secrets", "add", DEPOT_SECRET, "--value", token],
-                       capture_output=True, text=True, timeout=60)
-    return r.returncode == 0, (r.stderr or r.stdout or "").strip()[:200]
+def depot_push(depot, token, timeout=60):
+    try:
+        r = subprocess.run([depot, "claude", "secrets", "add", DEPOT_SECRET, "--value", token],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # tekst TimeoutExpired niesie argumenty, a w nich token (--value): depot_sync_safe wpisałby go
+        # do switch.log, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
+        raise RuntimeError(f"depot claude secrets add: brak odpowiedzi po {timeout:.0f} s") from None
+    # komunikat idzie do logu: bez tokenu, gdyby CLI go powtórzył
+    return r.returncode == 0, (r.stderr or r.stdout or "").replace(token, "<token>").strip()[:200]
 
 
 def token_hash(token):

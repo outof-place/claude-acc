@@ -1261,6 +1261,21 @@ class KeychainMemoTest(unittest.TestCase):
         self.assertEqual(logged.count("w argumentach `security`"), 5)
         self.assertNotIn(token, logged)
 
+    def test_a_depot_push_that_times_out_or_fails_says_nothing_of_the_token(self):
+        # the access token goes to `depot` as --value: TimeoutExpired's text holds it, and
+        # depot_sync_safe logs str(err) to switch.log
+        token = f"sk-ant-oat01-{uuid.uuid4().hex}"
+        with mock.patch.dict(os.environ, {"FAKE_DEPOT_SLOW": "3"}), self.assertRaises(RuntimeError) as caught:
+            self.acc.depot_push(FAKE_DEPOT, token, timeout=1)
+        self.assertNotIn(token, str(caught.exception))
+        self.assertIn("brak odpowiedzi po 1 s", str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)
+        with mock.patch.dict(os.environ, {"FAKE_DEPOT_FAIL": "1", "FAKE_DEPOT_ECHO": "1"}):
+            ok, message = self.acc.depot_push(FAKE_DEPOT, token)
+        self.assertFalse(ok)
+        self.assertIn("rejected value <token>", message)
+        self.assertNotIn(token, message)
+
     def test_a_failed_write_at_the_line_limit_raises(self):
         os.environ["FAKE_FAIL_WRITE_SERVICE"] = "svc"
         secret = (uuid.uuid4().hex * 64)[:2025]  # 4094 bytes: through stdin
