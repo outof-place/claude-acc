@@ -269,11 +269,15 @@ def run(cmd, timeout=600):
 
 
 def du_size(path):
-    """du -sk w bajtach albo None, gdy du się nie udało (jego limit czasu, fork pod obciążeniem)."""
-    out = run(["du", "-sk", path], timeout=900)
+    """du -sk w bajtach albo None, gdy du się nie udało (jego limit czasu, fork pod obciążeniem).
+    Kod 1 z sumą na wyjściu (podkatalog bez prawa odczytu) to wciąż pomiar."""
     try:
-        return int(out.split()[0]) * 1024
-    except (AttributeError, IndexError, ValueError):
+        done = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=900, env=ENV)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return int(done.stdout.split()[0]) * 1024
+    except (IndexError, ValueError):
         return None
 
 
@@ -467,9 +471,11 @@ class Sweep:
         # do niej, bez zmian w katalogach, przebieg limitów nie zrobiłby nic innego
         self.retry_at = None
         # dla acc-cored (devguard caps): katalogi, które dopasowały globy limitów (rzeczywiste
-        # ścieżki: katalog-dowiązanie leży gdzie indziej), i wpisy, których du nie zmierzyło
+        # ścieżki: katalog-dowiązanie leży gdzie indziej), wpisy, których du nie zmierzyło, i ile
+        # najciaśniejszy z katalogów może jeszcze urosnąć, zanim przebieg cokolwiek by usunął
         self.cap_folders = []
         self.du_failures = 0
+        self.cap_headroom = None
         self.warnings = []
         self.failures = []  # (zadanie, błąd) dla panelu
         self.protect = [expand(p) for p in cfg["protect"]]
@@ -973,7 +979,13 @@ def task_caps(sw, _scan):
         limit = cap.get("max_gb", 10) * GB
         keep = cap.get("keep", 1)
         fresh = time.time() - cap.get("fresh_minutes", 10) * 60
-        for folder in sorted(glob.glob(os.path.expanduser(cap["path"]))):
+        pattern = os.path.expanduser(cap["path"])
+        # katalogi-dowiązania o poziom wyżej (wt1 -> repo/.perf): acc-cored obserwuje ich cele,
+        # zanim powstanie w nich folder z limitem
+        for parent in glob.glob(os.path.dirname(pattern)):
+            if os.path.islink(parent) and os.path.isdir(parent) and os.path.realpath(parent) not in sw.cap_folders:
+                sw.cap_folders.append(os.path.realpath(parent))
+        for folder in sorted(glob.glob(pattern)):
             if not os.path.isdir(folder):
                 continue
             if os.path.realpath(folder) not in sw.cap_folders:
@@ -989,6 +1001,7 @@ def task_caps(sw, _scan):
             # kolejność po dacie powstania: rsync -a kopiuje mtime źródła, więc mtime kłamie
             entries.sort(key=born, reverse=True)
             total = 0
+            removed = 0
             for i, path in enumerate(entries):
                 size = du_size(path)
                 if size is None:
@@ -1005,7 +1018,9 @@ def task_caps(sw, _scan):
                     sw.skip("caps", path, "w użyciu")
                     continue
                 name = os.path.basename(path)
-                sw.remove("caps", path, lambda n, want=name: n == want)
+                removed += sw.remove("caps", path, lambda n, want=name: n == want)
+            room = limit - (total - removed)
+            sw.cap_headroom = room if sw.cap_headroom is None else min(sw.cap_headroom, room)
 
 
 # granica czasu dla każdego katalogu: pliki zmienione wcześniej już przeszły kompresję

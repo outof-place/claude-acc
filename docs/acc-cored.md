@@ -101,21 +101,26 @@ memory pressure (a Dispatch memory-pressure source).
   changes only in these cases, so at each interval `CapsWatch` lets a run through only then:
   - something under a capped folder changed, or `janitor.json` did.
     - FSEvents watch the real paths of the globs' static prefixes and of the folders the last run
-      matched (a folder under the glob may be a link to elsewhere), or their nearest existing parent.
+      matched (a folder under the glob may be a link to elsewhere, and a linked directory one level
+      up is reported before its folder exists), or their nearest existing parent. A folder under
+      another watched path adds no root. Once the watch is due, further events cost a flag check.
     - The paths and their roots are computed again at every interval, so a folder made later (in
       any letter case) re-arms the stream. A root replaced by a rename is reported (`WatchRoot`).
     - A lost-events flag counts as a change.
-  - free space on a watched volume dropped by a tenth of the smallest cap (at most 1 GiB) since the
-    last run: a file growing behind an open descriptor gets no event until it's closed;
+  - free space on a watched volume dropped since the last run by more than the tightest folder's
+    headroom (`limit − total`, from the last run's report; at least a tenth of the smallest cap, at
+    most 1 GiB): a file growing behind an open descriptor gets no event until it's closed. The drop
+    counts from the highest free space seen since the run, so space freed meanwhile doesn't hide it;
   - the time the last run reported passed: an entry skipped as fresh (a write in progress) may go;
-  - the last run skipped an entry in use or one it couldn't move, or `du` failed on one: no event
-    says that changed, so the next interval runs again. Protected entries and ones in git stay so,
+  - the last run skipped an entry in use or one it couldn't move, or `du` failed on one (no total;
+    exit 1 with a total, an unreadable subfolder, is a size): no event says that changed, so the
+    next interval runs again. Protected entries and ones in git stay so,
     and don't count.
   - A cap whose path only expanduser or the working directory can place (`~user/`, `$HOME/`, a
     relative path), or a stream that didn't start, runs at every interval, as in Python.
 
   Six hours bound the rest. `devguard caps` prints its report as one JSON line (`busy`, `retry_at`,
-  `folders`). The stream holds its watch, and the guard stops it when it stops.
+  `folders`, `headroom`). The stream holds its watch, and the guard stops it when it stops.
 - **Config types:** a `devguard.json` value whose type differs from the default's is read
   differently by the two sides. `"runtimes": "node"` still finds servers in Python, where `in`
   works on a string, and finds none here. The brake's own keys count too. While such a value is
