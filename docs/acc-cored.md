@@ -78,8 +78,11 @@ memory pressure (a Dispatch memory-pressure source).
   `$`) are spelled out for ICU in `PyRegex`.
 - **Handed to Python:** a tick with a plan Python's loop would hand to `execute()`, or whose memory
   brake is due. acc-cored saves the state as it was before that tick and releases `devguard.lock`.
-  It then runs `acc.py devguard once` (killed after 120 s) and reloads the state Python saved. The
-  tick's own log lines and notifications are dropped then, since Python's tick writes its own. The
+  It then runs `acc.py devguard once` (killed after 120 s) and reloads the state Python saved. It
+  takes the lock back without waiting: if another guard took it meanwhile (launchd's `devguard
+  run`, a manual one), native neither saves nor runs the caps, and waits as after Python's loop
+  (below), so neither the queue nor a stop hangs on the lock. The tick's own log lines and
+  notifications are dropped then, since Python's tick writes its own. The
   caps run through `acc.py devguard caps` every `caps_minutes` while enforcing, as before.
 - **Waits after a handover:** Python's loop runs every tick without starting a process, so two kinds
   of handover wait (`HandoverPolicy`):
@@ -103,12 +106,14 @@ memory pressure (a Dispatch memory-pressure source).
   - A loop that ends within a minute (Python can't run that config either, e.g. a string
     `interval_seconds`) starts again after 10 s, doubling to 5 min, with one log line each time.
   - When the config reads natively again, or acc-cored stops, the loop gets SIGTERM. After 10 s it
-    is killed, with what it started (the whole tree is collected first).
+    is killed, with what it started: each process is stopped (SIGSTOP) before its children are
+    read, and the whole tree is collected before the kill, so nothing it starts meanwhile escapes.
   - Native ticks again only after taking the lock back without waiting, also when the loop had
     already ended and sat in its backoff. While another guard holds the lock (a `devguard run`
     agent, a manual `devguard once`), native doesn't tick. Then it starts from the state Python
     saved last (`brake_at`, `warned`).
-  - `interval_seconds` is capped at an hour (a timer's leeway would overflow).
+  - `interval_seconds` is capped at an hour (a timer's leeway would overflow) and floored at 0.5 s
+    (the waiting paths would spin).
   - A caps run in flight finishes before the loop starts.
 - **Kept between ticks:** process lines and their pattern answers (`ProcCache`, see
   [Readers](#readers)).
