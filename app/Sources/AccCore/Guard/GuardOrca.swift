@@ -68,7 +68,7 @@ public final class OrcaView {
             guard !root.isEmpty else { continue }
             var trimmed = root
             while trimmed.hasSuffix("/") { trimmed.removeLast() }
-            if path == root || path.pyStarts(trimmed + "/") {
+            if path.pyEq(root) || path.pyStarts(trimmed + "/") {
                 if best == nil || root.unicodeScalars.count > (best!["path"]?.string ?? "").unicodeScalars.count { best = w }
             }
         }
