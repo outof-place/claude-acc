@@ -297,7 +297,7 @@ case "run":
             return .object(PyObject([
                 ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
                 ("wakes", .int(schedRunning?.wakeCount.load(ordering: .relaxed) ?? 0)),
-                ("accswitch", .bool(switchRunning != nil)),
+                ("accswitch", switchRunning.map { .object($0.status()) } ?? .bool(false)),
             ]))
         default:
             return .object(PyObject([("ok", false), ("error", "unknown op")]))

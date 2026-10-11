@@ -438,9 +438,21 @@ def hook_hosts(hosts=None):
     return found
 
 
+def watched(home=None):
+    """The files resolve() reads: each host's SingletonLock, the Pod bundles and owner.json, which
+    names one. A daemon (acc-cored) asks again when one of them changes."""
+    paths = [os.path.join(h.user_data, "SingletonLock") for h in known(home=home)] + pod_apps(home)
+    try:
+        import owner
+        paths.append(owner.OWNER_PATH)
+    except ImportError:  # a copy without owner.py next to it
+        pass
+    return list(dict.fromkeys(paths))
+
+
 def main(argv):
     h = resolve()
-    fields = dict(h._asdict(), main=main_path(h), runtime=runtime_path(h), running=running(h))
+    fields = dict(h._asdict(), main=main_path(h), runtime=runtime_path(h), running=running(h), watch=watched())
     if argv:
         if argv[0] not in fields:
             print("orcahost.py [%s]" % "|".join(fields), file=sys.stderr)

@@ -6,14 +6,25 @@ Czyta to acc-cored, który uruchamia tick tylko wtedy, gdy przebieg mógłby zro
 Uruchomienie: /usr/bin/python3 -m unittest tests.test_accswitch_due
 """
 
+import json
+import os
 import shutil
 import time
 import unittest
 
 try:
-    from tests.test_e2e import Env, depot_store, with_depot
+    from tests.test_e2e import BASE, Env, depot_store, with_depot
 except ImportError:  # uruchomione z katalogu tests
-    from test_e2e import Env, depot_store, with_depot
+    from test_e2e import BASE, Env, depot_store, with_depot
+
+
+def set_server(w, **fields):
+    path = os.path.join(w.fake, "server.json")
+    with open(path) as f:
+        server = json.load(f)
+    server.update(fields)
+    with open(path, "w") as f:
+        json.dump(server, f)
 
 
 class TickDueTest(unittest.TestCase):
@@ -96,6 +107,55 @@ class TickDueTest(unittest.TestCase):
         self.assertTrue(due["quiet"])
         self.assertLessEqual(due["at"], time.time() + 600)
         self.assertEqual(due["why"], "token albo konto sandboxów Depot")
+
+
+    def test_a_tick_cut_short_leaves_no_quiet_deadline(self):
+        # SIGTERM przy pierwszym odczycie Pęku kluczy, już po zapisie last_tick: stary spokój
+        # z terminem za kwadrans nie może przetrwać, bo acc-cored pominąłby sloty do tego terminu
+        w = self.world()
+        a = w.account("a@x", session_used=10)
+        w.runtime(a)
+        w.write()
+        w.state(tick_due={"quiet": True, "at": time.time() + 900, "why": "wcześniej"})
+
+        r = w.run("tick", FAKE_SIGNAL_AT="1", FAKE_SIGNAL="TERM")
+
+        self.assertEqual(r.returncode, -15)
+        state = w.saved_state()
+        self.assertIsNone(state["tick_due"])
+        self.assertGreater(state["last_tick"], time.time() - 60)
+
+    def test_an_owner_lookup_without_an_answer_is_not_quiet(self):
+        # sesja odświeżyła token we wpisie bazowym: nowa para nie pasuje do żadnej kopii,
+        # więc czyje to konto, mówi API profilu, a bez sieci nikt
+        w = self.world()
+        a = w.account("a@x", session_used=10)
+        w.runtime(a, services=[BASE])
+        w.write()
+        w.session_refresh("a@x")
+        set_server(w, offline=True)
+
+        w.run("tick")
+        self.assertFalse(self.due(w)["quiet"])
+
+        set_server(w, offline=False)
+        w.run("tick")  # sieć wróciła: odczyt wsteczny i konto, które niesie
+        self.assertTrue(self.due(w)["quiet"])
+        self.assertIn("read-back", open(w.state_dir + "/switch.log").read())
+
+    def test_a_foreign_account_the_api_named_is_quiet(self):
+        w = self.world()
+        w.account("a@x", session_used=10)
+        w.runtime({"claudeAiOauth": {"accessToken": "at-z", "refreshToken": "rt-z",
+                                     "expiresAt": int((time.time() + 3600) * 1000)}})
+        w.server["access"]["at-z"] = "z@x"
+        w.write()
+
+        w.run("tick")
+
+        due = self.due(w)
+        self.assertTrue(due["quiet"])
+        self.assertEqual(due["why"], "obce dane w runtime")
 
 
 if __name__ == "__main__":

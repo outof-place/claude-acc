@@ -185,8 +185,9 @@ public enum Spawn {
 
     /// Starts argv without waiting (stdin /dev/null, stdout/stderr appended to `log`), in this
     /// process's group, so whatever stops this process's group stops it too; its pid, nil if it
-    /// can't start. The caller reaps it (`reap`).
-    public static func start(_ argv: [String], log: String? = nil) -> pid_t? {
+    /// can't start. The caller reaps it (`reap`). With `ownGroup` it leads a group of its own
+    /// instead, and outlives this process's group.
+    public static func start(_ argv: [String], env: [String: String]? = nil, log: String? = nil, ownGroup: Bool = false) -> pid_t? {
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         defer { posix_spawn_file_actions_destroy(&actions) }
@@ -196,7 +197,9 @@ public enum Spawn {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK))
+        let group = ownGroup ? POSIX_SPAWN_SETPGROUP : 0
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | group))
+        posix_spawnattr_setpgroup(&attr, 0)
         var all = sigset_t()
         sigfillset(&all)
         posix_spawnattr_setsigdefault(&attr, &all)
@@ -206,7 +209,7 @@ public enum Spawn {
         posix_spawnattr_setsigmask(&attr, &none)
         let cargs = argv.map { strdup($0) } + [nil]
         defer { cargs.forEach { free($0) } }
-        let environment = currentEnv().map { strdup("\($0.key)=\($0.value)") } + [nil]
+        let environment = (env ?? currentEnv()).map { strdup("\($0.key)=\($0.value)") } + [nil]
         defer { environment.forEach { free($0) } }
         var pid: pid_t = 0
         guard posix_spawnp(&pid, argv[0], &actions, &attr, cargs, environment) == 0 else { return nil }
