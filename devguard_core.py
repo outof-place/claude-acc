@@ -2405,10 +2405,20 @@ def cmd_caps(cfg, args):
     świeży może już pójść. acc-cored bez zmian w katalogach limitów i przed tym terminem nie
     woła limitów znowu."""
     sweep = check_caps(cfg, {}, time.time(), dry_run="--dry-run" in args)
-    busy = len([s for s in sweep.skipped if s[0] == "caps"]) if sweep else 0
-    print(json.dumps({"ran": sweep is not None, "freed": sweep.freed if sweep else 0, "busy": busy,
-                      "retry_at": sweep.retry_at if sweep else None}))
+    print(json.dumps(caps_report(sweep)))
     return 0
+
+
+def caps_report(sweep):
+    """Raport przebiegu limitów dla acc-cored. Zajęte to tylko to, co może się zwolnić bez śladu
+    w katalogach: wpis w użyciu, wpis, którego nie dało się przenieść, i pomiar du, który padł.
+    "Chronione" i "w gicie" trwają, więc wieczne "zajęte" wyłączałoby bramkę na zawsze.
+    folders to katalogi dopasowane przez globy (rzeczywiste ścieżki), które acc-cored też obserwuje."""
+    if sweep is None:
+        return {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": []}
+    busy = [s for s in sweep.skipped if s[0] == "caps" and (s[2] == "w użyciu" or s[2].startswith("nie da się przenieść"))]
+    return {"ran": True, "freed": sweep.freed, "busy": len(busy) + sweep.du_failures,
+            "retry_at": sweep.retry_at, "folders": sweep.cap_folders}
 
 
 def cmd_status(cfg, args):
