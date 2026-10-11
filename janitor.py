@@ -969,6 +969,52 @@ def task_uv(sw, _scan):
     sw.record("uv", "uv cache prune", before - du_bytes(cache))
 
 
+CAP_MAGIC = re.compile(r"[*?[]")
+
+
+def cap_spots(pattern):
+    """Gdzie folder z limitem może leżeć poza tym, co acc-cored już widzi (statyczny prefiks
+    wzorca): za dowiązaniem gdziekolwiek po drodze, które z niego wychodzi (wt1 -> repo/.perf),
+    także zanim folder albo katalog po drodze powstanie. Miejsce to rzeczywista ścieżka celu
+    plus dalsza stała część wzorca, nie cały dowiązany katalog: edycja w nim nie budzi limitów."""
+    parts = pattern.split("/")
+    first = next((i for i, part in enumerate(parts) if CAP_MAGIC.search(part)), len(parts))
+    spots = []
+
+    def walk(base, seen, rest):
+        # base istnieje, a jego rzeczywista ścieżka leży pod `seen`, czyli tym, co acc-cored obserwuje
+        if not rest:
+            return
+        name, more = rest[0], rest[1:]
+        paths = glob.glob(os.path.join(glob.escape(base), name)) if CAP_MAGIC.search(name) else [os.path.join(base, name)]
+        for path in paths:
+            if not os.path.isdir(path):
+                continue
+            real = os.path.realpath(path)
+            if real == seen or real.startswith(seen.rstrip("/") + "/"):
+                walk(path, seen, more)
+                continue
+            fixed = []
+            for part in more:
+                if CAP_MAGIC.search(part):
+                    break
+                fixed.append(part)
+            # najgłębszy istniejący katalog stałej części (dowiązanie po drodze rozwiązuje realpath)
+            # i to, czego jeszcze nie ma
+            cur, k = path, 0
+            while k < len(fixed) and os.path.isdir(os.path.join(cur, fixed[k])):
+                cur, k = os.path.join(cur, fixed[k]), k + 1
+            spot = os.path.normpath(os.path.join(os.path.realpath(cur), *fixed[k:]))
+            if spot not in spots:
+                spots.append(spot)
+            if k == len(fixed):
+                walk(cur, spot, more[k:])
+
+    top = "/".join(parts[:first]) or "/"
+    walk(top, os.path.realpath(top), parts[first:])
+    return spots
+
+
 def task_caps(sw, _scan):
     """Limit na katalogi z wynikami agentów: najstarsze wpisy ponad `max_gb` idą do kasacji.
 
@@ -981,11 +1027,10 @@ def task_caps(sw, _scan):
         keep = cap.get("keep", 1)
         fresh = time.time() - cap.get("fresh_minutes", 10) * 60
         pattern = os.path.expanduser(cap["path"])
-        # katalogi-dowiązania o poziom wyżej (wt1 -> repo/.perf): acc-cored obserwuje ich cele,
-        # zanim powstanie w nich folder z limitem
-        for parent in glob.glob(os.path.dirname(pattern)):
-            if os.path.islink(parent) and os.path.isdir(parent) and os.path.realpath(parent) not in sw.cap_folders:
-                sw.cap_folders.append(os.path.realpath(parent))
+        # foldery za dowiązaniami, które wychodzą z prefiksu wzorca: acc-cored obserwuje ich miejsca
+        for spot in cap_spots(pattern):
+            if spot not in sw.cap_folders:
+                sw.cap_folders.append(spot)
         for folder in sorted(glob.glob(pattern)):
             if not os.path.isdir(folder):
                 continue
@@ -1002,12 +1047,15 @@ def task_caps(sw, _scan):
             # kolejność po dacie powstania: rsync -a kopiuje mtime źródła, więc mtime kłamie
             entries.sort(key=born, reverse=True)
             total = 0
-            removed = 0
+            room = None
             for i, path in enumerate(entries):
                 size = du_size(path)
                 if size is None:
                     sw.du_failures += 1  # za niska suma: następny przebieg liczy jeszcze raz
                 total += size or 0
+                if i >= keep and total <= limit:
+                    # ostatni wpis zostawiony przez rozmiar: dopiero wzrost ponad to zmieni przebieg
+                    room = limit - total
                 if i < keep or total <= limit:
                     continue
                 last = changed(path)
@@ -1019,8 +1067,10 @@ def task_caps(sw, _scan):
                     sw.skip("caps", path, "w użyciu")
                     continue
                 name = os.path.basename(path)
-                removed += sw.remove("caps", path, lambda n, want=name: n == want)
-            room = limit - (total - removed)
+                sw.remove("caps", path, lambda n, want=name: n == want)
+            # nic nie zostaje przez rozmiar (wszystko w `keep` albo idzie): wzrost tego, co zostaje,
+            # niczego nie zmieni; limit to skończona górna granica (JSON nie zna nieskończoności)
+            room = limit if room is None else room
             sw.cap_headroom = room if sw.cap_headroom is None else min(sw.cap_headroom, room)
 
 

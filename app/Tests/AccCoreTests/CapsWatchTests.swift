@@ -206,6 +206,65 @@ func capsSpaceGate() throws {
     }
 }
 
+@Test("a headroom past Int64 (a cap of 1e10 GB or Infinity) compares as a Double; NaN gives the floor")
+func capsHugeHeadroom() throws {
+    let (home, watch, queue) = try capsHome("huge", caps: #"[{"path": "HOME/caps/*", "max_gb": 1}]"#)
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(home + "/caps/rec")
+    let volume = Volume()
+    watch.volumes = { _ in ["data": volume.free] }
+    let now = Kernel.wall()
+    queue.sync {
+        _ = watch.due(now: now)
+        for (i, headroom) in [1.073741824e19, .infinity, .nan].enumerated() {
+            let at = now + Double(i) * 1200
+            watch.started(now: at)
+            watch.finished(PyObject([("busy", 0), ("headroom", .double(headroom))]))
+            volume.free -= 50 << 30
+            // a crash here took the guard and sched down at every caps interval
+            #expect(watch.due(now: at + 600) == headroom.isNaN)
+        }
+        watch.stop()
+    }
+}
+
+@Test("free space sampled between intervals: space freed and growth in one interval don't hide each other")
+func capsSampledPeak() throws {
+    let (home, watch, queue) = try capsHome("sample", caps: #"[{"path": "HOME/caps/*", "max_gb": 1}]"#)
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(home + "/caps/rec")
+    let volume = Volume()
+    watch.volumes = { _ in ["data": volume.free] }
+    let now = Kernel.wall()
+    let gb: Int64 = 1 << 30
+    queue.sync {
+        _ = watch.due(now: now)
+        // freed first, then grown: the peak sampled in between keeps the growth
+        watch.started(now: now)
+        watch.finished(PyObject([("busy", 0)]))  // the floor: a tenth of 1 GB
+        volume.free += gb * 4 / 10
+        watch.sample()
+        volume.free -= gb * 3 / 10
+        #expect(watch.due(now: now + 600))
+
+        // grown first, then freed elsewhere: the sample in between saw the drop
+        watch.started(now: now + 600)
+        watch.finished(PyObject([("busy", 0)]))
+        volume.free -= gb * 3 / 10
+        watch.sample()
+        volume.free += gb * 4 / 10
+        #expect(watch.due(now: now + 1200))
+
+        // without a sample in between, the two cancel out (the interval's own look)
+        watch.started(now: now + 1200)
+        watch.finished(PyObject([("busy", 0)]))
+        volume.free -= gb * 3 / 10
+        volume.free += gb * 4 / 10
+        #expect(!watch.due(now: now + 1800))
+        watch.stop()
+    }
+}
+
 @Test("a storm of events after the watch is due costs a flag check; a moved root still re-arms; nested folders add no root")
 func capsEventCost() throws {
     let (home, watch, queue) = try capsHome("storm", caps: #"[{"path": "HOME/caps/*/builds", "max_gb": 10}]"#)
