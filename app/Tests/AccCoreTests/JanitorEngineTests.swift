@@ -52,7 +52,8 @@ func janitorEngineRuns() async throws {
         return 0
     }
     engine.start()
-    for _ in 0..<50 where engine.queue.sync(execute: { engine.sweeps }) == 0 { try await Task.sleep(nanoseconds: 20_000_000) }
+    // the sweep starts on a background-QoS thread, which a loaded Mac may hold back for seconds
+    for _ in 0..<500 where engine.queue.sync(execute: { engine.sweeps }) == 0 { try await Task.sleep(nanoseconds: 20_000_000) }
     #expect(ran.argv == [["/usr/sbin/taskpolicy", "-b", "/usr/bin/nice", "-n", "10", "/py", "/acc.py", "janitor", "sweep"]])
     #expect(engine.queue.sync { engine.sweeps } == 1)
     engine.stop()
