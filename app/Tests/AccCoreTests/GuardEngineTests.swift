@@ -338,3 +338,56 @@ func brakeTypes() {
     #expect(cfg(#"{"brake": {"emergency_cooldown_seconds": 5, "unknown": "x"}}"#).isEmpty)
     #expect(cfg(#"{"interval_seconds": "5"}"#) == ["interval_seconds"])
 }
+
+@Test("engine: back from Python's loop (ended, in its backoff) native takes the lock first and starts from Python's state")
+func pythonLoopRecovers() throws {
+    let home = try scratchHome("recover")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let config = GuardPaths.state(home) + "/devguard.json"
+    let statePath = GuardPaths.state(home) + "/devguard-state.json"
+    Files.mkdirs(GuardPaths.state(home))
+    let good = #"{"mode": "enforce", "interval_seconds": 3600, "caps_minutes": 0, "notify": false}"#
+    let odd = #"{"mode": "enforce", "interval_seconds": 3600, "runtimes": "node", "caps_minutes": 0, "notify": false}"#
+    #expect(Files.writeAtomic(config, good))
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    engine.loopStarter = { _ in Spawn.start(["/usr/bin/true"]) }  // a loop that ends at once
+    engine.probesFactory = { pressureWorld(home: home, now: 1_791_000_000, compressedGB: 1) }
+    engine.runner = { _ in 0 }
+    #expect(engine.start())
+    defer { engine.stop() }
+
+    #expect(Files.writeAtomic(config, odd))
+    engine.benchTick()
+    usleep(200_000)
+    engine.benchTick()  // it ended: the backoff, no loop, the lock still let go
+    #expect(engine.queue.sync { engine.pythonLoop == nil && engine.pythonMode && engine.loopShortRuns == 1 })
+    #expect(lockFree(home))
+    // what Python's loop saved last
+    #expect(Files.writeAtomic(statePath, #"{"brake_at": 1790999990.0, "warned": {"x": 1}, "writer": 1, "saved_at": 1790999990.0}"#))
+
+    // another guard holds the lock meanwhile: native waits, it doesn't tick beside it
+    let other = open(GuardPaths.state(home) + "/devguard.lock", O_WRONLY | O_CLOEXEC)
+    #expect(flock(other, LOCK_EX | LOCK_NB) == 0)
+    #expect(Files.writeAtomic(config, good))
+    let ticks = engine.queue.sync { engine.ticks }
+    engine.benchTick()
+    #expect(engine.queue.sync { engine.ticks } == ticks && engine.queue.sync { engine.pythonMode })
+    flock(other, LOCK_UN)
+    close(other)
+
+    engine.benchTick()
+    #expect(engine.queue.sync { engine.ticks } == ticks + 1)
+    #expect(!lockFree(home))
+    #expect(engine.queue.sync { !engine.pythonMode && engine.loopShortRuns == 0 })
+    let saved = Files.json(statePath, fallback: .null)
+    #expect(saved["brake_at"]?.double == 1_790_999_990 && saved["warned"]?["x"]?.double == 1)
+}
+
+@Test("an interval_seconds too large for a timer's leeway is capped at an hour")
+func intervalCap() {
+    let path = "/tmp/acc-cored-interval-\(getpid()).json"
+    defer { unlink(path) }
+    _ = Files.writeAtomic(path, #"{"interval_seconds": 1e17}"#)
+    let engine = GuardEngine(.init(home: "/nonexistent", shadow: true, python: ["/nonexistent/python"]))
+    #expect(engine.interval(GuardConfig.load(path: path)) == 3600)
+}
