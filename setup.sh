@@ -387,6 +387,17 @@ exec "$PY" "$RUN" accswitch "$@"
 EOF
 chmod +x "$HOME/.local/bin/claude-acc"
 
+# tick kont schodzi pod blokadą automatu: żaden tick nie jest wtedy między odświeżeniem tokenu a zapisem
+# do Pęku kluczy (blokada trzymana ponad 150 s: bootout idzie i tak, jak dotąd)
+bootout_job() {
+  local job=$1
+  shift
+  if [ "$job" = com.filip.claude-acc ] && /usr/bin/lockf -k -t 150 "$STATE/lock" launchctl bootout "$@" 2>/dev/null; then
+    return 0
+  fi
+  launchctl bootout "$@" 2>/dev/null || true
+}
+
 # automaty: tick kont co 2 minuty, porządki przy logowaniu i co 3 godziny, strażnik dev serwerów cały czas,
 # perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie), aktualizacje o 4:30 co 3 dni,
 # harmonogram blogów (jobs tick) co 2 minuty
@@ -394,12 +405,12 @@ chmod +x "$HOME/.local/bin/claude-acc"
 for job in $JOBS; do
   plist="$AGENTS/$job.plist"
   if [ -n "$POD_AGENTS" ]; then
-    launchctl bootout "gui/$(id -u)/$job" 2>/dev/null || true
+    bootout_job "$job" "gui/$(id -u)/$job"
     rm -f "$plist"
     continue
   fi
   sed "s|__HOME__|$HOME|g" "$SRC/launchd/$job.plist.template" > "$plist"
-  launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+  bootout_job "$job" "gui/$(id -u)" "$plist"
   launchctl bootstrap "gui/$(id -u)" "$plist"
 done
 

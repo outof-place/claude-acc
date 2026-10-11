@@ -22,6 +22,8 @@ LABEL=com.filip.claude-acc.cored
 REPLACED="com.filip.claude-acc.devguard com.filip.claude-acc com.filip.claude-acc.janitor"
 RECORD="$STATE/acc-cored-switch.json"
 LAUNCHCTL=${ACC_CORED_LAUNCHCTL:-launchctl}
+# how long the tick job's bootout waits for the switcher's lock (a tick holds it while it runs)
+LOCK_WAIT=${ACC_CORED_LOCK_WAIT:-150}
 
 cmd=${1:-status}
 shift || true
@@ -58,8 +60,20 @@ case "$cmd" in
     [ -f "$RECORD" ] && { echo "already switched ($RECORD); run off first" >&2; exit 1; }
     stopped=""
     for job in $REPLACED; do loaded "$job" && stopped="$stopped $job"; done
-    step cp "$BINARY" "$STATE/acc-cored.new"
-    step mv -f "$STATE/acc-cored.new" "$STATE/acc-cored"
+    step cp "$BINARY" "$STATE/acc-cored.new" || exit 1
+    step mv -f "$STATE/acc-cored.new" "$STATE/acc-cored" || exit 1
+    # the tick job first, under the switcher's own lock: no tick is between a token refresh and its
+    # Keychain write when launchd stops the job (-k keeps the lock file the ticks use). If the lock
+    # stays held (a hung `claude-acc status`, say), nothing else changes: a record saying "replaced"
+    # with launchd's tick still loaded beside acc-cored would tick twice
+    case " $stopped " in
+      *" com.filip.claude-acc "*)
+        if ! step /usr/bin/lockf -k -t "$LOCK_WAIT" "$STATE/lock" "$LAUNCHCTL" bootout "$DOMAIN/com.filip.claude-acc"; then
+          echo "the accswitch tick job didn't go (the switcher's lock held over $LOCK_WAIT s?): nothing else changed" >&2
+          exit 1
+        fi
+        ;;
+    esac
     if [ -n "$APPLY" ]; then
       sed "s#__HOME__#$HOME#g" "$SRC/launchd/$LABEL.plist.template" > "$AGENTS/$LABEL.plist"
       echo "+ wrote $AGENTS/$LABEL.plist"
@@ -69,15 +83,12 @@ case "$cmd" in
       echo "would: write $AGENTS/$LABEL.plist and $RECORD (replaced:$stopped)"
     fi
     for job in $stopped; do
-      if [ "$job" = com.filip.claude-acc ]; then
-        # under the switcher's own lock: no tick is between a token refresh and its Keychain write
-        # when launchd stops the job (-k keeps the lock file the ticks use)
-        step /usr/bin/lockf -k -t 150 "$STATE/lock" "$LAUNCHCTL" bootout "$DOMAIN/$job"
-      else
-        step "$LAUNCHCTL" bootout "$DOMAIN/$job"
-      fi
+      [ "$job" = com.filip.claude-acc ] || step "$LAUNCHCTL" bootout "$DOMAIN/$job"
     done
-    step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$LABEL.plist"
+    if ! step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$LABEL.plist"; then
+      echo "acc-cored didn't start: $0 off --apply brings the jobs back" >&2
+      exit 1
+    fi
     [ -n "$APPLY" ] || echo "(check only: add --apply)"
     ;;
   off)

@@ -97,6 +97,22 @@ class SwitchTest(unittest.TestCase):
         self.assertNotIn("com.filip.claude-acc", self.loaded_jobs())
         self.assertTrue(os.path.exists(os.path.join(self.state, "lock")))  # the ticks' lock file stays
 
+    def test_a_lock_held_too_long_changes_nothing(self):
+        # a hung lock holder: lockf times out, and no other job goes, no record, no acc-cored
+        import fcntl
+
+        lock = open(os.path.join(self.state, "lock"), "w")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        env = dict(os.environ, HOME=self.home, ACC_CORED_LAUNCHCTL=os.path.join(HERE, "fakes-launchctl", "launchctl"),
+                   FAKE_LOADED=self.loaded, FAKE_LOG=os.path.join(self.tmp, "calls.log"), ACC_CORED_LOCK_WAIT="1")  # fmt: skip
+        done = subprocess.run([SCRIPT, "on", "--apply", "--binary", self.binary], env=env, capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("didn't go", done.stderr)
+        self.assertEqual(self.loaded_jobs(), JOBS)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "acc-cored-switch.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+
     def test_on_brings_back_only_what_it_stopped(self):
         with open(self.loaded, "w") as f:
             f.write("com.filip.claude-acc.devguard\n")  # the tick and the janitor weren't loaded

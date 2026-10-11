@@ -473,11 +473,14 @@ registers its own agents.
     running binary gets its next launch killed) and writes `com.filip.claude-acc.cored.plist`. The
     job runs `acc-cored run --guard --sched --accswitch --janitor` as `ProcessType Interactive`,
     with `KeepAlive`.
-  - It boots out whichever of the three jobs are loaded, records them in
-    `$STATE/acc-cored-switch.json`, and bootstraps acc-cored. The tick's job goes under the
-    switcher's own lock (`lockf -k $STATE/lock`), so no tick is between a token refresh and its
-    Keychain write when launchd stops it. The job runs with `--wait-lock` and `ExitTimeOut` 30 s
-    (stopping ends Python's guard loop first, up to 10 s).
+  - The tick's job goes first, under the switcher's own lock (`lockf -k -t 150 $STATE/lock`), so
+    no tick is between a token refresh and its Keychain write when launchd stops it. If the lock
+    stays held past 150 s (a hung `claude-acc status`, say), the script stops there: no other job
+    goes, no record, no acc-cored, and it exits 1.
+  - Then it records the jobs it stops in `$STATE/acc-cored-switch.json`, boots out the other two,
+    and bootstraps acc-cored (a failed bootstrap exits 1 and points at `off`). The job runs with
+    `--wait-lock` and `ExitTimeOut` 30 s (stopping ends Python's guard loop first, up to 10 s).
+  - setup.sh boots the tick's job out under the same lock too (past 150 s, without it, as before).
   - The three plists stay where setup.sh wrote them.
 - **`off`** is the undo. It boots acc-cored out, bootstraps the recorded jobs from their plists
   again, and removes the plist and the record.
