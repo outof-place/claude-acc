@@ -221,7 +221,8 @@ public final class CapsWatch {
     }
 
     /// A folder's subfolders and links (what a wildcard after it goes on through), hidden ones too,
-    /// sorted by bytes; [] when it can't be read.
+    /// sorted by bytes; [] when it can't be read. A link is `name -> target`, so a link retargeted
+    /// (`ln -sfn`) or swapped for a folder of its name changes the list too.
     static func entries(_ path: String) -> [String] {
         guard let dir = opendir(path) else { return [] }
         defer { closedir(dir) }
@@ -235,7 +236,15 @@ public final class CapsWatch {
                 guard lstat(path + "/" + name, &st) == 0 else { continue }
                 kind = st.st_mode & S_IFMT == S_IFDIR ? DT_DIR : st.st_mode & S_IFMT == S_IFLNK ? DT_LNK : DT_REG
             }
-            if kind == DT_DIR || kind == DT_LNK { names.append(name) }
+            if kind == DT_DIR {
+                names.append(name)
+            } else if kind == DT_LNK {
+                var buf = [UInt8](repeating: 0, count: Int(PATH_MAX))
+                let n = buf.withUnsafeMutableBufferPointer { b in
+                    b.withMemoryRebound(to: CChar.self) { readlink(path + "/" + name, $0.baseAddress, $0.count) }
+                }
+                names.append(name + " -> " + (n >= 0 ? String(decoding: buf.prefix(n), as: UTF8.self) : ""))
+            }
         }
         return names.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
     }
