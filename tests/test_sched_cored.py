@@ -156,6 +156,38 @@ class CoredSchedTest(unittest.TestCase):
         self.assertIn("hello", done.stdout)
         self.assertLess(time.time() - start, 5)
 
+    def test_events_dies_of_sigpipe_under_an_inherited_ignore_while_frames_keep_coming(self):
+        # frames every 0.2 s, so the once-a-second look at stdout never comes into play: only the
+        # SIG_DFL `events` sets ends it at its next line (with SIG_IGN kept, it would write into EPIPE)
+        import threading
+
+        owner = os.path.join(self.state, "owner.json")
+
+        def write(n):
+            with open(owner + ".t", "w") as f:
+                f.write(json.dumps({"n": n}))
+            os.replace(owner + ".t", owner)
+
+        write(0)
+        self.start_cored()
+        stop = threading.Event()
+
+        def writer():
+            n = 0
+            while not stop.wait(0.2):
+                n += 1
+                write(n)
+
+        threading.Thread(target=writer, daemon=True).start()
+        self.addCleanup(stop.set)
+        cli = subprocess.Popen([BUILT, "events", "owner"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               restore_signals=False)  # fmt: skip
+        self.addCleanup(lambda: cli.poll() is None and cli.kill())
+        self.assertIn(b"hello", cli.stdout.readline())
+        cli.stdout.close()
+        cli.wait(timeout=10)
+        self.assertEqual(cli.returncode, -13)
+
     def test_events_ends_with_its_reader_under_an_ignored_sigpipe_and_no_frames(self):
         # a parent that ignores SIGPIPE passes it on (restore_signals=False keeps Python's SIG_IGN);
         # no file changes, so no frame comes after the first ones: the once-a-second look at stdout
