@@ -165,6 +165,7 @@ struct DepotRuns: Decodable {
 struct BuildsCard: View {
     let store: Store
     @Environment(\.now) private var now
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Card("Builds", symbol: "square.stack.3d.up.fill") {
@@ -196,8 +197,10 @@ struct BuildsCard: View {
                 }
                 // short: while it runs SwiftUI redraws the whole column on every frame, agents start
                 // and finish a build every few seconds, and the default spring (~0.9 s at 120 Hz) cost
-                // 12 ms/s of CPU with the panel open; this one costs 3
-                .animation(.easeOut(duration: 0.2), value: state.running.map(\.id) + depotRunning.map(\.id) + state.queue.map(\.id))
+                // 12 ms/s of CPU with the panel open; this one costs 3, and none with Reduce Motion
+                .animation(
+                    reduceMotion ? nil : .easeOut(duration: 0.2),
+                    value: state.running.map(\.id) + depotRunning.map(\.id) + state.queue.map(\.id))
             } else {
                 VStack(alignment: .leading, spacing: 4) {
                     Label("The build scheduler hasn't run yet", systemImage: "square.stack.3d.up")
