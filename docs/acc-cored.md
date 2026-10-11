@@ -459,13 +459,35 @@ prints the live reading and what the engine would do.
 
 ## Switching
 
-Not done by this branch. The plan:
-- Pod registers `codes.pod.app.acc.cored` in place of the devguard agent.
-- Standalone installs swap `com.filip.claude-acc.devguard` for a `cored` plist.
-- Undo: bootout the cored job and bootstrap the devguard plist again.
+`scripts/acc-cored-switch.sh` swaps three launchd jobs for one acc-cored job, and back: devguard,
+the accswitch tick (`com.filip.claude-acc`) and the janitor. Standalone installs only; Pod
+registers its own agents.
 
-The scheduler needs no switch of its own. Wrappers use acc-cored only while it runs with `--sched`
-and marks the state, and they fall back on their own when it stops.
+    scripts/acc-cored-switch.sh status
+    scripts/acc-cored-switch.sh on  [--apply] [--binary PATH]
+    scripts/acc-cored-switch.sh off [--apply]
 
-Both guard loops hold `devguard.lock`, so they never run together. `acc-cored guard --shadow FILE` runs
-the native loop beside the Python one, observe-only, and writes its state to FILE.
+- **Check-only by default:** without `--apply` it prints what it would do.
+- **`on`:**
+  - It installs the binary as `$STATE/acc-cored` (a temp file, then a rename: overwriting a
+    running binary gets its next launch killed) and writes `com.filip.claude-acc.cored.plist`. The
+    job runs `acc-cored run --guard --sched --accswitch --janitor` as `ProcessType Interactive`,
+    with `KeepAlive`.
+  - It boots out whichever of the three jobs are loaded, records them in
+    `$STATE/acc-cored-switch.json`, and bootstraps acc-cored.
+  - The three plists stay where setup.sh wrote them.
+- **`off`** is the undo. It boots acc-cored out, bootstraps the recorded jobs from their plists
+  again, and removes the plist and the record.
+- **After a setup.sh run**, the three jobs come back beside acc-cored. The two guards then share
+  `devguard.lock`, the ticks the switcher's lock, and the sweeps `janitor.lock`, so they take turns
+  instead of acting twice. Run `off` and `on` again after it.
+- **With main's Python** (no `tick_due`, no sched cooperation) acc-cored still works:
+  - the tick runs in every slot, as launchd ran it;
+  - wrappers keep their own loops, and the sched pass stays idle;
+  - the guard and the janitor gain fully.
+
+Before the first live switch: measure the stage-3 handover latency (a cold `devguard once` under
+memory pressure).
+
+`acc-cored guard --shadow FILE` runs the native guard beside the Python one, observe-only, and
+writes its state to FILE. `run --accswitch-shadow FILE` does the same for the tick.

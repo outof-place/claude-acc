@@ -1,0 +1,8 @@
+#!/bin/bash
+# fake launchctl: loaded labels live in $FAKE_LOADED, one per line; every call goes to $FAKE_LOG
+echo "$*" >> "$FAKE_LOG"
+case "$1" in
+  print) grep -qx "${2#*/*/}" "$FAKE_LOADED" ;;
+  bootout) grep -vx "${2#*/*/}" "$FAKE_LOADED" > "$FAKE_LOADED.t"; mv "$FAKE_LOADED.t" "$FAKE_LOADED" ;;
+  bootstrap) basename "$3" .plist >> "$FAKE_LOADED" ;;
+esac
