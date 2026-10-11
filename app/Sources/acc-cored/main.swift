@@ -36,6 +36,10 @@ func value(_ flag: String, in args: [String]) -> String? {
     return args[i + 1]
 }
 
+// a peer gone mid-write (a wrapper whose call timed out, a host that quit) is EPIPE, never the
+// daemon's death: guard, sched, accswitch and janitor share this process. Children get every
+// signal back at its default (Spawn's posix_spawnattr_setsigdefault).
+signal(SIGPIPE, SIG_IGN)
 var args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else { fail(usage) }
 args.removeFirst()

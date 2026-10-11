@@ -149,6 +149,31 @@ class CoredSchedTest(unittest.TestCase):
         self.assertEqual(os.stat(path).st_mtime_ns, before)
 
 
+    def test_clients_gone_before_their_answer_leave_the_daemon_up(self):
+        # a wrapper whose call timed out closes first; XNU then refuses SO_NOSIGPIPE at accept, and
+        # an unchecked write killed the daemon (exit 141) after ~60 such clients
+        import socket
+
+        cored = self.start_cored()
+        path = os.path.join(self.state, "acc-cored.sock")
+        for _ in range(400):
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                c.connect(path)
+                c.sendall(b'{"op": "ping"}\n')
+            except OSError:
+                pass
+            c.close()
+        time.sleep(0.3)
+        self.assertIsNone(cored.poll(), "acc-cored ended with %s" % cored.returncode)
+        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c.settimeout(3)
+        c.connect(path)
+        c.sendall(b'{"op": "ping"}\n')
+        self.assertIn(b'"pid"', c.recv(65536))
+        c.close()
+
+
 @needs_binary
 class NativeScanTest(unittest.TestCase):
     def test_scan_matches_native_scan(self):

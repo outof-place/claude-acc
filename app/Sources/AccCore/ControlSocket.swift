@@ -47,7 +47,8 @@ public final class ControlSocket: @unchecked Sendable {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
         }
         umask(old)
-        guard bound == 0, chmod(path, 0o600) == 0, listen(fd, 16) == 0 else {
+        // a burst of wrappers at once (a build fan-out) fits the backlog; past it connect is refused
+        guard bound == 0, chmod(path, 0o600) == 0, listen(fd, SOMAXCONN) == 0 else {
             close(fd)
             return false
         }
@@ -114,8 +115,13 @@ public final class ControlSocket: @unchecked Sendable {
                 close(client)
                 continue
             }
+            // XNU refuses SO_NOSIGPIPE (EINVAL) on a socket whose peer closed before accept: such a
+            // client goes without a write, which would raise SIGPIPE (sends use MSG_NOSIGNAL too)
             var on: Int32 = 1
-            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+            guard setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                close(client)
+                continue
+            }
             _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK)
             let source = DispatchSource.makeReadSource(fileDescriptor: client, queue: queue)
             source.setEventHandler { [weak self] in self?.read(client) }
@@ -131,7 +137,7 @@ public final class ControlSocket: @unchecked Sendable {
         let deadline = Kernel.monotonic() + writeSeconds
         var sent = 0
         while sent < out.count {
-            let w = out.withUnsafeBytes { Darwin.write(fd, $0.baseAddress! + sent, $0.count - sent) }
+            let w = out.withUnsafeBytes { Darwin.send(fd, $0.baseAddress! + sent, $0.count - sent, MSG_NOSIGNAL) }
             if w > 0 {
                 sent += w
                 continue

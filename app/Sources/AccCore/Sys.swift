@@ -50,7 +50,7 @@ public enum UnixLineClient {
         var out = Array((line + "\n").utf8)
         var sent = 0
         while sent < out.count {
-            let n = out.withUnsafeBytes { send(fd, $0.baseAddress! + sent, $0.count - sent, 0) }
+            let n = out.withUnsafeBytes { send(fd, $0.baseAddress! + sent, $0.count - sent, MSG_NOSIGNAL) }
             if n <= 0 { if n < 0 && errno == EINTR { continue }; return nil }
             sent += n
         }

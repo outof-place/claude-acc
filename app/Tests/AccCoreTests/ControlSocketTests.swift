@@ -45,6 +45,29 @@ func controlAnswers() throws {
     #expect(!ControlSocket(path: dir + "/" + String(repeating: "x", count: 120)) { _ in .null }.start())
 }
 
+@Test("clients that close before their answer (some before accept) never raise SIGPIPE")
+func controlPeerGone() throws {
+    let dir = try socketDir()
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let socket = ControlSocket(path: dir + "/c.sock") { _ in .object(PyObject([("ok", true)])) }
+    #expect(socket.start())
+    defer { socket.stop() }
+    // swift test doesn't ignore SIGPIPE: one raised here ends the whole test run (exit 141)
+    for _ in 0..<400 {
+        let fd = connect(dir + "/c.sock")
+        guard fd >= 0 else { continue }
+        _ = Array(#"{"op": "ping"}"#.utf8 + [0x0A]).withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+        close(fd)
+    }
+    // under a full suite the burst can still fill the backlog or maxClients: a refused ping is tried again
+    var ok: PyJSON?
+    for _ in 0..<50 where ok == nil {
+        ok = UnixLineClient.exchange(path: dir + "/c.sock", line: #"{"op": "ping"}"#, timeout: 3) { try? PyJSON.loads($0) }
+        if ok == nil { usleep(20_000) }
+    }
+    #expect(ok?["ok"] == .bool(true))
+}
+
 @Test("a client that doesn't read its answer is dropped after writeSeconds; others still get answers")
 func controlWriteDeadline() throws {
     let dir = try socketDir()
