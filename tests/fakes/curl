@@ -66,5 +66,9 @@ if url.endswith("/v1/oauth/token"):
         reply(400, {"error": "invalid_grant"})
     server.setdefault("consumed", {})[token] = owner
     access, refresh = _store.issue(server, owner)
+    if server.get("drop_answer"):
+        # serwer zużył token i wydał parę, ale odpowiedź nie doszła (curl: timeout, kod 28)
+        _store.save("server.json", server)
+        sys.exit(28)
     reply(200, {"access_token": access, "refresh_token": refresh, "expires_in": 28800})
 reply(404, {"error": "unknown url"})

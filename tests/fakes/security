@@ -46,7 +46,8 @@ def _run(cmd, opt, key, args):
             open(os.path.join(_store.ROOT, "slow-write-started"), "w").close()
             time.sleep(3)
         kc = _store.load("keychain.json", {})
-        kc[key] = opt("-w")
+        # -X: dane szesnastkowo, jak w `security -i` z claude-acc (sekret nie idzie w argumentach)
+        kc[key] = bytes.fromhex(opt("-X")).decode() if "-X" in args else opt("-w")
         _store.save("keychain.json", kc)
         return 0
     if cmd == "delete-generic-password":

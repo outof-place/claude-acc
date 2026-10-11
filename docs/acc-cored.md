@@ -393,24 +393,45 @@ the writes fit in it):
   sees a used token, and every copy holds a live one. SIGINT and SIGHUP run inside the refresh.
   The same runs again with the signal sent to the tick's whole process group. SIGKILL right
   after the server's answer does leave a used token (the control).
-- A Keychain write that fails after the refresh (#155: a SecurityAgent prompt timing out, a locked
-  keychain, rc ≠ 0) leaves the new pair only in the tick's memory. It never goes to a file (a
-  secret on disk). Instead:
-  - every write is retried after 1, 2, 4, 8 and 16 s, for at most 45 s from the first attempt:
-    with curl's 20 s that's still inside `ExitTimeOut`;
-  - the runtime entries are written even when the account's copy failed, so the pair outlives the
-    tick there, and the next tick's read-back hands it to the account's copy;
-  - a write still failing is said loudly (log, stderr, a notification), without the token, and the
-    account is marked as needing a new login;
-  - the state keeps a 12-character hash of each refresh token the server used up (the last 64).
-    No tick sends such a token again, also not after `needs_login`'s 6 h retry, and read-back
-    never copies such a pair from runtime over the account's copy. A runtime entry left with one
-    gets the account's live pair instead;
-  - a `security` timeout says so without its arguments: the text of `TimeoutExpired` held the
-    `-w` secret, and `main()` logged it.
-- `tests/test_accswitch_kc_retry.py` covers these with the fake `security` (`FAKE_FAIL_WRITE_TIMES`,
-  `FAKE_FAIL_WRITE_ALL`, services by comma), and checks that no token the server ever issued is in
-  the log, the state files or a tick's output.
+- **A Keychain write that fails after the refresh** (#155): a SecurityAgent prompt timing out, a
+  locked keychain, rc ≠ 0. The new pair is then only in the tick's memory, and it never goes to a
+  file (a secret on disk). Instead:
+  - **Write-ahead:** before the request, the state keeps a 12-character hash of the refresh token
+    under its account (the last 16 per account, so other accounts' rotations never push one out).
+    If the state can't be written (a full disk), there's no refresh at all (fail closed).
+    - The hash comes off again when the server answers without a new pair, or when the request
+      never left the Mac (curl exit 5, 6, 7 or 35).
+    - With no answer after the request went out (a timeout, a dropped connection), the hash stays
+      and the account is parked.
+    - Such a token is never sent again, also not after `needs_login`'s 6 h retry. It's never
+      handed to the runtime either, not even while its access token is still valid.
+  - **The order of the writes:** the runtime entries of every config directory first (a Claude Code
+    session starting now would refresh with the used token), then the account's copy, each once.
+    Then whatever failed is retried after 1, 2, 4, 8 and 16 s, for at most 45 s from the first
+    attempt; with curl's 20 s that's still inside `ExitTimeOut`.
+  - **Lifting `needs_login`** (a state write) happens only after the Keychain writes, and its failure
+    doesn't stop them.
+  - **The pair in the runtime only:** if the account's copy failed but a runtime entry has the pair,
+    the account isn't parked.
+    - The next tick's read-back hands the pair to the copy.
+    - A switch in between first secures it (`keep_runtime_pair`), and refuses to switch while it
+      can't: overwriting the runtime would drop the only live pair.
+  - **The pair gone everywhere:** this is said loudly (log, stderr, a notification), without the
+    token, and the account is marked as needing a new login.
+  - **Runtime entries left with the used token:** these are listed in the state (`stale_runtime`),
+    and the next tick writes them the account's live pair, in any config directory. Read-back and
+    adopt never copy a used pair from the runtime over the account's copy.
+  - **Keychain writes go through `security -i`'s stdin with `-X <hex>`**, as credits.py and
+    runenv.py do. The secret is in no process's arguments, and a timeout's error carries neither
+    argv nor output (`from None`).
+- `tests/test_accswitch_kc_retry.py` covers each of these with the fake `security`
+  (`FAKE_FAIL_WRITE_TIMES`, `FAKE_FAIL_WRITE_ALL`, services by comma) and the fake server
+  (`drop_answer`: the token used up, the answer lost). Each tick-level test checks that no token
+  the server ever issued is in the log, the state files (subfolders too), the notifications or a
+  tick's output.
+- In `tests/test_accswitch_uninterrupted.py`, the control (SIGKILL right after the server's answer)
+  now ends with the account parked, not a reuse. Without the hash the reuse comes back, which shows
+  the test still sees it.
 - A tick past the deadline in its status snapshot (`survey`) skips the snapshot and ends not
   quiet: an older `status.json` must not be vouched for.
 

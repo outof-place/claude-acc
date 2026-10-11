@@ -341,22 +341,30 @@ def kc_read_many(keys, batch=8):
 
 
 def kc_write(service, account, contents, timeout=30):
+    """Zapis wpisu przez stdin `security -i` z danymi szesnastkowo (-X), jak credits.py i runenv.py:
+    sekret nie trafia do argumentów procesu (ps widzi tylko `security -i`), a zapis szesnastkowy nie
+    wymaga ucieczek w linii polecenia."""
     _KC_SEEN.pop((service, account), None)  # po nieudanym albo przerwanym zapisie nie wiadomo, co tam leży
+    if any(c in service + account for c in '"\\\n'):
+        raise RuntimeError("zapis do Keychain nieudany: usługa albo konto ze znakiem, którego linia `security -i` nie przeniesie")
+    secret = contents.encode().hex()
     try:
-        r = spawn(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], timeout=timeout)
+        r = spawn(["security", "-i"], input=f'add-generic-password -U -s "{service}" -a "{account}" -X {secret}\n', timeout=timeout)
     except subprocess.TimeoutExpired:
-        # tekst TimeoutExpired niesie argumenty, a w nich sekret (-w): main() wpisałby go do logu i na
-        # stderr, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
+        # TimeoutExpired niesie argumenty i to, co proces zdążył wypisać: main() wpisałby jego tekst do
+        # logu i na stderr, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
         raise RuntimeError(f"zapis do Keychain nieudany ({service}): brak odpowiedzi po {timeout:.0f} s") from None
-    if r.returncode != 0:
-        raise RuntimeError(f"zapis do Keychain nieudany ({service}): {r.stderr.strip()}")
+    # `security -i` nie powtarza polecenia przy błędzie, ale komunikat i tak idzie do logu: bez sekretu
+    error = (r.stderr or "").replace(secret, "<sekret>").strip()
+    if r.returncode != 0 or "error" in error.lower():
+        raise RuntimeError(f"zapis do Keychain nieudany ({service}): {error[:200]}")
     _KC_SEEN[(service, account)] = contents
 
 
-# Para po odświeżeniu żyje tylko w pamięci tego procesu: serwer zużył już stary refresh token. Jej
-# zapis ponawiamy z przerwami KC_RETRY_BACKOFF, najwyżej KC_RETRY_BUDGET s od pierwszej próby: z curl
-# (max-time 20) to mniej niż ExitTimeOut joba (90 s). Do pliku para nie trafia nigdy (sekret na dysku).
-# ACC_KC_RETRY_BUDGET może budżet tylko skrócić (testy).
+# Para po odświeżeniu żyje tylko w pamięci tego procesu: serwer zużył już stary refresh token. Zapisy,
+# które nie wyszły, ponawiamy z przerwami KC_RETRY_BACKOFF, najwyżej KC_RETRY_BUDGET s od pierwszej
+# próby: z curl (max-time 20) to mniej niż ExitTimeOut joba (90 s). Do pliku para nie trafia nigdy
+# (sekret na dysku). ACC_KC_RETRY_BUDGET może budżet tylko skrócić (testy).
 KC_RETRY_BACKOFF = (1, 2, 4, 8, 16)
 KC_RETRY_BUDGET = 45
 
@@ -368,20 +376,24 @@ def kc_retry_budget():
         return KC_RETRY_BUDGET
 
 
-def kc_write_retrying(service, account, contents, until):
-    """kc_write ponawiany z przerwami do skutku albo do chwili `until` (time.monotonic()); pierwsza
-    próba zawsze. None albo opis ostatniego błędu, bez sekretu (usługa i stderr `security`)."""
-    error = "zabrakło czasu na zapis"
+def write_all(targets, until):
+    """Zapisy (usługa, konto, treść) po kolei, każdy raz; potem te, które nie wyszły, ponawiane z
+    przerwami KC_RETRY_BACKOFF do skutku albo do chwili `until` (time.monotonic()). Pierwsza próba ma
+    zawsze pełne 30 s, kolejne nie wychodzą poza `until`. Zwraca {(usługa, konto): opis ostatniego
+    błędu} tych, które się nie udały, bez sekretu (usługa i stderr `security`)."""
+    failed = {}
     for i, pause in enumerate((0,) + KC_RETRY_BACKOFF):
-        if i and until - time.monotonic() < pause + 1:
+        pending = targets if i == 0 else [t for t in targets if (t[0], t[1]) in failed]
+        if i and (not pending or until - time.monotonic() < pause + 1):
             break
         time.sleep(pause)
-        try:
-            kc_write(service, account, contents, timeout=max(5, min(30, until - time.monotonic())))
-            return None
-        except (RuntimeError, OSError) as err:
-            error = str(err)
-    return error
+        for service, account, contents in pending:
+            try:
+                kc_write(service, account, contents, timeout=30 if i == 0 else max(1, min(30, until - time.monotonic())))
+                failed.pop((service, account), None)
+            except (RuntimeError, OSError) as err:
+                failed[(service, account)] = str(err)
+    return failed
 
 
 def kc_delete(service, account):
@@ -481,6 +493,18 @@ def with_oauth(creds_json, oauth):
 
 def http(url, data=None, headers=None):
     """curl przez stdin, żeby token nie trafił do listy procesów."""
+    status, resp, _ = http_sent(url, data, headers)
+    return status, resp
+
+
+# kody wyjścia curl, przy których żądanie nie wyszło z Maca: nazwa, połączenie, TLS
+CURL_NOT_SENT = (5, 6, 7, 35)
+
+
+def http_sent(url, data=None, headers=None):
+    """http() i to, czy żądanie mogło dojść do serwera: z kodem HTTP tak, a bez niego, gdy curl nie
+    skończył na nazwie, połączeniu albo TLS (CURL_NOT_SENT): timeout czy zerwane połączenie po
+    wysłaniu to żądanie, które serwer mógł już obsłużyć."""
     lines = [f'url = "{url}"', "silent", "max-time = 20", 'write-out = "\\n%{http_code}"']
     lines += [f'header = "{k}: {v}"' for k, v in (headers or {}).items()]
     if data is not None:
@@ -488,9 +512,10 @@ def http(url, data=None, headers=None):
     r = spawn(["curl", "-K", "-"], input="\n".join(lines), timeout=40)
     body, _, code = r.stdout.rpartition("\n")
     try:
-        return int(code), json.loads(body)
+        status, resp = int(code), json.loads(body)
     except ValueError:
-        return int(code or 0), None
+        status, resp = int(code or 0) if code.strip().isdigit() else 0, None
+    return status, resp, bool(status) or r.returncode not in CURL_NOT_SENT
 
 
 # ---------- konta ----------
@@ -530,6 +555,22 @@ def load_accounts():
             for acct_id, info in found if _KC_SEEN.get((MANAGED_SERVICE, acct_id))]
 
 
+def runtime_copies(old_refresh, oauth, cfg):
+    """Wpisy runtime wszystkich katalogów konfiguracji, które trzymają stary refresh token konta, z nową
+    parą: [(usługa, KEYCHAIN_USER, treść)]; osobno te, których `security` nie oddał w czasie (o nich nie
+    wiadomo, czy trzymają zużyty token). Kopia z tokenami MCP katalogu zostaje (with_oauth)."""
+    copies, unread = [], []
+    for service in runtime_services(cfg):
+        try:
+            current = kc_read(service, KEYCHAIN_USER)
+        except subprocess.TimeoutExpired:
+            unread.append(service)
+            continue
+        if current and oauth_of(current).get("refreshToken") == old_refresh:
+            copies.append((service, KEYCHAIN_USER, with_oauth(current, oauth)))
+    return copies, unread
+
+
 def propagate(old_refresh, new_creds_json, cfg, until=None):
     """Wstawia odświeżone dane wszędzie, gdzie leżał stary token tego konta.
 
@@ -538,21 +579,15 @@ def propagate(old_refresh, new_creds_json, cfg, until=None):
     i przy najbliższym odświeżeniu poprosiłaby o ponowne logowanie. Dotyczy to
     także pozostałych katalogów konfiguracji, których wpisów nigdy nie przełączamy.
 
-    Zapisy są ponawiane (kc_write_retrying), a linia w logu (pełny dysk) ich nie zatrzymuje.
+    Zapisy są ponawiane (write_all), a linia w logu (pełny dysk) ich nie zatrzymuje.
     Zwraca (zapisane, nieudane): wpisy z nową parą i te, które zostały ze zużytym tokenem.
     """
-    oauth = oauth_of(new_creds_json)
-    until = time.monotonic() + kc_retry_budget() if until is None else until
-    written, failed = [], []
-    for service in runtime_services(cfg):
-        current = kc_read(service, KEYCHAIN_USER)
-        if current and oauth_of(current).get("refreshToken") == old_refresh:
-            if kc_write_retrying(service, KEYCHAIN_USER, with_oauth(current, oauth), until) is None:
-                written.append(service)
-                quiet_log(f"propagacja odświeżonego tokenu do wpisu {service}")
-            else:
-                failed.append(service)
-    return written, failed
+    copies, unread = runtime_copies(old_refresh, oauth_of(new_creds_json), cfg)
+    failed = write_all(copies, time.monotonic() + kc_retry_budget() if until is None else until)
+    written = [service for service, account, _ in copies if (service, account) not in failed]
+    for service in written:
+        quiet_log(f"propagacja odświeżonego tokenu do wpisu {service}")
+    return written, [service for service, account, _ in copies if (service, account) in failed] + unread
 
 
 def refresh_mark(refresh):
@@ -564,41 +599,127 @@ def token_mark(creds_json):
     return refresh_mark(oauth_of(creds_json or "").get("refreshToken"))
 
 
-# ile skrótów zużytych refresh tokenów pamięta stan (po 12 znaków hex: z nich tokenu nie odtworzyć)
-CONSUMED_KEEP = 64
+# ile skrótów refresh tokenów pamięta stan na konto (po 12 znaków hex: z nich tokenu nie odtworzyć).
+# Na konto, nie wspólnie: obroty innych kont nie wypychają znacznika konta, które stoi z zużytym tokenem
+CONSUMED_KEEP = 16
 
 
-def remember_consumed(refresh):
-    """Skrót refresh tokenu, który serwer właśnie zużył (odpowiedział nową parą). Takiego tokenu żaden
-    przebieg nie wyśle już serwerowi (ponowne użycie unieważnia całe konto) ani nie wpisze z runtime
-    do kopii konta. Pełny dysk: skrótu nie ma, jak dotąd bez tej ochrony."""
+def consumed_marks(state):
+    """{e-mail: [skróty]} ze stanu; zapis sprzed kont (lista) się nie liczy."""
+    marks = state.get("consumed_tokens")
+    return marks if isinstance(marks, dict) else {}
+
+
+def remember_consumed(account, refresh):
+    """Skrót refresh tokenu zapisany z wyprzedzeniem, przed jego wysłaniem: serwer może go zaraz
+    zużyć, a odpowiedź może nie dojść. Takiego tokenu żaden przebieg nie wyśle już serwerowi (ponowne
+    użycie unieważnia całe konto) ani nie wpisze z runtime do kopii konta. False, gdy stanu nie da się
+    zapisać (pełny dysk): wtedy odświeżenia nie ma (fail closed)."""
     mark = refresh_mark(refresh)
     try:
         state = load_state()
-        marks = [m for m in state.get("consumed_tokens", []) if isinstance(m, str) and m != mark]
-        state["consumed_tokens"] = (marks + [mark])[-CONSUMED_KEEP:]
+        marks = consumed_marks(state)
+        mine = [m for m in marks.get(account.email, []) if isinstance(m, str) and m != mark]
+        marks[account.email] = (mine + [mark])[-CONSUMED_KEEP:]
+        state["consumed_tokens"] = marks
         save_state(state)
+        return True
     except (OSError, ValueError) as err:
-        quiet_log(f"skrót zużytego tokenu niezapisany: {err}")
-
-
-def consumed(creds_json):
-    """Czy refresh token tych danych serwer już zużył (remember_consumed)."""
-    refresh = oauth_of(creds_json or "").get("refreshToken")
-    try:
-        return bool(refresh) and refresh_mark(refresh) in load_state().get("consumed_tokens", [])
-    except (OSError, ValueError):
+        quiet_log(f"konto {account.email}: skrót tokenu niezapisany ({err}), bez odświeżenia")
         return False
 
 
-def write_lost(account, creds_json, error, written):
-    """Kopia konta została ze zużytym refresh tokenem: głośno (log, stderr, powiadomienie), bez
-    tokenu, i konto odstawione (wymaga ponownego logowania), zanim następny przebieg wyśle zużyty token."""
-    where = (f"; nowa para jest we wpisach {', '.join(written)}, kopia konta dogoni ją w następnym przebiegu"
-             if written else "; nowa para przepadła")
-    line = f"konto {account.email}: zapis odświeżonego tokenu do Keychain nieudany ({error}){where}"
+def forget_consumed(account, refresh):
+    """Serwer odpowiedział bez nowej pary albo żądanie nie wyszło z Maca: token nie jest zużyty. Gdy
+    skrótu nie da się zdjąć, konto stoi do ponownego logowania (lepsze niż ponowne użycie)."""
+    mark = refresh_mark(refresh)
+    try:
+        state = load_state()
+        marks = consumed_marks(state)
+        if mark in marks.get(account.email, []):
+            marks[account.email] = [m for m in marks[account.email] if m != mark]
+            state["consumed_tokens"] = marks
+            save_state(state)
+    except (OSError, ValueError) as err:
+        quiet_log(f"konto {account.email}: skrót tokenu nie zdjęty ({err})")
+
+
+def consumed(creds_json, account=None):
+    """Czy refresh token tych danych serwer już zużył (remember_consumed): wśród skrótów tego konta,
+    a bez konta wśród skrótów któregokolwiek."""
+    refresh = oauth_of(creds_json or "").get("refreshToken")
+    if not refresh:
+        return False
+    try:
+        marks = consumed_marks(load_state())
+    except (OSError, ValueError):
+        return False
+    lists = [marks.get(account.email)] if account else list(marks.values())
+    mark = refresh_mark(refresh)
+    return any(isinstance(m, list) and mark in m for m in lists)
+
+
+def remember_stale(services, account):
+    """Wpisy runtime, które zostały ze zużytym tokenem konta: heal_stale_runtime wpisze im żywą parę."""
+    try:
+        state = load_state()
+        stale = state.get("stale_runtime") if isinstance(state.get("stale_runtime"), dict) else {}
+        stale.update({service: account.email for service in services})
+        state["stale_runtime"] = stale
+        save_state(state)
+    except (OSError, ValueError) as err:
+        quiet_log(f"lista wpisów ze zużytym tokenem niezapisana ({err})")
+
+
+def heal_stale_runtime(accounts, cfg):
+    """Wpisy runtime (we wszystkich katalogach konfiguracji), które po odświeżeniu zostały ze zużytym
+    tokenem konta: dostają żywą parę z kopii konta, gdy ta ją ma. Wpis zmieniony inaczej (sesja,
+    logowanie) schodzi z listy bez zapisu."""
+    try:
+        stale = load_state().get("stale_runtime")
+    except (OSError, ValueError):
+        return
+    if not isinstance(stale, dict) or not stale:
+        return
+    by_email = {a.email: a for a in accounts}
+    done = []
+    for service, email in stale.items():
+        account = by_email.get(email)
+        current = kc_read(service, KEYCHAIN_USER)
+        if account is None or not current or not consumed(current, account):
+            done.append(service)
+            continue
+        managed = account.creds_json
+        if not managed or consumed(managed, account):
+            continue  # para przepadła: nie ma czego wpisać, konto stoi do ponownego logowania
+        try:
+            kc_write(service, KEYCHAIN_USER, with_oauth(current, oauth_of(managed)))
+        except RuntimeError as err:
+            quiet_log(f"wpis {service}: żywa para konta {email} niezapisana ({err})")
+            continue
+        quiet_log(f"wpis {service}: żywa para konta {email} zamiast zużytej")
+        done.append(service)
+    if done:
+        try:
+            state = load_state()
+            left = {s: e for s, e in (state.get("stale_runtime") or {}).items() if s not in done}
+            state["stale_runtime"] = left
+            save_state(state)
+        except (OSError, ValueError) as err:
+            quiet_log(f"lista wpisów ze zużytym tokenem niezapisana ({err})")
+
+
+def loud(line):
+    """Linia do logu i na stderr (launchd.log), nawet przy pełnym dysku."""
     quiet_log(line)
     print(line, file=sys.stderr)
+
+
+def write_lost(account, creds_json, error):
+    """Nowa para przepadła (żaden zapis nie wyszedł), a kopia konta trzyma zużyty token: głośno (log,
+    stderr, powiadomienie), bez tokenu, i konto odstawione do ponownego logowania. Zużytego tokenu
+    i tak żaden przebieg już nie wyśle (consumed)."""
+    loud(f"konto {account.email}: zapis odświeżonego tokenu do Keychain nieudany ({error}); nowa para przepadła")
     try:
         mark_needs_login(account, creds_json)
     except (OSError, ValueError) as err:
@@ -658,8 +779,9 @@ class OutOfTime(BaseException):
     (depot_sync_safe): przebieg kończy się w całości, a nie pomija kroku i idzie dalej."""
 
 
-# Odświeżenie tokenu potrzebuje do REFRESH_BUDGET sekund: curl ma max-time 20, zapisy do Pęku
-# kluczy trwają ułamki sekundy.
+# Odświeżenie tokenu potrzebuje zwykle do REFRESH_BUDGET sekund: curl ma max-time 20, zapisy do Pęku
+# kluczy trwają ułamki sekundy. Zapis, który nie wychodzi, wydłuża blok o ponowienia (KC_RETRY_BUDGET,
+# 45 s); termin acc-cored jest kooperacyjny, więc blok i tak kończy się w całości.
 REFRESH_BUDGET = 30
 
 
@@ -688,7 +810,7 @@ class uninterrupted:
     działa tak, jak działałby bez niego (domyślnie kończy proces). Dzieci startowane w bloku mają
     własną sesję, więc sygnał do całej grupy (Ctrl-C, zamknięty terminal) ich nie zabija. SIGKILL-a
     odroczyć się nie da: acc-cored go tickowi nie wysyła, a launchd dopiero po ExitTimeOut (90 s,
-    więcej niż curl z max-time 20 i zapisy)."""
+    więcej niż curl z max-time 20 i zapisy z ponowieniami, najwyżej KC_RETRY_BUDGET)."""
 
     SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
     # kończące najpierw: KeyboardInterrupt z SIGINT przerwałby ponowne wysłanie SIGTERM
@@ -734,24 +856,36 @@ def ensure_fresh(account, cfg, force=False):
     if not creds_json:
         return None, "brak danych w Keychain"
     oauth = oauth_of(creds_json)
-    if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
-        return creds_json, "token ważny"
-    if consumed(creds_json):
-        # serwer zużył ten token, a zapis nowej pary się nie udał: wysłanie go to ponowne użycie,
-        # za które serwer unieważnia całe konto (także po kilku godzinach needs_login)
+    if consumed(creds_json, account):
+        # serwer zużył ten token, a nowa para przepadła: wysłanie go to ponowne użycie, za które
+        # serwer unieważnia całe konto (także po kilku godzinach needs_login), a wpisanie do runtime
+        # (przełączenie, póki access token jeszcze ważny) daje go sesjom
         mark_needs_login(account, creds_json)
         return None, "token już zużyty, wymaga ponownego logowania"
+    if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
+        return creds_json, "token ważny"
     in_time(REFRESH_BUDGET)
     with uninterrupted():
         old_refresh = oauth.get("refreshToken")
+        # skrót przed żądaniem (write-ahead): bez niego, przy odpowiedzi, która nie dojdzie, i pełnym
+        # dysku, następny przebieg wysłałby zużyty token
+        if not remember_consumed(account, old_refresh):
+            return None, "stanu nie da się zapisać (pełny dysk?), odświeżenie wstrzymane"
         body = f"grant_type=refresh_token&refresh_token={old_refresh}&client_id={CLIENT_ID}"
-        status, resp = http(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT})
+        status, resp, sent = http_sent(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT})
         if status != 200 or not resp or not resp.get("access_token"):
+            if (status and status != 200) or not sent:
+                forget_consumed(account, old_refresh)  # serwer nie dał pary albo żądanie nie wyszło
+            else:
+                # bez odpowiedzi po wysłaniu (timeout, zerwane połączenie): serwer mógł token zużyć,
+                # więc skrót zostaje, a konto stoi
+                loud(f"konto {account.email}: brak odpowiedzi serwera po wysłaniu refresh tokenu; konto odstawione")
+                mark_needs_login(account, creds_json)
+                return None, "brak odpowiedzi serwera po wysłaniu tokenu, wymaga ponownego logowania"
             if status == 400:
                 mark_needs_login(account, creds_json)
                 return None, "wymaga ponownego logowania"
             return None, f"odświeżenie tokenu nieudane (HTTP {status})"
-        clear_needs_login(account)
         creds = json.loads(creds_json)
         fresh = dict(creds["claudeAiOauth"])
         fresh["accessToken"] = resp["access_token"]
@@ -764,24 +898,38 @@ def ensure_fresh(account, cfg, force=False):
         creds["claudeAiOauth"] = fresh
         new_json = json.dumps(creds, separators=(",", ":"))
         rotated = fresh.get("refreshToken") != old_refresh
-        if rotated:
-            remember_consumed(old_refresh)
-        # odtąd nowa para żyje tylko w pamięci tego procesu: zapisy ponawiane, do pliku nigdy; kopie
-        # runtime także po nieudanym zapisie kopii konta, bo w nich para przeżyje ten proces
-        until = time.monotonic() + kc_retry_budget()
-        failed = kc_write_retrying(MANAGED_SERVICE, account.id, new_json, until)
-        written, stale = propagate(old_refresh, new_json, cfg, until)
-        if stale:
-            line = (f"wpisy {', '.join(stale)} zostały ze zużytym refresh tokenem konta {account.email} "
-                    f"(zapis nieudany): następny przebieg wpisze im nową parę")
-            quiet_log(line)
-            print(line, file=sys.stderr)
-        if failed is not None:
-            if rotated:
-                write_lost(account, creds_json, failed, written)
+        if not rotated:
+            forget_consumed(account, old_refresh)  # serwer go nie obrócił: stary dalej działa
+        # odtąd nowa para żyje tylko w pamięci tego procesu: do pliku nigdy. Najpierw runtime (sesja
+        # Claude Code, która właśnie startuje, odświeżyłaby zużytym tokenem), potem kopia konta, każdy
+        # zapis raz; potem ponowienia tego, co nie wyszło
+        copies, unread = runtime_copies(old_refresh, oauth_of(new_json), cfg)
+        failed = write_all(copies + [(MANAGED_SERVICE, account.id, new_json)], time.monotonic() + kc_retry_budget())
+        written = [service for service, acct, _ in copies if (service, acct) not in failed]
+        stale = [service for service, acct, _ in copies if (service, acct) in failed] + unread
+        for service in written:
+            quiet_log(f"propagacja odświeżonego tokenu do wpisu {service}")
+        if stale and rotated:
+            remember_stale(stale, account)
+            loud(f"wpisy {', '.join(stale)} zostały ze zużytym refresh tokenem konta {account.email} "
+                 "(zapis nieudany): następny przebieg wpisze im żywą parę z kopii konta")
+        try:
+            clear_needs_login(account)  # dopiero po zapisach: pełny dysk tutaj nie kosztuje pary
+        except (OSError, ValueError) as err:
+            quiet_log(f"konto {account.email}: znacznik ponownego logowania nie zdjęty ({err})")
+        lost = failed.get((MANAGED_SERVICE, account.id))
+        if lost is not None:
+            if not rotated:
+                # bez rotacji stary refresh token dalej działa: przepada tylko nowy access token
+                quiet_log(f"konto {account.email}: nowy access token niezapisany ({lost}), refresh token bez zmian")
+            elif written:
+                # para przeżywa w runtime: konto nie stoi, read-back przepisze ją do kopii, a przełączenie
+                # nie nadpisze runtime, zanim kopia jej nie dostanie (keep_runtime_pair)
+                loud(f"konto {account.email}: kopia konta bez nowej pary ({lost}); para jest we wpisach "
+                     f"{', '.join(written)}, następny przebieg przepisze ją do kopii")
+            else:
+                write_lost(account, creds_json, lost)
                 return None, "zapis nowego tokenu do Keychain nieudany, wymaga ponownego logowania"
-            # bez rotacji stary refresh token dalej działa: przepada tylko nowy access token
-            quiet_log(f"konto {account.email}: nowy access token niezapisany ({failed}), refresh token bez zmian")
     return new_json, "token odświeżony"
 
 
@@ -1318,8 +1466,8 @@ def sync_back(account, cfg):
     managed_raw = account.creds_json
     if consumed(runtime_raw):
         # runtime został ze zużytym tokenem (jego zapis po odświeżeniu się nie udał): nigdy do kopii
-        # konta; dostaje parę z kopii konta, o ile ta żyje
-        if not consumed(managed_raw):
+        # konta; dostaje parę z kopii konta, o ile token był tego konta, a kopia żyje
+        if consumed(runtime_raw, account) and not consumed(managed_raw, account):
             align_runtime(cfg, oauth_of(managed_raw))
         return
     live, stored = oauth_of(runtime_raw), oauth_of(managed_raw)
@@ -1364,7 +1512,22 @@ def adopt_runtime(accounts, cfg):
         log(f"żywy token {account.email} z runtime zapisany do jego kopii w {HOST.name}")
 
 
-def switch_to(account, cfg, reason=""):
+def keep_runtime_pair(previous, cfg):
+    """Przed nadpisaniem runtime innym kontem: para, którą ma tylko runtime (sesja ją obróciła albo
+    zapis kopii konta po odświeżeniu nie wyszedł), idzie najpierw do kopii konta `previous`. Gdy tego
+    nie da się zrobić ani potwierdzić, przełączenia nie ma: nadpisanie skasowałoby jedyną żywą parę."""
+    raw = freshest_runtime(cfg)
+    live = oauth_of(raw)
+    if not live.get("refreshToken") or consumed(raw):
+        return
+    if live.get("refreshToken") == oauth_of(previous.creds_json).get("refreshToken"):
+        return
+    sync_back(previous, cfg)  # kc_write rzuca przy błędzie
+    if oauth_of(previous.creds_json).get("refreshToken") != live.get("refreshToken"):
+        raise RuntimeError(f"{previous.email}: para z runtime nie trafiła do kopii konta, nie przełączam")
+
+
+def switch_to(account, cfg, reason="", previous=None):
     creds_json, note = ensure_fresh(account, cfg)
     if not creds_json:
         raise RuntimeError(f"{account.email}: {note}")
@@ -1382,6 +1545,8 @@ def switch_to(account, cfg, reason=""):
     if status != 200:
         # 429 albo sieć: nie wiemy, czy token żyje, więc go nie ruszamy
         raise RuntimeError(f"API limitów chwilowo nie odpowiada (HTTP {status}), spróbuj za kilka minut")
+    if previous and previous.id != account.id:
+        keep_runtime_pair(previous, cfg)
     oauth = oauth_of(creds_json)
     for service in (scoped_service(cfg["config_dir"]), ACTIVE_SERVICE):
         kc_write(service, KEYCHAIN_USER, with_oauth(kc_read(service, KEYCHAIN_USER), oauth))
@@ -2014,7 +2179,7 @@ def cmd_switch(cfg, args):
         if not target:
             print(f"nie znam konta {args[0]}")
             return 1
-        switch_to(target, cfg, "ręcznie")
+        switch_to(target, cfg, "ręcznie", previous=active)
         depot_sync_safe(accounts, cfg, target)
         print(f"przełączono na {target.email}")
         return 0
@@ -2022,7 +2187,7 @@ def cmd_switch(cfg, args):
     if not rows:
         print("żadne konto nie ma zapasu, sprawdź claude-acc status")
         return 1
-    switch_to(rows[0]["account"], cfg, "ręcznie --auto")
+    switch_to(rows[0]["account"], cfg, "ręcznie --auto", previous=active)
     depot_sync_safe(accounts, cfg, rows[0]["account"])
     print(f"przełączono na {rows[0]['account'].email}")
     return 0
@@ -2458,6 +2623,7 @@ def tick(cfg, accounts):
         update_state(hands_off_notified=False)
 
     sync_back(active, cfg)
+    heal_stale_runtime(accounts, cfg)
     depot_sync_safe(accounts, cfg, active)
     dead = needs_login(active)
     data, note = (None, "token nie działa") if dead else active_usage(active, cfg)
@@ -2507,7 +2673,7 @@ def tick(cfg, accounts):
         scrap = confirmed(jobs_free(drain_queue(rows)), cfg, lambda d: min(headroom(d)) >= DRAIN_FLOOR)
         if scrap:
             target = scrap["account"]
-            switch_to(target, cfg, f"{reason}; dobijanie, {scrap['why']}")
+            switch_to(target, cfg, f"{reason}; dobijanie, {scrap['why']}", previous=active)
             keep_draining(reason)  # Depot bierze tylko konta z zapasem, więc resztek nie dotyka
             return 0
     if not candidates:
@@ -2522,7 +2688,7 @@ def tick(cfg, accounts):
         return 1
 
     target = candidates[0]["account"]
-    switch_to(target, cfg, reason)
+    switch_to(target, cfg, reason, previous=active)
     end_pause(f"przełączono na {target.email}")
     depot_sync_safe(accounts, cfg, target)  # sandboxy nie mogą zostać na nowym koncie lokalnym
     left = headroom(candidates[0]["data"])[1]
