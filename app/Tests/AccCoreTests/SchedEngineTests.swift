@@ -91,23 +91,23 @@ func wakeGuardsAlone() {
 @Test("reap signals only a dead wrapper's own group from this boot: no stale, reused, own or non-group")
 func reapSignals() throws {
     let boot = 1_000_000.0, fresh = boot + 60, own = 777
-    // the start stamp (µs) an entry names for a pid; the kernel gives the same one while it's that
-    // process, another once the pid is reused
-    let stamp = { (pid: Int) in 5_000_000_000_000 + pid * 1000 }
+    // the p_uniqueid an entry names for a pid; the kernel gives the same one while it's that process,
+    // another once the pid is reused
+    let stamp = { (pid: Int) in 30_000_000 + pid * 10 }
     var starts: [(String, PyJSON)] = []
     enum Live { case mine, reused, none }
     let run = { (id: String, pid: Int, pgid: PyJSON, at: Double?, wrapper: Live, group: Live, stamped: Bool) -> PyJSON in
         var o = PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(pid)), ("child_pgid", pgid)])
         o["enqueued_at"] = .double((at ?? fresh) - 10)
         if let at { o["started_at"] = .double(at) }
-        o["pid_start_us"] = .int(stamp(pid))
+        o["pid_uid"] = .int(stamp(pid))
         switch wrapper {
         case .mine: starts.append((String(pid), .int(stamp(pid))))
         case .reused: starts.append((String(pid), .int(stamp(pid) + 1)))
         case .none: break
         }
         if let g = pgid.int, g > 0 {
-            if stamped { o["child_start_us"] = .int(stamp(g)) }
+            if stamped { o["child_uid"] = .int(stamp(g)) }
             switch group {
             case .mine: starts.append((String(g), .int(stamp(g))))
             case .reused: starts.append((String(g), .int(stamp(g) + 1)))
@@ -119,7 +119,7 @@ func reapSignals() throws {
     let queued = { (id: String, pid: Int, at: Double, live: Live) -> PyJSON in
         if live == .mine { starts.append((String(pid), .int(stamp(pid)))) }
         if live == .reused { starts.append((String(pid), .int(stamp(pid) + 1))) }
-        return .object(PyObject([("id", .string(id)), ("pid", .int(pid)), ("enqueued_at", .double(at)), ("pid_start_us", .int(stamp(pid)))]))
+        return .object(PyObject([("id", .string(id)), ("pid", .int(pid)), ("enqueued_at", .double(at)), ("pid_uid", .int(stamp(pid)))]))
     }
     let before = PyObject([
         ("running", .array([
@@ -146,7 +146,7 @@ func reapSignals() throws {
     // checks keep them from a signal
     let alive: [PyJSON] = [201, 202, 103, 203, own, 205, -205, 1, 211, 111, 212, 1 << 40, 112, 213, 214, 215, 216, 301, 302, 304].map { .int($0) }
     let probes = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("boottime", .double(boot)), ("pgrp", .int(own)),
-                                               ("starts", .object(PyObject(starts)))]))
+                                               ("uids", .object(PyObject(starts)))]))
     var state = before
     Sched.reap(&state, probes)
     let ids = { (key: String) in (state[key]?.array ?? []).map { $0["id"]?.string ?? "" } }
@@ -156,18 +156,28 @@ func reapSignals() throws {
 
     // an unknown boot time (0) makes nothing stale: the same old entry is then signalled, so the
     // boot rule is what spared group 202 above
-    let blind = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("pgrp", .int(own)), ("starts", .object(PyObject(starts)))]))
+    let blind = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("pgrp", .int(own)), ("uids", .object(PyObject(starts)))]))
     state = before
     Sched.reap(&state, blind)
     let groups = blind.kills.compactMap { $0.array?.first?.int }
     #expect(groups == [201, 201, 202, 202])
     #expect(ids("running") == ["stale-alive", "live"])
 
-    // an entry without pid_start_us (written before it existed): alive is enough, as before
+    // an entry without pid_uid (written before it existed), or with one no Int64 holds: alive is
+    // enough, as before; a uid that isn't one gets no group signal either
     var old = PyObject([("running", .array([.object(PyObject([("id", "old"), ("where", "local"), ("pid", .int(111)), ("started_at", .double(fresh))]))])),
                         ("queue", .array([]))])
     Sched.reap(&old, probes)
     #expect((old["running"]?.array ?? []).count == 1)
+    let oddUID = { (id: String, uid: PyJSON) -> PyJSON in
+        .object(PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(111)), ("pid_uid", uid), ("started_at", .double(fresh))]))
+    }
+    var odd = PyObject([("running", .array([oddUID("big", .raw("1180591620717411303424")), oddUID("negative", .int(-3))])),
+                        ("queue", .array([]))])
+    Sched.reap(&odd, probes)
+    #expect((odd["running"]?.array ?? []).count == 2)
+    #expect(Sched.groupOf(.object(PyObject([("child_pgid", .int(212)), ("child_uid", .raw("1180591620717411303424"))])), probes) == nil)
+    #expect(Sched.groupOf(.object(PyObject([("child_pgid", .int(212)), ("child_uid", .int(-3))])), probes) == nil)
 }
 
 @Test("safety pauses the youngest heavy job whose group is still its own: never a reused or unstamped group")
@@ -175,37 +185,38 @@ func safetySignals() {
     let now = 1_000_000.0
     let job = { (id: String, pgid: Int, started: Double, stamp: Int?) -> PyJSON in
         var o = PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(1)), ("child_pgid", .int(pgid)), ("started_at", .double(started))])
-        if let stamp { o["child_start_us"] = .int(stamp) }
+        if let stamp { o["child_uid"] = .int(stamp) }
         return .object(o)
     }
     var state = PyObject([
         ("running", .array([
             job("a", 401, now - 30, 7001), job("b", 402, now - 20, 7002),
             job("c", 403, now - 10, 7003),  // the youngest, but its group is another process now
-            job("d", 404, now - 5, nil),  // no child_start_us: no way to check
+            job("d", 404, now - 5, nil),  // no child_uid: no way to check
         ])),
         ("memory", .object(PyObject([("swap_growth_2m_gb", 99), ("level_pct", 10), ("pressure", "critical")]))),
         ("today", .object(PyObject([("pauses", 0)]))),
     ])
     let starts = PyObject([("401", .int(7001)), ("402", .int(7002)), ("403", .int(9999)), ("404", .int(7004))])
-    let probes = RecordedSchedProbes(PyObject([("now", .double(now)), ("starts", .object(starts))]))
+    let probes = RecordedSchedProbes(PyObject([("now", .double(now)), ("uids", .object(starts))]))
     Sched.safety(&state, SchedConfig(raw: SchedConfig.defaults), probes)
     #expect(probes.kills == [.array([.int(402), .int(Int(SIGSTOP))])])
     #expect(state["running"]?.array?[1]["paused"]?.truthy == true)
 }
 
-@Test("the live boot time is now minus the time since boot; a process's start stamp is its own and stays put")
+@Test("the live boot time is now minus the time since boot; a process's p_uniqueid is its own, also for root's")
 func liveBootAndStart() {
     let boot = SchedNative.bootTime()
     let wall = Kernel.wall()
     let up = Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9
     #expect(boot > 0 && boot < wall)
     #expect(abs((wall - boot) - up) < 5)
-    let me = SchedNative.startMicros(getpid())
-    #expect(me.map { Double($0) / 1e6 >= boot - 1 && Double($0) / 1e6 <= wall } == true)
-    #expect(SchedNative.startMicros(getpid()) == me)
-    #expect(SchedNative.startMicros(getppid()) != me)
-    #expect(SchedNative.startMicros(pid_t(Int32.max)) == nil)
+    let me = SchedNative.uniqueID(getpid())
+    #expect(me != nil)
+    #expect(SchedNative.uniqueID(getpid()) == me)
+    #expect(SchedNative.uniqueID(getppid()) != me)
+    #expect(SchedNative.uniqueID(1) != nil)  // launchd, root's: proc_bsdinfo would give EPERM here
+    #expect(SchedNative.uniqueID(pid_t(Int32.max)) == nil)
 }
 
 @Test("no watch on an entry from before the boot or on a group that isn't the job's")
@@ -218,11 +229,11 @@ func watchesOnlyOwnGroups() throws {
     let now = Kernel.wall()
     let job = { (id: String, started: Double, stamp: Int) in
         PyObject([("id", .string(id)), ("monitor", "cored"), ("pid", .int(Int(getpid()))), ("child_pgid", .int(Int(getpid()))),
-                  ("started_at", .double(started)), ("child_started_at", .double(started)), ("child_start_us", .int(stamp))])
+                  ("started_at", .double(started)), ("child_started_at", .double(started)), ("child_uid", .int(stamp))])
     }
     engine.queue.sync {
         engine.updateWatches([job("old", 100, 42), job("reused", now, 41), job("mine", now, 42)], now: now,
-                             start: { _ in 42 }, boot: 1000)
+                             uid: { _ in 42 }, boot: 1000)
     }
     #expect(engine.queue.sync { Set(engine.watches.keys) } == ["mine"])
     engine.queue.sync { engine.standBack() }

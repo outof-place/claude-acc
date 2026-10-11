@@ -263,13 +263,13 @@ public final class SchedEngine: @unchecked Sendable {
     /// One watch per running job we monitor; a watch outlives its entry for 30 s (the final peak).
     /// Only on a group that is still the job's: an entry from before a reboot, or one whose group
     /// was reused, would sample someone else's processes until reap drops it.
-    func updateWatches(_ running: [PyObject], now: Double, start: (pid_t) -> Int? = SchedNative.startMicros,
+    func updateWatches(_ running: [PyObject], now: Double, uid: (pid_t) -> Int? = SchedNative.uniqueID,
                        boot: Double = SchedNative.bootTime()) {
         var seen: Set<String> = []
         for job in running where job["monitor"] == .string("cored") {
             guard let id = job["id"]?.string, let pgid = job["child_pgid"]?.int, pgid > 1, let wrapper = job["pid"]?.int, wrapper > 1
             else { continue }
-            if watches[id] == nil, Sched.stale(.object(job), "started_at", boot) || Sched.groupOf(.object(job), start: start) == nil {
+            if watches[id] == nil, Sched.stale(.object(job), "started_at", boot) || Sched.groupOf(.object(job), uid: uid) == nil {
                 continue
             }
             seen.insert(id)

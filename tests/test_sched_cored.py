@@ -119,8 +119,11 @@ class CoredSchedTest(unittest.TestCase):
         time.sleep(1.5)
         self.assertIsNone(job.poll())
         memory(80, "normal")
+        freed = time.time()
         self.assertEqual(job.wait(30), 0)
         self.assertGreaterEqual(self.ping()["wakes"], 1)
+        # sooner than the wrapper's own wake (CORED_WAKE_S, 5 s): one pass, the signal, the job's 0.2 s
+        self.assertLess(time.time() - freed, 4.5)
 
     def test_short_jobs_get_their_peak(self):
         self.start_cored()

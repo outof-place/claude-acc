@@ -207,19 +207,23 @@ may still answer: acc-cored refreshes the mark on every pass.
   other processes now. It never signals its own process group either. An unknown boot time (0)
   makes nothing stale.
 - **pids reused within one boot** (they wrap here every ~25 minutes, ~4000 a minute). A process is
-  told by its start stamp, `pbi_start_tvsec` and `pbi_start_tvusec` in µs: the kernel sets it
-  once at fork, so a clock change doesn't move it, and a reused pid has another one.
-  - A wrapper writes its own stamp into its entry (`pid_start_us`), and counts as alive only
-    while its pid still has that stamp (`owned`). Otherwise its entry goes, as for a dead wrapper.
-    An entry without the stamp (written before it existed) only needs its pid alive, as before.
-  - A wrapper also writes its child's stamp (`child_start_us`) when it starts the job. A job's
-    group is signalled (reap's SIGCONT + SIGTERM, safety's SIGSTOP and SIGCONT) only while its
-    leader still has that stamp (`group_of`). An entry without it, or without a numeric
-    `started_at`, gets no signal.
+  told by its `p_uniqueid` (`PROC_PIDUNIQIDENTIFIERINFO`): the kernel gives it at fork and not again
+  until a reboot, so a reused pid has another one and a clock change doesn't move it. Unlike
+  `proc_bsdinfo`, it's readable for other users' processes too (a wrapper started with sudo, root's
+  launchd).
+  - A wrapper writes its own uid into its entry (`pid_uid`), and counts as alive only while its pid
+    still has that uid (`owned`). Otherwise its entry goes, as for a dead wrapper. An entry without
+    one (written before it existed, or not an int of Int64 at 0 or above) only needs its pid alive,
+    as before.
+  - A wrapper also writes its child's uid (`child_uid`) when it starts the job. A job's group is
+    signalled (reap's SIGCONT + SIGTERM, safety's SIGSTOP and SIGCONT) only while its leader still
+    has that uid (`group_of`). An entry without it, or without a numeric `started_at` (an int of
+    Int64, as acc-cored reads it), gets no signal.
   - acc-cored puts no watch on an entry from before the boot or on a group that isn't the job's.
-  - Cost: one `proc_pidinfo` per entry and pass, microseconds. An earlier version compared the
-    kernel's start in seconds with `enqueued_at` (the wall clock). That's off by 1-2 s, and wrong
-    after a clock step back, and reap then SIGTERMed a live job.
+  - Cost: one `proc_pidinfo` per entry and pass, microseconds. Earlier versions compared the
+    kernel's start in seconds with `enqueued_at` (the wall clock): off by 1-2 s, wrong after a clock
+    step back, and reap then SIGTERMed a live job. The start stamp in µs, compared for equality,
+    fixed that but gave EPERM for root's processes, so a wrapper under sudo looked dead.
 
 The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
 checked (`LOCAL_PEERCRED`). A peer that closes before its answer (a wrapper whose call timed out)
@@ -234,8 +238,8 @@ ends them), sends use `MSG_NOSIGNAL`, and a client XNU refuses
   (local and Depot, small, native, paused, stalled, passed heads, starving heads, simulators), plus
   memory readings, guard snapshots and configs. Each one runs through sched.py's own five functions.
   `record` reads the live state and readings without writing anything. The fixtures carry the boot
-  time, the reaper's own group and the processes' start stamps (some a pid or group reused since,
-  some unreadable, some entries from before `pid_start_us`), and `child_pgid` takes odd values too: negative, 0, 1, `true`,
+  time, the reaper's own group and the processes' `p_uniqueid` (some a pid or group reused since,
+  some unreadable, some entries from before `pid_uid`, some uids no Int64 holds or of another type), and `child_pgid` takes odd values too: negative, 0, 1, `true`,
   2**40, a string, the reaper's own group.
 - `acc-cored sched-replay` runs the native pass on every fixture. The state, the admissions and the
   signals sent must match.
@@ -247,8 +251,8 @@ ends them), sends use `MSG_NOSIGNAL`, and a client XNU refuses
 Results on 2026-10-10:
 - fuzz: 10,500 of 10,500 fixtures identical (again after the review fixes, 2026-10-11), and
   12,000 of 12,000 with the reboot and own-group rules (seeds 7 and 11, Python 3.14), and again
-  12,000 of 12,000 with the start-stamp identity (seed 7: 3,966 live wrappers whose pid is
-  another process now, 775 reused groups, 745 expected signals);
+  12,000 of 12,000 with the `p_uniqueid` identity (seed 7: 3,463 live wrappers whose pid is another
+  process now, 3,098 odd uids, 645 reused groups, 685 expected signals);
 - live: 10 of 10 recorded passes identical (6 on 2026-10-10, 4 on 2026-10-11, one job running).
 
 ### Cost

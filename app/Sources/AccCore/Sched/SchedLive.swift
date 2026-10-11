@@ -75,7 +75,7 @@ public final class LiveSchedProbes: SchedProbes {
 
     public func ownGroup() -> pid_t { getpgrp() }
 
-    public func startMicros(_ pid: pid_t) -> Int? { SchedNative.startMicros(pid) }
+    public func uniqueID(_ pid: pid_t) -> Int? { SchedNative.uniqueID(pid) }
 
     public func day() -> String {
         var t = time_t(now)
@@ -156,9 +156,13 @@ public enum SchedNative {
         return sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 ? Double(tv.tv_sec) : 0
     }
 
-    /// The process's start stamp in µs (pbi_start_tvsec, pbi_start_tvusec), nil when it's gone
-    public static func startMicros(_ pid: pid_t) -> Int? {
-        bsd(pid).map { Int($0.pbi_start_tvsec) * 1_000_000 + Int($0.pbi_start_tvusec) }
+    /// The process's p_uniqueid (PROC_PIDUNIQIDENTIFIERINFO), nil when it's gone. The SDK doesn't
+    /// export struct proc_uniqidentifierinfo: p_uuid[16], then p_uniqueid (u64), 56 bytes in all
+    public static func uniqueID(_ pid: pid_t) -> Int? {
+        var buf = [UInt8](repeating: 0, count: 56)
+        let got = buf.withUnsafeMutableBytes { proc_pidinfo(pid, 17, 0, $0.baseAddress, 56) }
+        guard got == 56 else { return nil }
+        return Int(exactly: buf.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 16, as: UInt64.self) })
     }
 
     static func bsd(_ pid: pid_t) -> proc_bsdinfo? {
