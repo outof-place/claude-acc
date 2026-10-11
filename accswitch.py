@@ -337,9 +337,11 @@ def kc_read_many(keys, batch=8):
                     proc.wait()
 
 
-# `security -i` czyta polecenie przez fgets do bufora 4096 bajtów: dłuższa linia idzie dalej jako drugie
-# polecenie, a pierwsze zapisałoby ucięty sekret (zmierzone na /usr/bin/security, macOS 27)
-SECURITY_LINE_MAX = 4095
+# `security -i` czyta polecenie przez fgets do bufora 4096 bajtów, czyli 4095 znaków: dłuższa linia idzie
+# dalej jako drugie polecenie, a pierwsze zapisałoby ucięty sekret (zmierzone na /usr/bin/security,
+# macOS 27). Linia dokładnie 4095 + `\n` wchodzi cała, ale `\n` zostaje na puste polecenie z kodem 0,
+# a `security -i` kończy się kodem OSTATNIEGO polecenia: nieudany zapis wyglądałby na udany
+SECURITY_LINE_MAX = 4094
 
 
 def kc_write(service, account, contents, timeout=30):
@@ -368,7 +370,8 @@ def kc_write(service, account, contents, timeout=30):
     # Linia rozcięta mimo limitu (mniejszy bufor niż zmierzony) puściłaby resztę jako polecenie,
     # które `security` nazywa na stderr: znika też każdy ciąg szesnastkowy od 16 znaków
     error = re.sub(r"[0-9a-fA-F]{16,}", "<hex>", (r.stderr or "").replace(secret, "<sekret>")).strip()
-    if r.returncode != 0 or "error" in error.lower():
+    # nieudane polecenie `security -i` pisze "<polecenie>: returned <kod>" (bez słowa "error")
+    if r.returncode != 0 or "error" in error.lower() or ": returned " in error:
         raise RuntimeError(f"zapis do Keychain nieudany ({service}): {error[:200]}")
     _KC_SEEN[(service, account)] = contents
 

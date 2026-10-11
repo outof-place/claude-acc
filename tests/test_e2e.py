@@ -1235,14 +1235,16 @@ class KeychainMemoTest(unittest.TestCase):
 
     def test_a_write_one_security_i_line_cannot_carry_goes_through_argv_and_says_so(self):
         # `security -i` reads 4095 bytes per command: a longer line would run on as a second
-        # command after a first one that writes a cut secret (the fake splits the same way)
+        # command after a first one that writes a cut secret (the fake splits the same way), and a
+        # line of exactly 4095 leaves its newline as an empty command whose rc 0 hides a failure
         token = uuid.uuid4().hex
         argv_log = os.path.join(self.w.fake, "security-argv.log")
-        cases = [  # 43 + 2 * 2026 = 4095: the longest line `security -i` reads whole
-            ("svc", "u", (token * 64)[:2026], "-i"),
+        cases = [  # 44 + 2 * 2025 = 4094: the longest line sent through stdin
+            ("svc", "uu", (token * 64)[:2025], "-i"),
+            ("svc", "u", (token * 64)[:2026], "add-generic-password"),  # 4095 bytes
             ("svc", "uu", (token * 64)[:2026], "add-generic-password"),  # 4096 bytes
             ("svc", "u", (token * 64)[:2027], "add-generic-password"),
-            ("svc", "\u0142", (token * 64)[:2026], "add-generic-password"),  # 4095 characters, 4096 bytes
+            ("svc", "\u0142u", (token * 64)[:2025], "add-generic-password"),  # 4094 characters, 4095 bytes
             ('s"vc', "u", token, "add-generic-password"),  # a quote the line can't carry
         ]
         for service, account, secret, via in cases:
@@ -1256,8 +1258,21 @@ class KeychainMemoTest(unittest.TestCase):
                 self.assertEqual(self.acc.kc_peek(service, account), secret)
         with open(os.path.join(self.w.state_dir, "switch.log")) as f:
             logged = f.read()
-        self.assertEqual(logged.count("w argumentach `security`"), 4)
+        self.assertEqual(logged.count("w argumentach `security`"), 5)
         self.assertNotIn(token, logged)
+
+    def test_a_failed_write_at_the_line_limit_raises(self):
+        os.environ["FAKE_FAIL_WRITE_SERVICE"] = "svc"
+        secret = (uuid.uuid4().hex * 64)[:2025]  # 4094 bytes: through stdin
+        with self.assertRaises(RuntimeError) as caught:
+            self.acc.kc_write("svc", "uu", secret)
+        self.assertIn("returned 1", str(caught.exception))
+        # one byte more over stdin (a limit of 4095): the newline runs as an empty command, `security`
+        # exits 0, and only "returned" on stderr tells the failure
+        with mock.patch.object(self.acc, "SECURITY_LINE_MAX", 4095), self.assertRaises(RuntimeError):
+            self.acc.kc_write("svc", "u", (secret + "x")[:2026])
+        with open(os.path.join(self.w.fake, "security-argv.log")) as f:
+            self.assertEqual(f.read().splitlines()[-1], "-i")
 
     def test_a_cut_line_leaves_no_piece_of_the_secret_in_the_error(self):
         # should a line be cut anyway (a smaller buffer than measured), its rest runs as a command,

@@ -60,10 +60,14 @@ def lines(data):
 
 
 if sys.argv[1] == "-i":
-    # tryb interaktywny: polecenia z stdin, linia po linii, jak `security -i`
+    # tryb interaktywny: polecenia z stdin, linia po linii, jak `security -i`. Jak prawdziwe: kod wyjścia
+    # to kod OSTATNIEGO polecenia (pusta linia to polecenie z kodem 0), a nieudane pisze na stderr
+    # "<polecenie>: returned <kod>"
     code = 0
     for line in lines(sys.stdin.buffer.read()):
-        if line.strip():
-            code = run(shlex.split(line)) or code
+        args = shlex.split(line) if line.strip() else []
+        code = run(args) if args else 0
+        if code:
+            print(f"{args[0]}: returned {code}", file=sys.stderr)
     sys.exit(code)
 sys.exit(run(sys.argv[1:]))
