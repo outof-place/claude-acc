@@ -457,8 +457,10 @@ class BrakeChooseTest(unittest.TestCase):
         table = {101: (1, CLAUDE), 104: (1, "/usr/local/bin/some-daemon"), 105: (104, "node worker.js")}
         stale = {"id": "j-1", "pid": 103, "child_pgid": 104, "cmd": "pnpm sm capture"}
         self.assertIsNone(lr.choose(table, lambda pid: 3 * GB, lambda pid: 600, jobs=[stale]))
-        # ani wpis bez pidu wrappera
-        self.assertIsNone(lr.choose(table, lambda pid: 3 * GB, lambda pid: 600, jobs=[{"child_pgid": 104}]))
+        # ani wpis bez pidu wrappera, ani zepsuty (launchd jako wrapper pasowałby do każdej sieroty)
+        for bad in (None, 1, True, 0, -1, "103"):
+            job = {"child_pgid": 104} if bad is None else {"pid": bad, "child_pgid": 104}
+            self.assertIsNone(lr.choose(table, lambda pid: 3 * GB, lambda pid: 600, jobs=[job]), bad)
         # żywy wrapper, którego powłoka to wciąż jego dziecko: job jak zawsze
         live = {**table, 103: (101, "python acc.py sched run"), 104: (103, SCHED_SHELL)}
         self.assertEqual(lr.choose(live, lambda pid: 3 * GB, lambda pid: 600, jobs=[stale])[0], "job")

@@ -248,7 +248,8 @@ def choose(table, size_of, age_of, skip=(), owned=lambda pid: False, level=2, jo
         # to wciąż powłoka tego joba tylko, gdy jej rodzicem jest wrapper z wpisu: wpis po martwym
         # wrapperze zostaje w state.json do reapu, a pid jego powłoki bywa już obcym procesem
         # (pidy zawijają się co ~25 minut), którego dzieci hamulec wziąłby za job od stopnia 2
-        if not job.get("pid") or table[shell][0] != job["pid"]:
+        wrapper = job.get("pid")
+        if not isinstance(wrapper, int) or isinstance(wrapper, bool) or wrapper <= 1 or table[shell][0] != wrapper:
             continue
         roots = [c for c in children.get(shell, []) if c not in skip]
         tree = []
