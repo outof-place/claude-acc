@@ -197,6 +197,8 @@ class KeychainWriteUnitTest(unittest.TestCase):
         for cache in (accswitch._KC_SEEN, accswitch._TOOLS):
             cache.clear()
             self.addCleanup(cache.clear)
+        # these tests write and time out writes: never through the real `security` (login keychain)
+        self.assertEqual(accswitch.tool("security"), os.path.join(HERE, "fakes", "security"))
 
     def test_a_write_that_times_out_says_nothing_of_the_secret(self):
         self.w.write()
