@@ -996,6 +996,8 @@ def cap_spots(pattern):
             link = os.path.islink(path)
             if not link and not os.path.isdir(path):
                 continue
+            if link and os.path.exists(path) and not os.path.isdir(path):
+                continue  # dowiązanie do pliku: nic pod nim nie powstanie (wiszące może być katalogiem)
             # realpath tylko dla dowiązań (w 3.9 to czysty Python i dominował koszt spaceru)
             real = os.path.realpath(path) if link or name in (".", "..") else os.path.join(base_real, os.path.basename(path))
             if covered(real):
