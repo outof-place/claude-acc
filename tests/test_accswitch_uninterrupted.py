@@ -4,8 +4,9 @@ tokenu: serwer karze jego ponowne użycie unieważnieniem całego konta (wylogow
 Atrapy curl i security mają po dwa punkty na wywołanie (start i chwila tuż przed odpowiedzią).
 Test przerywa tick po kolei w każdym z nich, potem puszcza zwykły tick i sprawdza, że serwer
 nie dostał zużytego tokenu, a każda kopia konta trzyma token, który serwer jeszcze przyjmuje.
-Kontrola: SIGKILL (którego ani launchd, ani acc-cored tickowi nie wysyłają) między odpowiedzią
-serwera a zapisem do Pęku kluczy naprawdę zostawia zużyty token, więc test widzi, co ma widzieć.
+Kontrola: SIGKILL (acc-cored tickowi go nie wysyła, launchd dopiero po ExitTimeOut 90 s) między
+odpowiedzią serwera a zapisem do Pęku kluczy naprawdę zostawia zużyty token, więc test widzi, co
+ma widzieć.
 
 Świat z tests/test_e2e.py (atrapy Pęku kluczy i API, osobny $HOME), prawdziwy accswitch.py.
 Punkty idą po 4 naraz (każdy w swoim $HOME): po kolei cały przegląd trwał 3,5 minuty.

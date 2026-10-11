@@ -248,6 +248,50 @@ func switchClockAndOffsets() {
     #expect(ISODate.epoch("1970-01-01T01:00:00+0100") == 0)
 }
 
+@Test("engine: a check is a tick that got the lock and ended with 0; a held lock, a crash or a failed start isn't")
+func switchEngineChecks() throws {
+    let (home, dir) = try switchHome("checks")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let now = Kernel.wall()
+    writeState(dir, state(lastTick: now - 100, quiet: false))  // not quiet: every slot runs
+    let engine = SwitchEngine(.init(home: home, python: ["/nonexistent/python"]))
+    engine.resolver = { nil }
+    final class Tick: @unchecked Sendable { var rc: Int32 = 0; var locked = true; var at = 0.0 }
+    let tick = Tick()
+    tick.at = now - 100
+    engine.runner = { _, _ in
+        if tick.locked {  // it got the lock: its first write is last_tick
+            tick.at += 1
+            writeState(dir, state(lastTick: tick.at, quiet: false))
+        }
+        return tick.rc
+    }
+    let sentinel = 1_000.0
+    for (rc, locked) in [(Int32(0), false), (1, true), (134, true), (137, true)] {
+        tick.rc = rc
+        tick.locked = locked
+        engine.queue.sync {
+            engine.lastHealthy = sentinel
+            engine.slotFired()
+        }
+        let record = Files.json(dir + "/accswitch-slot.json", fallback: .null)
+        #expect(record["ran"]?.truthy == true && record["rc"]?.double == Double(rc))
+        #expect(record["checked_at"]?.double == sentinel, "rc \(rc), lock taken: \(locked)")
+    }
+    tick.rc = 0
+    tick.locked = true
+    engine.queue.sync { engine.slotFired() }
+    let record = Files.json(dir + "/accswitch-slot.json", fallback: .null)
+    #expect(record["checked_at"]?.double == record["at"]?.double)
+
+    // a start that fails, slot after slot: one log line, not one per slot
+    engine.runner = nil
+    for _ in 0..<3 { engine.queue.sync { engine.slotFired() } }
+    let log = String(decoding: Files.read(dir + "/launchd.log") ?? [], as: UTF8.self)
+    #expect(log.components(separatedBy: "the tick didn't start").count == 2)
+    engine.stop()
+}
+
 @Test("engine: a tick that doesn't start is a tried slot, not a check: the switcher goes silent; ping never waits")
 func switchEngineDeadTick() throws {
     let (home, dir) = try switchHome("dead")

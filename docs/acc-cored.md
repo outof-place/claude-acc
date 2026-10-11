@@ -400,9 +400,10 @@ the writes fit in it):
 
 Every slot writes `accswitch-slot.json`: `at`, whether it `ran` the tick and why (`reasons`), the
 tick's exit code (`rc`) and time (`tick_s`), the counts, and `checked_at`: the last slot that was a
-check, i.e. a skip or a tick that ended with 0. A tick that didn't start (rc 127, with a line in
-`launchd.log`) or crashed is tried, not checked. The tick's output goes to `launchd.log`, as with
-launchd. `ping` returns the counts, the last slot and how long a running tick has run, without
+check, i.e. a skip or a tick that got the lock (a new `last_tick`) and ended with 0. A tick that
+didn't start (rc 127, with one line in `launchd.log` until a tick starts again), crashed, or found
+the lock held (a hung `claude-acc status`, say: the tick returns 0 then) is tried, not checked.
+The tick's output goes to `launchd.log`, as with launchd. `ping` returns the counts, the last slot and how long a running tick has run, without
 waiting for the engine's queue (an `orcahost.py` lookup may hold it).
 
 A skipped slot also names the `status.json` it vouches for (`status_at`, its `generated_at`):

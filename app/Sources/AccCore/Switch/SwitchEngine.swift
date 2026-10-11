@@ -9,17 +9,18 @@
 // acc-cored never reads, refreshes or copies credentials: the tick stays Python's, and the
 // Keychain is only a file stamp here.
 //
-// Nothing here ever signals a tick, as launchd never does: a tick killed between a token refresh
-// and its Keychain write leaves a used refresh token behind, and the server answers its reuse by
-// revoking the account. The tick leads a group of its own (it outlives acc-cored, launchd reaps
+// Nothing here ever signals a tick: a tick killed between a token refresh and its Keychain write
+// leaves a used refresh token behind, and the server answers its reuse by revoking the account
+// (launchd's SIGTERM at a bootout waits out that stretch: `uninterrupted`, ExitTimeOut 90 s). The tick leads a group of its own (it outlives acc-cored, launchd reaps
 // it then), and its timeout is cooperative: `ACC_TICK_DEADLINE` tells it when to stop starting
 // work, and it starts a refresh only with time left to finish it (accswitch.py `in_time`).
 // The next slot is scheduled when the tick ends, so two never overlap.
 //
 // Every slot leaves a record in accswitch-slot.json: whether it ran the tick and why, the tick's
 // exit code and time, and `checked_at`, the last slot that was a check: a skip, or a tick that
-// ended with 0 (a tick that didn't start or crashed isn't one, so a dead switcher still goes
-// "silent"). A skipped slot also names the status.json it vouches for (one the latest tick
+// got the lock (a new last_tick) and ended with 0. A tick that didn't start, crashed, or found the
+// lock held (by a hung `claude-acc status`, say: it returns 0 without a tick) isn't one, so a dead
+// switcher still goes "silent". A skipped slot also names the status.json it vouches for (one the latest tick
 // wrote): nothing a tick reads changed since that snapshot, so the menu bar counts it fresh.
 //
 // Shadow mode runs nothing. It watches launchd's own ticks and records, for each, whether this
@@ -73,6 +74,8 @@ public final class SwitchEngine: @unchecked Sendable {
     var running: Running?
     /// the last slot that was a check (a skip, or a tick that ended with 0)
     var lastHealthy: Double?
+    /// "the tick didn't start" is logged once until a tick starts again, not at every slot
+    var startFailLogged = false
     var hostFailureLogged = false
     /// what `ping` reads, without waiting for the engine's queue (an orcahost lookup may hold it)
     struct Published: Sendable {
@@ -231,7 +234,7 @@ public final class SwitchEngine: @unchecked Sendable {
         pending = []
         guard decision.run else {
             skips += 1
-            record(ran: false, reasons: [], rc: nil, seconds: nil)
+            record(ran: false, reasons: [], rc: nil, seconds: nil, checked: true)
             scheduleSlot()
             return
         }
@@ -250,13 +253,17 @@ public final class SwitchEngine: @unchecked Sendable {
         }
         guard let pid = Spawn.start(argv, env: env, log: stateDir + "/launchd.log", ownGroup: true) else {
             // a tried slot that isn't a check: the menu bar says "silent" as it did under launchd
-            Files.append(stateDir + "/launchd.log", "acc-cored: accswitch: the tick didn't start (\(argv[0]))\n")
+            if !startFailLogged {
+                Files.append(stateDir + "/launchd.log", "acc-cored: accswitch: the tick didn't start (\(argv[0]))\n")
+                startFailLogged = true
+            }
             pending = ["the tick didn't start"]
             runs += 1
-            record(ran: true, reasons: run.reasons, rc: 127, seconds: nil)
+            record(ran: true, reasons: run.reasons, rc: 127, seconds: nil, checked: false)
             scheduleSlot()
             return
         }
+        startFailLogged = false
         var started = run
         started.pid = pid
         running = started
@@ -265,7 +272,8 @@ public final class SwitchEngine: @unchecked Sendable {
             var status: Int32 = 0
             while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
             let rc = status & 0x7f == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f)
-            self?.queue.async { self?.tickEnded(rc) }
+            guard let engine = self else { return }
+            engine.queue.async { [weak engine] in engine?.tickEnded(rc) }
         }
     }
 
@@ -279,7 +287,8 @@ public final class SwitchEngine: @unchecked Sendable {
         runs += 1
         let after = stamps()
         let lastTick = Files.json(stateDir + "/state.json", fallback: .null)["last_tick"]?.double ?? 0
-        if lastTick > run.lastTick {
+        let ticked = lastTick > run.lastTick
+        if ticked {
             // it ran (its first write is last_tick): what others wrote meanwhile isn't in its result,
             // so a change to another input arms the next slot, which settles after one more tick
             pending = Set(after.keys).union(run.before.keys)
@@ -289,14 +298,16 @@ public final class SwitchEngine: @unchecked Sendable {
         }
         // without a new last_tick the tick didn't get the lock: the old baseline keeps what was due
         if rc != 0 && rc != 1 { pending.append("the tick ended with \(rc)") }
-        record(ran: true, reasons: run.reasons, rc: rc, seconds: Kernel.wall() - run.started)
+        // a check only with the lock taken: a tick that found it held returns 0 without ticking
+        // (another ticker moves last_tick itself, so nothing is lost)
+        record(ran: true, reasons: run.reasons, rc: rc, seconds: Kernel.wall() - run.started, checked: rc == 0 && ticked)
         scheduleSlot()
     }
 
     /// accswitch-slot.json: this slot, the last check, and for a skipped one the status.json it vouches for.
-    func record(ran: Bool, reasons: [String], rc: Int32?, seconds: Double?) {
+    func record(ran: Bool, reasons: [String], rc: Int32?, seconds: Double?, checked: Bool) {
         let now = Kernel.wall().rounded()
-        if ran ? rc == 0 : rc == nil { lastHealthy = now }
+        if checked { lastHealthy = now }
         var statusAt: Double?
         if !ran {
             // only the latest tick's snapshot: a tick that didn't get to write it left an older one

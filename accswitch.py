@@ -277,7 +277,8 @@ def tool(name):
     """Pełna ścieżka narzędzia z PATH, szukana raz na przebieg. Z pełną ścieżką i bez
     close_fds subprocess startuje proces przez posix_spawn zamiast forka interpretera:
     około 2 ms mniej na wywołanie (zmierzone 10,8 -> 8,9 ms). Deskryptorów Pythona dziecko
-    i tak nie dziedziczy (PEP 446), więc blokada przebiegu zostaje w tym procesie."""
+    i tak nie dziedziczy (PEP 446), więc blokada przebiegu zostaje w tym procesie. Wewnątrz
+    `uninterrupted` (start_new_session) subprocess wraca do forka: te ~2 ms na wywołanie."""
     if name not in _TOOLS:
         _TOOLS[name] = shutil.which(name) or name
     return _TOOLS[name]
