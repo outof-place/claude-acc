@@ -1981,6 +1981,37 @@ class StateTest(Paths):
         self.assertIsNone(sleeper.poll())
         self.assertEqual([S.group_id(v) for v in bad + [sleeper.pid]], [None] * len(bad) + [sleeper.pid])
 
+    def test_reap_spares_entries_from_before_the_boot_and_its_own_group(self):
+        # po restarcie Maca pid i grupa starego wpisu należą do obcych procesów; własnej grupy
+        # sprzątający nie rusza; ponad pid_t group_id daje None, a nie OverflowError z os.kill
+        sleepers = [subprocess.Popen(["sleep", "30"], preexec_fn=os.setpgrp) for _ in range(2)]
+        for p in sleepers:
+            self.addCleanup(lambda p=p: p.poll() is None and p.kill())
+        old, own = sleepers
+        boot = S.boot_time()
+        self.assertTrue(0 < boot < time.time())
+        st = self.state()
+        st["running"] = [
+            {"id": "stale", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": boot - 60},
+            {"id": "stale-alive", "where": "local", "pid": os.getpid(), "started_at": boot - 60},
+            {"id": "own", "where": "local", "pid": 999999, "child_pgid": own.pid, "started_at": time.time()},
+            {"id": "wide", "where": "local", "pid": 999999, "child_pgid": 2**40, "started_at": time.time()},
+        ]  # fmt: skip
+        st["queue"] = [{"id": "q-stale", "pid": os.getpid(), "enqueued_at": boot - 1},
+                       {"id": "q-live", "pid": os.getpid(), "enqueued_at": time.time()}]  # fmt: skip
+        with mock.patch.object(S.os, "getpgrp", return_value=own.pid), mock.patch.object(S.os, "killpg") as killpg:
+            S.reap(st)
+        killpg.assert_not_called()
+        self.assertEqual(st["running"], [])
+        self.assertEqual([j["id"] for j in st["queue"]], ["q-live"])
+        self.assertEqual([S.group_id(v) for v in (2**40, 2**31, 2**31 - 1)], [None, None, 2**31 - 1])
+        # ten sam wpis z tego startu dostaje sygnał: chroniła go reguła startu, nie co innego
+        st["running"] = [{"id": "orphan", "where": "local", "pid": 999999, "child_pgid": old.pid,
+                          "started_at": time.time()}]  # fmt: skip
+        S.reap(st)
+        self.assertIsNotNone(old.wait(timeout=5))
+        self.assertIsNone(own.poll())
+
 
 FAKE_DEPOT_API = r"""#!%s
 # podróbka CLI Depot dla `sched.py depot`: odpowiedzi z $FAKE_DEPOT_DATA, wywołania do $FAKE_DEPOT_CALLS

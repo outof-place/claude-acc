@@ -23,6 +23,10 @@ public protocol SchedProbes: AnyObject {
     func descendants(_ pid: pid_t) -> Set<pid_t>
     /// os.killpg, errors ignored (the group comes through Sched.groupID)
     func killpg(_ pgid: pid_t, _ signal: Int32) -> Bool
+    /// boot_time(): kern.boottime in seconds, 0 when unknown
+    func bootTime() -> Double
+    /// os.getpgrp(): the reaper's own process group
+    func ownGroup() -> pid_t
     /// time.strftime("%Y-%m-%d") at `now`
     func day() -> String
 }
@@ -82,6 +86,17 @@ public enum Sched {
         return pid_t(n)
     }
 
+    /// stale(job, key, boot): an entry from before this boot (its time in `key`)
+    static func stale(_ job: PyJSON, _ key: String, _ boot: Double) -> Bool {
+        let at: Double
+        switch job[key] {
+        case .int(let i)?: at = Double(i)
+        case .double(let d)?: at = d
+        default: return false
+        }
+        return at > 0 && at < boot
+    }
+
     public static let GB = 1_073_741_824.0
     public static let stageText = ["normal", "tight", "brake", "emergency"]
     public static let longLivedFamilies = ["dev", "metro", "watchers", "simulators", "headless", "lsp", "docker"]
@@ -99,18 +114,20 @@ public enum Sched {
 
     /// reap(state): entries of dead wrappers go; their orphaned job gets SIGCONT, SIGTERM
     public static func reap(_ state: inout PyObject, _ probes: SchedProbes) {
+        let boot = probes.bootTime()
         var keep: [PyJSON] = []
         for job in state["running"]?.array ?? [] {
+            if stale(job, "started_at", boot) { continue }  // from before a reboot: no signal to anyone
             if probes.alive(job["pid"]) {
                 keep.append(job)
                 continue
             }
-            if let g = Sched.groupID(job["child_pgid"]), probes.alive(.int(Int(g))) {
+            if let g = Sched.groupID(job["child_pgid"]), g != probes.ownGroup(), probes.alive(.int(Int(g))) {
                 for sig in [SIGCONT, SIGTERM] { _ = probes.killpg(g, sig) }
             }
         }
         state["running"] = .array(keep)
-        state["queue"] = .array((state["queue"]?.array ?? []).filter { probes.alive($0["pid"]) })
+        state["queue"] = .array((state["queue"]?.array ?? []).filter { !stale($0, "enqueued_at", boot) && probes.alive($0["pid"]) })
     }
 
     /// reserve_target(job, now)

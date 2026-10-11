@@ -36,7 +36,7 @@ def serve(S, fixture):
     now = fixture["now"]
     kills = []
     real = (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-            S.time.strftime, S.DEVGUARD_CONFIG)  # fmt: skip
+            S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp)  # fmt: skip
     alive = set(fixture["alive"])
     desc = {int(k): set(v) for k, v in fixture.get("descendants", {}).items()}
     tmp = None
@@ -58,6 +58,8 @@ def serve(S, fixture):
                 raise OSError("no such group")
 
         S.os.killpg = killpg
+        S.boot_time = lambda: fixture.get("boottime", 0.0)
+        S.os.getpgrp = lambda: fixture.get("pgrp", -1)
         S.time.time = lambda: now
         S.time.strftime = lambda fmt, *a: (
             fixture["day"] if fmt == "%Y-%m-%d" and not a else real[7](fmt, *a)
@@ -79,7 +81,7 @@ def serve(S, fixture):
         S.update_queue_view(state, cfg)
     finally:
         (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-         S.time.strftime, S.DEVGUARD_CONFIG) = real  # fmt: skip
+         S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp) = real  # fmt: skip
         if tmp:
             os.unlink(tmp.name)
     return {
@@ -111,7 +113,7 @@ def record(src, ticks, every, out):
                 "native_scan": {"gb": scan["gb"], "active": scan["active"], "pids": sorted(scan["pids"])},
                 "alive": sorted(p for p in pids if S.alive(p)),
                 "descendants": {str(j["pid"]): sorted(S.descendants(j["pid"])) for j in state["running"] if j.get("pid")},
-                "max_server_gb": max_server,
+                "max_server_gb": max_server, "boottime": S.boot_time(), "pgrp": os.getpgrp(),
             }  # fmt: skip
             fixture["expect"] = serve(S, fixture)
             f.write(json.dumps(fixture, ensure_ascii=False) + "\n")
@@ -148,7 +150,7 @@ def fuzz_fixture(rng):
             j.update(where=rng.choice(["local", "local", "local", "depot"]), started_at=now - rng.random() * 2400,
                      mem_now_gb=rng.choice([0.0, round(rng.random() * 8, 2)]), mem_peak_gb=round(rng.random() * 9, 2),
                      paused=rng.random() < 0.15, stalled_s=rng.choice([None, None, None, 650]),
-                     child_pgid=rng.choice([None, next(pid)]))  # fmt: skip
+                     child_pgid=rng.choice([None, next(pid), next(pid), -next(pid), 0, 1, True, 2**40, "77"]))  # fmt: skip
             if rng.random() < 0.2:
                 j["native_done"] = True
             if rng.random() < 0.2:
@@ -161,8 +163,10 @@ def fuzz_fixture(rng):
         if queue and rng.random() < 0.3:
             r["passed"] = rng.choice(queue)["id"]
     alive = [j["pid"] for j in running + queue if rng.random() < 0.9] + [
-        r["child_pgid"] for r in running if r.get("child_pgid") and rng.random() < 0.7
+        abs(r["child_pgid"]) if isinstance(r.get("child_pgid"), int) and not isinstance(r.get("child_pgid"), bool) else r.get("child_pgid")
+        for r in running if r.get("child_pgid") and rng.random() < 0.7
     ]
+    groups = [r["child_pgid"] for r in running if isinstance(r.get("child_pgid"), int) and not isinstance(r.get("child_pgid"), bool)]
     ram = rng.choice([16.0, 24.0, 48.0, 64.0])
     state = {
         "version": 1, "updated_at": now - 1, "idle_since": None, "host": {"ram_gb": ram},
@@ -207,6 +211,8 @@ def fuzz_fixture(rng):
         "snapshot": snapshot, "native_scan": {"gb": round(rng.random() * 9, 3), "active": rng.random() < 0.3, "pids": scan_pids},
         "alive": alive, "descendants": {str(r["pid"]): [r["pid"]] + scan_pids[:1] for r in running if rng.random() < 0.5},
         "max_server_gb": rng.choice([None, 4, 5.5]), "killpg_fails": rng.random() < 0.1,
+        # entries from before a reboot, and a job's group that is the reaper's own
+        "boottime": rng.choice([0.0, now - 1e6, now - rng.random() * 2400]), "pgrp": rng.choice([-1, -1] + groups),
     }  # fmt: skip
 
 

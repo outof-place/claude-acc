@@ -2574,15 +2574,40 @@ def save_cache(cache):
     os.replace(tmp, CACHE_PATH)
 
 
+def boot_time():
+    """Chwila startu systemu (kern.boottime, sekundy); 0, gdy jądro nie odpowie."""
+    if not _BOOT:
+        k = kernel()
+        tv = (k.ctypes.c_int64 * 2)()
+        size = k.ctypes.c_size_t(k.ctypes.sizeof(tv))
+        ok = k.libc.sysctlbyname(b"kern.boottime", tv, k.ctypes.byref(size), None, 0) == 0
+        _BOOT.append(float(tv[0]) if ok else 0.0)
+    return _BOOT[0]
+
+
+_BOOT = []
+
+
+def stale(job, key, boot):
+    """Wpis sprzed startu systemu (czas w `key`): jego pid i grupa należą dziś do obcych procesów."""
+    at = job.get(key)
+    return isinstance(at, (int, float)) and not isinstance(at, bool) and 0 < at < boot
+
+
 def reap(state):
-    """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM."""
+    """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM. Wpis sprzed
+    restartu Maca znika bez sygnałów: nikt z niego nie żyje, a jego pid i grupa są dziś czyjeś.
+    Własnej grupy procesów sprzątający nie dotyka."""
+    boot = boot_time()
     keep = []
     for job in state["running"]:
+        if stale(job, "started_at", boot):
+            continue
         if alive(job.get("pid")):
             keep.append(job)
             continue
         pgid = group_id(job.get("child_pgid"))
-        if pgid and alive(pgid):
+        if pgid and pgid != os.getpgrp() and alive(pgid):
             import signal
 
             for sig in (signal.SIGCONT, signal.SIGTERM):
@@ -2591,7 +2616,7 @@ def reap(state):
                 except OSError:
                     pass
     state["running"] = keep
-    state["queue"] = [j for j in state["queue"] if alive(j.get("pid"))]
+    state["queue"] = [j for j in state["queue"] if not stale(j, "enqueued_at", boot) and alive(j.get("pid"))]
 
 
 # rezerwa po rozgrzewce: job, który przebiegł max(60 s, połowę prognozy czasu), najwyżej 300 s,
@@ -4744,8 +4769,10 @@ def signal_job(job, sig):
 
 def group_id(value):
     """child_pgid ze stanu jako grupa procesów albo None. killpg(-N) to kill(N), killpg(0) to własna
-    grupa, a 1 to launchd: stan, który pisze też inny proces, nie może wskazać obcego."""
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 1 else None
+    grupa, a 1 to launchd: stan, który pisze też inny proces, nie może wskazać obcego. Ponad pid_t
+    (2**31 - 1) os.killpg rzuca OverflowError, a nie OSError: przebieg by padł."""
+    ok = isinstance(value, int) and not isinstance(value, bool) and 1 < value < 2**31
+    return value if ok else None
 
 
 def kill_child(job):

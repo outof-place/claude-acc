@@ -8,6 +8,7 @@ changed. Build first:
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 BUILT = os.path.join(ROOT, "app/.build/release/acc-cored")
 needs_binary = unittest.skipUnless(os.access(BUILT, os.X_OK), "no app/.build/release/acc-cored")
+
+
+def python_312():
+    """An interpreter of 3.12 or newer, as the live sched.py runs on: from 3.12 `sum()` of floats is
+    compensated, and acc-cored mirrors that (on 3.9, 0.17 + 4.49 + 2.395 rounds to 7.05, not 7.06)."""
+    if sys.version_info >= (3, 12):
+        return sys.executable
+    for name in ("python3.14", "python3.13", "python3.12", "python3"):
+        path = shutil.which(name)
+        if path and subprocess.run([path, "-I", "-c", "import sys; sys.exit(sys.version_info < (3, 12))"]).returncode == 0:
+            return path
+    return None
 
 
 @needs_binary
@@ -60,10 +73,13 @@ class GuardReplayTest(unittest.TestCase):
 @needs_binary
 class SchedReplayTest(unittest.TestCase):
     def test_fuzzed_passes_match_python(self):
+        python = python_312()
+        if python is None:
+            self.skipTest("no Python 3.12 or newer, whose sum() of floats acc-cored mirrors")
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "sched.jsonl")
             made = subprocess.run(
-                [sys.executable, "-I", os.path.join(HERE, "acc_cored", "sched_replay.py"), "fuzz", ROOT, "--n", "300",
+                [python, "-I", os.path.join(HERE, "acc_cored", "sched_replay.py"), "fuzz", ROOT, "--n", "300",
                  "--seed", "7", "--out", out],
                 capture_output=True, text=True,
             )  # fmt: skip

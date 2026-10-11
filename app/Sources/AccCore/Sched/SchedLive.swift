@@ -71,6 +71,14 @@ public final class LiveSchedProbes: SchedProbes {
 
     public func killpg(_ pgid: pid_t, _ signal: Int32) -> Bool { Darwin.killpg(pgid, signal) == 0 }
 
+    public func bootTime() -> Double {
+        var tv = timeval()
+        var size = MemoryLayout<timeval>.size
+        return sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 ? Double(tv.tv_sec) : 0
+    }
+
+    public func ownGroup() -> pid_t { getpgrp() }
+
     public func day() -> String {
         var t = time_t(now)
         var tm = tm()

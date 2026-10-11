@@ -62,6 +62,68 @@ func wakeTargets() throws {
     #expect(sent.pids == [idle])
 }
 
+@Test("with every pid reading as a wrapper, only a pid above 1 and within pid_t is signalled")
+func wakeGuardsAlone() {
+    let entry = { (id: String, pid: PyJSON) in PyObject([("id", .string(id)), ("pid", pid), ("wake", "usr1")]) }
+    let queued = [
+        entry("minus-one", .int(-1)), entry("zero", .int(0)), entry("one", .int(1)), entry("bool", .bool(true)),
+        entry("float", .double(4242)), entry("string", "4242"), entry("wide", .int(Int(Int32.max) + 1)),
+        entry("raw", .raw("100000000000000000000")), entry("ok", .int(4242)), entry("max", .int(Int(Int32.max))),
+    ]
+    final class Sent: @unchecked Sendable { var pids: [pid_t] = [] }
+    let sent = Sent()
+    // no signal leaves the test: the guard alone has to stop the bad pids, not is_wrapper
+    let n = SchedEngine.wake(queued, admitted: Set(queued.map { $0["id"] ?? .null }), isWrapper: { _ in true }) { pid in
+        sent.pids.append(pid)
+        return true
+    }
+    #expect(sent.pids == [4242, Int32.max])
+    #expect(n == 2)
+}
+
+@Test("reap signals only a dead wrapper's live group from this boot: no stale entry, own group or non-group")
+func reapSignals() throws {
+    let boot = 1_000_000.0, fresh = boot + 60, own = 777
+    let run = { (id: String, pid: Int, pgid: PyJSON, at: Double) -> PyJSON in
+        .object(PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(pid)), ("child_pgid", pgid),
+                          ("started_at", .double(at))]))
+    }
+    let queued = { (id: String, pid: Int, at: Double) -> PyJSON in
+        .object(PyObject([("id", .string(id)), ("pid", .int(pid)), ("enqueued_at", .double(at))]))
+    }
+    let before = PyObject([
+        ("running", .array([
+            run("orphan", 101, .int(201), fresh),  // a dead wrapper, its group alive: SIGCONT + SIGTERM
+            run("stale", 102, .int(202), boot - 60),  // from before the boot: group 202 is someone else's now
+            run("stale-alive", 103, .int(203), boot - 60),  // pid 103 alive, but another process now
+            run("own", 104, .int(own), fresh),  // the reaper's own process group
+            run("negative", 105, .int(-205), fresh), run("zero", 106, .int(0), fresh), run("one", 107, .int(1), fresh),
+            run("flag", 108, .bool(true), fresh), run("wide", 109, .int(1 << 40), fresh), run("text", 110, "211", fresh),
+            run("live", 111, .int(212), fresh),
+        ])),
+        ("queue", .array([queued("q-stale", 301, boot - 1), queued("q-live", 302, fresh), queued("q-dead", 303, fresh)])),
+    ])
+    // every group above is alive (kill(-205, 0) probes group 205, 1 is launchd), so only the checks
+    // keep them from a signal
+    let alive: [PyJSON] = [201, 202, 103, 203, own, 205, -205, 1, 211, 111, 212, 1 << 40, 301, 302].map { .int($0) }
+    let probes = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("boottime", .double(boot)), ("pgrp", .int(own))]))
+    var state = before
+    Sched.reap(&state, probes)
+    let ids = { (key: String) in (state[key]?.array ?? []).map { $0["id"]?.string ?? "" } }
+    #expect(probes.kills == [.array([.int(201), .int(Int(SIGCONT))]), .array([.int(201), .int(Int(SIGTERM))])])
+    #expect(ids("running") == ["live"])
+    #expect(ids("queue") == ["q-live"])
+
+    // an unknown boot time (0) makes nothing stale: the same old entry is then signalled, so the
+    // boot rule is what spared group 202 above
+    let blind = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("pgrp", .int(own))]))
+    state = before
+    Sched.reap(&state, blind)
+    let groups = blind.kills.compactMap { $0.array?.first?.int }
+    #expect(groups == [201, 201, 202, 202])
+    #expect(ids("running") == ["stale-alive", "live"])
+}
+
 @Test("a pass that stands back (a config read otherwise) drops its watches and their samples")
 func standBackDropsWatches() throws {
     var template = Array("/tmp/acc-cored-standback-XXXXXX".utf8CString)

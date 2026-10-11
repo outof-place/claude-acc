@@ -197,10 +197,15 @@ may still answer: acc-cored refreshes the mark on every pass.
 - **One daemon:** `run` takes `$STATE/acc-cored.lock` first. A second instance exits instead of
   taking the socket. With `--wait-lock` (launchd's job, whose KeepAlive would restart an exiting
   one every 10 s) it waits for the lock instead.
-- **Signals:** SIGUSR1 goes only to a pid above 1 that is still the job's wrapper (`is_wrapper`).
-  A `child_pgid` is a process group only when it's an int above 1 (`group_id`, on both sides):
-  `killpg(-N)` is `kill(N)`, `killpg(0)` the sender's own group, and 1 is launchd. That applies to
-  the orphan's SIGTERM in `reap`, `safety`'s SIGSTOP and SIGCONT, and `kill_child`.
+- **Signals:** SIGUSR1 goes only to a pid above 1 and within `pid_t` that is still the job's
+  wrapper (`is_wrapper`). A `child_pgid` is a process group only when it's an int above 1 and
+  below 2**31 (`group_id`, on both sides): `killpg(-N)` is `kill(N)`, `killpg(0)` the sender's own
+  group, 1 is launchd, and past `pid_t` Python's `os.kill` raises OverflowError, not OSError. That
+  applies to the orphan's SIGTERM in `reap`, `safety`'s SIGSTOP and SIGCONT, and `kill_child`.
+- **After a reboot:** `reap` drops an entry whose `started_at` (a queued one: `enqueued_at`) is
+  older than `kern.boottime`, with no signal: nothing of it lives, and its pid and group belong to
+  other processes now. It never signals its own process group either. An unknown boot time (0)
+  makes nothing stale.
 
 The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
 checked (`LOCAL_PEERCRED`).
@@ -210,13 +215,19 @@ checked (`LOCAL_PEERCRED`).
 - `tests/acc_cored/sched_replay.py fuzz` builds synthetic states. They cover queues and running jobs
   (local and Depot, small, native, paused, stalled, passed heads, starving heads, simulators), plus
   memory readings, guard snapshots and configs. Each one runs through sched.py's own five functions.
-  `record` reads the live state and readings without writing anything.
+  `record` reads the live state and readings without writing anything. The fixtures carry the boot
+  time and the reaper's own group, and `child_pgid` takes odd values too: negative, 0, 1, `true`,
+  2**40, a string, the reaper's own group.
 - `acc-cored sched-replay` runs the native pass on every fixture. The state, the admissions and the
   signals sent must match.
-- `tests/test_acc_cored.py` runs 300 fuzzed fixtures.
+- `tests/test_acc_cored.py` runs 300 fuzzed fixtures. Their Python side runs on 3.12 or newer (the
+  suite's own interpreter, else the first `python3.1x` or `python3` on PATH that is): from 3.12
+  `sum()` of floats is compensated, and acc-cored mirrors that, as the live sched.py runs on 3.14.
+  On 3.9 a sum such as 0.17 + 4.49 + 2.395 rounds to 7.05, not 7.06.
 
 Results on 2026-10-10:
-- fuzz: 10,500 of 10,500 fixtures identical (again after the review fixes, 2026-10-11);
+- fuzz: 10,500 of 10,500 fixtures identical (again after the review fixes, 2026-10-11), and
+  12,000 of 12,000 with the reboot and own-group rules (seeds 7 and 11, Python 3.14);
 - live: 10 of 10 recorded passes identical (6 on 2026-10-10, 4 on 2026-10-11, one job running).
 
 ### Cost
