@@ -220,7 +220,7 @@ class CapsCommandTest(unittest.TestCase):
         self.assertEqual([c.args[1] for c in check.call_args_list], [{}, {}])
         self.assertEqual([c.kwargs["dry_run"] for c in check.call_args_list], [True, False])
         self.assertEqual(json.loads(out.call_args.args[0]),
-                         {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": [], "headroom": None})
+                         {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": [], "shallow": [], "headroom": None})
         self.assertIn("caps", dg.COMMANDS)
         self.assertIn("caps [--dry-run]", entry.__doc__)
 
@@ -359,6 +359,34 @@ class CapsCommandTest(unittest.TestCase):
                          sorted([os.path.join(os.path.realpath(third), "runs"),
                                  os.path.join(os.path.realpath(elsewhere), "builds")]))  # fmt: skip
 
+    def test_a_link_before_another_wildcard_is_watched_shallow_and_dangling_links_resolve(self):
+        tmp, far, third = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+        for path in (tmp, far, third):
+            self.addCleanup(shutil.rmtree, path, True)
+        os.makedirs(os.path.join(tmp, "caps"))
+        os.makedirs(os.path.join(far, "t1", "s0", "builds"))
+        os.makedirs(os.path.join(far, "t1", "s1", "src"))
+        os.symlink(os.path.join(far, "t1"), os.path.join(tmp, "caps", "l1"))
+
+        def report(*tail):
+            jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(tmp, "caps", *tail), "max_gb": 1, "keep": 0,
+                                                          "fresh_minutes": 0}])  # fmt: skip
+            return self.report(jcfg)
+
+        t1 = os.path.realpath(os.path.join(far, "t1"))
+        # caps/*/*/builds with l1 -> a worktree: its own entries only, and a deep watch per folder in it
+        got = report("*", "*", "builds")
+        self.assertEqual(got["shallow"], [t1])
+        self.assertEqual(sorted(got["folders"]), [os.path.join(t1, "s0", "builds"), os.path.join(t1, "s1", "builds")])
+        self.assertNotIn(t1, got["folders"])
+        # a link whose target isn't there yet, and one on the fixed part
+        os.symlink(os.path.join(far, "later"), os.path.join(tmp, "caps", "wt2"))
+        self.assertIn(os.path.join(os.path.realpath(far), "later", "builds"), report("*", "builds")["folders"])
+        os.makedirs(os.path.join(far, "x"))
+        os.symlink(os.path.join(third, "out"), os.path.join(far, "x", "out"))
+        os.symlink(os.path.join(far, "x"), os.path.join(tmp, "caps", "wt3"))
+        self.assertIn(os.path.join(os.path.realpath(third), "out", "builds"), report("*", "out", "builds")["folders"])
+
     def test_the_headroom_is_the_minimum_over_folders(self):
         # ciasny folder pierwszy: „ostatni wygrywa” i max dałyby luźny
         tmp = tempfile.mkdtemp()
@@ -381,6 +409,18 @@ class CapsCommandTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         jcfg = self.caps_world(tmp, keep=1)
         self.assertAlmostEqual(self.report(jcfg)["headroom"], 1e-6 * dg.janitor.GB)
+        # mały najnowszy w `keep`, duży starszy idzie: nic nie zostaje przez rozmiar, więc limit,
+        # a nie limit minus mały (`i >= keep` w regule)
+        mixed = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, mixed, True)
+        for name, size, age in (("old", 262144, 3600), ("new", 65536, 60)):  # the order is by birth
+            os.makedirs(os.path.join(mixed, "b", name))
+            with open(os.path.join(mixed, "b", name, "blob"), "wb") as f:
+                f.write(b"x" * size)
+            os.utime(os.path.join(mixed, "b", name), (time.time() - age,) * 2)
+        jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(mixed, "b"), "max_gb": 131072 / dg.janitor.GB, "keep": 1,
+                                                      "fresh_minutes": 0}])  # fmt: skip
+        self.assertEqual(self.report(jcfg)["headroom"], 131072)
         # wpis zostawiony przez rozmiar za `keep`: zapas liczony od niego
         jcfg = self.caps_world_again(tmp)
         jcfg["caps"][0].update(max_gb=1, keep=1)

@@ -474,6 +474,7 @@ class Sweep:
         # ścieżki: katalog-dowiązanie leży gdzie indziej), wpisy, których du nie zmierzyło, i ile
         # najciaśniejszy z katalogów może jeszcze urosnąć, zanim przebieg cokolwiek by usunął
         self.cap_folders = []
+        self.cap_shallow = []
         self.du_failures = 0
         self.cap_headroom = None
         self.warnings = []
@@ -974,44 +975,58 @@ CAP_MAGIC = re.compile(r"[*?[]")
 def cap_spots(pattern):
     """Gdzie folder z limitem może leżeć poza tym, co acc-cored już widzi (statyczny prefiks
     wzorca): za dowiązaniem gdziekolwiek po drodze, które z niego wychodzi (wt1 -> repo/.perf),
-    także zanim folder albo katalog po drodze powstanie. Miejsce to rzeczywista ścieżka celu
-    plus dalsza stała część wzorca, nie cały dowiązany katalog: edycja w nim nie budzi limitów."""
+    także zanim folder albo katalog po drodze powstanie, także za dowiązaniem, którego cel jeszcze
+    nie istnieje. Zwraca (głębokie, płytkie):
+    - głębokie: rzeczywista ścieżka celu plus dalsza stała część wzorca, obserwowane z całą
+      zawartością; nie cały dowiązany katalog, więc edycja w nim nie budzi limitów;
+    - płytkie: cel dowiązania, po którym od razu idzie kolejna gwiazdka (caps/*/*/builds,
+      l1 -> worktree): tylko jego własne wpisy (nowy podkatalog), a foldery pod nim jako głębokie."""
     parts = pattern.split("/")
     first = next((i for i, part in enumerate(parts) if CAP_MAGIC.search(part)), len(parts))
-    spots = []
+    deep, shallow = [], []
 
-    def walk(base, seen, rest):
-        # base istnieje, a jego rzeczywista ścieżka leży pod `seen`, czyli tym, co acc-cored obserwuje
+    def walk(base, base_real, covered, rest):
+        # base istnieje; covered(r): acc-cored już widzi zmiany pod rzeczywistą ścieżką r
         if not rest:
             return
         name, more = rest[0], rest[1:]
         paths = glob.glob(os.path.join(glob.escape(base), name)) if CAP_MAGIC.search(name) else [os.path.join(base, name)]
         for path in paths:
-            if not os.path.isdir(path):
+            link = os.path.islink(path)
+            if not link and not os.path.isdir(path):
                 continue
-            real = os.path.realpath(path)
-            if real == seen or real.startswith(seen.rstrip("/") + "/"):
-                walk(path, seen, more)
+            # realpath tylko dla dowiązań (w 3.9 to czysty Python i dominował koszt spaceru)
+            real = os.path.realpath(path) if link or name in (".", "..") else os.path.join(base_real, os.path.basename(path))
+            if covered(real):
+                if os.path.isdir(path):
+                    walk(path, real, covered, more)
                 continue
             fixed = []
             for part in more:
                 if CAP_MAGIC.search(part):
                     break
                 fixed.append(part)
-            # najgłębszy istniejący katalog stałej części (dowiązanie po drodze rozwiązuje realpath)
-            # i to, czego jeszcze nie ma
+            # najgłębszy istniejący katalog stałej części i to, czego jeszcze nie ma; realpath
+            # rozwiązuje też dowiązania, których cel jeszcze nie istnieje
             cur, k = path, 0
             while k < len(fixed) and os.path.isdir(os.path.join(cur, fixed[k])):
                 cur, k = os.path.join(cur, fixed[k]), k + 1
-            spot = os.path.normpath(os.path.join(os.path.realpath(cur), *fixed[k:]))
-            if spot not in spots:
-                spots.append(spot)
-            if k == len(fixed):
-                walk(cur, spot, more[k:])
+            spot = os.path.realpath(os.path.join(cur, *fixed[k:]))
+            if fixed:
+                if spot not in deep:
+                    deep.append(spot)
+                if k == len(fixed):
+                    walk(cur, spot, lambda r, s=spot: r == s or r.startswith(s.rstrip("/") + "/"), more[k:])
+            else:
+                if spot not in shallow:
+                    shallow.append(spot)
+                if os.path.isdir(path):
+                    walk(path, spot, lambda r: False, more)
 
     top = "/".join(parts[:first]) or "/"
-    walk(top, os.path.realpath(top), parts[first:])
-    return spots
+    real_top = os.path.realpath(top)
+    walk(top, real_top, lambda r: r == real_top or r.startswith(real_top.rstrip("/") + "/"), parts[first:])
+    return deep, shallow
 
 
 def task_caps(sw, _scan):
@@ -1027,9 +1042,13 @@ def task_caps(sw, _scan):
         fresh = time.time() - cap.get("fresh_minutes", 10) * 60
         pattern = os.path.expanduser(cap["path"])
         # foldery za dowiązaniami, które wychodzą z prefiksu wzorca: acc-cored obserwuje ich miejsca
-        for spot in cap_spots(pattern):
+        deep, shallow = cap_spots(pattern)
+        for spot in deep:
             if spot not in sw.cap_folders:
                 sw.cap_folders.append(spot)
+        for spot in shallow:
+            if spot not in sw.cap_shallow:
+                sw.cap_shallow.append(spot)
         for folder in sorted(glob.glob(pattern)):
             if not os.path.isdir(folder):
                 continue

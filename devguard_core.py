@@ -2369,14 +2369,16 @@ def caps_report(sweep):
     w katalogach: wpis w użyciu, wpis, którego nie dało się przenieść, i pomiar du, który padł.
     "Chronione" i "w gicie" trwają, więc wieczne "zajęte" wyłączałoby bramkę na zawsze.
     folders to katalogi dopasowane przez globy i miejsca za dowiązaniami, które wychodzą z prefiksu
-    globu (rzeczywiste ścieżki, cap_spots), a acc-cored też je obserwuje;
+    globu (rzeczywiste ścieżki, cap_spots), a acc-cored też je obserwuje; shallow to cele dowiązań,
+    po których idzie kolejna gwiazdka: acc-cored widzi tam tylko ich własne wpisy;
     headroom (bajty), ile najciaśniejszy z nich może urosnąć, zanim przebieg coś by usunął: mniejszy
     ubytek wolnego miejsca nie zmieni wyniku."""
     if sweep is None:
-        return {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": [], "headroom": None}
+        return {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": [], "shallow": [], "headroom": None}
     busy = [s for s in sweep.skipped if s[0] == "caps" and (s[2] == "w użyciu" or s[2].startswith("nie da się przenieść"))]
     return {"ran": True, "freed": sweep.freed, "busy": len(busy) + sweep.du_failures,
-            "retry_at": sweep.retry_at, "folders": sweep.cap_folders, "headroom": sweep.cap_headroom}
+            "retry_at": sweep.retry_at, "folders": sweep.cap_folders, "shallow": sweep.cap_shallow,
+            "headroom": sweep.cap_headroom}
 
 
 def cmd_status(cfg, args):
