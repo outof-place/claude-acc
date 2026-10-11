@@ -23,7 +23,8 @@ final class RootHelper {
     @ObservationIgnored private let connector: (() throws -> PodRootdClient)?
     @ObservationIgnored private var client: PodRootdClient?
     @ObservationIgnored private var ticker: Task<Void, Never>?
-    @ObservationIgnored private var fans: Fans?
+    /// One reading of the SMC: the fans and the hottest sensors (tests give their own).
+    @ObservationIgnored private var read: (() -> Reading)?
     @ObservationIgnored private var history: [[Double]] = []
     @ObservationIgnored private var statusAt = -Double.infinity
     /// The lid hold Awake asks for (nil: none), and when the helper last got it.
@@ -44,12 +45,18 @@ final class RootHelper {
     /// A hold is renewed this often, so a hold without an end outlasts the helper's 24 h cap.
     private static let lidRenew: TimeInterval = 30 * 60
     private static let sampleEvery: Duration = .seconds(5)
+    /// How far back the Load & Heat chart goes.
+    private static let historySpan: TimeInterval = 20 * 60
 
-    init(appIdentifier: String?, connector: (() throws -> PodRootdClient)? = nil, ticking: Bool = true) {
+    init(
+        appIdentifier: String?, connector: (() throws -> PodRootdClient)? = nil, reader: (() -> Reading)? = nil,
+        ticking: Bool = true
+    ) {
         self.appIdentifier = appIdentifier
         self.connector = connector
+        read = reader
         guard appIdentifier != nil || connector != nil, ticking else { return }
-        fans = (try? SMC()).map(Fans.init)
+        if read == nil, let fans = (try? SMC()).map(Fans.init) { read = { fans.reading() } }
         ticker = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.tick()
@@ -137,8 +144,18 @@ final class RootHelper {
         if panelOpen || now - statusAt >= 60 || status == nil {
             await refreshStatus()
         }
-        if owns { sample() }
+        // closed, the menu bar label asks for its reading itself (closedReading)
+        if owns, panelOpen { sample() }
         await syncLid()
+    }
+
+    /// The fans for the menu bar label while the panel is closed: Store's minute poll takes one
+    /// reading here, where the tick took one every 5 s. A reading is ~170 SMC calls, 1.9 ms of CPU
+    /// and 19 ms on the main actor on an M4 Max (0.37 ms/s at the tick's pace), and closed only the
+    /// label's 90 °C mark looks at it, at that poll. Open, the tick keeps the 5 s pace.
+    func closedReading() -> FanState? {
+        if owns, !panelOpen { sample() }
+        return fanState
     }
 
     private func refreshStatus() async {
@@ -275,11 +292,13 @@ final class RootHelper {
 
     /// One reading of the fans and the hottest sensors, plus fanctl's 20-minute history.
     private func sample() {
-        guard let fans else { return }
-        let reading = fans.reading()
+        guard let read else { return }
+        let reading = read()
         let rpm = reading.fans.isEmpty ? 0 : reading.fans.map(\.rpm).reduce(0, +) / Double(reading.fans.count)
         let tenth = { (value: Double?) in ((value ?? 0) * 10).rounded() / 10 }
         history.append([reading.at.rounded(), tenth(reading.cpu), tenth(reading.gpu), rpm.rounded()])
+        // 20 minutes back whatever the pace: a row every 5 s open, one a minute closed
+        history.removeAll { $0[0] < reading.at.rounded() - Self.historySpan }
         if history.count > 240 { history.removeFirst(history.count - 240) }
         let helper = status?.fans
         var mode = "auto"
