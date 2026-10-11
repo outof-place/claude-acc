@@ -71,7 +71,7 @@ public final class LiveSchedProbes: SchedProbes {
 
     public func killpg(_ pgid: pid_t, _ signal: Int32) -> Bool { Darwin.killpg(pgid, signal) == 0 }
 
-    public func bootTime() -> Double { SchedNative.bootTime() }
+    public func bootSession() -> String? { SchedNative.bootSession }
 
     public func ownGroup() -> pid_t { getpgrp() }
 
@@ -149,12 +149,16 @@ public enum SchedNative {
         return n > 0 ? cText(buffer) : ""
     }
 
-    /// kern.boottime in seconds (wall clock), 0 when the kernel doesn't answer
-    public static func bootTime() -> Double {
-        var tv = timeval()
-        var size = MemoryLayout<timeval>.size
-        return sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 ? Double(tv.tv_sec) : 0
-    }
+    /// kern.bootsessionuuid: new at every boot, and a clock step doesn't move it (every
+    /// settimeofday moves kern.boottime); nil when the kernel doesn't answer. Read once, as sched.py
+    /// does: it can't change while this process lives.
+    public static let bootSession: String? = {
+        var buffer = [CChar](repeating: 0, count: 64)
+        var size = buffer.count
+        guard sysctlbyname("kern.bootsessionuuid", &buffer, &size, nil, 0) == 0 else { return nil }
+        let text = cText(buffer)
+        return text.isEmpty ? nil : text
+    }()
 
     /// The process's p_uniqueid (PROC_PIDUNIQIDENTIFIERINFO), nil when it's gone. The SDK doesn't
     /// export struct proc_uniqidentifierinfo: p_uuid[16], then p_uniqueid (u64), 56 bytes in all

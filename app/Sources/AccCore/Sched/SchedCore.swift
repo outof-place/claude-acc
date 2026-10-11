@@ -23,8 +23,8 @@ public protocol SchedProbes: AnyObject {
     func descendants(_ pid: pid_t) -> Set<pid_t>
     /// os.killpg, errors ignored (the group comes through Sched.groupID)
     func killpg(_ pgid: pid_t, _ signal: Int32) -> Bool
-    /// boot_time(): kern.boottime in seconds, 0 when unknown
-    func bootTime() -> Double
+    /// boot_session(): kern.bootsessionuuid, nil when unknown
+    func bootSession() -> String?
     /// os.getpgrp(): the reaper's own process group
     func ownGroup() -> pid_t
     /// proc_uid(pid): the process's p_uniqueid, set at fork and not given again until a reboot (a
@@ -119,26 +119,36 @@ public enum Sched {
         return probes.uniqueID(pid) == mine
     }
 
-    /// group_of(job): child_pgid while its leader is still the job's child (child_uid); without it,
-    /// no group to signal
+    /// group_of(job, session): child_pgid while the entry is from this boot (sameBoot) and its leader
+    /// is still the job's child (child_uid), so (session, group, p_uniqueid) with no clock; without
+    /// them, no group to signal
     static func groupOf(_ job: PyJSON, _ probes: SchedProbes) -> pid_t? {
-        groupOf(job, uid: probes.uniqueID)
+        groupOf(job, session: probes.bootSession(), uid: probes.uniqueID)
     }
 
-    static func groupOf(_ job: PyJSON, uid: (pid_t) -> Int?) -> pid_t? {
-        guard let g = Sched.groupID(job["child_pgid"]), let mine = uidOf(job["child_uid"]), uid(g) == mine else { return nil }
+    static func groupOf(_ job: PyJSON, session: String?, uid: (pid_t) -> Int?) -> pid_t? {
+        guard sameBoot(job, session), let g = Sched.groupID(job["child_pgid"]), let mine = uidOf(job["child_uid"]), uid(g) == mine
+        else { return nil }
         return g
     }
 
-    /// stale(job, key, boot): an entry from before this boot (its time in `key`)
-    static func stale(_ job: PyJSON, _ key: String, _ boot: Double) -> Bool {
-        let at: Double
-        switch job[key] {
-        case .int(let i)?: at = Double(i)
-        case .double(let d)?: at = d
+    /// stale(job, session): an entry from another boot, its boot_session not this one. Its pid and
+    /// group are someone else's now, and p_uniqueid counts again from each boot (at first equal to
+    /// the pid), so the same (pid, uid) pair may be someone else's too. No clock decides: every
+    /// settimeofday moves kern.boottime. An entry without boot_session isn't stale (nor signalled).
+    static func stale(_ job: PyJSON, _ session: String?) -> Bool {
+        guard let session else { return false }
+        switch job["boot_session"] {
+        case .string(let mine)?: return !mine.pyEq(session)
+        case .raw(let text)? where text.hasPrefix("\""): return true  // a lone surrogate: no session reads so
         default: return false
         }
-        return at > 0 && at < boot
+    }
+
+    /// same_boot(job, session): the entry wrote this boot's session
+    static func sameBoot(_ job: PyJSON, _ session: String?) -> Bool {
+        guard let session, case .string(let mine)? = job["boot_session"] else { return false }
+        return mine.pyEq(session)
     }
 
     public static let GB = 1_073_741_824.0
@@ -158,21 +168,21 @@ public enum Sched {
 
     /// reap(state): entries of dead wrappers go; their orphaned job gets SIGCONT, SIGTERM
     public static func reap(_ state: inout PyObject, _ probes: SchedProbes) {
-        let boot = probes.bootTime()
+        let session = probes.bootSession()
         var keep: [PyJSON] = []
         for job in state["running"]?.array ?? [] {
-            if stale(job, "started_at", boot) { continue }  // from before a reboot: no signal to anyone
+            if stale(job, session) { continue }  // from another boot: no signal to anyone
             if owned(job, probes) {
                 keep.append(job)
                 continue
             }
             // a pid or group reused within this boot isn't the job's; nor is an entry without started_at
-            if let g = groupOf(job, probes), g != probes.ownGroup(), number(job["started_at"]) != nil {
+            if let g = groupOf(job, session: session, uid: probes.uniqueID), g != probes.ownGroup(), number(job["started_at"]) != nil {
                 for sig in [SIGCONT, SIGTERM] { _ = probes.killpg(g, sig) }
             }
         }
         state["running"] = .array(keep)
-        state["queue"] = .array((state["queue"]?.array ?? []).filter { !stale($0, "enqueued_at", boot) && owned($0, probes) })
+        state["queue"] = .array((state["queue"]?.array ?? []).filter { !stale($0, session) && owned($0, probes) })
     }
 
     /// reserve_target(job, now)

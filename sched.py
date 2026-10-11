@@ -2574,24 +2574,33 @@ def save_cache(cache):
     os.replace(tmp, CACHE_PATH)
 
 
-def boot_time():
-    """Chwila startu systemu (kern.boottime, sekundy); 0, gdy jądro nie odpowie."""
+def boot_session():
+    """Ten start systemu (kern.bootsessionuuid): nowy po każdym restarcie, a zmiana zegara go nie
+    rusza (kern.boottime przesuwa każdy settimeofday). None, gdy jądro nie odpowie."""
     if not _BOOT:
         k = kernel()
-        tv = (k.ctypes.c_int64 * 2)()
-        size = k.ctypes.c_size_t(k.ctypes.sizeof(tv))
-        ok = k.libc.sysctlbyname(b"kern.boottime", tv, k.ctypes.byref(size), None, 0) == 0
-        _BOOT.append(float(tv[0]) if ok else 0.0)
+        buf = k.ctypes.create_string_buffer(64)
+        size = k.ctypes.c_size_t(64)
+        ok = k.libc.sysctlbyname(b"kern.bootsessionuuid", buf, k.ctypes.byref(size), None, 0) == 0
+        _BOOT.append((buf.value.decode("ascii", "replace") or None) if ok else None)
     return _BOOT[0]
 
 
 _BOOT = []
 
 
-def stale(job, key, boot):
-    """Wpis sprzed startu systemu (czas w `key`): jego pid i grupa należą dziś do obcych procesów."""
-    at = job.get(key)
-    return isinstance(at, (int, float)) and not isinstance(at, bool) and 0 < at < boot
+def stale(job, session):
+    """Wpis z innego startu systemu: jego boot_session to nie dzisiejsza sesja. Jego pid i grupa
+    należą dziś do obcych procesów, a p_uniqueid liczy się po restarcie od nowa (na początku równy
+    pidowi), więc ta sama para (pid, p_uniqueid) bywa już czyjaś. Wpis bez boot_session (sprzed tej
+    reguły) nie jest stary: sygnału i tak nie dostanie (group_of)."""
+    mine = job.get("boot_session")
+    return isinstance(mine, str) and session is not None and mine != session
+
+
+def same_boot(job, session):
+    """Wpis z tego startu systemu: zapisał w boot_session dzisiejszą sesję."""
+    return session is not None and job.get("boot_session") == session
 
 
 PROC_PIDUNIQIDENTIFIERINFO = 17
@@ -2642,30 +2651,32 @@ def owned(job):
     return proc_uid(pid) == mine
 
 
-def group_of(job):
-    """child_pgid joba, jeśli to wciąż jego grupa: lider ma ten p_uniqueid, który wrapper zapisał przy
-    uruchomieniu (child_uid). Bez niego nie ma czym tego sprawdzić, więc i sygnału nie ma."""
+def group_of(job, session):
+    """child_pgid joba, jeśli to wciąż jego grupa: wpis jest z tego startu systemu (same_boot), a lider
+    ma ten p_uniqueid, który wrapper zapisał przy uruchomieniu (child_uid). Tożsamość to więc (sesja,
+    grupa, p_uniqueid), bez zegara. Bez nich nie ma czym tego sprawdzić, więc i sygnału nie ma."""
     pgid = group_id(job.get("child_pgid"))
     mine = uid_of(job.get("child_uid"))
-    if not pgid or mine is None:
+    if not pgid or mine is None or not same_boot(job, session):
         return None
     return pgid if proc_uid(pgid) == mine else None
 
 
 def reap(state):
     """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM. Wpis sprzed
-    restartu Maca znika bez sygnałów: nikt z niego nie żyje, a jego pid i grupa są dziś czyjeś.
-    Pid wrappera albo grupa użyte ponownie w tym samym starcie (owned, group_of) też nie dostają
-    sygnału, wpis bez liczbowego started_at również. Własnej grupy procesów sprzątający nie dotyka."""
-    boot = boot_time()
+    restartu Maca (stale: inna sesja) znika bez sygnałów: nikt z niego nie żyje, a jego pid i grupa
+    są dziś czyjeś. Pid wrappera albo grupa użyte ponownie w tym samym starcie (owned, group_of) też
+    nie dostają sygnału, wpis bez liczbowego started_at również. Własnej grupy procesów sprzątający
+    nie dotyka."""
+    session = boot_session()
     keep = []
     for job in state["running"]:
-        if stale(job, "started_at", boot):
+        if stale(job, session):
             continue
         if owned(job):
             keep.append(job)
             continue
-        pgid = group_of(job)
+        pgid = group_of(job, session)
         if pgid and pgid != os.getpgrp() and number(job.get("started_at")):
             import signal
 
@@ -2675,7 +2686,7 @@ def reap(state):
                 except OSError:
                     pass
     state["running"] = keep
-    state["queue"] = [j for j in state["queue"] if not stale(j, "enqueued_at", boot) and owned(j)]
+    state["queue"] = [j for j in state["queue"] if not stale(j, session) and owned(j)]
 
 
 # rezerwa po rozgrzewce: job, który przebiegł max(60 s, połowę prognozy czasu), najwyżej 300 s,
@@ -3302,7 +3313,8 @@ def safety(state, cfg):
     mem = state["memory"]
     growth = mem.get("swap_growth_2m_gb", 0)
     # tylko grupa, która wciąż jest joba (group_of): SIGSTOP obcej byłby gorszy niż swap
-    local = [j for j in state["running"] if j["where"] == "local" and group_of(j)]
+    session = boot_session()
+    local = [j for j in state["running"] if j["where"] == "local" and group_of(j, session)]
     paused = [j for j in local if j.get("paused")]
     swapping = (growth > cfg["pause_swap_gb"] and mem["level_pct"] < 25) or mem.get(
         "pressure"
@@ -3470,6 +3482,8 @@ def new_entry(job, command, argv, opts):
         "pid": os.getpid(),
         # tożsamość wrappera dla owned(): pid po ponownym użyciu ma inny p_uniqueid
         "pid_uid": proc_uid(os.getpid()),
+        # i start systemu, z którego są pid i p_uniqueid (po restarcie liczą się od nowa)
+        "boot_session": boot_session(),
         "via": opts.get("via", "cli"),
         "enqueued_at": time.time(),
     }

@@ -1957,7 +1957,7 @@ class StateTest(Paths):
         sleeper = self.sleeper()
         st["running"].append(
             {"id": "dead", "where": "local", "pid": 999999, "child_pgid": sleeper.pid,
-             "started_at": time.time(), "child_uid": S.proc_uid(sleeper.pid)}
+             "started_at": time.time(), "child_uid": S.proc_uid(sleeper.pid), "boot_session": S.boot_session()}
         )  # fmt: skip
         S.save_state(st)
         st = S.load_state(self.cfg)
@@ -1973,70 +1973,81 @@ class StateTest(Paths):
         bad = [-sleeper.pid, 0, 1, True, 3.7, str(sleeper.pid)]
         st = self.state()
         # everything else would let a signal through: only the value of child_pgid stops it
-        stamp = S.proc_uid(sleeper.pid)
+        stamp, session = S.proc_uid(sleeper.pid), S.boot_session()
         st["running"] = [{"id": f"dead{i}", "where": "local", "pid": 999999, "child_pgid": v, "started_at": time.time(),
-                          "child_uid": stamp} for i, v in enumerate(bad)]  # fmt: skip
+                          "child_uid": stamp, "boot_session": session} for i, v in enumerate(bad)]  # fmt: skip
         with mock.patch.object(S.os, "killpg") as killpg:
             S.reap(st)
             for v in bad:
                 self.assertFalse(S.kill_child({"pid": os.getpid(), "child_pgid": v}))
             st["running"] = [{"id": f"run{i}", "where": "local", "pid": os.getpid(), "child_pgid": v,
-                              "started_at": i, "child_uid": stamp} for i, v in enumerate(bad)]  # fmt: skip
+                              "started_at": i, "child_uid": stamp, "boot_session": session} for i, v in enumerate(bad)]  # fmt: skip
             st["memory"] = {"swap_growth_2m_gb": 99, "level_pct": 10, "pressure": "critical"}
             S.safety(st, self.cfg)
         killpg.assert_not_called()
         self.assertIsNone(sleeper.poll())
         self.assertEqual([S.group_id(v) for v in bad + [sleeper.pid]], [None] * len(bad) + [sleeper.pid])
 
-    def test_reap_spares_entries_from_before_the_boot_and_its_own_group(self):
-        # po restarcie Maca pid i grupa starego wpisu należą do obcych procesów; własnej grupy
-        # sprzątający nie rusza; ponad pid_t group_id daje None, a nie OverflowError z os.kill
+    def test_reap_spares_entries_from_another_boot_and_its_own_group(self):
+        # po restarcie Maca pid i grupa starego wpisu należą do obcych procesów, a p_uniqueid liczy się
+        # od nowa, więc para (pid, p_uniqueid) bywa ta sama: decyduje sesja startu, nie zegar. Własnej
+        # grupy sprzątający nie rusza; ponad pid_t group_id daje None, a nie OverflowError z os.kill
         old, own = self.sleeper(), self.sleeper()
-        boot = S.boot_time()
-        self.assertTrue(0 < boot < time.time())
-        now = time.time()
+        session, other = S.boot_session(), "0F1E2D3C-0000-4000-8000-000000000001"
+        self.assertRegex(session, r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
+        now, me = time.time(), S.proc_uid(os.getpid())
         st = self.state()
-        # the children's real start stamps everywhere: only the rule under test stops each signal
+        # the processes' real p_uniqueid everywhere: only the rule under test stops each signal
         st["running"] = [
-            {"id": "stale", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": boot - 60,
-             "child_uid": S.proc_uid(old.pid)},
-            {"id": "stale-alive", "where": "local", "pid": os.getpid(), "started_at": boot - 60},
+            {"id": "stale", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": now,
+             "child_uid": S.proc_uid(old.pid), "boot_session": other},
+            {"id": "stale-alive", "where": "local", "pid": os.getpid(), "pid_uid": me, "started_at": now,
+             "boot_session": other},
             {"id": "own", "where": "local", "pid": 999999, "child_pgid": own.pid, "started_at": now,
-             "child_uid": S.proc_uid(own.pid)},
-            {"id": "wide", "where": "local", "pid": 999999, "child_pgid": 2**40, "started_at": now, "child_uid": 1},
+             "child_uid": S.proc_uid(own.pid), "boot_session": session},
+            {"id": "wide", "where": "local", "pid": 999999, "child_pgid": 2**40, "started_at": now, "child_uid": 1,
+             "boot_session": session},
+            # from before boot_session: no signal, there's nothing to tell its boot by
+            {"id": "legacy", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": now,
+             "child_uid": S.proc_uid(old.pid)},
         ]  # fmt: skip
-        st["queue"] = [{"id": "q-stale", "pid": os.getpid(), "enqueued_at": boot - 1},
-                       {"id": "q-live", "pid": os.getpid(), "enqueued_at": time.time()}]  # fmt: skip
+        st["queue"] = [{"id": "q-stale", "pid": os.getpid(), "pid_uid": me, "enqueued_at": now, "boot_session": other},
+                       {"id": "q-live", "pid": os.getpid(), "pid_uid": me, "enqueued_at": now, "boot_session": session},
+                       {"id": "q-legacy", "pid": os.getpid(), "enqueued_at": now}]  # fmt: skip
         with mock.patch.object(S.os, "getpgrp", return_value=own.pid), mock.patch.object(S.os, "killpg") as killpg:
             S.reap(st)
         killpg.assert_not_called()
         self.assertEqual(st["running"], [])
-        self.assertEqual([j["id"] for j in st["queue"]], ["q-live"])
+        self.assertEqual([j["id"] for j in st["queue"]], ["q-live", "q-legacy"])
         self.assertEqual([S.group_id(v) for v in (2**40, 2**31, 2**31 - 1)], [None, None, 2**31 - 1])
-        # ten sam wpis z tego startu dostaje sygnał: chroniła go reguła startu, nie co innego
+        # the same entry from this boot gets its signal, even with a start from before the boot by the
+        # clock (a step forward): the session protected it, nothing else
         st["running"] = [{"id": "orphan", "where": "local", "pid": 999999, "child_pgid": old.pid,
-                          "started_at": time.time(), "child_uid": S.proc_uid(old.pid)}]  # fmt: skip
+                          "started_at": 1.0, "child_uid": S.proc_uid(old.pid), "boot_session": session}]  # fmt: skip
         S.reap(st)
         self.assertIsNotNone(old.wait(timeout=5))
         self.assertIsNone(own.poll())
+        self.assertEqual([S.stale({"boot_session": v}, session) for v in (other, "", session, None, 7)],
+                         [True, True, False, False, False])  # fmt: skip
+        self.assertFalse(S.stale({"boot_session": other}, None))  # the kernel didn't answer: nothing is stale
 
     def test_a_pid_or_group_reused_within_this_boot_gets_no_signal(self):
         # pidy zawijają się tu co ~25 minut: pid martwego wrappera i grupa jego dziecka bywają już
         # obce. Tożsamość to p_uniqueid (proc_uid), nadany przy fork: inny to inny proces, a zmiana
         # zegara (enqueued_at z innej epoki) go nie rusza
         reused_wrapper, reused_group, orphan, mine = (self.sleeper() for _ in range(4))
-        stamp = S.proc_uid
+        stamp, session = S.proc_uid, S.boot_session()
         now = time.time()
         st = self.state()
         st["running"] = [
             {"id": "w", "where": "local", "pid": reused_wrapper.pid, "pid_uid": stamp(reused_wrapper.pid) - 1,
              "enqueued_at": now, "started_at": now, "child_pgid": reused_group.pid,
-             "child_uid": stamp(reused_group.pid) - 1},
+             "child_uid": stamp(reused_group.pid) - 1, "boot_session": session},
             {"id": "o", "where": "local", "pid": 999999, "enqueued_at": now - 10, "started_at": now - 5,
-             "child_pgid": orphan.pid, "child_uid": stamp(orphan.pid)},
+             "child_pgid": orphan.pid, "child_uid": stamp(orphan.pid), "boot_session": session},
             # the clock stepped back an hour after it started: still its own wrapper, kept
             {"id": "m", "where": "local", "pid": mine.pid, "pid_uid": stamp(mine.pid), "enqueued_at": now - 3600,
-             "started_at": now - 3600},
+             "started_at": now - 3600, "boot_session": session},
         ]  # fmt: skip
         st["queue"] = [{"id": "q", "pid": reused_wrapper.pid, "pid_uid": stamp(reused_wrapper.pid) + 1, "enqueued_at": now},
                        {"id": "q2", "pid": mine.pid, "pid_uid": stamp(mine.pid), "enqueued_at": now + 3600},
@@ -2048,17 +2059,25 @@ class StateTest(Paths):
         self.assertIsNotNone(orphan.wait(timeout=5))  # the real orphan still goes
         self.assertIsNone(reused_group.poll())
         self.assertIsNone(reused_wrapper.poll())
-        self.assertIsNone(S.group_of({"child_pgid": mine.pid}))  # no child_uid: nothing to check by
+        self.assertIsNone(S.group_of({"child_pgid": mine.pid, "boot_session": session}, session))  # no child_uid
+        # the identity is (session, group, p_uniqueid): the right uid from another boot, or with no
+        # session known, is no group
+        ok = {"child_pgid": mine.pid, "child_uid": stamp(mine.pid), "boot_session": session}
+        self.assertEqual(S.group_of(ok, session), mine.pid)
+        self.assertIsNone(S.group_of(dict(ok, boot_session="0F1E2D3C-0000-4000-8000-000000000001"), session))
+        self.assertIsNone(S.group_of({k: v for k, v in ok.items() if k != "boot_session"}, session))
+        self.assertIsNone(S.group_of(ok, None))
         # a root process (launchd) has a p_uniqueid too: a wrapper started with sudo isn't taken for dead
         self.assertTrue(S.owned({"pid": 1, "pid_uid": S.proc_uid(1)}))
         # values no Int64 holds, or of another type, count as no uid, as in acc-cored
         self.assertTrue(S.owned({"pid": mine.pid, "pid_uid": 2**70}))
-        self.assertIsNone(S.group_of({"child_pgid": mine.pid, "child_uid": 2**70}))
-        self.assertIsNone(S.group_of({"child_pgid": mine.pid, "child_uid": -3}))
+        self.assertIsNone(S.group_of({"child_pgid": mine.pid, "child_uid": 2**70, "boot_session": session}, session))
+        self.assertIsNone(S.group_of({"child_pgid": mine.pid, "child_uid": -3, "boot_session": session}, session))
         self.assertEqual([S.number(v) for v in (1.5, 2**62, 2**63, -(2**63), -(2**63) - 1, True, "1")],
                          [True, True, False, True, False, False, False])  # fmt: skip
         # without a numeric started_at the entry goes without a signal, whatever its group
-        st["running"] = [{"id": "n", "where": "local", "pid": 999999, "child_pgid": mine.pid, "child_uid": stamp(mine.pid)}]
+        st["running"] = [{"id": "n", "where": "local", "pid": 999999, "child_pgid": mine.pid, "child_uid": stamp(mine.pid),
+                          "boot_session": session}]  # fmt: skip
         with mock.patch.object(S.os, "killpg") as killpg:
             S.reap(st)
         killpg.assert_not_called()
@@ -2068,11 +2087,14 @@ class StateTest(Paths):
         a, b, c = self.sleeper(), self.sleeper(), self.sleeper()
         st["running"] = [
             {"id": "a", "where": "local", "pid": os.getpid(), "started_at": now - 30, "child_pgid": a.pid,
-             "child_uid": stamp(a.pid)},
+             "child_uid": stamp(a.pid), "boot_session": session},
             {"id": "b", "where": "local", "pid": os.getpid(), "started_at": now - 20, "child_pgid": b.pid,
-             "child_uid": stamp(b.pid)},
+             "child_uid": stamp(b.pid), "boot_session": session},
             {"id": "c", "where": "local", "pid": os.getpid(), "started_at": now - 10, "child_pgid": c.pid,
-             "child_uid": stamp(c.pid) + 1},
+             "child_uid": stamp(c.pid) + 1, "boot_session": session},
+            # the youngest of all, its group's right uid, from another boot
+            {"id": "d", "where": "local", "pid": os.getpid(), "started_at": now - 5, "child_pgid": c.pid,
+             "child_uid": stamp(c.pid), "boot_session": "0F1E2D3C-0000-4000-8000-000000000001"},
         ]  # fmt: skip
         st["memory"] = {"swap_growth_2m_gb": 99, "level_pct": 10, "pressure": "critical"}
         with mock.patch.object(S.os, "killpg") as killpg:
@@ -2361,7 +2383,8 @@ class RunTest(unittest.TestCase):
         self.assertIsInstance(job.get("child_started_at"), float)
         self.assertEqual(job.get("child_uid"), S.proc_uid(job["child_pgid"]))
         self.assertEqual(job.get("pid_uid"), S.proc_uid(p.pid))  # the wrapper's own p_uniqueid
-        self.assertEqual(S.group_of(job), job["child_pgid"])
+        self.assertEqual(job.get("boot_session"), S.boot_session())  # and the boot both come from
+        self.assertEqual(S.group_of(job, S.boot_session()), job["child_pgid"])
         self.assertEqual(self.done(p)[0], 0)
 
     def test_not_go_runs_plain(self):

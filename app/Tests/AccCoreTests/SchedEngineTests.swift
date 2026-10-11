@@ -90,7 +90,13 @@ func wakeGuardsAlone() {
 
 @Test("reap signals only a dead wrapper's own group from this boot: no stale, reused, own or non-group")
 func reapSignals() throws {
-    let boot = 1_000_000.0, fresh = boot + 60, own = 777
+    let fresh = 1_000_060.0, own = 777
+    let session = "A65B8586-4170-4DF0-ACBC-3CE4E4062188", other = "0F1E2D3C-0000-4000-8000-000000000001"
+    // every entry from this boot but the stale ones (another boot, with the same pids and uids the
+    // kernel gives today), one with a lone surrogate and one from before boot_session
+    let from = { (id: String) -> PyJSON? in
+        id == "legacy" ? nil : id == "stale-raw" ? .raw("\"\\ud800\"") : .string(id.contains("stale") ? other : session)
+    }
     // the p_uniqueid an entry names for a pid; the kernel gives the same one while it's that process,
     // another once the pid is reused
     let stamp = { (pid: Int) in 30_000_000 + pid * 10 }
@@ -98,6 +104,7 @@ func reapSignals() throws {
     enum Live { case mine, reused, none }
     let run = { (id: String, pid: Int, pgid: PyJSON, at: Double?, wrapper: Live, group: Live, stamped: Bool) -> PyJSON in
         var o = PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(pid)), ("child_pgid", pgid)])
+        if let s = from(id) { o["boot_session"] = s }
         o["enqueued_at"] = .double((at ?? fresh) - 10)
         if let at { o["started_at"] = .double(at) }
         o["pid_uid"] = .int(stamp(pid))
@@ -119,13 +126,15 @@ func reapSignals() throws {
     let queued = { (id: String, pid: Int, at: Double, live: Live) -> PyJSON in
         if live == .mine { starts.append((String(pid), .int(stamp(pid)))) }
         if live == .reused { starts.append((String(pid), .int(stamp(pid) + 1))) }
-        return .object(PyObject([("id", .string(id)), ("pid", .int(pid)), ("enqueued_at", .double(at)), ("pid_uid", .int(stamp(pid)))]))
+        var o = PyObject([("id", .string(id)), ("pid", .int(pid)), ("enqueued_at", .double(at)), ("pid_uid", .int(stamp(pid)))])
+        if let s = from(id) { o["boot_session"] = s }
+        return .object(o)
     }
     let before = PyObject([
         ("running", .array([
             run("orphan", 101, .int(201), fresh, .none, .mine, true),  // a dead wrapper, its own group: SIGCONT + SIGTERM
-            run("stale", 102, .int(202), boot - 60, .none, .mine, true),  // from before the boot
-            run("stale-alive", 103, .int(203), boot - 60, .mine, .mine, true),
+            run("stale", 102, .int(202), 1, .none, .mine, true),  // from another boot, a start from 1970 by the clock
+            run("stale-alive", 103, .int(203), fresh, .mine, .mine, true),
             run("own", 104, .int(own), fresh, .none, .mine, true),  // the reaper's own process group
             run("negative", 105, .int(-205), fresh, .none, .none, true), run("zero", 106, .int(0), fresh, .none, .none, true),
             run("one", 107, .int(1), fresh, .none, .mine, true), run("flag", 108, .bool(true), fresh, .none, .none, true),
@@ -136,16 +145,19 @@ func reapSignals() throws {
             run("reused-group", 113, .int(214), fresh, .none, .reused, true),  // a dead wrapper, someone else's group
             run("no-child-stamp", 114, .int(215), fresh, .none, .mine, false),  // nothing to check the group by
             run("no-started-at", 115, .int(216), nil, .none, .mine, true),
+            run("legacy", 116, .int(217), fresh, .none, .mine, true),  // no boot_session: nothing to tell its boot by
+            run("stale-raw", 117, .int(218), fresh, .mine, .mine, true),
         ])),
         ("queue", .array([
-            queued("q-stale", 301, boot - 1, .mine), queued("q-live", 302, fresh, .mine), queued("q-dead", 303, fresh, .none),
+            queued("q-stale", 301, fresh, .mine), queued("q-live", 302, fresh, .mine), queued("q-dead", 303, fresh, .none),
             queued("q-reused", 304, fresh, .reused),
         ])),
     ])
     // every pid and group above is alive (kill(-205, 0) probes group 205, 1 is launchd), so only the
     // checks keep them from a signal
-    let alive: [PyJSON] = [201, 202, 103, 203, own, 205, -205, 1, 211, 111, 212, 1 << 40, 112, 213, 214, 215, 216, 301, 302, 304].map { .int($0) }
-    let probes = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("boottime", .double(boot)), ("pgrp", .int(own)),
+    let alive: [PyJSON] = [201, 202, 103, 203, own, 205, -205, 1, 211, 111, 212, 1 << 40, 112, 213, 214, 215, 216, 217, 117, 218,
+                           301, 302, 304].map { .int($0) }
+    let probes = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("session", .string(session)), ("pgrp", .int(own)),
                                                ("uids", .object(PyObject(starts)))]))
     var state = before
     Sched.reap(&state, probes)
@@ -154,14 +166,22 @@ func reapSignals() throws {
     #expect(ids("running") == ["live"])
     #expect(ids("queue") == ["q-live"])
 
-    // an unknown boot time (0) makes nothing stale: the same old entry is then signalled, so the
-    // boot rule is what spared group 202 above
+    // seen from the other boot, the stale entry's dead wrapper gets its group signalled (a start
+    // stamp from 1970 or not): the session is what spared group 202 above
+    let theirs = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("session", .string(other)), ("pgrp", .int(own)),
+                                               ("uids", .object(PyObject(starts)))]))
+    state = before
+    Sched.reap(&state, theirs)
+    #expect(theirs.kills.compactMap { $0.array?.first?.int } == [202, 202])
+    #expect(ids("running") == ["stale-alive"])
+
+    // an unknown session (the kernel didn't answer) makes nothing stale and no group this boot's:
+    // no signal at all, the owned entries stay
     let blind = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("pgrp", .int(own)), ("uids", .object(PyObject(starts)))]))
     state = before
     Sched.reap(&state, blind)
-    let groups = blind.kills.compactMap { $0.array?.first?.int }
-    #expect(groups == [201, 201, 202, 202])
-    #expect(ids("running") == ["stale-alive", "live"])
+    #expect(blind.kills == [])
+    #expect(ids("running") == ["stale-alive", "live", "stale-raw"])
 
     // an entry without pid_uid (written before it existed), or with one no Int64 holds: alive is
     // enough, as before; a uid that isn't one gets no group signal either
@@ -176,41 +196,47 @@ func reapSignals() throws {
                         ("queue", .array([]))])
     Sched.reap(&odd, probes)
     #expect((odd["running"]?.array ?? []).count == 2)
-    #expect(Sched.groupOf(.object(PyObject([("child_pgid", .int(212)), ("child_uid", .raw("1180591620717411303424"))])), probes) == nil)
-    #expect(Sched.groupOf(.object(PyObject([("child_pgid", .int(212)), ("child_uid", .int(-3))])), probes) == nil)
+    let child = { (uid: PyJSON, s: PyJSON) in
+        PyJSON.object(PyObject([("child_pgid", .int(212)), ("child_uid", uid), ("boot_session", s)]))
+    }
+    #expect(Sched.groupOf(child(.int(stamp(212)), .string(session)), probes) == 212)
+    #expect(Sched.groupOf(child(.int(stamp(212)), .string(other)), probes) == nil)
+    #expect(Sched.groupOf(child(.int(stamp(212)), .int(7)), probes) == nil)
+    #expect(Sched.groupOf(child(.raw("1180591620717411303424"), .string(session)), probes) == nil)
+    #expect(Sched.groupOf(child(.int(-3), .string(session)), probes) == nil)
 }
 
 @Test("safety pauses the youngest heavy job whose group is still its own: never a reused or unstamped group")
 func safetySignals() {
-    let now = 1_000_000.0
-    let job = { (id: String, pgid: Int, started: Double, stamp: Int?) -> PyJSON in
-        var o = PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(1)), ("child_pgid", .int(pgid)), ("started_at", .double(started))])
+    let now = 1_000_000.0, session = "A65B8586-4170-4DF0-ACBC-3CE4E4062188"
+    let job = { (id: String, pgid: Int, started: Double, stamp: Int?, from: String) -> PyJSON in
+        var o = PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(1)), ("child_pgid", .int(pgid)), ("started_at", .double(started)),
+                          ("boot_session", .string(from))])
         if let stamp { o["child_uid"] = .int(stamp) }
         return .object(o)
     }
     var state = PyObject([
         ("running", .array([
-            job("a", 401, now - 30, 7001), job("b", 402, now - 20, 7002),
-            job("c", 403, now - 10, 7003),  // the youngest, but its group is another process now
-            job("d", 404, now - 5, nil),  // no child_uid: no way to check
+            job("a", 401, now - 30, 7001, session), job("b", 402, now - 20, 7002, session),
+            job("c", 403, now - 10, 7003, session),  // the youngest, but its group is another process now
+            job("d", 404, now - 5, nil, session),  // no child_uid: no way to check
+            job("e", 404, now - 2, 7004, "0F1E2D3C-0000-4000-8000-000000000001"),  // the group's uid, from another boot
         ])),
         ("memory", .object(PyObject([("swap_growth_2m_gb", 99), ("level_pct", 10), ("pressure", "critical")]))),
         ("today", .object(PyObject([("pauses", 0)]))),
     ])
     let starts = PyObject([("401", .int(7001)), ("402", .int(7002)), ("403", .int(9999)), ("404", .int(7004))])
-    let probes = RecordedSchedProbes(PyObject([("now", .double(now)), ("uids", .object(starts))]))
+    let probes = RecordedSchedProbes(PyObject([("now", .double(now)), ("session", .string(session)), ("uids", .object(starts))]))
     Sched.safety(&state, SchedConfig(raw: SchedConfig.defaults), probes)
     #expect(probes.kills == [.array([.int(402), .int(Int(SIGSTOP))])])
     #expect(state["running"]?.array?[1]["paused"]?.truthy == true)
 }
 
-@Test("the live boot time is now minus the time since boot; a process's p_uniqueid is its own, also for root's")
-func liveBootAndStart() {
-    let boot = SchedNative.bootTime()
-    let wall = Kernel.wall()
-    let up = Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9
-    #expect(boot > 0 && boot < wall)
-    #expect(abs((wall - boot) - up) < 5)
+@Test("the live boot session is a UUID; a process's p_uniqueid is its own, also for root's")
+func liveBootAndStart() throws {
+    let session = try #require(SchedNative.bootSession)
+    #expect(session.split(separator: "-").map(\.count) == [8, 4, 4, 4, 12])
+    #expect(LiveSchedProbes(stateDir: "/nonexistent").bootSession() == session)
     let me = SchedNative.uniqueID(getpid())
     #expect(me != nil)
     #expect(SchedNative.uniqueID(getpid()) == me)
@@ -219,7 +245,7 @@ func liveBootAndStart() {
     #expect(SchedNative.uniqueID(pid_t(Int32.max)) == nil)
 }
 
-@Test("no watch on an entry from before the boot or on a group that isn't the job's")
+@Test("no watch on an entry from another boot or on a group that isn't the job's")
 func watchesOnlyOwnGroups() throws {
     var template = Array("/tmp/acc-cored-watch-XXXXXX".utf8CString)
     let dir = try #require(template.withUnsafeMutableBufferPointer { mkdtemp($0.baseAddress) }.map { String(cString: $0) })
@@ -227,13 +253,14 @@ func watchesOnlyOwnGroups() throws {
     Files.mkdirs(dir + "/sched")
     let engine = SchedEngine(stateDir: dir)
     let now = Kernel.wall()
-    let job = { (id: String, started: Double, stamp: Int) in
+    let job = { (id: String, from: String, stamp: Int) in
         PyObject([("id", .string(id)), ("monitor", "cored"), ("pid", .int(Int(getpid()))), ("child_pgid", .int(Int(getpid()))),
-                  ("started_at", .double(started)), ("child_started_at", .double(started)), ("child_uid", .int(stamp))])
+                  ("started_at", .double(now)), ("child_started_at", .double(now)), ("child_uid", .int(stamp)),
+                  ("boot_session", .string(from))])
     }
     engine.queue.sync {
-        engine.updateWatches([job("old", 100, 42), job("reused", now, 41), job("mine", now, 42)], now: now,
-                             uid: { _ in 42 }, boot: 1000)
+        engine.updateWatches([job("old", "B", 42), job("reused", "A", 41), job("mine", "A", 42)], now: now,
+                             uid: { _ in 42 }, session: "A")
     }
     #expect(engine.queue.sync { Set(engine.watches.keys) } == ["mine"])
     engine.queue.sync { engine.standBack() }

@@ -25,9 +25,16 @@ GB = 1024**3
 
 
 def load(src):
-    sys.path.insert(0, src)
+    """sched.py from `src`, the repo or the file. The stdlib has a `sched` too: imported from a wrong
+    path, every fixture would raise, be dropped, and the replay would pass on an empty file."""
+    path = src if src.endswith(".py") else os.path.join(src, "sched.py")
+    if not os.path.isfile(path):
+        sys.exit(f"no sched.py at {path}")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
     import sched as S
 
+    if os.path.realpath(S.__file__) != os.path.realpath(path):
+        sys.exit(f"imported {S.__file__}, not {path}")
     return S
 
 
@@ -36,7 +43,7 @@ def serve(S, fixture):
     now = fixture["now"]
     kills = []
     real = (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-            S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_uid)  # fmt: skip
+            S.time.strftime, S.DEVGUARD_CONFIG, S.boot_session, S.os.getpgrp, S.proc_uid)  # fmt: skip
     alive = set(fixture["alive"])
     desc = {int(k): set(v) for k, v in fixture.get("descendants", {}).items()}
     tmp = None
@@ -58,7 +65,7 @@ def serve(S, fixture):
                 raise OSError("no such group")
 
         S.os.killpg = killpg
-        S.boot_time = lambda: fixture.get("boottime", 0.0)
+        S.boot_session = lambda: fixture.get("session")
         S.os.getpgrp = lambda: fixture.get("pgrp", -1)
         S.proc_uid = lambda pid: fixture.get("uids", {}).get(str(pid))
         S.time.time = lambda: now
@@ -82,7 +89,7 @@ def serve(S, fixture):
         S.update_queue_view(state, cfg)
     finally:
         (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-         S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_uid) = real  # fmt: skip
+         S.time.strftime, S.DEVGUARD_CONFIG, S.boot_session, S.os.getpgrp, S.proc_uid) = real  # fmt: skip
         if tmp:
             os.unlink(tmp.name)
     return {
@@ -114,7 +121,7 @@ def record(src, ticks, every, out):
                 "native_scan": {"gb": scan["gb"], "active": scan["active"], "pids": sorted(scan["pids"])},
                 "alive": sorted(p for p in pids if S.alive(p)),
                 "descendants": {str(j["pid"]): sorted(S.descendants(j["pid"])) for j in state["running"] if j.get("pid")},
-                "max_server_gb": max_server, "boottime": S.boot_time(), "pgrp": os.getpgrp(),
+                "max_server_gb": max_server, "session": S.boot_session(), "pgrp": os.getpgrp(),
                 "uids": {str(p): S.proc_uid(p) for p in pids if S.pid_of(p) and S.proc_uid(p) is not None},
             }  # fmt: skip
             fixture["expect"] = serve(S, fixture)
@@ -126,6 +133,10 @@ def record(src, ticks, every, out):
 
 def fuzz_fixture(rng):
     now = 1_791_000_000.0 + rng.random() * 1e6
+    # this boot's session (now and then unknown); entries mostly from it, some from another boot
+    # (whose pid and p_uniqueid the kernel may give again), some from before boot_session or odd
+    session = rng.choice(["A65B8586-4170-4DF0-ACBC-3CE4E4062188"] * 9 + [None])
+    sessions = ["A65B8586-4170-4DF0-ACBC-3CE4E4062188"] * 14 + ["0F1E2D3C-0000-4000-8000-000000000001"] * 3 + [None, "", 7]
     ids = iter(range(1000, 2000))
     pid = iter(range(5000, 9000, 7))
     uid = iter(range(30_000_000, 40_000_000, 13))
@@ -141,6 +152,9 @@ def fuzz_fixture(rng):
             "small": rng.random() < 0.4, "lang": lang, "exclusive": lang == "native" and rng.random() < 0.6,
             "enqueued_at": now - rng.random() * 900, "class": "go:test", "route": {"choice": rng.choice(["local", "local", "depot"])},
         }  # fmt: skip
+        mine = rng.choice(sessions)
+        if mine is not None:
+            j["boot_session"] = mine
         if lang == "native":
             j["native_tool"] = rng.choice(
                 ["xcodebuild", "portivo-mobile", "simulator", "expo-run"]
@@ -233,8 +247,8 @@ def fuzz_fixture(rng):
         "snapshot": snapshot, "native_scan": {"gb": round(rng.random() * 9, 3), "active": rng.random() < 0.3, "pids": scan_pids},
         "alive": alive, "descendants": {str(r["pid"]): [r["pid"]] + scan_pids[:1] for r in running if rng.random() < 0.5},
         "max_server_gb": rng.choice([None, 4, 5.5]), "killpg_fails": rng.random() < 0.1,
-        # entries from before a reboot, and a job's group that is the reaper's own
-        "boottime": rng.choice([0.0, now - 1e6, now - rng.random() * 2400]), "pgrp": rng.choice([-1, -1] + groups),
+        # a job's group that is the reaper's own
+        "session": session, "pgrp": rng.choice([-1, -1] + groups),
         "uids": uids,
     }  # fmt: skip
 
@@ -269,7 +283,7 @@ def main(argv):
                     continue
                 f.write(json.dumps(fixture, ensure_ascii=False) + "\n")
         print(f"fixtures: {n - bad}, dropped (Python raised): {bad}")
-        return 0
+        return 0 if n - bad else 1
     print(__doc__)
     return 2
 

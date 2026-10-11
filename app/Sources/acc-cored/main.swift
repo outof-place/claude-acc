@@ -208,6 +208,7 @@ case "sched-replay":
         }
     }
     print("same \(same), different \(different)")
+    if same + different == 0 { fail("no fixtures in \(path)", 1) }  // an empty file proves nothing
     exit(different == 0 ? 0 : 1)
 case "sched-scan":
     // native_scan() as JSON: what builds and simulators the scheduler counts (parity)

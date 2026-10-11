@@ -202,10 +202,15 @@ may still answer: acc-cored refreshes the mark on every pass.
   below 2**31 (`group_id`, on both sides): `killpg(-N)` is `kill(N)`, `killpg(0)` the sender's own
   group, 1 is launchd, and past `pid_t` Python's `os.kill` raises OverflowError, not OSError. That
   applies to the orphan's SIGTERM in `reap`, `safety`'s SIGSTOP and SIGCONT, and `kill_child`.
-- **After a reboot:** `reap` drops an entry whose `started_at` (a queued one: `enqueued_at`) is
-  older than `kern.boottime`, with no signal: nothing of it lives, and its pid and group belong to
-  other processes now. It never signals its own process group either. An unknown boot time (0)
-  makes nothing stale.
+- **After a reboot:** a wrapper writes this boot's `kern.bootsessionuuid` into its entry
+  (`boot_session`). `reap` drops an entry from another session with no signal: nothing of it
+  lives, and its pid and group belong to other processes now. `p_uniqueid` counts again from each
+  boot (early on it equals the pid: launchd is 1, a pid 351 has uid 351), so the same (pid, uid)
+  pair can come back. No clock decides: every `settimeofday` moves `kern.boottime`, and a step
+  forward by Δ would have dropped the entries of a boot's first Δ seconds while their jobs ran on
+  unaccounted. A signal needs the entry's session to be this one (`same_boot`), so an entry without
+  one (written before it existed) gets none, and an unknown session (the kernel didn't answer)
+  makes nothing stale and signals nobody. `reap` never signals its own process group either.
 - **pids reused within one boot** (they wrap here every ~25 minutes, ~4000 a minute). A process is
   told by its `p_uniqueid` (`PROC_PIDUNIQIDENTIFIERINFO`): the kernel gives it at fork and not again
   until a reboot, so a reused pid has another one and a clock change doesn't move it. Unlike
@@ -219,7 +224,8 @@ may still answer: acc-cored refreshes the mark on every pass.
     signalled (reap's SIGCONT + SIGTERM, safety's SIGSTOP and SIGCONT) only while its leader still
     has that uid (`group_of`). An entry without it, or without a numeric `started_at` (an int of
     Int64, as acc-cored reads it), gets no signal.
-  - acc-cored puts no watch on an entry from before the boot or on a group that isn't the job's.
+  - So a group's identity is (session, group, uid), with no clock in it.
+  - acc-cored puts no watch on an entry from another boot or on a group that isn't the job's.
   - Cost: one `proc_pidinfo` per entry and pass, microseconds. Earlier versions compared the
     kernel's start in seconds with `enqueued_at` (the wall clock): off by 1-2 s, wrong after a clock
     step back, and reap then SIGTERMed a live job. The start stamp in µs, compared for equality,
@@ -238,11 +244,14 @@ ends them), sends use `MSG_NOSIGNAL`, and a client XNU refuses
   (local and Depot, small, native, paused, stalled, passed heads, starving heads, simulators), plus
   memory readings, guard snapshots and configs. Each one runs through sched.py's own five functions.
   `record` reads the live state and readings without writing anything. The fixtures carry the boot
-  time, the reaper's own group and the processes' `p_uniqueid` (some a pid or group reused since,
+  session (now and then unknown; entries from another boot with a pid and uid the kernel gives
+  again, from before `boot_session`, or with an odd one), the reaper's own group and the processes' `p_uniqueid` (some a pid or group reused since,
   some unreadable, some entries from before `pid_uid`, some uids no Int64 holds or of another type), and `child_pgid` takes odd values too: negative, 0, 1, `true`,
   2**40, a string, the reaper's own group.
 - `acc-cored sched-replay` runs the native pass on every fixture. The state, the admissions and the
-  signals sent must match.
+  signals sent must match. A file with no fixture fails, and so does `fuzz` when Python dropped every
+  one, or when `<src>` holds no sched.py (the stdlib has a `sched` too, and every fixture would
+  raise).
 - `tests/test_acc_cored.py` runs 300 fuzzed fixtures. Their Python side runs on 3.12 or newer (the
   suite's own interpreter, else the first `python3.1x` or `python3` on PATH that is): from 3.12
   `sum()` of floats is compensated, and acc-cored mirrors that, as the live sched.py runs on 3.14.
