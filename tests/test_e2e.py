@@ -1158,6 +1158,8 @@ class KeychainMemoTest(unittest.TestCase):
         for cache in (accswitch._KC_SEEN, accswitch._TOOLS):
             cache.clear()
             self.addCleanup(cache.clear)
+        # these tests write (and time out writes): never through the real `security` (login keychain)
+        self.assertEqual(accswitch.tool("security"), os.path.join(FAKES, "security"))
 
     def behind_our_back(self, value):
         """Inny proces (sesja Claude Code, Orca) zapisuje wpis."""
