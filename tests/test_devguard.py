@@ -10,6 +10,7 @@ i komend to devguard.py.
 Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 """
 
+import contextlib
 import json
 import os
 import shlex
@@ -229,7 +230,8 @@ class CapsCommandTest(unittest.TestCase):
             self.assertEqual(dg.cmd_caps(dg.load_config(), []), 0)
         self.assertEqual([c.args[1] for c in check.call_args_list], [{}, {}])
         self.assertEqual([c.kwargs["dry_run"] for c in check.call_args_list], [True, False])
-        self.assertEqual(json.loads(out.call_args.args[0]), {"ran": False, "freed": 0, "busy": 0, "retry_at": None})
+        self.assertEqual(json.loads(out.call_args.args[0]),
+                         {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": []})
         self.assertIn("caps", dg.COMMANDS)
         self.assertIn("caps [--dry-run]", entry.__doc__)
 
@@ -253,6 +255,59 @@ class CapsCommandTest(unittest.TestCase):
         newest = max(max(os.stat(p).st_mtime, os.stat(p).st_ctime) for p in (old, new))
         self.assertLessEqual(report["retry_at"], newest + 600)
         self.assertGreater(report["retry_at"], time.time() + 590)
+
+    def caps_world(self, tmp, **cap):
+        """Dwa wpisy po 64 KiB pod limitem 1 KB: starszy idzie (keep 0, nie świeże)."""
+        builds = os.path.join(tmp, "p", "builds")
+        for name in ("old", "new"):
+            os.makedirs(os.path.join(builds, name))
+            with open(os.path.join(builds, name, "blob"), "wb") as f:
+                f.write(b"x" * 65536)
+            os.utime(os.path.join(builds, name), (time.time() - 3600,) * 2)
+        return dict(dg.janitor.DEFAULT_CONFIG, caps=[dict({"path": os.path.join(tmp, "*", "builds"), "max_gb": 1e-6,
+                                                           "keep": 0, "fresh_minutes": 0}, **cap)])  # fmt: skip
+
+    def report(self, jcfg, **patches):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(dg.janitor, "load_config", return_value=jcfg))
+            stack.enter_context(mock.patch.object(dg, "log"))
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(dg.janitor, name, value))
+            out = stack.enter_context(mock.patch("builtins.print"))
+            self.assertEqual(dg.cmd_caps(dg.load_config(), ["--dry-run"]), 0)
+        return json.loads(out.call_args.args[0])
+
+    def test_the_report_names_the_matched_folders_by_their_real_paths(self):
+        # acc-cored watches them too: a folder under the glob that is a link lives elsewhere
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp)
+        target = os.path.join(tmp, "elsewhere", "builds")
+        os.makedirs(target)
+        os.makedirs(os.path.join(tmp, "q"))
+        os.symlink(target, os.path.join(tmp, "q", "builds"))
+
+        report = self.report(jcfg)
+
+        self.assertEqual(sorted(report["folders"]),
+                         sorted([os.path.realpath(os.path.join(tmp, "p", "builds")), os.path.realpath(target)]))
+
+    def test_busy_counts_what_may_free_itself_and_failed_du(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp)
+        in_use = mock.Mock()
+        in_use.busy.return_value = True
+        with mock.patch.object(dg.janitor.Sweep, "usage", in_use):
+            self.assertEqual(self.report(jcfg)["busy"], 2)  # both entries in use
+        self.assertEqual(self.report(jcfg, du_size=lambda _p: None)["busy"], 2)  # du failed on both
+        # protected: it stays so, and a busy that never ends would keep the gate open for good
+        protected = dict(jcfg, protect=[tmp])
+        self.assertEqual(self.report(protected)["busy"], 0)
+
+    def test_acc_cored_reads_the_caps_without_janitors_defaults(self):
+        # CapsWatch.swift reads janitor.json's "caps" as written: a default cap here would go unwatched
+        self.assertEqual(dg.janitor.DEFAULT_CONFIG["caps"], [])
 
 
 class NoteTest(unittest.TestCase):

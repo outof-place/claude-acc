@@ -269,12 +269,17 @@ def run(cmd, timeout=600):
     return done.stdout if done.returncode == 0 else None
 
 
-def du_bytes(path):
+def du_size(path):
+    """du -sk w bajtach albo None, gdy du się nie udało (jego limit czasu, fork pod obciążeniem)."""
     out = run(["du", "-sk", path], timeout=900)
     try:
         return int(out.split()[0]) * 1024
     except (AttributeError, IndexError, ValueError):
-        return 0
+        return None
+
+
+def du_bytes(path):
+    return du_size(path) or 0
 
 
 def disk():
@@ -462,6 +467,10 @@ class Sweep:
         # najbliższa chwila, w której wpis pominięty jako świeży (zapis w toku) może już pójść:
         # do niej, bez zmian w katalogach, przebieg limitów nie zrobiłby nic innego
         self.retry_at = None
+        # dla acc-cored (devguard caps): katalogi, które dopasowały globy limitów (rzeczywiste
+        # ścieżki: katalog-dowiązanie leży gdzie indziej), i wpisy, których du nie zmierzyło
+        self.cap_folders = []
+        self.du_failures = 0
         self.warnings = []
         self.failures = []  # (zadanie, błąd) dla panelu
         self.protect = [expand(p) for p in cfg["protect"]]
@@ -968,6 +977,8 @@ def task_caps(sw, _scan):
         for folder in sorted(glob.glob(os.path.expanduser(cap["path"]))):
             if not os.path.isdir(folder):
                 continue
+            if os.path.realpath(folder) not in sw.cap_folders:
+                sw.cap_folders.append(os.path.realpath(folder))
             try:
                 entries = [
                     e.path
@@ -980,7 +991,10 @@ def task_caps(sw, _scan):
             entries.sort(key=born, reverse=True)
             total = 0
             for i, path in enumerate(entries):
-                total += du_bytes(path)
+                size = du_size(path)
+                if size is None:
+                    sw.du_failures += 1  # za niska suma: następny przebieg liczy jeszcze raz
+                total += size or 0
                 if i < keep or total <= limit:
                     continue
                 last = changed(path)
