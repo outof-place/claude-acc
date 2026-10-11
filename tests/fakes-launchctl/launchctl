@@ -3,12 +3,15 @@
 echo "$*" >> "$FAKE_LOG"
 # the job: gui/UID/label, or a plist named after its label (bootstrap, and bootout gui/UID x.plist)
 if [ -n "${3:-}" ]; then label=$(basename "$3" .plist); else label=${2#*/*/}; fi
-# FAKE_FAIL=op:label fails that call (exit 5); op:label:after does it first, then fails (exit 36)
+# FAKE_FAIL=op:label fails that call (exit 5); op:label:after does it first, then fails (exit 36);
+# several, comma-separated
 if [ -n "${FAKE_FAIL:-}" ]; then
-  case "$FAKE_FAIL" in
-    "$1:$label") echo "$1 failed: 5" >&2; exit 5 ;;
-    "$1:$label:after") after=36 ;;
-  esac
+  for fail in ${FAKE_FAIL//,/ }; do
+    case "$fail" in
+      "$1:$label") echo "$1 failed: 5" >&2; exit 5 ;;
+      "$1:$label:after") after=36 ;;
+    esac
+  done
 fi
 case "$1" in
   print) grep -qx "$label" "$FAKE_LOADED"; exit $? ;;

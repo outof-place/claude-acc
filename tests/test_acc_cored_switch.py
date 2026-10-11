@@ -160,6 +160,9 @@ class SwitchTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(self.record()))
                 self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
                 self.assertFalse(os.path.exists(os.path.join(self.state, "acc-cored")))
+        # also without a binary: Pod's ownership is the answer, not the missing build
+        done = self.run_switch("on", "--binary", os.path.join(self.tmp, "none"))
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
         # a tombstone (handed back to Homebrew) is a standalone install again
         with open(os.path.join(self.state, "owner.json"), "w") as f:
             json.dump({"owner": "brew", "version": "1.31.8", "app": None, "at": 1}, f)
@@ -202,6 +205,36 @@ class SwitchTest(unittest.TestCase):
         with open(self.record()) as f:
             self.assertIn("com.filip.claude-acc", json.load(f)["replaced"])
         self.assertEqual(self.loaded_jobs(), ["com.filip.claude-acc.cored"])
+
+    def test_a_job_that_stays_brings_back_what_went(self):
+        # devguard (or the janitor) still loaded beside acc-cored: the tick that went comes back
+        for job in ("com.filip.claude-acc.devguard", "com.filip.claude-acc.janitor"):
+            with self.subTest(job=job):
+                done = self.run_switch("on", "--apply", "--binary", self.binary, FAKE_FAIL=f"bootout:{job}")
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertIn("didn't go: the jobs are back as they were", done.stderr)
+                self.assertEqual(sorted(self.loaded_jobs()), sorted(JOBS))
+                self.assertFalse(os.path.exists(self.record()))
+                self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+
+    def test_a_job_that_stays_and_one_that_won_t_come_back_keep_the_record(self):
+        done = self.run_switch("on", "--apply", "--binary", self.binary,
+                               FAKE_FAIL="bootout:com.filip.claude-acc.devguard,bootstrap:com.filip.claude-acc")  # fmt: skip
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("off --apply brings them back", done.stderr)
+        self.assertTrue(os.path.exists(self.record()))
+        self.assertNotIn("com.filip.claude-acc.cored", self.loaded_jobs())
+        self.assertEqual(self.run_switch("off", "--apply").returncode, 0)
+        self.assertEqual(sorted(self.loaded_jobs()), sorted(JOBS))
+
+    def test_a_bootstrap_that_fails_after_the_job_started_counts_by_launchd(self):
+        done = self.run_switch("on", "--apply", "--binary", self.binary, FAKE_FAIL="bootstrap:com.filip.claude-acc.cored:after")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.loaded_jobs(), ["com.filip.claude-acc.cored"])
+        done = self.run_switch("off", "--apply", FAKE_FAIL="bootstrap:com.filip.claude-acc.devguard:after")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(sorted(self.loaded_jobs()), sorted(JOBS))
+        self.assertFalse(os.path.exists(self.record()))
 
     def setup_functions(self):
         with open(os.path.join(ROOT, "setup.sh")) as f:

@@ -57,11 +57,12 @@ case "$cmd" in
     [ -f "$RECORD" ] && echo "switched    $(cat "$RECORD")" || echo "switched    no"
     ;;
   on)
+    # Pod runs its own agents where it owns claude-acc: acc-cored beside them would guard, tick and
+    # sweep twice (owner.py says so, exit 3, as it does for setup.sh); first, so a missing binary
+    # doesn't hide it
+    /usr/bin/python3 -B "$SRC/owner.py" check || exit $?
     [ -x "$BINARY" ] || { echo "no acc-cored binary at $BINARY (cd app && swift build -c release --product acc-cored)" >&2; exit 1; }
     [ -f "$RECORD" ] && { echo "already switched ($RECORD); run off first" >&2; exit 1; }
-    # Pod runs its own agents where it owns claude-acc: acc-cored beside them would guard, tick and
-    # sweep twice (owner.py says so, exit 3, as it does for setup.sh)
-    /usr/bin/python3 -B "$SRC/owner.py" check || exit $?
     stopped=""
     for job in $REPLACED; do loaded "$job" && stopped="$stopped $job"; done
     if [ -z "$stopped" ]; then
@@ -97,6 +98,27 @@ case "$cmd" in
     for job in $stopped; do
       [ "$job" = com.filip.claude-acc ] || step "$LAUNCHCTL" bootout "$DOMAIN/$job"
     done
+    # judged by launchd too: a devguard still loaded beside acc-cored holds devguard.lock, so
+    # acc-cored's guard exits and KeepAlive restarts it every 10 s, with the tick already gone. Then
+    # what went comes back, and acc-cored doesn't start; if that fails too, the record stays for `off`
+    if [ -n "$APPLY" ]; then
+      stuck=""
+      for job in $stopped; do loaded "$job" && stuck="$stuck $job"; done
+      if [ -n "$stuck" ]; then
+        back=1
+        for job in $stopped; do
+          loaded "$job" || step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$job.plist"
+          loaded "$job" || back=0
+        done
+        if [ "$back" -eq 1 ]; then
+          rm -f "$AGENTS/$LABEL.plist" "$RECORD"
+          echo "$stuck didn't go: the jobs are back as they were and acc-cored didn't start (the new binary is in place)" >&2
+        else
+          echo "$stuck didn't go, and not every job came back: $0 off --apply brings them back" >&2
+        fi
+        exit 1
+      fi
+    fi
     # whether it started is what launchd says afterwards, as for the tick
     step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$LABEL.plist"
     if [ -n "$APPLY" ] && ! loaded $LABEL; then
