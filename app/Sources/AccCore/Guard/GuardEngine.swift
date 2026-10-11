@@ -167,6 +167,7 @@ public final class GuardEngine: @unchecked Sendable {
             pressureSource?.cancel()
             // Python's loop goes first: an orphan would keep devguard.lock and guard on its own
             endPythonLoop()
+            capsWatch.stop()
             if !options.shadow { shaper.restoreAll() }
             GuardLog.write("koniec strażnika (acc-cored)")
             if lockFd >= 0 {

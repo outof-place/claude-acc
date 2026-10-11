@@ -2,11 +2,16 @@
 // walks every entry with `du -sk` (17 processes and ~1.8 s of CPU per run on the author's Mac,
 // every 10 minutes), but its outcome changes only when:
 // - something under a capped folder changes (FSEvents on the folders, or the nearest parent that
-//   exists), or janitor.json does;
+//   exists), or janitor.json does. The folders are the globs' static prefixes and the folders the
+//   last run's globs matched, both as real paths: a symlinked folder lives where its link points;
+// - free space on a watched volume dropped since the last run: a file growing behind an open
+//   descriptor shows up there, while FSEvents reports it only when it's closed;
 // - an entry skipped as fresh (a write in progress) may go: the time the last run reported;
-// - an entry skipped as busy may be free: no event says so, so such a run is followed by the
-//   next one at the usual interval.
+// - an entry skipped as busy (in use, can't be moved, du failed) may be free: no event says so,
+//   so such a run is followed by the next one at the usual interval.
 // `maxGap` bounds the rest (an event the kernel dropped is reported as such and counts as a change).
+// A cap whose path this can't place (`~user/`, `$HOME/`, relative), or a stream that didn't start,
+// runs at every interval, as Python does.
 import CoreServices
 import Darwin
 import Dispatch
@@ -20,8 +25,17 @@ public final class CapsWatch {
     var busy = 0
     var retryAt: Double?
     var lastRun = 0.0
+    /// the real paths watched: the caps' static prefixes and the folders the last run matched
     public private(set) var prefixes: [String] = []
+    var patterns: [String] = []
+    var folders: [String] = []
+    var smallestGB = 10.0
     var configStamp = ""
+    /// the stream's roots (the nearest existing directory of each prefix); a change re-arms it
+    var roots: [String] = []
+    var rearm = false
+    /// free bytes of each watched volume (by fsid) when the last run started
+    var freeAtStart: [String: Int64] = [:]
     private var stream: FSEventStreamRef?
 
     public init(home: String, queue: DispatchQueue, maxGap: Double = 6 * 3600) {
@@ -30,13 +44,19 @@ public final class CapsWatch {
         self.maxGap = maxGap
     }
 
-    deinit { stopStream() }
-
     var configPath: String { GuardPaths.state(home) + "/janitor.json" }
 
-    /// The static part of each cap's glob ("~/.cache/portivo-perf/*/builds" -> ~/.cache/portivo-perf)
-    static func prefix(_ pattern: String, home: String) -> String {
-        var path = pattern.pyStarts("~/") ? home + String(pattern.unicodeScalars.dropFirst(1).map(Character.init)) : pattern
+    /// The static part of each cap's glob ("~/.cache/portivo-perf/*/builds" -> ~/.cache/portivo-perf),
+    /// nil for a form expanduser or the working directory decides (`~user/`, `$HOME/`, relative).
+    static func prefix(_ pattern: String, home: String) -> String? {
+        var path: String
+        if pattern == "~" || pattern.pyStarts("~/") {
+            path = home + String(pattern.unicodeScalars.dropFirst(1).map(Character.init))
+        } else if pattern.pyStarts("/") {
+            path = pattern
+        } else {
+            return nil
+        }
         if let glob = path.unicodeScalars.firstIndex(where: { "*?[".unicodeScalars.contains($0) }) {
             path = dirname(String(path.unicodeScalars[..<glob]) + "x")
         }
@@ -49,18 +69,38 @@ public final class CapsWatch {
         return String(Substring(u))
     }
 
-    /// Whether a run is worth it now; reloads the caps and the watch when janitor.json changed.
+    /// Whether a run is worth it now (asked once per caps interval). Reloads the caps when
+    /// janitor.json changed, and re-arms the stream when the real paths or their roots moved.
     public func due(now: Double) -> Bool {
         let stamp = Files.stamp(configPath).map { "\($0)" } ?? "-"
         if stamp != configStamp {
             configStamp = stamp
             let caps = Files.json(configPath, fallback: .null)["caps"]?.array ?? []
-            // FSEvents reports real paths (/private/tmp, not /tmp)
-            prefixes = caps.compactMap { $0["path"]?.string }.map { Files.realpath(Self.prefix($0, home: home)) }
+            patterns = caps.compactMap { $0["path"]?.string }
+            smallestGB = caps.map { $0["max_gb"]?.double ?? 10 }.min() ?? 10
+            folders = []
+            dirty = true
+        }
+        if patterns.isEmpty {  // check_caps returns at once without caps
+            stopStream()
+            roots = []
+            return false
+        }
+        let placed = patterns.map { Self.prefix($0, home: home) }
+        var watched: [String] = []
+        // FSEvents reports real paths (/private/tmp, not /tmp), and a folder made later in another
+        // letter case is the same folder on APFS: realpath again on every interval
+        for p in placed.compactMap({ $0 }).map(Files.realpath) + folders where !watched.contains(p) { watched.append(p) }
+        prefixes = watched
+        let wanted = Self.roots(of: watched)
+        if wanted != roots || rearm || stream == nil {  // a stream that didn't start is tried again
+            roots = wanted
+            rearm = false
             restartStream()
             dirty = true
         }
-        if prefixes.isEmpty { return false }  // check_caps returns at once without caps
+        if placed.contains(where: { $0 == nil }) || stream == nil { return true }
+        if spaceDropped() { dirty = true }
         return dirty || busy > 0 || (retryAt.map { $0 <= now } ?? false) || now - lastRun >= maxGap
     }
 
@@ -68,6 +108,7 @@ public final class CapsWatch {
     public func started(now: Double) {
         dirty = false
         lastRun = now
+        freeAtStart = Self.freeSpace(roots)
     }
 
     /// The run's report (`devguard caps`'s JSON line); a run that said nothing counts as busy.
@@ -79,6 +120,41 @@ public final class CapsWatch {
         }
         busy = report["busy"]?.int ?? 0
         retryAt = report["retry_at"]?.double
+        folders = report["folders"]?.array?.compactMap(\.string) ?? folders
+    }
+
+    /// Stops the stream (on `queue`): it holds this watch, so nothing else frees it.
+    public func stop() {
+        stopStream()
+    }
+
+    /// A drop of free space on a watched volume since the run started, as large as a tenth of the
+    /// smallest cap (at most 1 GiB): what one file growing under a cap looks like.
+    func spaceDropped() -> Bool {
+        let threshold = Int64(min(1, smallestGB / 10) * Double(1 << 30))
+        let now = Self.freeSpace(roots)
+        return freeAtStart.contains { volume, before in (now[volume].map { before - $0 } ?? 0) >= threshold }
+    }
+
+    static func freeSpace(_ paths: [String]) -> [String: Int64] {
+        var out: [String: Int64] = [:]
+        for p in paths {
+            var fs = statfs()
+            guard statfs(p, &fs) == 0 else { continue }
+            out["\(fs.f_fsid.val.0):\(fs.f_fsid.val.1)"] = Int64(fs.f_bavail) * Int64(fs.f_bsize)
+        }
+        return out
+    }
+
+    /// The nearest existing directory of each path: a folder made later shows up as an event there.
+    static func roots(of paths: [String]) -> [String] {
+        var roots: [String] = []
+        for p in paths {
+            var dir = p
+            while dir != "/", !Files.isDirectory(dir) { dir = dirname(dir) }
+            if !roots.contains(dir) { roots.append(dir) }
+        }
+        return roots
     }
 
     /// `acc-cored caps-watch`: the seconds (from the start) in which something under the capped
@@ -95,12 +171,14 @@ public final class CapsWatch {
         while Kernel.wall() - start < seconds {
             sleep(1)
             queue.sync {
+                _ = watch.due(now: Kernel.wall())
                 if watch.dirty {
                     changes.append(Int(Kernel.wall() - start))
                     watch.started(now: Kernel.wall())
                 }
             }
         }
+        queue.sync { watch.stop() }
         return (queue.sync { watch.prefixes }, changes)
     }
 
@@ -108,16 +186,13 @@ public final class CapsWatch {
 
     func restartStream() {
         stopStream()
-        // the nearest existing directory of each prefix: a folder made later shows up as an event there
-        var roots: [String] = []
-        for p in prefixes {
-            var dir = p
-            while dir != "/", !Files.isDirectory(dir) { dir = dirname(dir) }
-            if !roots.contains(dir) { roots.append(dir) }
-        }
         guard !roots.isEmpty else { return }
+        // the stream holds the watch (retain/release): a callback never sees a freed one
         var context = FSEventStreamContext(
-            version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
+            version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: { info in info.map { UnsafeRawPointer(Unmanaged<CapsWatch>.fromOpaque($0).retain().toOpaque()) } },
+            release: { info in info.map { Unmanaged<CapsWatch>.fromOpaque($0).release() } },
+            copyDescription: nil)
         let callback: FSEventStreamCallback = { _, info, count, paths, flags, _ in
             guard let info else { return }
             let watch = Unmanaged<CapsWatch>.fromOpaque(info).takeUnretainedValue()
@@ -126,19 +201,15 @@ public final class CapsWatch {
                 watch.event(String(cString: list[i]), flags: flags[i])
             }
         }
-        let cfPaths = roots as CFArray
+        // WatchRoot: a root replaced or renamed away is reported (RootChanged), and re-armed
         guard let s = FSEventStreamCreate(
-            kCFAllocatorDefault, callback, &context, cfPaths, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0,
-            FSEventStreamCreateFlags(kFSEventStreamCreateFlagNone))
-        else {
-            dirty = true
-            return
-        }
+            kCFAllocatorDefault, callback, &context, roots as CFArray, FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 1.0,
+            FSEventStreamCreateFlags(kFSEventStreamCreateFlagWatchRoot))
+        else { return }
         FSEventStreamSetDispatchQueue(s, queue)
         if !FSEventStreamStart(s) {
             FSEventStreamInvalidate(s)
             FSEventStreamRelease(s)
-            dirty = true
             return
         }
         stream = s
@@ -152,12 +223,16 @@ public final class CapsWatch {
         stream = nil
     }
 
-    /// One event: a change under a capped folder, or above it (a folder on the way made or
-    /// removed), or a sign that events were lost.
+    /// One event: a change under a watched folder, or above it (a folder on the way made or
+    /// removed), a root that moved, or a sign that events were lost.
     func event(_ path: String, flags: FSEventStreamEventFlags) {
+        if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0 {
+            dirty = true
+            rearm = true
+            return
+        }
         let lost = FSEventStreamEventFlags(
-            kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped
-                | kFSEventStreamEventFlagRootChanged)
+            kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped)
         if flags & lost != 0 {
             dirty = true
             return
