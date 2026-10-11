@@ -2739,6 +2739,119 @@ def tweak(name):
     return None
 
 
+# perf keep w acc-cored (`run --perf`): poprawka wraca po zdarzeniu na jej plikach, a nie co 5 minut.
+# safety: bezpieczeństwo i polityka strażnika, od razu i bez przerwy na przepychankę (KEEP_FIGHT);
+# perf: wydajność i wygląd, od razu na te same zdarzenia, z przerwą na przepychankę; reszta (procesy,
+# Docker, repozytoria, claude-hooks-async) bez taniego zdarzenia: tylko pełny przebieg co KEEP_PERIODIC s.
+KEEP_CLASS = {
+    "claude-hooks-native": "safety",
+    "devguard-budget": "safety",
+    "devguard-max-server": "safety",
+    "security-slim": "safety",
+    "node-compile-cache": "perf",
+    "claude-limits": "perf",
+    "subagent-cache-1h": "perf",
+    "fast-npx-hooks": "perf",
+    "rg-threads": "perf",
+    "workflow-size": "perf",
+    "claude-ui": "perf",
+    "docker-vm": "perf",
+    "git-speed": "perf",
+    "tether-profile": "perf",
+}
+# pliki poza ustawieniami samej poprawki (settings_path albo path), które ją cofają
+KEEP_EXTRA = {
+    "security-slim": (lambda item: os.path.join(item.claude_dir or CLAUDE_DIR, "plugins", "installed_plugins.json"),),
+    "rg-threads": (lambda item: item.value,),
+    "git-speed": (lambda item: os.path.join(HOME, ".gitconfig"),),
+}
+# poprawki, które zależą od sieci (zmiana ścieżki domyślnej): link to łącze dla updates.py
+KEEP_NETWORK = ("tether-profile", "link")
+KEEP_PERIODIC = 1800
+# tyle napraw jednej poprawki w tylu sekundach znaczy, że ktoś ją cofa: przerwa na tyle sekund
+KEEP_FIGHT = (3, 600, 3600)
+
+
+def keep_paths(item):
+    """Pliki, których zmiana może cofnąć poprawkę: jej ustawienia i to, co dokłada KEEP_EXTRA."""
+    paths = []
+    if hasattr(item, "settings_path"):
+        paths.append(item.settings_path())
+    elif getattr(item, "path", None):
+        paths.append(item.path)
+    paths += [extra(item) for extra in KEEP_EXTRA.get(item.name, ())]
+    return paths
+
+
+def keep_spec(state):
+    """Co obserwuje acc-cored: włączone poprawki z klasą, plikami i zależnością od sieci, plus hook
+    admit obok łańcucha fasthooks (admit-chain, w settings.json) i łącze (link, od sieci)."""
+    tweaks = []
+    for item in TWEAKS:
+        if item.root or item.name not in state.get("applied", {}):
+            continue
+        cls = KEEP_CLASS.get(item.name, "periodic")
+        tweaks.append({"name": item.name, "class": cls, "paths": keep_paths(item) if cls != "periodic" else [],
+                       "network": item.name in KEEP_NETWORK})  # fmt: skip
+    tweaks.append({"name": "admit-chain", "class": "safety", "paths": [CLAUDE_SETTINGS], "network": False})
+    tweaks.append({"name": "link", "class": "perf", "paths": [], "network": True})
+    return {"v": 1, "periodic_s": KEEP_PERIODIC, "config": [CONFIG_PATH, STATE_PATH], "tweaks": tweaks}
+
+
+def keep_backed_off(state, name, now):
+    """Poprawka na przerwie po przepychance (keep_fight); minione przerwy znikają ze stanu."""
+    until = state.get("keep_backoff", {}).get(name)
+    if until is None:
+        return False
+    if until > now:
+        return True
+    del state["keep_backoff"][name]
+    return False
+
+
+def keep_fight(state, name, now):
+    """Naprawa poprawki: przy KEEP_FIGHT[0] naprawach w KEEP_FIGHT[1] s ktoś ją cofa (inne narzędzie,
+    ręczna edycja). Poprawka wydajności czeka wtedy KEEP_FIGHT[2] s, zamiast się z nim przepychać;
+    poprawka bezpieczeństwa (safety) nie czeka nigdy i mówi o tym w logu najwyżej raz na KEEP_FIGHT[2] s."""
+    count, window, pause = KEEP_FIGHT
+    repairs = state.setdefault("keep_repairs", {})
+    recent = [t for t in repairs.get(name, []) if now - t < window] + [now]
+    repairs[name] = recent
+    if len(recent) < count:
+        return
+    if KEEP_CLASS.get(name) == "safety":
+        said = state.setdefault("keep_fight_said", {})
+        if now - said.get(name, 0) >= pause:
+            said[name] = now
+            log(f"keep {name}: ktoś cofa tę poprawkę ({count}× w {window // 60} min); "
+                "bezpieczeństwo wraca za każdym razem")  # fmt: skip
+        return
+    state.setdefault("keep_backoff", {})[name] = now + pause
+    repairs[name] = []
+    log(f"keep {name}: ktoś cofa tę poprawkę ({count}× w {window // 60} min): przerwa na {pause // 60} min")
+
+
+def keep_lock(wait=60.0):
+    """Jeden pisarz perf-state.json naraz: keep z launchd i z acc-cored, apply, undo i ultra z CLI.
+    Otwarty plik z blokadą (perf.lock obok stanu) albo RuntimeError po `wait` s; blokada trwa do
+    zamknięcia pliku."""
+    import fcntl
+
+    path = os.path.join(os.path.dirname(STATE_PATH), "perf.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    handle = open(path, "a")
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise RuntimeError(f"inny przebieg perf trzyma {path} ponad {wait:.0f} s")
+            time.sleep(0.05)
+
+
 # skrypty claude-acc: wprost (`/usr/bin/python3 <STATE>/devguard.py run`) albo przez
 # launcher z bajtkodem w cache (`<STATE>/python <STATE>/acc.py devguard run`)
 ACC_SCRIPTS = ("accswitch", "devguard", "janitor", "perf", "sched", "updates")
@@ -4300,19 +4413,31 @@ def cmd_undo(cfg, args, system=None):
     return 0
 
 
+def keep_only(args):
+    """`--only a,b` (acc-cored po zdarzeniu): zbiór nazw albo None dla pełnego przebiegu."""
+    if "--only" not in args:
+        return None
+    i = args.index("--only")
+    return {n for n in (args[i + 1] if i + 1 < len(args) else "").split(",") if n}
+
+
 def cmd_keep(cfg, args, system=None):
     """Pilnuje włączonych poprawek (dla launchd co kilka minut): procesy z listy wstają
     z nowym pid, ktoś nadpisał settings.json, zapis do Dockera czekał na jego zamknięcie;
-    kończy też cofnięcia, które musiały poczekać."""
+    kończy też cofnięcia, które musiały poczekać. `--only a,b`: tylko te poprawki (acc-cored po
+    zdarzeniu na ich plikach albo zmianie sieci), bez cofnięć w toku i Ultry."""
     system = system or System()
+    only = keep_only(args)
+    now = time.time()
     state = load_state()
     # łącze dla updates.py: na tetheringu zaplanowane aktualizacje czekają
-    try:
-        state["link"] = system.link()
-    except (OSError, ValueError) as err:
-        log(f"keep: łącze nieznane {err!r}")
+    if only is None or "link" in only:
+        try:
+            state["link"] = system.link()
+        except (OSError, ValueError) as err:
+            log(f"keep: łącze nieznane {err!r}")
     errors = state.setdefault("keep_errors", {})
-    for name, record in list(state.get("deferred", {}).items()):
+    for name, record in list(state.get("deferred", {}).items() if only is None else []):
         if tweak(name) is None:
             continue
         try:
@@ -4323,7 +4448,9 @@ def cmd_keep(cfg, args, system=None):
         log(f"keep {name}: dokończone cofnięcie")
     for item in TWEAKS:
         old = state["applied"].get(item.name)
-        if old is None or item.root:
+        if old is None or item.root or (only is not None and item.name not in only):
+            continue
+        if keep_backed_off(state, item.name, now):
             continue
         try:
             record, changed = item.apply(cfg, system, old)
@@ -4348,8 +4475,9 @@ def cmd_keep(cfg, args, system=None):
         state["applied"][item.name] = record
         if changed:
             log(f"keep {item.name}: {', '.join(changed)}")
+            keep_fight(state, item.name, now)
     ultra = ultra_state(state)
-    if ultra["on"]:
+    if ultra["on"] and only is None:
         # aktualizacja claude-acc dokłada poprawki do Ultry: włączona Ultra je przejmuje
         for name in ULTRA:
             if name in ultra["applied"] or name in ultra["declined"]:
@@ -4462,9 +4590,13 @@ def cmd_record(cfg, args, system=None):
 
 
 def cmd_keep_launchd(cfg, args):
-    """`keep` z launchd: poprawki, a po nich hook admit obok łańcucha fasthooks (admitchain.py).
-    Testy wołają cmd_keep wprost, więc prawdziwy settings.json zostaje poza nimi."""
+    """`keep` z launchd albo z acc-cored: poprawki, a po nich hook admit obok łańcucha fasthooks
+    (admitchain.py; z `--only` tylko, gdy jest wśród nazw jako admit-chain). Testy wołają cmd_keep
+    wprost, więc prawdziwy settings.json zostaje poza nimi."""
     rc = cmd_keep(cfg, args)
+    only = keep_only(args)
+    if only is not None and "admit-chain" not in only:
+        return rc
     try:
         import admitchain
 
@@ -4477,8 +4609,18 @@ def cmd_keep_launchd(cfg, args):
     return rc
 
 
+def cmd_keep_spec(cfg, args, system=None):
+    """Dla acc-cored (`run --perf`): JSON keep_spec, czyli co obserwować i co jak szybko wraca."""
+    print(json.dumps(keep_spec(load_state())))
+    return 0
+
+
+# polecenia, które piszą perf-state.json: po jednym naraz (keep_lock)
+LOCKED = ("keep", "apply", "undo", "ultra", "record")
+
 COMMANDS = {
     "status": cmd_status,
+    "keep-spec": cmd_keep_spec,
     "bench": cmd_bench,
     "apply": cmd_apply,
     "undo": cmd_undo,
@@ -4498,7 +4640,12 @@ def main(argv):
         print(__doc__)
         return 2
     try:
-        return COMMANDS[cmd](load_config(), argv[1:])
+        lock = keep_lock() if cmd in LOCKED else None
+        try:
+            return COMMANDS[cmd](load_config(), argv[1:])
+        finally:
+            if lock:
+                lock.close()
     except SystemExit:
         raise
     except Exception as err:

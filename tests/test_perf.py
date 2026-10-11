@@ -2321,5 +2321,99 @@ class HostFixtureTest(unittest.TestCase):
                 self.assertIn("devtools", perf.pending_manual(state))
 
 
+class KeepNativeTest(Isolated):
+    """perf keep z acc-cored: spec do obserwowania, `--only`, przepychanka i perf.lock."""
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.claude, claude_settings())
+        self.write(self.files["devguard-budget"], {"budget_percent": 35})
+        for name in ("claude-limits", "workflow-size", "devguard-budget"):
+            self.assertEqual(self.run_cmd(perf.cmd_apply, name, system=FakeSystem({}))[0], 0)
+
+    def revert(self):
+        """Ktoś (inne narzędzie, ręczna edycja) cofa wszystkie trzy poprawki."""
+        self.write(self.claude, claude_settings())
+        self.write(self.files["devguard-budget"], {"budget_percent": 35})
+
+    def limits_on(self):
+        return self.read(self.claude)["env"].get("BASH_MAX_TIMEOUT_MS") == "3600000"
+
+    def test_the_spec_lists_applied_tweaks_with_their_class_and_files(self):
+        code, out = self.run_cmd(perf.cmd_keep_spec)
+        self.assertEqual(code, 0)
+        spec = json.loads(out)
+        tweaks = {t["name"]: t for t in spec["tweaks"]}
+        self.assertEqual(spec["periodic_s"], 1800)
+        self.assertEqual(sorted(tweaks), ["admit-chain", "claude-limits", "devguard-budget", "link", "workflow-size"])
+        self.assertEqual((tweaks["claude-limits"]["class"], tweaks["claude-limits"]["paths"]), ("perf", [self.claude]))
+        self.assertEqual(tweaks["devguard-budget"]["class"], "safety")
+        self.assertEqual(tweaks["devguard-budget"]["paths"], [self.files["devguard-budget"]])
+        self.assertEqual((tweaks["link"]["network"], tweaks["link"]["paths"]), (True, []))
+        self.assertIn(perf.STATE_PATH, spec["config"])
+        # a tweak without a cheap event: only in the periodic pass, nothing to watch
+        self.run_cmd(perf.cmd_apply, "bg-helpers", system=FakeSystem({10: [100, WORKER, False]}))
+        bg = {t["name"]: t for t in perf.keep_spec(perf.load_state())["tweaks"]}["bg-helpers"]
+        self.assertEqual((bg["class"], bg["paths"]), ("periodic", []))
+
+    def test_only_runs_just_the_named_tweaks(self):
+        self.revert()
+        self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}, tethered=True))
+        self.assertTrue(self.limits_on())
+        self.assertNotIn("workflowSizeGuideline", self.read(self.claude))
+        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 35)
+        self.assertNotIn("link", perf.load_state())  # the link only when named
+        self.run_cmd(perf.cmd_keep, "--only", "link,devguard-budget", system=FakeSystem({}, tethered=True))
+        self.assertTrue(perf.load_state()["link"]["tethered"])
+        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
+
+    def test_a_perf_tweak_reverted_three_times_in_ten_minutes_waits_an_hour(self):
+        t0 = 1_800_000_000.0
+        for i, at in enumerate((t0, t0 + 60, t0 + 120)):
+            self.revert()
+            with mock.patch.object(perf.time, "time", return_value=at):
+                self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}))
+            self.assertTrue(self.limits_on(), i)
+        self.assertIn("przerwa na 60 min", self.text(perf.LOG_PATH))
+        self.revert()
+        with mock.patch.object(perf.time, "time", return_value=t0 + 180):
+            self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}))
+            self.run_cmd(perf.cmd_keep, system=FakeSystem({}))  # the full pass waits too
+        self.assertFalse(self.limits_on())
+        with mock.patch.object(perf.time, "time", return_value=t0 + 120 + 3601):
+            self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}))
+        self.assertTrue(self.limits_on())
+        self.assertNotIn("claude-limits", perf.load_state().get("keep_backoff", {}))
+
+    def test_a_safety_tweak_comes_back_every_time_and_says_so_once_an_hour(self):
+        t0 = 1_800_000_000.0
+        for i in range(5):
+            self.revert()
+            with mock.patch.object(perf.time, "time", return_value=t0 + 60 * i):
+                self.run_cmd(perf.cmd_keep, "--only", "devguard-budget", system=FakeSystem({}))
+            self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25, i)
+        self.assertEqual(self.text(perf.LOG_PATH).count("bezpieczeństwo wraca za każdym razem"), 1)
+        self.assertNotIn("devguard-budget", perf.load_state().get("keep_backoff", {}))
+
+    def test_the_admit_chain_runs_only_when_named_or_in_the_full_pass(self):
+        fake = mock.Mock()
+        fake.heal.return_value = None
+        with mock.patch.dict(sys.modules, {"admitchain": fake}), mock.patch.object(perf, "System", lambda: FakeSystem({})):
+            perf.cmd_keep_launchd(self.cfg, ["--only", "claude-limits"])
+            self.assertEqual(fake.heal.call_count, 0)
+            perf.cmd_keep_launchd(self.cfg, ["--only", "admit-chain"])
+            perf.cmd_keep_launchd(self.cfg, [])
+            self.assertEqual(fake.heal.call_count, 2)
+
+    def test_one_writer_of_the_state_at_a_time(self):
+        held = perf.keep_lock()
+        self.addCleanup(held.close)
+        self.assertEqual(os.path.dirname(held.name), os.path.dirname(perf.STATE_PATH))
+        with self.assertRaises(RuntimeError):
+            perf.keep_lock(wait=0.2)
+        held.close()
+        perf.keep_lock(wait=0.2).close()
+
+
 if __name__ == "__main__":
     unittest.main()
