@@ -58,14 +58,31 @@ def _run(cmd, opt, key, args):
         for k in kc:
             print(f'    "svce"<blob>="{k.split("|")[0]}"')
         return 0
+    print(f'security: unknown command "{cmd}"', file=sys.stderr)  # jak prawdziwe, z nazwą polecenia
     return 1
 
 
+
+
+def lines(data):
+    """Jak fgets do bufora 4096 bajtów w `security -i`: z dłuższej linii pierwsze 4095 bajtów to jedno
+    polecenie, a reszta następne (zmierzone na /usr/bin/security, macOS 27, nieznanym poleceniem)."""
+    while data:
+        cut = data.find(b"\n") + 1 or len(data)
+        cut = min(cut, 4095)
+        yield data[:cut].rstrip(b"\n").decode()
+        data = data[cut:]
+
+
 if sys.argv[1] == "-i":
-    # tryb interaktywny: polecenia z stdin, linia po linii, jak `security -i`
+    # tryb interaktywny: polecenia z stdin, linia po linii, jak `security -i`. Jak prawdziwe: kod wyjścia
+    # to kod OSTATNIEGO polecenia (pusta linia to polecenie z kodem 0), a nieudane pisze na stderr
+    # "<polecenie>: returned <kod>"
     code = 0
-    for line in sys.stdin.read().splitlines():
-        if line.strip():
-            code = run(shlex.split(line)) or code
+    for line in lines(sys.stdin.buffer.read()):
+        args = shlex.split(line) if line.strip() else []
+        code = run(args) if args else 0
+        if code:
+            print(f"{args[0]}: returned {code}", file=sys.stderr)
     sys.exit(code)
 sys.exit(run(sys.argv[1:]))
