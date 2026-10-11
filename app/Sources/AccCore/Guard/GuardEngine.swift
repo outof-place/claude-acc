@@ -103,6 +103,10 @@ public final class GuardEngine: @unchecked Sendable {
     var loopStartedAt = 0.0
     var loopRestartAt = 0.0
     var loopShortRuns = 0
+    /// the lock was let go for Python's loop (alive, ended, or waiting out its backoff): native
+    /// ticks again only after taking it back
+    var pythonMode = false
+    var lockWaitLogged = false
     /// the first host lookup answered (or failed): until then nobody counts as watched, so no shaping
     var hostSettled = false
     var shaper = QoSShaper()
@@ -156,7 +160,7 @@ public final class GuardEngine: @unchecked Sendable {
             timer?.cancel()
             pressureSource?.cancel()
             // Python's loop goes first: an orphan would keep devguard.lock and guard on its own
-            stopPythonLoop()
+            endPythonLoop()
             if !options.shadow { shaper.restoreAll() }
             GuardLog.write("koniec strażnika (acc-cored)")
             if lockFd >= 0 {
@@ -215,7 +219,11 @@ public final class GuardEngine: @unchecked Sendable {
             if reschedule { schedule(after: interval(cfg)) }
             return
         }
-        if pythonLoop != nil { stopPythonLoop() }
+        // back from Python's loop: only with the lock in hand and Python's last state
+        if pythonMode, !leavePythonMode() {
+            if reschedule { schedule(after: interval(cfg)) }
+            return
+        }
         let probes = probesFactory?() ?? LiveProbes(home: options.home, orca: client, cache: procCache)
         let enforce = !options.shadow && cfg["mode"] == .string("enforce")
         var next = state
@@ -252,7 +260,7 @@ public final class GuardEngine: @unchecked Sendable {
     func interval(_ cfg: GuardConfig) -> Double {
         let v = cfg["interval_seconds"]
         guard v.string == nil, let n = v.double, n > 0 else { return GuardConfig.defaults["interval_seconds"]?.double ?? 5 }
-        return n
+        return min(n, 3600)  // a timer's leeway is n * 100 ms in an Int: 1e17 would trap
     }
 
     /// The tick goes to Python: the state as it was before this tick, the lock let go, `devguard once`,
@@ -286,12 +294,13 @@ public final class GuardEngine: @unchecked Sendable {
             var status: Int32 = 0
             if waitpid(pid, &status, WNOHANG) == 0 { return }
             pythonLoop = nil
-            loopShortRuns = now - loopStartedAt < 60 ? loopShortRuns + 1 : 0
-            loopRestartAt = now + min(10 * pow(2, Double(max(loopShortRuns - 1, 0))), 300)
-            GuardLog.write("acc-cored: pętla Pythona skończyła się (status \(status)), następny start za \(Int(loopRestartAt - now)) s")
+            backOff(now, ran: now - loopStartedAt)
+            let how = status & 0x7f == 0 ? "kod \((status >> 8) & 0xff)" : "sygnał \(status & 0x7f)"
+            GuardLog.write("acc-cored: pętla Pythona skończyła się (\(how)), następny start za \(Int(loopRestartAt - now)) s")
         }
         guard now >= loopRestartAt else { return }
         if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_UN) }
+        pythonMode = true
         // Python restores what it pinned itself; what native pinned goes back now, or the two caches lie
         shaper.restoreAll()
         shaper.forget()
@@ -299,36 +308,57 @@ public final class GuardEngine: @unchecked Sendable {
         loopStartedAt = now
         pythonLoop = loopStarter?(argv) ?? Spawn.start(argv, log: GuardPaths.state(options.home) + "/devguard-launchd.log")
         if pythonLoop == nil {
-            loopRestartAt = now + 10
-            GuardLog.write("acc-cored: pętla Pythona nie wystartowała (\(argv[0])), następna próba za 10 s")
+            backOff(now, ran: 0)
+            GuardLog.write("acc-cored: pętla Pythona nie wystartowała (\(argv[0])), następna próba za \(Int(loopRestartAt - now)) s")
         }
     }
 
-    /// The config reads natively again (or the guard stops): Python's loop ends (SIGTERM: it restores
-    /// QoS and logs its end), the lock comes back, and the state is Python's last one. After 10 s it
-    /// is killed with what it started (simctl, orca): they aren't in a group of their own.
-    func stopPythonLoop() {
-        guard let pid = pythonLoop else { return }
-        pythonLoop = nil
+    /// 10 s after a loop that lived a minute or more; doubling to 5 min while it ends sooner (or
+    /// doesn't start)
+    func backOff(_ now: Double, ran: Double) {
+        loopShortRuns = ran < 60 ? loopShortRuns + 1 : 0
+        loopRestartAt = now + min(10 * pow(2, Double(max(loopShortRuns - 1, 0))), 300)
+    }
+
+    /// The config reads natively again: Python's loop ends, and native takes the lock back without
+    /// waiting (another guard may hold it: `devguard run` from launchd, a manual `devguard once`);
+    /// false while it can't, and native doesn't tick. Then Python's last state is the state.
+    func leavePythonMode() -> Bool {
+        endPythonLoop()
+        if lockFd >= 0, !Self.flockRetrying(lockFd, LOCK_EX | LOCK_NB) {
+            if !lockWaitLogged { GuardLog.write("acc-cored: devguard.lock trzyma inny strażnik, czekam") }
+            lockWaitLogged = true
+            return false
+        }
+        lockWaitLogged = false
+        pythonMode = false
         loopShortRuns = 0
         loopRestartAt = 0
-        kill(pid, SIGTERM)
-        let killed = Spawn.reap(pid, deadline: Kernel.wall() + 10, beforeKill: {
-            var seen: Set<pid_t> = [pid]
-            var todo = [pid]
-            while let p = todo.popLast() {
-                for c in Proc.children(of: p) where c > 1 && !seen.contains(c) {
-                    seen.insert(c)
-                    todo.append(c)
-                    kill(c, SIGKILL)
-                }
-            }
-        }) == nil
-        if killed { GuardLog.write("acc-cored: pętla Pythona nie skończyła się w 10 s, zabita") }
-        if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_EX) }
         state = Files.json(statePath, fallback: .object(state)).object ?? state
         savedStamp = Files.stamp(statePath)
         shaper.forget()
+        return true
+    }
+
+    /// Python's loop, if it runs, ends (SIGTERM: it restores QoS and logs its end). After 10 s it is
+    /// killed with what it started (simctl, orca): they aren't in a group of their own, so the whole
+    /// tree is collected first and then killed (a child killed first would hand its own to launchd).
+    func endPythonLoop() {
+        guard let pid = pythonLoop else { return }
+        pythonLoop = nil
+        kill(pid, SIGTERM)
+        let killed = Spawn.reap(pid, deadline: Kernel.wall() + 10, beforeKill: {
+            var tree: [pid_t] = []
+            var todo = [pid]
+            while let p = todo.popLast() {
+                for c in Proc.children(of: p) where c > 1 && !tree.contains(c) && c != pid {
+                    tree.append(c)
+                    todo.append(c)
+                }
+            }
+            for c in tree { kill(c, SIGKILL) }
+        }) == nil
+        if killed { GuardLog.write("acc-cored: pętla Pythona nie skończyła się w 10 s, zabita") }
     }
 
     /// What changes when execute() acts: last_action (stop, restart, shutdown), the events, the warns.
