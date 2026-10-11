@@ -131,17 +131,23 @@ public enum Spawn {
     }
 
     /// Waits for `pid` until `deadline` (kqueue NOTE_EXIT), then kills its group and waits for it;
-    /// its wait status, or nil when it had to be killed.
-    static func reap(_ pid: pid_t, deadline: Double) -> Int32? {
+    /// its wait status, or nil when it had to be killed. Without a kqueue watch (no descriptor left:
+    /// EMFILE) it polls waitpid until the deadline instead, so the deadline holds either way.
+    static func reap(_ pid: pid_t, deadline: Double, queue makeQueue: () -> Int32 = { kqueue() }) -> Int32? {
         var status: Int32 = 0
-        let kq = kqueue()
-        defer { close(kq) }
+        let kq = makeQueue()
+        defer { if kq >= 0 { close(kq) } }
         var change = kevent(ident: UInt(pid), filter: Int16(EVFILT_PROC), flags: UInt16(EV_ADD | EV_ONESHOT), fflags: NOTE_EXIT, data: 0, udata: nil)
         var event = kevent()
         // ESRCH: it has already ended (or is ending); NOTE_EXIT comes while it exits, a moment
-        // before waitpid can reap it, so both wait for it rather than ask once
-        var exited = kevent(kq, &change, 1, nil, 0, nil) != 0
-        while !exited {
+        // before waitpid can reap it, so both wait for it rather than ask once. Any other error
+        // says nothing about the child.
+        var exited = false
+        var watching = false
+        if kq >= 0 {
+            if kevent(kq, &change, 1, nil, 0, nil) == 0 { watching = true } else { exited = errno == ESRCH }
+        }
+        while watching && !exited {
             let left = deadline - Kernel.wall()
             if left <= 0 { break }
             let n: Int32
@@ -154,6 +160,14 @@ public enum Spawn {
             if n < 0 && errno == EINTR { continue }
             exited = n > 0
             break
+        }
+        if !watching && !exited {
+            while Kernel.wall() < deadline {
+                let r = waitpid(pid, &status, WNOHANG)
+                if r == pid { return status }
+                if r < 0 && errno != EINTR { break }
+                usleep(useconds_t(max(0, min(0.05, deadline - Kernel.wall())) * 1e6))
+            }
         }
         var r: pid_t
         repeat { r = waitpid(pid, &status, exited ? 0 : WNOHANG) } while r < 0 && errno == EINTR

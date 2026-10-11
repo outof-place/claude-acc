@@ -55,3 +55,26 @@ func spawnDeadline() {
     #expect(Spawn.output(["/bin/echo", "hi"], timeout: 5) == Array("hi\n".utf8))
     #expect(Kernel.wall() - start < 5)
 }
+
+/// A child of this process, for reap; nil if it can't start.
+private func child(_ argv: [String]) -> pid_t? {
+    var pid: pid_t = 0
+    let cargs = argv.map { strdup($0) } + [nil]
+    defer { cargs.forEach { free($0) } }
+    return posix_spawn(&pid, argv[0], nil, nil, cargs, environ) == 0 ? pid : nil
+}
+
+@Test("reap keeps its deadline without a kqueue (EMFILE) or with a watch that fails for another reason")
+func reapWithoutKqueue() throws {
+    // -1: kqueue() failed; /dev/null: EV_ADD fails with an error that isn't ESRCH
+    for opener in [{ Int32(-1) }, { open("/dev/null", O_RDONLY) }] {
+        let quick = try #require(child(["/bin/sh", "-c", "sleep 0.2; exit 3"]))
+        let status = Spawn.reap(quick, deadline: Kernel.wall() + 5, queue: opener)
+        #expect(status.map { ($0 >> 8) & 0xff } == 3)
+        let slow = try #require(child(["/bin/sleep", "30"]))
+        let start = Kernel.wall()
+        #expect(Spawn.reap(slow, deadline: Kernel.wall() + 0.3, queue: opener) == nil)
+        #expect(Kernel.wall() - start < 2)
+        #expect(kill(slow, 0) != 0)
+    }
+}
