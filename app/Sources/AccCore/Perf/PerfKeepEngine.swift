@@ -67,12 +67,13 @@ public final class PerfKeepEngine: @unchecked Sendable {
     }
 
     public func start() {
-        queue.async {
-            self.watch.changed = { [weak self] moved in self?.changed(moved) }
-            self.loadSpec()
-            self.armNetwork()
-            self.fullDue = true  // as launchd's RunAtLoad
-            self.kick(after: 0)
+        queue.async { [self] in
+            // the watch lives in this engine: a strong reference back would keep both forever
+            watch.changed = { [weak self] moved in self?.changed(moved) }
+            loadSpec()
+            armNetwork()
+            fullDue = true  // as launchd's RunAtLoad
+            kick(after: 0)
         }
     }
 
