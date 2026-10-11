@@ -135,16 +135,18 @@ final class Store {
         if let desktop { self.desktop = desktop }
     }
 
-    init() {
-        awake = Awake()
-        dictation = Dictation()
+    /// `sideEffects: false` (`--measure-panel`): the live readings and timers, without the login
+    /// item, Stay Awake's assertions or dictation.
+    init(sideEffects: Bool = true) {
+        awake = Awake(preview: !sideEffects)
+        dictation = Dictation(preview: !sideEffects)
         // quitting during a sign-in must not leave the script with `claude` behind
         NotificationCenter.default.addObserver(
             forName: NSApplication.willTerminateNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.cancelLogin() }
         }
-        registerLoginItemUnlessTurnedOff()
+        if sideEffects { registerLoginItemUnlessTurnedOff() }
         launchAtLogin = SMAppService.mainApp.status == .enabled
         poller = Task { [weak self] in
             while !Task.isCancelled {

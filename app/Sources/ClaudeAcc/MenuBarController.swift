@@ -247,6 +247,15 @@ final class PanelWindow: NSPanel {
         layer.add(fade, forKey: "fade-in")
     }
 
+    /// `--measure-panel`: shown at `origin`, off every display, without the drop and without
+    /// becoming key, so the app the user works in keeps the keyboard.
+    func showOffscreen(at origin: NSPoint) {
+        isOpen = true
+        card.layer?.opacity = 1
+        setFrameOrigin(origin)
+        orderFrontRegardless()
+    }
+
     /// Eases back up into the menu bar while it fades, then leaves the screen; `done` runs
     /// after that, so whatever the app does next can't stall the animation.
     func dismiss(done: @escaping () -> Void) {
