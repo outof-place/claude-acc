@@ -231,7 +231,7 @@ class CapsCommandTest(unittest.TestCase):
         self.assertEqual([c.args[1] for c in check.call_args_list], [{}, {}])
         self.assertEqual([c.kwargs["dry_run"] for c in check.call_args_list], [True, False])
         self.assertEqual(json.loads(out.call_args.args[0]),
-                         {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": []})
+                         {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": [], "headroom": None})
         self.assertIn("caps", dg.COMMANDS)
         self.assertIn("caps [--dry-run]", entry.__doc__)
 
@@ -304,6 +304,44 @@ class CapsCommandTest(unittest.TestCase):
         # protected: it stays so, and a busy that never ends would keep the gate open for good
         protected = dict(jcfg, protect=[tmp])
         self.assertEqual(self.report(protected)["busy"], 0)
+
+    def test_the_report_gives_the_tightest_folder_s_headroom(self):
+        # acc-cored counts a drop of free space only when it could push a cap over its limit
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp, max_gb=1)
+        report = self.report(jcfg)
+        sizes = sum(dg.janitor.du_size(os.path.join(tmp, "p", "builds", n)) for n in ("old", "new"))
+        self.assertEqual(report["headroom"], dg.janitor.GB - sizes)
+        # over the limit with both entries removable: what's left is empty
+        self.assertAlmostEqual(self.report(self.caps_world_again(tmp))["headroom"], 1e-6 * dg.janitor.GB)
+
+    def caps_world_again(self, tmp):
+        return dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(tmp, "*", "builds"), "max_gb": 1e-6,
+                                                       "keep": 0, "fresh_minutes": 0}])  # fmt: skip
+
+    def test_a_linked_folder_without_builds_yet_is_reported_too(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp)
+        os.makedirs(os.path.join(tmp, "repo", ".perf"))
+        os.symlink(os.path.join(tmp, "repo", ".perf"), os.path.join(tmp, "wt1"))
+
+        self.assertIn(os.path.realpath(os.path.join(tmp, "repo", ".perf")), self.report(jcfg)["folders"])
+
+    def test_du_with_an_unreadable_subfolder_still_measures(self):
+        # du prints the total and exits 1: a size, not a failure that keeps the gate open
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        locked = os.path.join(tmp, "entry", "locked")
+        os.makedirs(locked)
+        with open(os.path.join(tmp, "entry", "blob"), "wb") as f:
+            f.write(b"x" * 65536)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o755)
+        if subprocess.run(["du", "-sk", os.path.join(tmp, "entry")], capture_output=True).returncode == 0:
+            self.skipTest("du reads the folder anyway (root)")
+        self.assertGreaterEqual(dg.janitor.du_size(os.path.join(tmp, "entry")), 65536)
 
     def test_acc_cored_reads_the_caps_without_janitors_defaults(self):
         # CapsWatch.swift reads janitor.json's "caps" as written: a default cap here would go unwatched
