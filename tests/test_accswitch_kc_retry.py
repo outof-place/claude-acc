@@ -410,6 +410,13 @@ class KeychainWriteUnitTest(unittest.TestCase):
         for cache in (accswitch._KC_SEEN, accswitch._TOOLS):
             cache.clear()
             self.addCleanup(cache.clear)
+        # accswitch took its state paths from the real HOME at import: every one of them goes to the test's
+        state_dir = accswitch.STATE_DIR
+        for name, value in vars(accswitch).items():
+            if isinstance(value, str) and (value == state_dir or value.startswith(state_dir + os.sep)):
+                patcher = mock.patch.object(accswitch, name, self.w.state_dir + value[len(state_dir):])
+                patcher.start()
+                self.addCleanup(patcher.stop)
         # these tests write and time out writes: never through the real `security` (login keychain)
         self.assertEqual(
             accswitch.tool("security"), os.path.join(HERE, "fakes", "security")
@@ -445,6 +452,35 @@ class KeychainWriteUnitTest(unittest.TestCase):
         self.assertEqual(len(written), 3)
         for service in (BASE, scoped(self.w.config_dir), scoped(self.w.other_dir)):
             self.assertEqual(self.w.entry(service)["claudeAiOauth"], new)
+
+    def test_propagate_counts_an_entry_it_cannot_read_as_failed(self):
+        # a read that times out, or a `security` that can't start, never escapes ensure_fresh: the
+        # entry is reported as left with the used token, and the next tick heals it
+        old = {"accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 1}
+        new = {"accessToken": "at-new", "refreshToken": "rt-new", "expiresAt": 2}
+        stuck, broken = scoped(self.w.other_dir), scoped(self.w.config_dir)
+        self.w.runtime({"claudeAiOauth": old}, services=(BASE, broken, stuck))
+        self.w.write()
+        cfg = {"config_dir": self.w.config_dir, "other_config_dirs": [self.w.other_dir]}
+        read = self.acc.kc_read
+
+        def flaky(service, account):
+            if service == stuck:
+                raise subprocess.TimeoutExpired(["security"], 30)
+            if service == broken:
+                raise OSError(35, "Resource temporarily unavailable")
+            return read(service, account)
+
+        with mock.patch.object(self.acc, "kc_read", side_effect=flaky):
+            written, failed = self.acc.propagate("rt-old", json.dumps({"claudeAiOauth": new}), cfg)
+        self.assertEqual(written, [BASE])
+        self.assertEqual(sorted(failed), sorted([stuck, broken]))
+        self.assertEqual(self.w.entry(BASE)["claudeAiOauth"], new)
+
+    def test_the_in_process_state_paths_are_the_test_s(self):
+        self.assertEqual(self.acc.STATE_DIR, self.w.state_dir)
+        self.assertTrue(self.acc.STATE_PATH.startswith(self.w.state_dir + os.sep))
+        self.assertTrue(self.acc.LOG_PATH.startswith(self.w.state_dir + os.sep))
 
     def test_the_retry_budget_can_only_shrink(self):
         for value, want in (("2", 2.0), ("999", 45), ("-1", 0.0), ("x", 45)):

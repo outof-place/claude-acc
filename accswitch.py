@@ -563,7 +563,7 @@ def runtime_copies(old_refresh, oauth, cfg):
     for service in runtime_services(cfg):
         try:
             current = kc_read(service, KEYCHAIN_USER)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):  # OSError: `security` się nie uruchomił (fork, brak pliku)
             unread.append(service)
             continue
         if current and oauth_of(current).get("refreshToken") == old_refresh:
