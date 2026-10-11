@@ -9,6 +9,7 @@ Uruchomienie: /usr/bin/python3 -m unittest discover -s ~/.local/share/claude-acc
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -1257,6 +1258,16 @@ class KeychainMemoTest(unittest.TestCase):
             logged = f.read()
         self.assertEqual(logged.count("w argumentach `security`"), 4)
         self.assertNotIn(token, logged)
+
+    def test_a_cut_line_leaves_no_piece_of_the_secret_in_the_error(self):
+        # should a line be cut anyway (a smaller buffer than measured), its rest runs as a command,
+        # and `security` names that command on stderr: a piece of the hex secret
+        secret = (uuid.uuid4().hex * 70)[:2100]
+        with mock.patch.object(self.acc, "SECURITY_LINE_MAX", 8192):
+            with self.assertRaises(RuntimeError) as caught:
+                self.acc.kc_write("svc", "u", secret)
+        self.assertIn("unknown command", str(caught.exception))  # the cut happened, as with the real one
+        self.assertIsNone(re.search(r"[0-9a-f]{16,}", str(caught.exception)))
 
     def test_write_is_remembered_and_a_failed_write_forgets_the_entry(self):
         acc = self.acc

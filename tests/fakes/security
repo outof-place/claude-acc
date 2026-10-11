@@ -43,6 +43,7 @@ def run(args):
         for k in kc:
             print(f'    "svce"<blob>="{k.split("|")[0]}"')
         return 0
+    print(f'security: unknown command "{cmd}"', file=sys.stderr)  # jak prawdziwe, z nazwą polecenia
     return 1
 
 

@@ -364,8 +364,10 @@ def kc_write(service, account, contents, timeout=30):
         # TimeoutExpired niesie argumenty i to, co proces zdążył wypisać: main() wpisałby jego tekst do
         # logu i na stderr, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
         raise RuntimeError(f"zapis do Keychain nieudany ({service}): brak odpowiedzi po {timeout:.0f} s") from None
-    # `security` nie powtarza polecenia przy błędzie, ale komunikat i tak idzie do logu: bez sekretu
-    error = (r.stderr or "").replace(secret, "<sekret>").strip()
+    # `security` nie powtarza polecenia przy błędzie, ale komunikat i tak idzie do logu: bez sekretu.
+    # Linia rozcięta mimo limitu (mniejszy bufor niż zmierzony) puściłaby resztę jako polecenie,
+    # które `security` nazywa na stderr: znika też każdy ciąg szesnastkowy od 16 znaków
+    error = re.sub(r"[0-9a-fA-F]{16,}", "<hex>", (r.stderr or "").replace(secret, "<sekret>")).strip()
     if r.returncode != 0 or "error" in error.lower():
         raise RuntimeError(f"zapis do Keychain nieudany ({service}): {error[:200]}")
     _KC_SEEN[(service, account)] = contents
