@@ -239,7 +239,11 @@ public final class GuardEngine: @unchecked Sendable {
         let handover = options.shadow ? nil : policy.next(actable: result.actable, brakeDue: result.brakeDue, now: probes.now, brakeGap: gap, stage: stage)
         if let handover {
             GuardLog.release(write: false)  // Python's tick logs and notifies from its own reading
-            handOver(handover, result: result, cfg: cfg)
+            // another guard took the lock meanwhile: no save, no caps, until native has it back
+            guard handOver(handover, result: result, cfg: cfg) else {
+                if reschedule { schedule(after: interval(cfg)) }
+                return
+            }
         } else {
             GuardLog.release(write: true)
             state = next
@@ -260,23 +264,32 @@ public final class GuardEngine: @unchecked Sendable {
     func interval(_ cfg: GuardConfig) -> Double {
         let v = cfg["interval_seconds"]
         guard v.string == nil, let n = v.double, n > 0 else { return GuardConfig.defaults["interval_seconds"]?.double ?? 5 }
-        return min(n, 3600)  // a timer's leeway is n * 100 ms in an Int: 1e17 would trap
+        // a timer's leeway is n * 100 ms in an Int: 1e17 would trap; 0.001 would spin the paths
+        // that wait (a mismatched config, a lock held by another guard) at a kilohertz
+        return max(0.5, min(n, 3600))
     }
 
     /// The tick goes to Python: the state as it was before this tick, the lock let go, `devguard once`,
-    /// then the state Python saved. Python's tick re-reads the Mac, decides and acts.
-    func handOver(_ handover: HandoverPolicy.Handover, result: GuardTickResult, cfg: GuardConfig) {
+    /// then the state Python saved. Python's tick re-reads the Mac, decides and acts. False when
+    /// another guard (launchd's `devguard run`, a manual one) took the lock in that window: native
+    /// doesn't wait for it here (the queue and stop() would hang on it) but goes to pythonMode, and
+    /// leavePythonMode takes the lock back without waiting, with Python's state.
+    func handOver(_ handover: HandoverPolicy.Handover, result: GuardTickResult, cfg: GuardConfig) -> Bool {
         save()
         let before = actedStamp(state)
         if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_UN) }
         // a hung tick (an Orca call that never answers) must not stop the guard for good
         let argv = options.python + ["devguard", "once"]
         let rc = runner?(argv) ?? Spawn.run(argv, log: nil, timeout: Self.onceTimeout)
-        if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_EX) }
         handovers += 1
         state = Files.json(statePath, fallback: .object(state)).object ?? state
         if rc != 0 { GuardLog.write("acc-cored: devguard once wyszedł z kodem \(rc) (\(handover.reason))") }
         policy.record(handover, acted: actedStamp(state) != before, now: result.world.now, stage: result.world.pressure.stage)
+        if lockFd >= 0, !Self.flockRetrying(lockFd, LOCK_EX | LOCK_NB) {
+            pythonMode = true
+            return false
+        }
+        return true
     }
 
     /// Python's slowest tick: a pool Simulator's shutdown (lsappinfo 2 × 5 s, running_apps 20 s,
@@ -343,15 +356,19 @@ public final class GuardEngine: @unchecked Sendable {
     /// Python's loop, if it runs, ends (SIGTERM: it restores QoS and logs its end). After 10 s it is
     /// killed with what it started (simctl, orca): they aren't in a group of their own, so the whole
     /// tree is collected first and then killed (a child killed first would hand its own to launchd).
+    /// Each process is stopped before its children are read: a running one could start another
+    /// between the read and the kill, and that one would escape.
     func endPythonLoop() {
         guard let pid = pythonLoop else { return }
         pythonLoop = nil
         kill(pid, SIGTERM)
         let killed = Spawn.reap(pid, deadline: Kernel.wall() + 10, beforeKill: {
+            kill(pid, SIGSTOP)
             var tree: [pid_t] = []
             var todo = [pid]
             while let p = todo.popLast() {
                 for c in Proc.children(of: p) where c > 1 && !tree.contains(c) && c != pid {
+                    kill(c, SIGSTOP)
                     tree.append(c)
                     todo.append(c)
                 }
@@ -416,7 +433,8 @@ public final class GuardEngine: @unchecked Sendable {
         resolving = true
         let python = options.python, home = options.home, resolver = resolver
         DispatchQueue.global(qos: .utility).async {
-            let found = resolver?() ?? HostResolver.resolve(python: python, home: home)
+            // a stub's nil is a failed lookup, not a reason to ask the live host
+            let found = resolver.map { $0() } ?? HostResolver.resolve(python: python, home: home)
             self.queue.async {
                 self.resolving = false
                 self.hostSettled = true
