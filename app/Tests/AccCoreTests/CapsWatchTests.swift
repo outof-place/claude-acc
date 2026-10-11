@@ -1,3 +1,4 @@
+import CoreServices
 import Darwin
 import Dispatch
 import Foundation
@@ -171,6 +172,58 @@ func capsFolderMadeLater() throws {
     queue.sync {
         #expect(watch.due(now: now + 1200))
         #expect(watch.prefixes == [Files.realpath(home) + "/caps"])
+        watch.stop()
+    }
+}
+
+private final class Volume: @unchecked Sendable { var free: Int64 = 100 << 30 }
+
+@Test("the space gate: only a drop past the tightest folder's headroom, counted from the highest free space since the run")
+func capsSpaceGate() throws {
+    let (home, watch, queue) = try capsHome("space", caps: #"[{"path": "HOME/caps/*", "max_gb": 1}]"#)
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(home + "/caps/rec")
+    let volume = Volume()
+    watch.volumes = { _ in ["data": volume.free] }
+    let now = Kernel.wall()
+    let gb: Int64 = 1 << 30
+    queue.sync {
+        _ = watch.due(now: now)
+        watch.started(now: now)
+        watch.finished(PyObject([("busy", 0), ("headroom", .double(Double(5 * gb)))]))
+        volume.free -= 2 * gb  // a build elsewhere on the volume: within the headroom
+        #expect(!watch.due(now: now + 600))
+        volume.free -= 4 * gb  // 6 GiB down: a capped file may have outgrown its folder's room
+        #expect(watch.due(now: now + 1200))
+
+        watch.started(now: now + 1200)
+        watch.finished(PyObject([("busy", 0)]))  // no headroom known: a tenth of the smallest cap
+        volume.free += gb * 4 / 10  // the Trash emptied
+        #expect(!watch.due(now: now + 1800))
+        volume.free -= gb * 3 / 10  // a file grows: 0.3 GiB down from the peak, though above the start
+        #expect(watch.due(now: now + 2400))
+        watch.stop()
+    }
+}
+
+@Test("a storm of events after the watch is due costs a flag check; a moved root still re-arms; nested folders add no root")
+func capsEventCost() throws {
+    let (home, watch, queue) = try capsHome("storm", caps: #"[{"path": "HOME/caps/*/builds", "max_gb": 10}]"#)
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(home + "/caps/a/builds")
+    let prefix = Files.realpath(home + "/caps")
+    let now = Kernel.wall()
+    queue.sync {
+        _ = watch.due(now: now)
+        watch.started(now: now)
+        // the run reports a plain folder under the prefix: no root of its own
+        watch.finished(PyObject([("busy", 0), ("folders", .array([.string(prefix + "/a/builds")]))]))
+        #expect(!watch.due(now: now + 600))
+        #expect(watch.prefixes == [prefix])
+        watch.event(prefix + "/a/builds/x", flags: 0)
+        #expect(watch.dirty)
+        watch.event(prefix + "/elsewhere", flags: FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged))
+        #expect(watch.rearm)
         watch.stop()
     }
 }

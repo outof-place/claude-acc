@@ -4,8 +4,11 @@
 // - something under a capped folder changes (FSEvents on the folders, or the nearest parent that
 //   exists), or janitor.json does. The folders are the globs' static prefixes and the folders the
 //   last run's globs matched, both as real paths: a symlinked folder lives where its link points;
-// - free space on a watched volume dropped since the last run: a file growing behind an open
-//   descriptor shows up there, while FSEvents reports it only when it's closed;
+// - free space on a watched volume dropped since the last run by more than the tightest folder's
+//   headroom (what it may still grow before a run removes something; at least a tenth of the
+//   smallest cap, at most 1 GiB): a file growing behind an open descriptor shows up there, while
+//   FSEvents reports it only when it's closed. The drop counts from the highest free space since
+//   the run, so space freed meanwhile doesn't hide the growth;
 // - an entry skipped as fresh (a write in progress) may go: the time the last run reported;
 // - an entry skipped as busy (in use, can't be moved, du failed) may be free: no event says so,
 //   so such a run is followed by the next one at the usual interval.
@@ -34,8 +37,12 @@ public final class CapsWatch {
     /// the stream's roots (the nearest existing directory of each prefix); a change re-arms it
     var roots: [String] = []
     var rearm = false
-    /// free bytes of each watched volume (by fsid) when the last run started
+    /// free bytes of each watched volume (by fsid) since the last run started, the highest seen
     var freeAtStart: [String: Int64] = [:]
+    /// how much the tightest folder may grow before a run removes something (the last report)
+    var headroom: Double?
+    /// tests: the volumes' free bytes in place of statfs
+    var volumes: (([String]) -> [String: Int64])?
     private var stream: FSEventStreamRef?
 
     public init(home: String, queue: DispatchQueue, maxGap: Double = 6 * 3600) {
@@ -91,8 +98,9 @@ public final class CapsWatch {
         // FSEvents reports real paths (/private/tmp, not /tmp), and a folder made later in another
         // letter case is the same folder on APFS: realpath again on every interval
         for p in placed.compactMap({ $0 }).map(Files.realpath) + folders where !watched.contains(p) { watched.append(p) }
-        prefixes = watched
-        let wanted = Self.roots(of: watched)
+        // a folder under another watched path adds nothing but a root (and a run when it comes or goes)
+        prefixes = watched.filter { p in !watched.contains { q in q != p && p.pyStarts(q + "/") } }
+        let wanted = Self.roots(of: prefixes)
         if wanted != roots || rearm || stream == nil {  // a stream that didn't start is tried again
             roots = wanted
             rearm = false
@@ -108,7 +116,7 @@ public final class CapsWatch {
     public func started(now: Double) {
         dirty = false
         lastRun = now
-        freeAtStart = Self.freeSpace(roots)
+        freeAtStart = volumes?(roots) ?? Self.freeSpace(roots)
     }
 
     /// The run's report (`devguard caps`'s JSON line); a run that said nothing counts as busy.
@@ -121,6 +129,7 @@ public final class CapsWatch {
         busy = report["busy"]?.int ?? 0
         retryAt = report["retry_at"]?.double
         folders = report["folders"]?.array?.compactMap(\.string) ?? folders
+        headroom = report["headroom"]?.double
     }
 
     /// Stops the stream (on `queue`): it holds this watch, so nothing else frees it.
@@ -128,12 +137,22 @@ public final class CapsWatch {
         stopStream()
     }
 
-    /// A drop of free space on a watched volume since the run started, as large as a tenth of the
-    /// smallest cap (at most 1 GiB): what one file growing under a cap looks like.
+    /// A drop of free space on a watched volume, from the highest free space since the run started,
+    /// larger than the tightest folder's headroom (and at least a tenth of the smallest cap, at most
+    /// 1 GiB): what one file growing under a cap enough to change a run looks like.
     func spaceDropped() -> Bool {
-        let threshold = Int64(min(1, smallestGB / 10) * Double(1 << 30))
-        let now = Self.freeSpace(roots)
-        return freeAtStart.contains { volume, before in (now[volume].map { before - $0 } ?? 0) >= threshold }
+        let floor = min(1, smallestGB / 10) * Double(1 << 30)
+        let threshold = Int64(max(floor, headroom ?? 0))
+        let now = volumes?(roots) ?? Self.freeSpace(roots)
+        var dropped = false
+        for (volume, free) in now {
+            guard let before = freeAtStart[volume] else { continue }
+            // space freed since the run would hide growth of the same size: count from the peak
+            let peak = max(before, free)
+            freeAtStart[volume] = peak
+            if peak - free >= threshold { dropped = true }
+        }
+        return dropped
     }
 
     static func freeSpace(_ paths: [String]) -> [String: Int64] {
@@ -231,6 +250,7 @@ public final class CapsWatch {
             rearm = true
             return
         }
+        if dirty { return }  // already due: a storm of events costs one flag check each
         let lost = FSEventStreamEventFlags(
             kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped)
         if flags & lost != 0 {
