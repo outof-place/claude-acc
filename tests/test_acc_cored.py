@@ -91,6 +91,21 @@ class SchedReplayTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn(f"same {count}, different 0", done.stdout)
 
+    def test_an_empty_or_wrong_source_never_passes(self):
+        # sched_replay from a path without sched.py would import the stdlib `sched`, every fixture would
+        # raise and be dropped, and the replay would pass on an empty file
+        python = python_312() or sys.executable
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "sched.jsonl")
+            made = subprocess.run([python, "-I", "-B", os.path.join(HERE, "acc_cored", "sched_replay.py"), "fuzz", tmp, "--n", "3",
+                                   "--out", out], capture_output=True, text=True)  # fmt: skip
+            self.assertNotEqual(made.returncode, 0)
+            self.assertIn("no sched.py", made.stdout + made.stderr)
+            open(out, "w").close()
+            done = subprocess.run([BUILT, "sched-replay", out], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("no fixtures", done.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
