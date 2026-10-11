@@ -265,6 +265,33 @@ func capsSampledPeak() throws {
     }
 }
 
+@Test("a shallow folder (a link right before another wildcard) counts only its own entries; deep ones below it count whole")
+func capsShallow() throws {
+    let (home, watch, queue) = try capsHome("shallow", caps: #"[{"path": "HOME/caps/*/*/builds", "max_gb": 10}]"#)
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(home + "/far/t1/s0/builds")
+    Files.mkdirs(home + "/caps")
+    let t1 = Files.realpath(home + "/far/t1")
+    let now = Kernel.wall()
+    queue.sync {
+        _ = watch.due(now: now)
+        watch.started(now: now)
+        watch.finished(PyObject([("busy", 0), ("folders", .array([.string(t1 + "/s0/builds")])), ("shallow", .array([.string(t1)]))]))
+        #expect(watch.due(now: now + 1))  // new roots: the stream re-arms, and that counts as a change once
+        watch.started(now: now + 1)
+        #expect(!watch.due(now: now + 600))
+        #expect(watch.shallow == [t1])
+        watch.event(t1 + "/s1/src", flags: 0)  // an edit in the worktree
+        #expect(!watch.dirty)
+        watch.event(t1 + "/s0/builds/run2", flags: 0)  // under a deep folder found in it
+        #expect(watch.dirty)
+        watch.started(now: now + 600)
+        watch.event(t1, flags: 0)  // a new subfolder in it
+        #expect(watch.dirty)
+        watch.stop()
+    }
+}
+
 @Test("a storm of events after the watch is due costs a flag check; a moved root still re-arms; nested folders add no root")
 func capsEventCost() throws {
     let (home, watch, queue) = try capsHome("storm", caps: #"[{"path": "HOME/caps/*/builds", "max_gb": 10}]"#)
