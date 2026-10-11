@@ -56,9 +56,12 @@ public struct GuardConfig: Sendable {
     }
 
     /// The keys whose value the native tick would read differently from Python: a number where a
-    /// number belongs (an int, a float or a bool), a string for a string, a list of strings for a
-    /// list. `"runtimes": "node"` still finds servers in Python (`in` on a string) and none here.
-    /// Flags are read by truthiness on both sides, so any type passes.
+    /// number belongs (an int, a float or a bool), a string for a string, a list for a list.
+    /// `"runtimes": "node"` still finds servers in Python (`in` on a string) and none here. The
+    /// lists' items: `protect` takes ports as ints too (both sides read str(p)), `runtimes` anything
+    /// (an int is never a runtime on either side), `scope` and `simulator_protect` strings only
+    /// (Python's expanduser and fnmatch raise on anything else). Flags are read by truthiness on
+    /// both sides, so any type passes.
     public var mismatched: [String] {
         var out: [String] = []
         for (key, def) in Self.defaults {
@@ -68,13 +71,24 @@ public struct GuardConfig: Sendable {
             case .int, .double: ok = value.double != nil && value.string == nil
             case .bool: ok = true
             case .string: ok = value.string != nil && !value.isRaw
-            case .array: ok = value.array.map { $0.allSatisfy { $0.string != nil && !$0.isRaw } } ?? false
+            case .array:
+                guard let items = value.array else {
+                    ok = false
+                    break
+                }
+                switch key {
+                case "runtimes": ok = true
+                case "protect": ok = items.allSatisfy { ($0.string != nil && !$0.isRaw) || (Self.isInt($0)) }
+                default: ok = items.allSatisfy { $0.string != nil && !$0.isRaw }
+                }
             default: ok = true
             }
             if !ok { out.append(key) }
         }
         return out
     }
+
+    static func isInt(_ v: PyJSON) -> Bool { if case .int = v { true } else { false } }
 
     public subscript(key: String) -> PyJSON { raw[key] ?? .null }
     public func number(_ key: String) -> Double { self[key].double ?? 0 }

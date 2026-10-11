@@ -90,7 +90,7 @@ public final class GuardWorld {
                 unit.consumers = orca.worktrees.filter { w in consumerIds.contains(w["worktreeId"] ?? .null) }
             }
             unit.protected = !Set(unit.ports).isDisjoint(with: protectedPorts)
-                || unit.servers.contains { s in protect.contains { s.cwd == $0 || s.cwd.pyStarts($0 + "/") } }
+                || unit.servers.contains { s in protect.contains { s.cwd.pyEq($0) || s.cwd.pyStarts($0 + "/") } }
             unit.pin = pins.first { pinMatches($0, unit) }
             if unit.pin != nil { unit.protected = true }
             seen.insert(unit.key)
@@ -198,7 +198,7 @@ func pinMatches(_ pin: PyObject, _ unit: Unit) -> Bool {
         guard !digits.isEmpty, digits.unicodeScalars.allSatisfy(pyIsDigit), let n = Int(digits) else { return false }
         return unit.ports.contains(n)
     }
-    return unit.servers.contains { $0.cwd == target || $0.cwd.pyStarts(target + "/") }
+    return unit.servers.contains { $0.cwd.pyEq(target) || $0.cwd.pyStarts(target + "/") }
 }
 
 extension GuardPaths {
@@ -650,12 +650,13 @@ func brakeDue(_ cfg: GuardConfig, _ world: GuardWorld, _ state: PyObject, now: D
 
 func checkPending(_ world: GuardWorld, _ state: inout PyObject, probes: GuardProbes) {
     var pending: [PyJSON] = []
-    let apps = Set(world.units.map(\.appKey))
+    // by code point, as Python's set of str
+    let apps = Set(world.units.map { Array($0.appKey.utf8) })
     for entry in state["pending"]?.array ?? [] {
         let app = entry["app"]?.string ?? ""
         let at = entry["at"]?.double ?? 0
         let label = pyStr(entry["label"] ?? .null)
-        if apps.contains(app) {
+        if apps.contains(Array(app.utf8)) {
             GuardLog.write("wstał po restarcie \(label) w \(GuardText.round(world.now - at)) s")
         } else if world.now - at > 60 {
             let command = pyStr(entry["command"] ?? .null)
