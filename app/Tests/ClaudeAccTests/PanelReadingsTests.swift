@@ -75,3 +75,18 @@ func podProfileRow() throws {
     #expect(!account.isProfile)
     #expect(!account.isStale)
 }
+
+@Test("hotspot: the daemon's rewrite with only a new stamp is the same reading; a new rate is not")
+func hotspotStampOnly() throws {
+    // hotspot-state.json as the daemon wrote it 2 s apart, 2026-10-11 00:20
+    let first = try #require(Store.decode(
+        HotspotState.self, from: Data(#"{"active": false, "at": 1791670858.228381, "enabled": true, "pid": 1547}"#.utf8)))
+    let next = try #require(Store.decode(
+        HotspotState.self, from: Data(#"{"active": false, "at": 1791670860.231107, "enabled": true, "pid": 1547}"#.utf8)))
+    #expect(next.sameReading(as: first))
+    let shaping = try #require(Store.decode(
+        HotspotState.self,
+        from: Data(#"{"active": true, "at": 1791670862.2, "enabled": true, "rate_kbps": 650, "shaping": true}"#.utf8)))
+    #expect(!shaping.sameReading(as: next))
+    #expect(!next.sameReading(as: nil))
+}

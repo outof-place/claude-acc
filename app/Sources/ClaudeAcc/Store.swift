@@ -60,6 +60,9 @@ final class Store {
     /// The fan mode just picked, until the daemon's state file shows it.
     private(set) var fanPick: String?
     private(set) var hotspot: HotspotState?
+    /// The daemon stamps its file every 2 s, mostly with nothing else new: `hotspot` takes only a
+    /// new reading (each one re-ran Stay Awake's card), the stamp says it is still running.
+    @ObservationIgnored private var hotspotAt: Double = 0
     /// The hotspot switch just flipped, until the daemon's state file shows it.
     private(set) var hotspotPick: Bool?
     /// The value asked of a watcher setting's command, shown until a reading confirms it.
@@ -253,7 +256,9 @@ final class Store {
         }
         if let pick = fanPick, pick == fanMode { fanPick = nil }
         if let data = changedFile(CLI.hotspotState) {
-            hotspot = Self.decode(HotspotState.self, from: data)
+            let fresh = Self.decode(HotspotState.self, from: data)
+            hotspotAt = fresh?.at ?? 0
+            if fresh.map({ $0.sameReading(as: hotspot) }) != true { hotspot = fresh }
         }
         if let pick = hotspotPick, pick == hotspot?.enabled { hotspotPick = nil }
         if let data = changedFile(CLI.hotspotConfig) {
@@ -783,7 +788,7 @@ final class Store {
 
     /// The daemon writes every 2 seconds; much older than that means it isn't running.
     var hotspotLive: HotspotState? {
-        guard let state = hotspot, Date.now.timeIntervalSince1970 - state.at < 15 else { return nil }
+        guard let state = hotspot, Date.now.timeIntervalSince1970 - max(state.at, hotspotAt) < 15 else { return nil }
         return state
     }
 
