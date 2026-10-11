@@ -6,6 +6,9 @@
 // five minutes after boot); it runs as launchd ran it, in the background band
 // (`taskpolicy -b`: E cores, throttled IO) at nice 10.
 // Nothing polls while the sweep isn't due: one timer at the due time, then one per idle check.
+// An attempt counts as launchd's start did: a sweep that ends without recording itself (no Python,
+// an exception, its own gates) is tried again `every` later, not at once. It runs without a time
+// limit, as under launchd: a kill would stop it mid-file and skip its cleanup.
 import Darwin
 import Dispatch
 import Foundation
@@ -32,6 +35,10 @@ public final class JanitorEngine: @unchecked Sendable {
     public struct Reading: Sendable {
         public var now: Double
         public var lastSweep: Double
+        /// when this engine last started a sweep (0: not since it started)
+        public var lastAttempt: Double = 0
+        /// janitor.json's min_hours_between_sweeps in seconds: Python skips a sweep sooner than that
+        public var minGap: Double = 0
         public var running: Bool
         public var idle: Double?
         public var builds: Int
@@ -52,6 +59,8 @@ public final class JanitorEngine: @unchecked Sendable {
     let queue = DispatchQueue(label: "acc-cored.janitor", qos: .utility)
     var timer: DispatchSourceTimer?
     var sweeping = false
+    var stopped = false
+    var lastAttempt = 0.0
     public private(set) var sweeps = 0
     /// tests: the sweep's run in place of Python's
     var runner: (@Sendable ([String]) -> Int32)?
@@ -62,7 +71,7 @@ public final class JanitorEngine: @unchecked Sendable {
     }
 
     static func decide(_ r: Reading, every: Double, idleSeconds: Double, maxDefer: Double) -> Decision {
-        let due = r.lastSweep + every
+        let due = max(r.lastSweep + max(every, r.minGap), r.lastAttempt + every)
         if r.now < due { return Decision(run: false, next: due, why: "not due") }
         if r.running { return Decision(run: false, next: r.now + 600, why: "a sweep is running") }
         if r.uptime < 300 { return Decision(run: false, next: r.now + (300 - r.uptime), why: "just booted") }
@@ -82,20 +91,25 @@ public final class JanitorEngine: @unchecked Sendable {
     }
 
     public func stop() {
-        queue.sync { timer?.cancel() }
+        queue.sync {
+            stopped = true
+            timer?.cancel()
+        }
     }
 
     func check() {
-        guard !sweeping else { return }
-        let r = reader?() ?? Self.liveReading(home: options.home)
+        guard !sweeping, !stopped else { return }
+        var r = reader?() ?? Self.liveReading(home: options.home)
+        r.lastAttempt = max(r.lastAttempt, lastAttempt)
         let d = Self.decide(r, every: options.every, idleSeconds: options.idleSeconds, maxDefer: options.maxDefer)
         if d.run {
             sweeping = true
+            lastAttempt = r.now
             let argv = ["/usr/sbin/taskpolicy", "-b", "/usr/bin/nice", "-n", "10"] + options.python + ["janitor", "sweep"]
             let run = runner
             let log = GuardPaths.state(options.home) + "/janitor-launchd.log"
             DispatchQueue.global(qos: .background).async {
-                _ = run?(argv) ?? Spawn.run(argv, log: log, timeout: 3 * 3600)
+                _ = run?(argv) ?? Spawn.run(argv, log: log)
                 self.queue.async { self.finished() }
             }
             return
@@ -124,7 +138,8 @@ public final class JanitorEngine: @unchecked Sendable {
         let o = Options(home: home)
         let d = decide(r, every: o.every, idleSeconds: o.idleSeconds, maxDefer: o.maxDefer)
         let idle = r.idle.map { GuardText.fixed($0, 1) + " s" } ?? "unknown"
-        return "last sweep \(GuardText.round(r.now - r.lastSweep)) s ago, running \(r.running), idle \(idle), builds \(r.builds), "
+        let last = r.lastSweep > 0 ? "last sweep \(GuardText.round(r.now - r.lastSweep)) s ago" : "no sweep recorded"
+        return "\(last), running \(r.running), idle \(idle), builds \(r.builds), "
             + "uptime \(GuardText.round(r.uptime)) s, battery \(r.onBattery ? "on" : "off") \(r.percent)%\n"
             + (d.run ? "would sweep now (\(d.why))" : "would look again in \(GuardText.round(d.next - r.now)) s (\(d.why))")
     }
@@ -140,6 +155,7 @@ public final class JanitorEngine: @unchecked Sendable {
         let (onBattery, percent) = battery()
         return Reading(
             now: Kernel.wall(), lastSweep: janitor["last_sweep"]?["at"]?.double ?? 0,
+            minGap: (cfg["min_hours_between_sweeps"]?.double ?? 2) * 3600,  // janitor.py's DEFAULTS
             running: locked(state + "/janitor.lock"), idle: hidIdle(), builds: builds,
             uptime: uptime(), onBattery: onBattery, percent: percent, minBattery: cfg["min_battery_percent"]?.int ?? 30)
     }

@@ -447,7 +447,14 @@ sweep includes `compress` (APFS compression), which is CPU-heavy.
 Six hours past due it runs anyway, though still not on a low battery. While the sweep isn't due
 nothing polls: one timer waits for the due time, then one waits for each idle check (the idle time
 it still lacks). The sweep is Python's and keeps its own gates. It runs as launchd ran it, in the
-background band (`taskpolicy -b`: E cores, throttled IO) at nice 10. `acc-cored janitor-check`
+background band (`taskpolicy -b`: E cores, throttled IO) at nice 10, without a time limit (launchd
+had none, and a kill would stop `compress` mid-file).
+
+"Due" is 3 hours after the later of the last recorded sweep and the engine's last start. So a sweep
+that ends without recording itself is tried again 3 hours later, as launchd would, not in a loop.
+That covers a missing `$STATE/python`, an exception, and Python's own gates. `min_hours_between_sweeps`
+from `janitor.json` holds it as well. Idle is keyboard and mouse only: a video or a call without
+input counts as idle. A user who comes back during a sweep doesn't stop it. `acc-cored janitor-check`
 prints the live reading and what the engine would do.
 
 ## Switching
