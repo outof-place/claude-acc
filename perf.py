@@ -2739,6 +2739,218 @@ def tweak(name):
     return None
 
 
+# perf keep w acc-cored (`run --perf`): poprawka wraca po zdarzeniu na jej plikach, a nie co 5 minut.
+# safety: bezpieczeństwo i polityka strażnika, od razu i bez przerwy na przepychankę (KEEP_FIGHT);
+# perf: wydajność i wygląd, od razu na te same zdarzenia, z przerwą na przepychankę; reszta (procesy,
+# Docker, repozytoria, claude-hooks-async) bez taniego zdarzenia: tylko pełny przebieg co KEEP_PERIODIC s.
+KEEP_CLASS = {
+    "claude-hooks-native": "safety",
+    "devguard-budget": "safety",
+    "devguard-max-server": "safety",
+    "security-slim": "safety",
+    "node-compile-cache": "perf",
+    "claude-limits": "perf",
+    "subagent-cache-1h": "perf",
+    "fast-npx-hooks": "perf",
+    "rg-threads": "perf",
+    "workflow-size": "perf",
+    "claude-ui": "perf",
+    # docker-vm: tylko pełny przebieg. Jego plik leży w kontenerze grupy Dockera (Group Containers),
+    # a open() tam z acc-cored to monit TCC albo EPERM, po którym obserwacja wisiałaby na rodzicu
+    "git-speed": "perf",
+    "tether-profile": "perf",
+}
+# pliki poza ustawieniami samej poprawki (settings_path albo path), które ją cofają
+KEEP_EXTRA = {
+    "security-slim": (
+        lambda item: os.path.join(item.claude_dir or CLAUDE_DIR, "plugins", "installed_plugins.json"),
+        # wygenerowany marketplace: hooks.json wskazuje te pliki ścieżką bezwzględną, więc ich brak
+        # (Mole wyczyścił już raz katalog stanu) psuje hook
+        lambda item: os.path.join(item.hooks_dir(), "hooks.json"),
+        lambda item: os.path.join(item.hooks_dir(), "sec_slim.py"),
+        lambda item: os.path.join(item.hooks_dir(), "patterns.py"),
+    ),
+    "rg-threads": (lambda item: item.value,),
+    "git-speed": (lambda item: os.path.join(HOME, ".gitconfig"),),
+}
+# poprawki, które zależą od sieci (zmiana ścieżki domyślnej): link to łącze dla updates.py
+KEEP_NETWORK = ("tether-profile", "link")
+KEEP_PERIODIC = 1800
+# poprawki bez zdarzenia, którym 30 min to za rzadko: docker-idle liczy próbki połączeń do progu 2 h
+# (24 próbki co 5 min, jak z launchd, a nie 4)
+KEEP_EVERY = {"docker-idle": 300}
+# tyle napraw jednej poprawki w tylu sekundach znaczy, że ktoś ją cofa: przerwa na tyle sekund
+KEEP_FIGHT = (3, 600, 3600)
+# poprawka bezpieczeństwa w walce wraca coraz rzadziej: pierwszy odstęp i sufit (s). Odstęp rośnie
+# dwukrotnie z każdą naprawą (20, 40, 80, 160, 300), więc stan ustalony to ≤12 napraw na godzinę, jak
+# keep z launchd co 300 s; cisza przez cały sufit kończy walkę
+KEEP_SAFETY_BACKOFF = (20, 300)
+
+
+def keep_paths(item):
+    """Pliki, których zmiana może cofnąć poprawkę: jej ustawienia i to, co dokłada KEEP_EXTRA."""
+    paths = []
+    if hasattr(item, "settings_path"):
+        paths.append(item.settings_path())
+    elif getattr(item, "path", None):
+        paths.append(item.path)
+    paths += [extra(item) for extra in KEEP_EXTRA.get(item.name, ())]
+    return paths
+
+
+def keep_spec(state):
+    """Co obserwuje acc-cored: włączone poprawki z klasą, plikami, zależnością od sieci i własnym
+    odstępem (KEEP_EVERY), plus hook admit obok łańcucha fasthooks (admit-chain: settings.json
+    z CLAUDE_CONFIG_DIR, znacznik i pod-hook-client, jak w admitchain.broken) i łącze (link, od sieci)."""
+    import admitchain
+
+    tweaks = []
+    for item in TWEAKS:
+        if item.root or item.name not in state.get("applied", {}):
+            continue
+        cls = KEEP_CLASS.get(item.name, "periodic")
+        entry = {"name": item.name, "class": cls, "paths": keep_paths(item) if cls != "periodic" else [],
+                 "network": item.name in KEEP_NETWORK}  # fmt: skip
+        if item.name in KEEP_EVERY:
+            entry["every_s"] = KEEP_EVERY[item.name]
+        tweaks.append(entry)
+    chain = admitchain.paths()
+    tweaks.append({"name": "admit-chain", "class": "safety", "paths": [chain["settings"], chain["marker"], chain["client"]],
+                   "network": False})  # fmt: skip
+    tweaks.append({"name": "link", "class": "perf", "paths": [], "network": True})
+    # poprawka bezpieczeństwa w walce, której naprawa czeka na swój termin: acc-cored budzi się na niego
+    # jednym timerem jednorazowym, uzbrojonym tylko wtedy. Termin, który minął (naprawa w nim rzuciła
+    # i `waiting` zostało), nie uzbraja niczego: inaczej każde przeładowanie spec dałoby dodatkowy przebieg
+    now = time.time()
+    retry = {name: fight["next"] for name, fight in state.get("keep_fights", {}).items()
+             if fight.get("waiting") and fight.get("next") and fight["next"] > now}  # fmt: skip
+    return {"v": 1, "periodic_s": KEEP_PERIODIC, "config": [CONFIG_PATH, STATE_PATH], "tweaks": tweaks, "retry": retry}
+
+
+def keep_backed_off(state, name, now):
+    """Poprawka na przerwie po przepychance (keep_fight); minione przerwy znikają ze stanu, a z nimi
+    walka poprawki wydajności."""
+    until = state.get("keep_backoff", {}).get(name)
+    if until is None:
+        return False
+    if until > now:
+        return True
+    del state["keep_backoff"][name]
+    state.get("keep_fights", {}).pop(name, None)
+    return False
+
+
+def keep_waiting(state, name, now):
+    """Poprawka bezpieczeństwa w walce przed swoim terminem: naprawa czeka (acc-cored budzi się na
+    termin z keep_spec, keep z launchd przychodzi i tak co 300 s)."""
+    fight = state.get("keep_fights", {}).get(name)
+    if not fight or not fight.get("next") or now >= fight["next"]:
+        return False
+    fight["waiting"] = True
+    return True
+
+
+def keep_can_fight(name):
+    """O poprawkę można się przepychać tylko w plikach: tę od sieci zmienia zmiana sieci, a poprawki
+    bez plików (nowy pid, stan Dockera) nikt nie cofa."""
+    item = tweak(name)
+    return item is not None and name not in KEEP_NETWORK and bool(keep_paths(item))
+
+
+def keep_reverter(name, changed):
+    """Kto cofa poprawkę, gdy widać to po samej naprawie, albo None. Hooki statusu hosta bez async:
+    menedżer hooków Pod albo Orki (applyManagedHooks) przy każdym starcie wpisuje je od nowa bez async."""
+    if name == "claude-hooks-async":
+        hosts = sorted({line.split(": ", 1)[-1] for line in changed} & set(HOST_HOOKS.values()))
+        if hosts:
+            return f"{'/'.join(hosts)} (applyManagedHooks)"
+    return None
+
+
+def keep_fight(state, name, now, changed=()):
+    """Naprawa poprawki; True, gdy trwa walka (wtedy bez linii w logu na każdą naprawę).
+
+    KEEP_FIGHT[0] napraw w KEEP_FIGHT[1] s znaczy, że ktoś ją cofa (inne narzędzie, ręczna edycja):
+    walka. Jedna walka to jedna linia w logu, z nazwą tego, kto cofa, gdy ją znamy (keep_reverter).
+    Poprawka wydajności czeka wtedy KEEP_FIGHT[2] s, zamiast się przepychać. Poprawka bezpieczeństwa
+    wraca, ale coraz rzadziej (KEEP_SAFETY_BACKOFF), a cisza przez cały sufit kończy walkę."""
+    if not keep_can_fight(name):
+        return False
+    first, cap = KEEP_SAFETY_BACKOFF
+    fights = state.setdefault("keep_fights", {})
+    fight = fights.get(name)
+    if fight and fight.get("next"):
+        if fight.get("waiting") or now - fight["last"] < cap:
+            fight["gap"] = min(fight["gap"] * 2, cap)
+            fight.update(repairs=fight["repairs"] + 1, last=now, next=now + fight["gap"], waiting=False)
+            state["keep_last_fight"] = dict(fight, name=name)
+            return True
+        del fights[name]  # nikt nie cofał przez cały sufit: ta naprawa liczy się od zera
+    count, window, pause = KEEP_FIGHT
+    repairs = state.setdefault("keep_repairs", {})
+    recent = [t for t in repairs.get(name, []) if now - t < window] + [now]
+    repairs[name] = recent
+    if len(recent) < count:
+        return False
+    repairs[name] = []
+    by = keep_reverter(name, changed)
+    who = f" ({by})" if by else ""
+    if KEEP_CLASS.get(name) == "safety":
+        fights[name] = {"since": now, "repairs": len(recent), "last": now, "gap": first, "next": now + first, "by": by}
+        log(f"keep {name}: walka, ktoś cofa tę poprawkę{who} ({count}× w {window // 60} min); wraca coraz "
+            f"rzadziej, od {first} s do co {cap // 60} min")  # fmt: skip
+    else:
+        fights[name] = {"since": now, "repairs": len(recent), "last": now, "until": now + pause, "by": by}
+        state.setdefault("keep_backoff", {})[name] = now + pause
+        log(f"keep {name}: walka, ktoś cofa tę poprawkę{who} ({count}× w {window // 60} min): przerwa na {pause // 60} min")
+    state["keep_last_fight"] = dict(fights[name], name=name)
+    return True
+
+
+def keep_quiet(state, name, now):
+    """Poprawka bez zmiany w walce poprawki bezpieczeństwa: jej termin minął bez niczego do naprawy, więc
+    już nie czeka, a gdy nikt nie cofał przez cały sufit, walka się skończyła (znacznik ostatniej
+    zostaje w keep_last_fight)."""
+    fight = state.get("keep_fights", {}).get(name)
+    if not fight or not fight.get("next"):
+        return
+    fight["waiting"] = False
+    if now - fight["last"] >= KEEP_SAFETY_BACKOFF[1]:
+        del state["keep_fights"][name]
+
+
+def keep_fights_view(state, now):
+    """Dla `perf status --json`: walki, które trwają, i znacznik ostatniej."""
+    cap = KEEP_SAFETY_BACKOFF[1]
+    current = {}
+    for name, fight in state.get("keep_fights", {}).items():
+        on = fight.get("waiting") or now - fight.get("last", 0) < cap if fight.get("next") else now < fight.get("until", 0)
+        if on:
+            current[name] = {k: fight.get(k) for k in ("since", "repairs", "by", "next", "until") if fight.get(k) is not None}
+    return {"current": current, "last": state.get("keep_last_fight")}
+
+
+def keep_lock(wait=60.0):
+    """Jeden pisarz perf-state.json naraz: keep z launchd i z acc-cored, apply, undo i ultra z CLI.
+    Otwarty plik z blokadą (perf.lock obok stanu) albo RuntimeError po `wait` s; blokada trwa do
+    zamknięcia pliku."""
+    import fcntl
+
+    path = os.path.join(os.path.dirname(STATE_PATH), "perf.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    handle = open(path, "a")
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise RuntimeError(f"inny przebieg perf trzyma {path} ponad {wait:.0f} s")
+            time.sleep(0.05)
+
+
 # skrypty claude-acc: wprost (`/usr/bin/python3 <STATE>/devguard.py run`) albo przez
 # launcher z bajtkodem w cache (`<STATE>/python <STATE>/acc.py devguard run`)
 ACC_SCRIPTS = ("accswitch", "devguard", "janitor", "perf", "sched", "updates")
@@ -4123,6 +4335,7 @@ def cmd_status(cfg, args, system=None):
             "bench": state["bench"],
             "ultra": ultra_state(state),
             "link": state.get("link"),
+            "fights": keep_fights_view(state, time.time()),
         }
         print(json.dumps(out, ensure_ascii=False))
         return 0
@@ -4135,6 +4348,9 @@ def cmd_status(cfg, args, system=None):
             f"Łącze ({ago(link['at'])}): {link.get('port') or '?'} ({link.get('iface')}, "
             f"brama {link.get('gateway')}), {kind}"
         )
+    for name, fight in keep_fights_view(state, time.time())["current"].items():
+        by = f", cofa {fight['by']}" if fight.get("by") else ""
+        print(f"Walka: {name}, {fight['repairs']} napraw od {ago(fight['since'])}{by}")
     print("Poprawki:")
     for entry in tweaks:
         mark = "x" if entry["applied"] else " "
@@ -4300,19 +4516,36 @@ def cmd_undo(cfg, args, system=None):
     return 0
 
 
+def keep_only(args):
+    """`--only a,b` (acc-cored po zdarzeniu): zbiór nazw albo None dla pełnego przebiegu."""
+    if "--only" not in args:
+        return None
+    i = args.index("--only")
+    return {n for n in (args[i + 1] if i + 1 < len(args) else "").split(",") if n}
+
+
 def cmd_keep(cfg, args, system=None):
     """Pilnuje włączonych poprawek (dla launchd co kilka minut): procesy z listy wstają
     z nowym pid, ktoś nadpisał settings.json, zapis do Dockera czekał na jego zamknięcie;
-    kończy też cofnięcia, które musiały poczekać."""
+    kończy też cofnięcia, które musiały poczekać. `--only a,b`: tylko te poprawki (acc-cored po
+    zdarzeniu na ich plikach albo zmianie sieci), bez cofnięć w toku i Ultry."""
+    only = keep_only(args)
+    if only is not None:
+        unknown = only - {item.name for item in TWEAKS} - {"link", "admit-chain"}
+        if not only or unknown:
+            print(f"keep --only: {'nieznane ' + ','.join(sorted(unknown)) if unknown else 'pusta lista'}", file=sys.stderr)
+            return 2
     system = system or System()
+    now = time.time()
     state = load_state()
     # łącze dla updates.py: na tetheringu zaplanowane aktualizacje czekają
-    try:
-        state["link"] = system.link()
-    except (OSError, ValueError) as err:
-        log(f"keep: łącze nieznane {err!r}")
+    if only is None or "link" in only:
+        try:
+            state["link"] = system.link()
+        except (OSError, ValueError) as err:
+            log(f"keep: łącze nieznane {err!r}")
     errors = state.setdefault("keep_errors", {})
-    for name, record in list(state.get("deferred", {}).items()):
+    for name, record in list(state.get("deferred", {}).items() if only is None else []):
         if tweak(name) is None:
             continue
         try:
@@ -4323,7 +4556,9 @@ def cmd_keep(cfg, args, system=None):
         log(f"keep {name}: dokończone cofnięcie")
     for item in TWEAKS:
         old = state["applied"].get(item.name)
-        if old is None or item.root:
+        if old is None or item.root or (only is not None and item.name not in only):
+            continue
+        if keep_backed_off(state, item.name, now) or keep_waiting(state, item.name, now):
             continue
         try:
             record, changed = item.apply(cfg, system, old)
@@ -4346,10 +4581,12 @@ def cmd_keep(cfg, args, system=None):
         ):
             record["active"] = False
         state["applied"][item.name] = record
-        if changed:
+        if not changed:
+            keep_quiet(state, item.name, now)
+        elif not keep_fight(state, item.name, now, changed):
             log(f"keep {item.name}: {', '.join(changed)}")
     ultra = ultra_state(state)
-    if ultra["on"]:
+    if ultra["on"] and only is None:
         # aktualizacja claude-acc dokłada poprawki do Ultry: włączona Ultra je przejmuje
         for name in ULTRA:
             if name in ultra["applied"] or name in ultra["declined"]:
@@ -4462,9 +4699,13 @@ def cmd_record(cfg, args, system=None):
 
 
 def cmd_keep_launchd(cfg, args):
-    """`keep` z launchd: poprawki, a po nich hook admit obok łańcucha fasthooks (admitchain.py).
-    Testy wołają cmd_keep wprost, więc prawdziwy settings.json zostaje poza nimi."""
+    """`keep` z launchd albo z acc-cored: poprawki, a po nich hook admit obok łańcucha fasthooks
+    (admitchain.py; z `--only` tylko, gdy jest wśród nazw jako admit-chain). Testy wołają cmd_keep
+    wprost, więc prawdziwy settings.json zostaje poza nimi."""
     rc = cmd_keep(cfg, args)
+    only = keep_only(args)
+    if rc == 2 or (only is not None and "admit-chain" not in only):
+        return rc
     try:
         import admitchain
 
@@ -4477,8 +4718,18 @@ def cmd_keep_launchd(cfg, args):
     return rc
 
 
+def cmd_keep_spec(cfg, args, system=None):
+    """Dla acc-cored (`run --perf`): JSON keep_spec, czyli co obserwować i co jak szybko wraca."""
+    print(json.dumps(keep_spec(load_state())))
+    return 0
+
+
+# polecenia, które piszą perf-state.json: po jednym naraz (keep_lock)
+LOCKED = ("keep", "apply", "undo", "ultra", "record")
+
 COMMANDS = {
     "status": cmd_status,
+    "keep-spec": cmd_keep_spec,
     "bench": cmd_bench,
     "apply": cmd_apply,
     "undo": cmd_undo,
@@ -4498,7 +4749,12 @@ def main(argv):
         print(__doc__)
         return 2
     try:
-        return COMMANDS[cmd](load_config(), argv[1:])
+        lock = keep_lock() if cmd in LOCKED else None
+        try:
+            return COMMANDS[cmd](load_config(), argv[1:])
+        finally:
+            if lock:
+                lock.close()
     except SystemExit:
         raise
     except Exception as err:

@@ -13,7 +13,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "scripts", "acc-cored-switch.sh")
-JOBS = ["com.filip.claude-acc.devguard", "com.filip.claude-acc", "com.filip.claude-acc.janitor"]
+JOBS = ["com.filip.claude-acc.devguard", "com.filip.claude-acc", "com.filip.claude-acc.janitor", "com.filip.claude-acc.perf"]
 
 
 class SwitchTest(unittest.TestCase):
@@ -63,10 +63,12 @@ class SwitchTest(unittest.TestCase):
         with open(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")) as f:
             plist = f.read()
         self.assertIn(self.home + "/.local/share/claude-acc/acc-cored", plist)
+        for flag in ("--guard", "--sched", "--accswitch", "--janitor", "--perf", "--wait-lock"):
+            self.assertIn(f"<string>{flag}</string>", plist)
         self.assertNotIn("__HOME__", plist)
         with open(os.path.join(self.state, "acc-cored-switch.json")) as f:
             self.assertEqual(json.load(f)["replaced"], JOBS)
-        # the three plists stay for the undo
+        # the replaced jobs' plists stay for the undo
         for job in JOBS:
             self.assertTrue(os.path.exists(os.path.join(self.agents, job + ".plist")))
 
@@ -167,7 +169,7 @@ class SwitchTest(unittest.TestCase):
         with open(os.path.join(self.state, "owner.json"), "w") as f:
             json.dump({"owner": "brew", "version": "1.31.8", "app": None, "at": 1}, f)
         self.assertEqual(self.run_switch("on", "--binary", self.binary).returncode, 0)
-        # none of the three loaded, and no owner: nothing to replace
+        # none of the jobs loaded, and no owner: nothing to replace
         with open(self.loaded, "w") as f:
             f.write("codes.pod.app.acc.tick\n")
         done = self.run_switch("on", "--apply", "--binary", self.binary)
@@ -196,7 +198,7 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("missing " + os.path.join(self.agents, "com.filip.claude-acc.plist"), done.stderr)
         self.assertTrue(os.path.exists(self.record()))
-        self.assertEqual(sorted(self.loaded_jobs()), sorted(["com.filip.claude-acc.devguard", "com.filip.claude-acc.janitor"]))
+        self.assertEqual(sorted(self.loaded_jobs()), sorted(j for j in JOBS if j != "com.filip.claude-acc"))
 
     def test_a_bootout_that_fails_after_the_job_went_counts_by_launchd(self):
         # rc != 0, but launchd no longer has the job: the switch goes on, and the record names it
@@ -271,7 +273,7 @@ class SwitchTest(unittest.TestCase):
 set -euo pipefail
 drop_cored
 bootout_job com.filip.claude-acc gui/{uid}/com.filip.claude-acc
-bootout_job com.filip.claude-acc.perf gui/{uid}/com.filip.claude-acc.perf
+bootout_job com.filip.claude-acc.updates gui/{uid}/com.filip.claude-acc.updates
 """
         done = subprocess.run(["/bin/bash", "-c", script], env=env, capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -282,9 +284,9 @@ bootout_job com.filip.claude-acc.perf gui/{uid}/com.filip.claude-acc.perf
         self.assertTrue(os.path.exists(os.path.join(self.state, "lock")))  # the tick went under the lock
         with open(os.path.join(self.tmp, "calls.log")) as f:
             calls = f.read().splitlines()
-        # perf isn't loaded: a look, no bootout, and no wait for the switcher's lock
-        self.assertIn(f"print gui/{uid}/com.filip.claude-acc.perf", calls)
-        self.assertNotIn(f"bootout gui/{uid}/com.filip.claude-acc.perf", calls)
+        # updates isn't loaded: a look, no bootout, and no wait for the switcher's lock
+        self.assertIn(f"print gui/{uid}/com.filip.claude-acc.updates", calls)
+        self.assertNotIn(f"bootout gui/{uid}/com.filip.claude-acc.updates", calls)
 
     def test_the_fake_boots_out_a_plist_too(self):
         # setup.sh boots jobs out by plist (gui/UID x.plist): the fake drops those as launchd does

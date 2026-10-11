@@ -2321,5 +2321,246 @@ class HostFixtureTest(unittest.TestCase):
                 self.assertIn("devtools", perf.pending_manual(state))
 
 
+class KeepNativeTest(Isolated):
+    """perf keep z acc-cored: spec do obserwowania, `--only`, przepychanka i perf.lock."""
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.claude, claude_settings())
+        self.write(self.files["devguard-budget"], {"budget_percent": 35})
+        for name in ("claude-limits", "workflow-size", "devguard-budget"):
+            self.assertEqual(self.run_cmd(perf.cmd_apply, name, system=FakeSystem({}))[0], 0)
+
+    def revert(self):
+        """Ktoś (inne narzędzie, ręczna edycja) cofa wszystkie trzy poprawki."""
+        self.write(self.claude, claude_settings())
+        self.write(self.files["devguard-budget"], {"budget_percent": 35})
+
+    def limits_on(self):
+        return self.read(self.claude)["env"].get("BASH_MAX_TIMEOUT_MS") == "3600000"
+
+    def test_the_spec_lists_applied_tweaks_with_their_class_and_files(self):
+        code, out = self.run_cmd(perf.cmd_keep_spec)
+        self.assertEqual(code, 0)
+        spec = json.loads(out)
+        tweaks = {t["name"]: t for t in spec["tweaks"]}
+        self.assertEqual(spec["periodic_s"], 1800)
+        self.assertEqual(sorted(tweaks), ["admit-chain", "claude-limits", "devguard-budget", "link", "workflow-size"])
+        self.assertEqual((tweaks["claude-limits"]["class"], tweaks["claude-limits"]["paths"]), ("perf", [self.claude]))
+        self.assertEqual(tweaks["devguard-budget"]["class"], "safety")
+        self.assertEqual(tweaks["devguard-budget"]["paths"], [self.files["devguard-budget"]])
+        self.assertEqual((tweaks["link"]["network"], tweaks["link"]["paths"]), (True, []))
+        self.assertIn(perf.STATE_PATH, spec["config"])
+        # a tweak without a cheap event: only in the periodic pass, nothing to watch
+        self.run_cmd(perf.cmd_apply, "bg-helpers", system=FakeSystem({10: [100, WORKER, False]}))
+        bg = {t["name"]: t for t in perf.keep_spec(perf.load_state())["tweaks"]}["bg-helpers"]
+        self.assertEqual((bg["class"], bg["paths"]), ("periodic", []))
+
+    def test_the_spec_watches_the_admit_chain_s_own_files_and_the_slim_hooks(self):
+        # admitchain.broken() checks settings.json (CLAUDE_CONFIG_DIR), the marker and pod-hook-client
+        home, config = os.path.join(self.dir, "home"), os.path.join(self.dir, "config")
+        with mock.patch.dict(os.environ, {"HOME": home, "CLAUDE_CONFIG_DIR": config}):
+            chain = {t["name"]: t for t in perf.keep_spec(perf.load_state())["tweaks"]}["admit-chain"]
+        fasthooks = os.path.join(home, ".claude", "hooks", "fasthooks")
+        self.assertEqual(chain["paths"], [os.path.join(config, "settings.json"), os.path.join(fasthooks, "chains-claude-acc"),
+                                          os.path.join(fasthooks, "pod-hook-client")])  # fmt: skip
+        slim = perf.tweak("security-slim")
+        hooks = os.path.join(self.dir, "plugins", "security-slim", "hooks")
+        self.assertEqual(perf.keep_paths(slim)[-3:], [os.path.join(hooks, n) for n in ("hooks.json", "sec_slim.py", "patterns.py")])
+        # docker-vm's file lies in Docker's group container: the full pass only, no watch
+        self.assertEqual(perf.KEEP_CLASS.get("docker-vm", "periodic"), "periodic")
+        # docker-idle samples every 5 min, as under launchd
+        spec = perf.keep_spec({"applied": {"docker-idle": {}}})
+        idle = {t["name"]: t for t in spec["tweaks"]}["docker-idle"]
+        self.assertEqual((idle["class"], idle["every_s"]), ("periodic", 300))
+
+    def test_only_names_tweaks_it_knows(self):
+        for only in ("claude-limits,nope", "", ","):
+            with self.subTest(only=only):
+                code, _ = self.run_cmd(perf.cmd_keep, "--only", only, system=FakeSystem({}))
+                self.assertEqual(code, 2)
+        code, _ = self.run_cmd(perf.cmd_keep, "--only", "admit-chain,link", system=FakeSystem({}))
+        self.assertEqual(code, 0)
+
+    def test_keep_takes_the_state_lock(self):
+        # main() takes perf.lock before `keep` runs: one writer of perf-state.json at a time
+        ran = mock.Mock(return_value=0)
+        with mock.patch.dict(perf.COMMANDS, {"keep": ran}), mock.patch.object(perf, "keep_lock", side_effect=RuntimeError("held")):
+            self.assertEqual(perf.main(["keep", "--only", "link"]), 1)
+        ran.assert_not_called()
+
+    def test_network_and_periodic_tweaks_never_count_as_a_fight(self):
+        # a Wi-Fi/tether/Wi-Fi switch every 90 s changes tether-profile each time; a new pid, bg-helpers
+        t0 = 1_800_000_000.0
+        state = {}
+        for name in ("tether-profile", "link", "bg-helpers", "docker-idle"):
+            for i in range(5):
+                perf.keep_fight(state, name, t0 + 90 * i)
+        self.assertEqual(state.get("keep_backoff", {}), {})
+        for i in range(3):
+            perf.keep_fight(state, "claude-limits", t0 + 60 * i)
+        self.assertIn("claude-limits", state["keep_backoff"])
+
+    def test_only_runs_just_the_named_tweaks(self):
+        self.revert()
+        self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}, tethered=True))
+        self.assertTrue(self.limits_on())
+        self.assertNotIn("workflowSizeGuideline", self.read(self.claude))
+        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 35)
+        self.assertNotIn("link", perf.load_state())  # the link only when named
+        self.run_cmd(perf.cmd_keep, "--only", "link,devguard-budget", system=FakeSystem({}, tethered=True))
+        self.assertTrue(perf.load_state()["link"]["tethered"])
+        self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
+
+    def test_a_perf_tweak_reverted_three_times_in_ten_minutes_waits_an_hour(self):
+        t0 = 1_800_000_000.0
+        for i, at in enumerate((t0, t0 + 60, t0 + 120)):
+            self.revert()
+            with mock.patch.object(perf.time, "time", return_value=at):
+                self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}))
+            self.assertTrue(self.limits_on(), i)
+        self.assertIn("przerwa na 60 min", self.text(perf.LOG_PATH))
+        self.revert()
+        with mock.patch.object(perf.time, "time", return_value=t0 + 180):
+            self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}))
+            self.run_cmd(perf.cmd_keep, system=FakeSystem({}))  # the full pass waits too
+        self.assertFalse(self.limits_on())
+        with mock.patch.object(perf.time, "time", return_value=t0 + 120 + 3601):
+            self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}))
+        self.assertTrue(self.limits_on())
+        self.assertNotIn("claude-limits", perf.load_state().get("keep_backoff", {}))
+
+    def retry_at(self, at):
+        """keep-spec's `retry` as acc-cored would read it at `at`."""
+        with mock.patch.object(perf.time, "time", return_value=at):
+            return perf.keep_spec(perf.load_state())["retry"]
+
+    def keep_at(self, at, name="devguard-budget"):
+        """Jeden przebieg `keep --only name` o czasie `at`; czy poprawka jest na miejscu."""
+        with mock.patch.object(perf.time, "time", return_value=at):
+            self.run_cmd(perf.cmd_keep, "--only", name, system=FakeSystem({}))
+        return self.read(self.files["devguard-budget"])["budget_percent"] == 25
+
+    def test_a_safety_tweak_in_a_fight_comes_back_ever_more_rarely(self):
+        # someone reverts devguard-budget right after every repair. acc-cored runs keep on the revert's
+        # event; in a fight that run waits, and the spec's `retry` brings it back at its turn
+        t, repaired = 1_800_000_000.0, []
+        for _ in range(30):
+            self.revert()
+            if not self.keep_at(t + 1):
+                retry = self.retry_at(t + 1)
+                self.assertEqual(list(retry), ["devguard-budget"])
+                self.assertTrue(self.keep_at(retry["devguard-budget"]))
+                t = retry["devguard-budget"]
+            else:
+                t += 1
+            repaired.append(t)
+            self.assertEqual(self.retry_at(t), {})  # nothing waits after a repair
+        gaps = [round(repaired[i + 1] - repaired[i]) for i in range(len(repaired) - 1)]  # no pairwise on 3.9
+        # three quick repairs start the fight; then 20, 40, 80, 160 s and the 5-minute ceiling
+        self.assertEqual(gaps[:7], [1, 1, 20, 40, 80, 160, 300])
+        self.assertTrue(all(g == 300 for g in gaps[7:]))
+        self.assertEqual(len([r for r in repaired if r > repaired[-1] - 3600]), 12)  # launchd's 12 an hour
+        log = self.text(perf.LOG_PATH)
+        self.assertEqual(log.count("walka"), 1)  # one fight, one line
+        self.assertEqual(log.count("keep devguard-budget: "), 3)  # two repairs before it, then the fight
+        fights = perf.keep_fights_view(perf.load_state(), t + 1)
+        self.assertEqual(fights["current"]["devguard-budget"]["repairs"], 30)
+        self.assertEqual(fights["last"]["name"], "devguard-budget")
+
+    def test_a_quiet_ceiling_ends_the_fight(self):
+        t0 = 1_800_000_000.0
+        for i in range(3):
+            self.revert()
+            self.assertTrue(self.keep_at(t0 + i))
+        self.assertIn("devguard-budget", perf.load_state()["keep_fights"])
+        # a revert while it waits, put back by someone else before its turn: the turn finds nothing
+        # to repair, and nothing waits any more
+        self.revert()
+        self.assertFalse(self.keep_at(t0 + 5))
+        self.assertIn("devguard-budget", self.retry_at(t0 + 5))
+        self.write(self.files["devguard-budget"], {"budget_percent": 25})
+        self.assertTrue(self.keep_at(t0 + 30))
+        self.assertEqual(self.retry_at(t0 + 30), {})
+        # nobody reverts for the whole ceiling: the next revert is repaired at once, and the count starts over
+        self.revert()
+        self.assertTrue(self.keep_at(t0 + 2 + 301))
+        state = perf.load_state()
+        self.assertNotIn("devguard-budget", state["keep_fights"])
+        self.assertEqual(state["keep_last_fight"]["repairs"], 3)
+        _, out = self.run_cmd(perf.cmd_status, "--json", system=FakeSystem({}))
+        fights = json.loads(out)["fights"]
+        self.assertEqual((fights["current"], fights["last"]["name"]), ({}, "devguard-budget"))
+
+    def test_a_turn_whose_repair_raises_leaves_no_retry_in_the_past(self):
+        # apply raising at its turn leaves `waiting`: a spec with that past turn would arm a timer
+        # at 0 on every reload, one more `keep --only` each time
+        t0 = 1_800_000_000.0
+        for i in range(3):
+            self.revert()
+            self.assertTrue(self.keep_at(t0 + i))
+        self.revert()
+        self.assertFalse(self.keep_at(t0 + 5))
+        with mock.patch.object(perf.tweak("devguard-budget"), "apply", side_effect=OSError(28, "No space left on device")):
+            self.keep_at(t0 + 25)
+        self.assertEqual(self.retry_at(t0 + 26), {})
+
+    def test_pod_stripping_async_from_its_hooks_is_a_fight_with_a_name(self):
+        # the real one (2026-10-11): Pod's applyManagedHooks writes its status hooks anew at every Pod or
+        # runtime start, without async; perf keep adds it back. A perf tweak: one line naming Pod, then
+        # an hour's pause instead of a tug of war
+        self.write(self.claude, claude_settings())
+        with mock.patch.object(perf, "HOST_HOOKS", {".orca/agent-hooks": "Pod"}):
+            self.assertEqual(self.run_cmd(perf.cmd_apply, "claude-hooks-async", system=FakeSystem({}))[0], 0)
+
+            def pod_starts():
+                data = self.read(self.claude)
+                for groups in data["hooks"].values():
+                    for group in groups:
+                        for hook in group["hooks"]:
+                            if ".orca/agent-hooks/" in hook.get("command", ""):
+                                hook.pop("async", None)
+                self.write(self.claude, data)
+
+            def is_async():
+                hooks = self.read(self.claude)["hooks"]["PostToolUse"][1]["hooks"]
+                return hooks[1].get("async") is True
+
+            t0 = 1_800_000_000.0
+            for i in range(3):
+                pod_starts()
+                self.keep_at(t0 + 60 * i, "claude-hooks-async")
+                self.assertTrue(is_async(), i)
+            pod_starts()
+            self.keep_at(t0 + 180, "claude-hooks-async")
+            self.assertFalse(is_async())  # paused: Pod's version stays
+            log = self.text(perf.LOG_PATH)
+            self.assertEqual(log.count("walka"), 1)
+            self.assertIn("keep claude-hooks-async: walka, ktoś cofa tę poprawkę (Pod (applyManagedHooks))", log)
+            self.assertIn("przerwa na 60 min", log)
+        fights = perf.keep_fights_view(perf.load_state(), t0 + 200)
+        self.assertEqual(fights["current"]["claude-hooks-async"]["by"], "Pod (applyManagedHooks)")
+        self.assertEqual(fights["current"]["claude-hooks-async"]["repairs"], 3)
+
+    def test_the_admit_chain_runs_only_when_named_or_in_the_full_pass(self):
+        fake = mock.Mock()
+        fake.heal.return_value = None
+        with mock.patch.dict(sys.modules, {"admitchain": fake}), mock.patch.object(perf, "System", lambda: FakeSystem({})):
+            perf.cmd_keep_launchd(self.cfg, ["--only", "claude-limits"])
+            self.assertEqual(fake.heal.call_count, 0)
+            perf.cmd_keep_launchd(self.cfg, ["--only", "admit-chain"])
+            perf.cmd_keep_launchd(self.cfg, [])
+            self.assertEqual(fake.heal.call_count, 2)
+
+    def test_one_writer_of_the_state_at_a_time(self):
+        held = perf.keep_lock()
+        self.addCleanup(held.close)
+        self.assertEqual(os.path.dirname(held.name), os.path.dirname(perf.STATE_PATH))
+        with self.assertRaises(RuntimeError):
+            perf.keep_lock(wait=0.2)
+        held.close()
+        perf.keep_lock(wait=0.2).close()
+
+
 if __name__ == "__main__":
     unittest.main()
