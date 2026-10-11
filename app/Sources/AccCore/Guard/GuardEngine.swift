@@ -14,14 +14,17 @@ import Dispatch
 ///   while the plans under it and the brake still go;
 /// - a brake, whatever its outcome (no victim, or a state Python couldn't save): brake()'s own gap
 ///   for the stage it is at now (`emergency_cooldown_seconds` at stage 3, else
-///   `brake_cooldown_seconds`), so pressure climbing to stage 3 shortens the wait at once.
+///   `brake_cooldown_seconds`), so pressure climbing to stage 3 shortens the wait at once; a stage
+///   above the last brake's goes at once (stage 3 picks victims stage 2 can't: Python's brake_at
+///   moved only if stage 2 reaped, and then brakeDue already waits for it).
 /// Every other plan is tried again on the next tick: Python's reading may differ for a moment
 /// (pressure flickering), and it acts as soon as it agrees.
 public struct HandoverPolicy {
     public static let holdSeconds = 60.0
     public private(set) var heldUntil: [String: Double] = [:]
-    /// when the last brake went to Python
+    /// when the last brake went to Python, and at which stage
     public private(set) var lastBrake = -Double.infinity
+    public private(set) var lastBrakeStage = 0
 
     public init() {}
 
@@ -33,19 +36,22 @@ public struct HandoverPolicy {
 
     static func key(_ plan: Plan) -> String { plan.key + "|" + plan.action + "|" + plan.code }
 
-    /// The first actable plan that isn't held, and the brake when it's due and its gap (for the
-    /// stage the tick is at) has passed since the last brake handover.
-    public func next(actable: [Plan], brakeDue: Bool, now: Double, brakeGap: Double) -> Handover? {
+    /// The first actable plan that isn't held, and the brake when it's due and either the stage
+    /// rose since the last brake handover or its gap (for the stage the tick is at) has passed.
+    public func next(actable: [Plan], brakeDue: Bool, now: Double, brakeGap: Double, stage: Int) -> Handover? {
         let plan = actable.first { (heldUntil[Self.key($0)] ?? 0) <= now }
-        let brake = brakeDue && now - lastBrake >= brakeGap
+        let brake = brakeDue && (stage > lastBrakeStage || now - lastBrake >= brakeGap)
         return plan != nil || brake ? Handover(plan: plan, brake: brake) : nil
     }
 
     /// After Python's tick: `acted` when it stopped, restarted, shut down or warned something.
-    public mutating func record(_ handover: Handover, acted: Bool, now: Double) {
+    public mutating func record(_ handover: Handover, acted: Bool, now: Double, stage: Int) {
         heldUntil = heldUntil.filter { $0.value > now }
         if let plan = handover.plan, !acted, declinable(plan) { heldUntil[Self.key(plan)] = now + Self.holdSeconds }
-        if handover.brake { lastBrake = now }
+        if handover.brake {
+            lastBrake = now
+            lastBrakeStage = stage
+        }
     }
 
     /// brake()'s gap at a stage: emergency_cooldown_seconds at 3, brake_cooldown_seconds below
@@ -92,6 +98,13 @@ public final class GuardEngine: @unchecked Sendable {
     /// Python's own loop while devguard.json doesn't read natively, and the pid of a test stand-in
     var pythonLoop: pid_t?
     var loopStarter: (([String]) -> pid_t?)?
+    /// when the loop last started, and when it may start again: a loop that ends within a minute
+    /// (a config Python can't run either) waits 10 s, doubling to 5 min, as launchd would throttle it
+    var loopStartedAt = 0.0
+    var loopRestartAt = 0.0
+    var loopShortRuns = 0
+    /// the first host lookup answered (or failed): until then nobody counts as watched, so no shaping
+    var hostSettled = false
     var shaper = QoSShaper()
     let procCache = ProcCache()
     var lastTick = 0.0
@@ -142,6 +155,8 @@ public final class GuardEngine: @unchecked Sendable {
         queue.sync {
             timer?.cancel()
             pressureSource?.cancel()
+            // Python's loop goes first: an orphan would keep devguard.lock and guard on its own
+            stopPythonLoop()
             if !options.shadow { shaper.restoreAll() }
             GuardLog.write("koniec strażnika (acc-cored)")
             if lockFd >= 0 {
@@ -181,7 +196,11 @@ public final class GuardEngine: @unchecked Sendable {
     func loop(reschedule: Bool = true) {
         let cfg = Profile.measure("config") { GuardConfig.load(path: configPath) }
         Profile.measure("merge") { mergeForeign() }
-        if probesFactory == nil || resolver != nil { Profile.measure("host") { refreshHost() } }
+        if probesFactory == nil || resolver != nil {
+            Profile.measure("host") { refreshHost() }
+        } else {
+            hostSettled = true
+        }
         let mismatched = cfg.mismatched
         if mismatched != mismatchLogged {
             mismatchLogged = mismatched
@@ -191,8 +210,9 @@ public final class GuardEngine: @unchecked Sendable {
         }
         // a config the native tick can't read the way Python does: Python's own loop, until it can
         if !options.shadow, !mismatched.isEmpty {
-            runPythonLoop()
-            if reschedule { schedule(after: max(0.5, cfg.number("interval_seconds"))) }
+            // a caps run in flight finishes first: Python's loop would run its own check_caps beside it
+            if !capsRunning { runPythonLoop() }
+            if reschedule { schedule(after: interval(cfg)) }
             return
         }
         if pythonLoop != nil { stopPythonLoop() }
@@ -200,13 +220,15 @@ public final class GuardEngine: @unchecked Sendable {
         let enforce = !options.shadow && cfg["mode"] == .string("enforce")
         var next = state
         GuardLog.hold()
-        let result = guardTick(cfg: cfg, state: &next, orca: orca, probes: probes, enforce: enforce, shaper: options.shadow ? nil : shaper)
+        // before the first host answer nobody counts as watched: shaping would push the focused server to the E cores
+        let result = guardTick(cfg: cfg, state: &next, orca: orca, probes: probes, enforce: enforce, shaper: options.shadow || !hostSettled ? nil : shaper)
         lastTick = probes.now
         ticks += 1
         // the first tick reads every process's arguments and asks every pattern once: not the loop's cost
         if ticks == 1, Profile.on { Profile.reset() }
-        let gap = HandoverPolicy.brakeGap(cfg, stage: result.world.pressure.stage)
-        let handover = options.shadow ? nil : policy.next(actable: result.actable, brakeDue: result.brakeDue, now: probes.now, brakeGap: gap)
+        let stage = result.world.pressure.stage
+        let gap = HandoverPolicy.brakeGap(cfg, stage: stage)
+        let handover = options.shadow ? nil : policy.next(actable: result.actable, brakeDue: result.brakeDue, now: probes.now, brakeGap: gap, stage: stage)
         if let handover {
             GuardLog.release(write: false)  // Python's tick logs and notifies from its own reading
             handOver(handover, result: result, cfg: cfg)
@@ -215,12 +237,22 @@ public final class GuardEngine: @unchecked Sendable {
             state = next
             save()
         }
-        // check_caps runs in Python's loop on every enforcing tick (`enforce and qos`)
-        if enforce, capsDue(cfg, now: probes.now) { runCaps() }
+        // check_caps runs in Python's loop on every enforcing tick (`enforce and qos`); its caps_at
+        // goes to the file now, so a Python loop taking over doesn't run the caps again at once
+        if enforce, capsDue(cfg, now: probes.now) {
+            save()
+            runCaps()
+        }
         guard reschedule else { return }
-        let stage = state["snapshot"]?["pressure"]?["stage"]?.int ?? 0
-        let interval = cfg.number("interval_seconds")
-        schedule(after: max(0.5, stage >= 1 ? min(interval, 2) : interval))
+        let snapshotStage = state["snapshot"]?["pressure"]?["stage"]?.int ?? 0
+        schedule(after: max(0.5, snapshotStage >= 1 ? min(interval(cfg), 2) : interval(cfg)))
+    }
+
+    /// interval_seconds, or its default when it isn't a number (Python's loop can't sleep on it either)
+    func interval(_ cfg: GuardConfig) -> Double {
+        let v = cfg["interval_seconds"]
+        guard v.string == nil, let n = v.double, n > 0 else { return GuardConfig.defaults["interval_seconds"]?.double ?? 5 }
+        return n
     }
 
     /// The tick goes to Python: the state as it was before this tick, the lock let go, `devguard once`,
@@ -236,7 +268,7 @@ public final class GuardEngine: @unchecked Sendable {
         handovers += 1
         state = Files.json(statePath, fallback: .object(state)).object ?? state
         if rc != 0 { GuardLog.write("acc-cored: devguard once wyszedł z kodem \(rc) (\(handover.reason))") }
-        policy.record(handover, acted: actedStamp(state) != before, now: result.world.now)
+        policy.record(handover, acted: actedStamp(state) != before, now: result.world.now, stage: result.world.pressure.stage)
     }
 
     /// Python's slowest tick: a pool Simulator's shutdown (lsappinfo 2 × 5 s, running_apps 20 s,
@@ -246,28 +278,57 @@ public final class GuardEngine: @unchecked Sendable {
     // MARK: Python's loop
 
     /// `devguard run` as a child, with the lock let go: a crash of acc-cored takes it along (same
-    /// process group), and it is started again if it ends.
+    /// process group), and it is started again if it ends, after a wait that grows while it ends
+    /// within a minute.
     func runPythonLoop() {
+        let now = Kernel.wall()
         if let pid = pythonLoop {
             var status: Int32 = 0
             if waitpid(pid, &status, WNOHANG) == 0 { return }
             pythonLoop = nil
+            loopShortRuns = now - loopStartedAt < 60 ? loopShortRuns + 1 : 0
+            loopRestartAt = now + min(10 * pow(2, Double(max(loopShortRuns - 1, 0))), 300)
+            GuardLog.write("acc-cored: pętla Pythona skończyła się (status \(status)), następny start za \(Int(loopRestartAt - now)) s")
         }
+        guard now >= loopRestartAt else { return }
         if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_UN) }
+        // Python restores what it pinned itself; what native pinned goes back now, or the two caches lie
+        shaper.restoreAll()
+        shaper.forget()
         let argv = options.python + ["devguard", "run"]
+        loopStartedAt = now
         pythonLoop = loopStarter?(argv) ?? Spawn.start(argv, log: GuardPaths.state(options.home) + "/devguard-launchd.log")
+        if pythonLoop == nil {
+            loopRestartAt = now + 10
+            GuardLog.write("acc-cored: pętla Pythona nie wystartowała (\(argv[0])), następna próba za 10 s")
+        }
     }
 
-    /// The config reads natively again: Python's loop ends (SIGTERM: it restores QoS and logs its end),
-    /// the lock comes back, and the state is Python's last one.
+    /// The config reads natively again (or the guard stops): Python's loop ends (SIGTERM: it restores
+    /// QoS and logs its end), the lock comes back, and the state is Python's last one. After 10 s it
+    /// is killed with what it started (simctl, orca): they aren't in a group of their own.
     func stopPythonLoop() {
         guard let pid = pythonLoop else { return }
         pythonLoop = nil
+        loopShortRuns = 0
+        loopRestartAt = 0
         kill(pid, SIGTERM)
-        if Spawn.reap(pid, deadline: Kernel.wall() + 10) == nil { GuardLog.write("acc-cored: pętla Pythona nie skończyła się w 10 s, zabita") }
+        let killed = Spawn.reap(pid, deadline: Kernel.wall() + 10, beforeKill: {
+            var seen: Set<pid_t> = [pid]
+            var todo = [pid]
+            while let p = todo.popLast() {
+                for c in Proc.children(of: p) where c > 1 && !seen.contains(c) {
+                    seen.insert(c)
+                    todo.append(c)
+                    kill(c, SIGKILL)
+                }
+            }
+        }) == nil
+        if killed { GuardLog.write("acc-cored: pętla Pythona nie skończyła się w 10 s, zabita") }
         if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_EX) }
         state = Files.json(statePath, fallback: .object(state)).object ?? state
         savedStamp = Files.stamp(statePath)
+        shaper.forget()
     }
 
     /// What changes when execute() acts: last_action (stop, restart, shutdown), the events, the warns.
@@ -328,6 +389,7 @@ public final class GuardEngine: @unchecked Sendable {
             let found = resolver?() ?? HostResolver.resolve(python: python, home: home)
             self.queue.async {
                 self.resolving = false
+                self.hostSettled = true
                 self.client = found
                 if found == nil { self.hostRetryAt = Kernel.wall() + 60 }
             }
@@ -415,6 +477,11 @@ public final class QoSShaper {
     /// restore_background: nothing stays pinned to the E cores after the guard exits
     public func restoreAll() {
         for (pid, (start, on)) in background where on && Proc.alive(pid, start: start) { set(pid, start: start, on: false) }
+    }
+
+    /// Another guard (Python's loop) sets the flags meanwhile: what this one remembers is stale.
+    public func forget() {
+        background = [:]
     }
 }
 

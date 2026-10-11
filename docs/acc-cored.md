@@ -88,13 +88,23 @@ memory pressure (a Dispatch memory-pressure source).
     under it and the brake still go in the meantime.
   - After a brake handover, whatever its outcome, the brake waits its own gap:
     `emergency_cooldown_seconds` at stage 3, `brake_cooldown_seconds` below. Without that wait, a
-    reap that finds no victim would start Python every 2 s.
+    reap that finds no victim would start Python every 2 s. A stage above the last brake's goes at
+    once: stage 3 picks victims stage 2 can't, and when stage 2 did reap, `brake_at` already holds
+    the brake back, as in Python.
   - Every other plan is tried again on the next tick. Python's reading may disagree for a moment
     (pressure flickering), and it acts as soon as it agrees.
 - **Config types:** a `devguard.json` value whose type differs from the default's is read
   differently by the two sides. `"runtimes": "node"` still finds servers in Python, where `in`
-  works on a string, and finds none here. While such a value is set, every tick goes to Python, and
-  the log says so once.
+  works on a string, and finds none here. The brake's own keys count too. While such a value is
+  set, Python's own loop (`devguard run`) guards, as a child of acc-cored with the lock let go,
+  and the log says so once.
+  - What native pinned to the E cores goes back before the loop starts, and its flags are
+    forgotten when the loop ends: the two would disagree otherwise.
+  - A loop that ends within a minute (Python can't run that config either, e.g. a string
+    `interval_seconds`) starts again after 10 s, doubling to 5 min, with one log line each time.
+  - When the config reads natively again, or acc-cored stops, the loop gets SIGTERM. After 10 s it
+    is killed, with what it started. Then the lock comes back.
+  - A caps run in flight finishes before the loop starts.
 - **Kept between ticks:** process lines and their pattern answers (`ProcCache`, see
   [Readers](#readers)).
 

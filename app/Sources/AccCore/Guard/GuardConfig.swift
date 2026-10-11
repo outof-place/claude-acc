@@ -85,6 +85,14 @@ public struct GuardConfig: Sendable {
             }
             if !ok { out.append(key) }
         }
+        // lastresort.settings: `(cfg.get("brake") or {}).items()`, then numbers compared with numbers
+        if let brake = raw["brake"], brake.truthy {
+            if let keys = brake.object {
+                for (k, v) in keys where LastResort.defaults[k] != nil && (v.double == nil || v.string != nil) { out.append("brake." + k) }
+            } else {
+                out.append("brake")
+            }
+        }
         return out
     }
 

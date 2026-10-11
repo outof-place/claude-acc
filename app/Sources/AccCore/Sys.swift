@@ -137,7 +137,7 @@ public enum Spawn {
     /// Waits for `pid` until `deadline` (kqueue NOTE_EXIT), then kills its group and waits for it;
     /// its wait status, or nil when it had to be killed. Without a kqueue watch (no descriptor left:
     /// EMFILE) it polls waitpid until the deadline instead, so the deadline holds either way.
-    static func reap(_ pid: pid_t, deadline: Double, queue makeQueue: () -> Int32 = { kqueue() }) -> Int32? {
+    static func reap(_ pid: pid_t, deadline: Double, queue makeQueue: () -> Int32 = { kqueue() }, beforeKill: () -> Void = {}) -> Int32? {
         var status: Int32 = 0
         let kq = makeQueue()
         defer { if kq >= 0 { close(kq) } }
@@ -176,6 +176,7 @@ public enum Spawn {
         var r: pid_t
         repeat { r = waitpid(pid, &status, exited ? 0 : WNOHANG) } while r < 0 && errno == EINTR
         if r == pid { return status }
+        beforeKill()
         killpg(pid, SIGKILL)
         kill(pid, SIGKILL)
         while waitpid(pid, &status, 0) < 0 && errno == EINTR {}

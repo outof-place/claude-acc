@@ -308,7 +308,7 @@ public final class Simulator {
         lease = probes.json(leasePath, fallback: .null).object
         leaseAlive = Simulator.alive(lease, probes: probes)
         self.watchers = watchers.sorted()
-        protected = cfg.strings("simulator_protect").contains { udid == $0 || fnmatchcase(name, $0) }
+        protected = cfg.strings("simulator_protect").contains { udid.pyEq($0) || fnmatchcase(name, $0) }
         // Python walks the tree as a set (hash order); the ints don't care, the float sum may differ in
         // its last bit, which the replay allows
         let stats = pids.compactMap { probes.usage($0) }
