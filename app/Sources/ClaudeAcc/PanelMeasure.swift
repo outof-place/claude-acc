@@ -8,7 +8,8 @@ import Darwin
 /// display's scale. After a 10 s warm-up and `seconds` one line of JSON gives CPU time per second of
 /// the app, its main thread and the scripts it ran. No login item, no Stay Awake assertion, no
 /// dictation, no ring. `--store-only` leaves the panel out (the difference is SwiftUI's); `--closed`
-/// keeps it hosted but closed, as it waits between clicks.
+/// keeps it hosted but closed, as it waits between clicks; `--measure-png <file>` saves the window
+/// as the warm-up ends, to look at the panel without it ever being on screen.
 final class PanelMeasure {
     private static let warmup: TimeInterval = 10
     private static let offscreen = NSPoint(x: -30_000, y: -30_000)
@@ -37,7 +38,7 @@ final class PanelMeasure {
         NSApp.setActivationPolicy(.accessory)
         if mode != "store-only" {
             let window = PanelWindow()
-            window.setContent(PanelView(store: store)) { [weak window] size in
+            window.setContent(store: store) { [weak window] size in
                 guard let window, size.width > 0 else { return }
                 window.setFrame(
                     PanelWindow.frame(forCard: NSRect(origin: Self.offscreen, size: size)), display: false)
@@ -53,6 +54,12 @@ final class PanelMeasure {
     }
 
     private func begin() {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--measure-png"), i + 1 < args.count,
+           let view = window?.contentView, let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: image)
+            try? image.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[i + 1]))
+        }
         let observer = CFRunLoopObserverCreateWithHandler(
             nil, CFRunLoopActivity.afterWaiting.rawValue | CFRunLoopActivity.beforeWaiting.rawValue, true, 0
         ) { [unowned self] _, activity in

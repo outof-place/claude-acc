@@ -5,11 +5,20 @@ import SwiftUI
 /// Wide rather than tall so it fits under the menu bar of a laptop, and a fixed height:
 /// what grows (account details, long server lists) scrolls inside its card, so the window
 /// never jumps in size while you click around.
+///
+/// This is the whole panel as one view, for a PNG. On screen PanelWindow puts its parts (the top
+/// banner, each column, the bottom) in NSHostingViews of their own: an update costs SwiftUI in
+/// proportion to the graph it runs in (the key view loop, dirtying, the display list), and with one
+/// graph for everything the builds' progress every second ran the whole panel. Open, that was
+/// 53 ms/s of CPU; a host per column is 24 (--measure-panel, 2026-10-11). Hosts of their own for
+/// the busiest cards (Builds, Load & Heat) inside a column cost more than they saved: 29.
 struct PanelView: View {
     let store: Store
     /// A fixed clock for rendering a snapshot file: times read as they did when it was taken.
     var frozenNow: Date?
     @Environment(\.renderingToFile) private var renderingToFile
+
+    static let padding: CGFloat = 14
 
     /// As tall as the screen under the menu bar allows (the padding, the footer and a little
     /// air taken off), between 760 and 1000: the cards that grew since 760 (Stay Awake's hotspot
@@ -20,67 +29,36 @@ struct PanelView: View {
     }
 
     var body: some View {
-        TimelineView(PanelClock(running: store.panelOpen)) { context in
-            VStack(spacing: 12) {
-                if let email = store.snapshot?.orcaSelected {
-                    Banner(
-                        symbol: "exclamationmark.triangle.fill", tint: .orange,
-                        title: "\(HostApp.current.name) has \(email) selected",
-                        text: "\(HostApp.current.name) reverts switches and refreshes tokens itself, and two refreshers sign accounts out. Auto-switch and switching are paused until you pick System default in \(HostApp.current.name)'s Claude account menu.")
-                }
-                HStack(alignment: .top, spacing: 12) {
-                    Column(width: 350) {
-                        ActiveAccountCard(store: store).fixedSize(horizontal: false, vertical: true)
-                        AccountsCard(store: store)
-                        if let credits = store.snapshot?.credits {
-                            CreditsCard(credits: credits).fixedSize(horizontal: false, vertical: true)
-                        }
-                        DiskCard(store: store).fixedSize(horizontal: false, vertical: true)
-                    }
-                    Column(width: 360) {
-                        DevServersCard(store: store)
-                        BuildsCard(store: store)
-                        MailCard(store: store).fixedSize(horizontal: false, vertical: true)
-                    }
-                    Column(width: 310) {
-                        AwakeCard(awake: store.awake, store: store).fixedSize(horizontal: false, vertical: true)
-                        if store.browser?.installed == true {
-                            BrowserCard(store: store).fixedSize(horizontal: false, vertical: true)
-                        }
-                        FansCard(store: store)
-                    }
-                    // Ultra scrolls inside its card, so this column absorbs the Desktop card;
-                    // the third one cannot: Load & Heat has a fixed chart and would spill out.
-                    Column(width: 300) {
-                        DictationCard(dictation: store.dictation).fixedSize(horizontal: false, vertical: true)
-                        UltraCard(store: store)
-                        if store.desktop?.installed == true {
-                            DesktopCard(store: store).fixedSize(horizontal: false, vertical: true)
-                        }
-                        UpdatesCard(store: store).fixedSize(horizontal: false, vertical: true)
-                    }
+        PanelPart(store: store, frozenNow: frozenNow) {
+            VStack(spacing: 0) {
+                PanelTop(store: store)
+                HStack(alignment: .top, spacing: PanelColumn.spacing) {
+                    ForEach(PanelColumn.allCases, id: \.self) { PanelColumnView(column: $0, store: store) }
                 }
                 // live: fixed height, lists scroll inside their cards; PNG: as tall as the content
                 .frame(height: renderingToFile ? nil : Self.columnHeight)
                 .frame(minHeight: renderingToFile ? 760 : nil)
                 .fixedSize(horizontal: false, vertical: renderingToFile)
-                if let notice = store.notice {
-                    Banner(
-                        symbol: notice.isError ? "xmark.octagon.fill" : "checkmark.circle.fill",
-                        tint: notice.isError ? .red : .green, title: notice.text
-                    ) { store.notice = nil }
-                }
-                if let problem = store.problem {
-                    Banner(symbol: "exclamationmark.octagon.fill", tint: .red, title: problem)
-                }
-                FooterBar(store: store)
+                PanelBottom(store: store)
             }
-            .padding(14)
-            .environment(\.now, frozenNow ?? context.date)
-            .environment(\.animating, store.panelOpen)
+            .padding(Self.padding)
+        }
+    }
+}
+
+/// The clock and the environment every part of the panel reads, around one part or all of them.
+struct PanelPart<Content: View>: View {
+    let store: Store
+    var frozenNow: Date?
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        TimelineView(PanelClock(running: store.panelOpen)) { context in
+            content
+                .environment(\.now, frozenNow ?? context.date)
+                .environment(\.animating, store.panelOpen)
         }
         .fontDesign(.rounded)
-        .animation(.smooth(duration: 0.35), value: store.notice)
     }
 }
 
@@ -94,6 +72,102 @@ private struct PanelClock: TimelineSchedule {
         return AnyIterator {
             defer { next = running ? next?.addingTimeInterval(5) : nil }
             return next
+        }
+    }
+}
+
+/// Above the columns: the host app has an account selected, which pauses switching.
+struct PanelTop: View {
+    let store: Store
+
+    var body: some View {
+        if let email = store.snapshot?.orcaSelected {
+            Banner(
+                symbol: "exclamationmark.triangle.fill", tint: .orange,
+                title: "\(HostApp.current.name) has \(email) selected",
+                text: "\(HostApp.current.name) reverts switches and refreshes tokens itself, and two refreshers sign accounts out. Auto-switch and switching are paused until you pick System default in \(HostApp.current.name)'s Claude account menu.")
+                .padding(.bottom, PanelColumn.spacing)
+        }
+    }
+}
+
+/// Under the columns: what the last action did, what went wrong, and the footer bar.
+struct PanelBottom: View {
+    let store: Store
+
+    var body: some View {
+        VStack(spacing: 12) {
+            if let notice = store.notice {
+                Banner(
+                    symbol: notice.isError ? "xmark.octagon.fill" : "checkmark.circle.fill",
+                    tint: notice.isError ? .red : .green, title: notice.text
+                ) { store.notice = nil }
+            }
+            if let problem = store.problem {
+                Banner(symbol: "exclamationmark.octagon.fill", tint: .red, title: problem)
+            }
+            FooterBar(store: store)
+        }
+        .padding(.top, PanelColumn.spacing)
+        .animation(.smooth(duration: 0.35), value: store.notice)
+    }
+}
+
+/// The panel's columns, left to right; on screen each one is its own NSHostingView.
+enum PanelColumn: CaseIterable {
+    case accounts, work, machine, tools
+
+    static let spacing: CGFloat = 12
+
+    var width: CGFloat {
+        switch self {
+        case .accounts: 350
+        case .work: 360
+        case .machine: 310
+        case .tools: 300
+        }
+    }
+
+    /// The columns side by side, with the padding around them.
+    static var panelWidth: CGFloat {
+        allCases.reduce(0) { $0 + $1.width } + spacing * CGFloat(allCases.count - 1) + 2 * PanelView.padding
+    }
+}
+
+struct PanelColumnView: View {
+    let column: PanelColumn
+    let store: Store
+
+    var body: some View {
+        Column(width: column.width) {
+            switch column {
+            case .accounts:
+                ActiveAccountCard(store: store).fixedSize(horizontal: false, vertical: true)
+                AccountsCard(store: store)
+                if let credits = store.snapshot?.credits {
+                    CreditsCard(credits: credits).fixedSize(horizontal: false, vertical: true)
+                }
+                DiskCard(store: store).fixedSize(horizontal: false, vertical: true)
+            case .work:
+                DevServersCard(store: store)
+                BuildsCard(store: store)
+                MailCard(store: store).fixedSize(horizontal: false, vertical: true)
+            case .machine:
+                AwakeCard(awake: store.awake, store: store).fixedSize(horizontal: false, vertical: true)
+                if store.browser?.installed == true {
+                    BrowserCard(store: store).fixedSize(horizontal: false, vertical: true)
+                }
+                FansCard(store: store)
+            case .tools:
+                // Ultra scrolls inside its card, so this column absorbs the Desktop card;
+                // the third one cannot: Load & Heat has a fixed chart and would spill out.
+                DictationCard(dictation: store.dictation).fixedSize(horizontal: false, vertical: true)
+                UltraCard(store: store)
+                if store.desktop?.installed == true {
+                    DesktopCard(store: store).fixedSize(horizontal: false, vertical: true)
+                }
+                UpdatesCard(store: store).fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
