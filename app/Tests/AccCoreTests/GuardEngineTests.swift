@@ -5,6 +5,11 @@ import Testing
 
 // Which tick goes to Python (`acc.py devguard once`) and the waits after a handover.
 
+// GuardEngine.init and loop() set GuardLog's and GuardContext's statics: in parallel these tests raced
+// (SIGSEGV in GuardLog.hold, 3 in ~25 runs), so they run one at a time.
+@Suite("the guard engine", .serialized)
+struct GuardEngineTests {
+
 private func plan(_ action: String, _ code: String) -> Plan {
     Plan(.simulators(footprint: 0, count: 0), action, 50, "test", code)
 }
@@ -305,7 +310,8 @@ func pythonLoopStartFails() throws {
     defer { try? FileManager.default.removeItem(atPath: home) }
     Files.mkdirs(GuardPaths.state(home))
     #expect(Files.writeAtomic(GuardPaths.state(home) + "/devguard.json", #"{"mode": "enforce", "interval_seconds": "5", "notify": false}"#))
-    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    // a python that starts: only the stub's nil makes this start fail, not Spawn.start's
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/usr/bin/true"]))
     final class Starts: @unchecked Sendable { var n = 0 }
     let starts = Starts()
     engine.loopStarter = { _ in
@@ -393,6 +399,8 @@ func pythonLoopRecovers() throws {
     #expect(lockFree(home))
     // what Python's loop saved last
     #expect(Files.writeAtomic(statePath, #"{"brake_at": 1790999990.0, "warned": {"x": 1}, "writer": 1, "saved_at": 1790999990.0}"#))
+    // what native pinned before Python's loop: forgotten on the way back, as Python restored it
+    engine.queue.sync { engine.shaper.background[99_999] = (1, true) }
 
     // another guard holds the lock meanwhile: native waits, it doesn't tick beside it
     let other = open(GuardPaths.state(home) + "/devguard.lock", O_WRONLY | O_CLOEXEC)
@@ -408,15 +416,101 @@ func pythonLoopRecovers() throws {
     #expect(engine.queue.sync { engine.ticks } == ticks + 1)
     #expect(!lockFree(home))
     #expect(engine.queue.sync { !engine.pythonMode && engine.loopShortRuns == 0 })
+    #expect(engine.queue.sync { engine.shaper.background[99_999] == nil })
     let saved = Files.json(statePath, fallback: .null)
     #expect(saved["brake_at"]?.double == 1_790_999_990 && saved["warned"]?["x"]?.double == 1)
 }
 
-@Test("an interval_seconds too large for a timer's leeway is capped at an hour")
+@Test("an interval_seconds too large for a timer's leeway is capped at an hour, a tiny one at half a second")
 func intervalCap() {
     let path = "/tmp/acc-cored-interval-\(getpid()).json"
     defer { unlink(path) }
-    _ = Files.writeAtomic(path, #"{"interval_seconds": 1e17}"#)
     let engine = GuardEngine(.init(home: "/nonexistent", shadow: true, python: ["/nonexistent/python"]))
-    #expect(engine.interval(GuardConfig.load(path: path)) == 3600)
+    for (raw, want) in [("1e17", 3600.0), ("0.001", 0.5), ("5", 5.0)] {
+        _ = Files.writeAtomic(path, "{\"interval_seconds\": \(raw)}")
+        #expect(engine.interval(GuardConfig.load(path: path)) == want)
+    }
+}
+
+@Test("engine: a guard that takes the lock during `devguard once` hangs neither the queue nor stop(); native waits for it")
+func handOverLockTaken() throws {
+    let home = try scratchHome("handlock")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let stateDir = GuardPaths.state(home)
+    Files.mkdirs(stateDir)
+    #expect(Files.writeAtomic(stateDir + "/devguard.json", #"{"mode": "enforce", "interval_seconds": 3600, "caps_minutes": 10, "notify": false}"#))
+    Files.mkdirs(home + "/caps/p/builds")
+    #expect(Files.writeAtomic(stateDir + "/janitor.json", "{\"caps\": [{\"path\": \"\(home)/caps/*/builds\", \"max_gb\": 10}]}"))
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    GuardLog.notifications = false
+    let gb = 1 << 30
+    engine.probesFactory = {
+        RecordedProbes(PyObject([
+            ("now", .double(1_791_000_000)), ("home", .string(home)), ("rows", [[4242, 1, "node /tmp/x/big.js"]]),
+            ("usage", ["4242": ["footprint": .int(40 * gb), "peak": .int(40 * gb), "cpu": 1.0, "written": 0, "start": 1]]),
+            ("sysctl", ["hw.memsize": .int(48 * gb)]), ("swap", [0, 0]),
+        ]))
+    }
+    final class Holder: @unchecked Sendable { var fd: Int32 = -1 }
+    let holder = Holder()
+    engine.runner = { _ in  // `devguard run` from launchd takes the lock while once runs
+        holder.fd = open(stateDir + "/devguard.lock", O_WRONLY | O_CLOEXEC)
+        _ = flock(holder.fd, LOCK_EX | LOCK_NB)
+        return 0
+    }
+    #expect(engine.start())
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        engine.benchTick()  // a runaway: the brake goes to Python
+        done.signal()
+    }
+    let finished = done.wait(timeout: .now() + 3) == .success
+    #expect(finished, "the tick hung on the lock")
+    if !finished {
+        flock(holder.fd, LOCK_UN)
+        _ = done.wait(timeout: .now() + 5)
+    }
+    #expect(engine.queue.sync { engine.handovers == 1 && engine.pythonMode })
+    // no save without the lock: the caps' due check would have written caps_at
+    #expect(Files.json(stateDir + "/devguard-state.json", fallback: .null)["caps_at"] == nil)
+    let ticks = engine.queue.sync { engine.ticks }
+    engine.benchTick()  // still held: no tick
+    #expect(engine.queue.sync { engine.ticks } == ticks)
+    flock(holder.fd, LOCK_UN)
+    close(holder.fd)
+    engine.runner = { _ in 0 }
+    engine.benchTick()
+    #expect(engine.queue.sync { engine.ticks } == ticks + 1 && !engine.queue.sync { engine.pythonMode })
+    #expect(!lockFree(home))
+    let start = Kernel.wall()
+    engine.stop()
+    #expect(Kernel.wall() - start < 2)
+}
+
+@Test("engine: the end of Python's loop is logged with its exit code or signal")
+func pythonLoopEndLine() throws {
+    let home = try scratchHome("endline")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(GuardPaths.state(home))
+    #expect(Files.writeAtomic(GuardPaths.state(home) + "/devguard.json", #"{"mode": "enforce", "interval_seconds": "5", "notify": false}"#))
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    final class Next: @unchecked Sendable { var argv = ["/bin/sh", "-c", "exit 3"] }
+    let next = Next()
+    engine.loopStarter = { _ in Spawn.start(next.argv) }
+    engine.probesFactory = { pressureWorld(home: home, now: 1_791_000_000, compressedGB: 1) }
+    engine.runner = { _ in 0 }
+    engine.benchTick()
+    usleep(300_000)
+    engine.benchTick()
+    next.argv = ["/bin/sh", "-c", "kill -9 $$"]
+    engine.queue.sync { engine.loopRestartAt = 0 }
+    engine.benchTick()
+    usleep(300_000)
+    engine.benchTick()
+    let log = String(decoding: Files.read(GuardPaths.state(home) + "/devguard.log") ?? [], as: UTF8.self)
+    #expect(log.contains("pętla Pythona skończyła się (kod 3)"))
+    #expect(log.contains("pętla Pythona skończyła się (sygnał 9)"))
+    engine.stop()
+}
+
 }
