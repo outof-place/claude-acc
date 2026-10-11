@@ -33,7 +33,12 @@ def signal_point(what):
         n = len(f.read().splitlines()) + 1
         f.write(what + "\n")
     if n == int(at):
-        os.kill(os.getppid(), getattr(signal, "SIG" + os.environ.get("FAKE_SIGNAL", "TERM")))
+        sig = getattr(signal, "SIG" + os.environ.get("FAKE_SIGNAL", "TERM"))
+        if os.environ.get("FAKE_SIGNAL_GROUP"):
+            # jak Ctrl-C albo zamknięty terminal: cała grupa procesów ticku (test daje mu własną)
+            os.killpg(os.getpgid(os.getppid()), sig)
+        else:
+            os.kill(os.getppid(), sig)
 
 
 def issue(server, email):

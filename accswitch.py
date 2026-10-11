@@ -284,8 +284,10 @@ def tool(name):
 
 
 def spawn(argv, **kwargs):
+    # w bloku uninterrupted dzieci (curl, security) dostają własną sesję: Ctrl-C, zamknięty terminal
+    # czy timeout agenta trafiają w całą grupę procesów i urwałyby odświeżenie w połowie
     return subprocess.run([tool(argv[0])] + argv[1:], capture_output=True, text=True, close_fds=False,
-                          check=False, **kwargs)
+                          check=False, start_new_session=_SHIELDED[0] > 0, **kwargs)
 
 
 # ---------- Pęk kluczy ----------
@@ -586,12 +588,20 @@ def in_time(need=0):
         raise OutOfTime(f"termin przebiegu: zostało {max(left, 0):.0f} s, krok potrzebuje {need} s")
 
 
+# głębokość bloków uninterrupted: spawn() daje wtedy dzieciom własną sesję
+_SHIELDED = [0]
+
+
 class uninterrupted:
     """Blok, którego SIGTERM, SIGINT ani SIGHUP nie przerywają: sygnał czeka do końca bloku i wtedy
-    działa tak, jak działałby bez niego (domyślnie kończy proces). SIGKILL-a odroczyć się nie da,
-    więc ani launchd, ani acc-cored go tickowi nie wysyłają."""
+    działa tak, jak działałby bez niego (domyślnie kończy proces). Dzieci startowane w bloku mają
+    własną sesję, więc sygnał do całej grupy (Ctrl-C, zamknięty terminal) ich nie zabija. SIGKILL-a
+    odroczyć się nie da: acc-cored go tickowi nie wysyła, a launchd dopiero po ExitTimeOut (90 s,
+    więcej niż curl z max-time 20 i zapisy)."""
 
     SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
+    # kończące najpierw: KeyboardInterrupt z SIGINT przerwałby ponowne wysłanie SIGTERM
+    ORDER = ("SIGTERM", "SIGHUP", "SIGINT")
 
     def __enter__(self):
         self.pending, self.previous = [], {}
@@ -602,6 +612,8 @@ class uninterrupted:
                 signal.signal(sig, lambda got, _frame: self.pending.append(got))
         except ValueError:  # poza głównym wątkiem sygnałów przejąć się nie da
             self._restore()
+            quiet_log("uninterrupted: poza głównym wątkiem, odświeżenie bez ochrony przed sygnałami")
+        _SHIELDED[0] += 1
         return self
 
     def _restore(self):
@@ -610,9 +622,12 @@ class uninterrupted:
         self.previous = {}
 
     def __exit__(self, *_exc):
+        _SHIELDED[0] -= 1
         self._restore()
-        for sig in dict.fromkeys(self.pending):
-            os.kill(os.getpid(), sig)
+        for name in self.ORDER:
+            sig = getattr(signal, name)
+            if sig in self.pending:
+                os.kill(os.getpid(), sig)
         return False
 
 
@@ -2252,14 +2267,19 @@ def cmd_tick(cfg, _args):
         return tick(cfg, accounts)
     except OutOfTime as err:
         _TICK_DUE.update(quiet=False, at=None, why="")
-        log(f"tick: {err}, reszta w następnym slocie")
+        quiet_log(f"tick: {err}, reszta w następnym slocie")
         return 1
     finally:
         try:
             update_state(tick_due=dict(_TICK_DUE))
         except Exception as err:  # noqa: BLE001 - termin to wskazówka, przebieg ważniejszy
             quiet_log(f"tick: zapis terminu nieudany: {err}")
-        save_status(cfg, accounts)
+        if not save_status(cfg, accounts) and _TICK_DUE["quiet"]:
+            # bez świeżej migawki spokój kłamie: acc-cored poświadczałby starszą
+            try:
+                update_state(tick_due={"quiet": False, "at": None, "why": ""})
+            except Exception as err:  # noqa: BLE001
+                quiet_log(f"tick: zapis terminu nieudany: {err}")
 
 
 def quiet_log(line):
@@ -2271,12 +2291,17 @@ def quiet_log(line):
 
 
 def save_status(cfg, accounts):
-    """Migawka dla aplikacji w pasku menu, jeszcze pod blokadą ticku. Jej błąd nie może
-    przesłonić wyniku ticku: aplikacja przy starym pliku sama uruchomi `status --json`."""
+    """Migawka dla aplikacji w pasku menu, jeszcze pod blokadą ticku; True, gdy zapisana. Jej błąd
+    nie może przesłonić wyniku ticku: aplikacja przy starym pliku sama uruchomi `status --json`.
+    Po terminie przebiegu z acc-cored (survey w migawce) migawki nie ma, a tick kończy się zwykle."""
     try:
         write_json(STATUS_PATH, snapshot(cfg, accounts))
+        return True
+    except OutOfTime as err:
+        quiet_log(f"tick: migawka pominięta, {err}")
     except Exception as err:
         quiet_log(f"tick: zapis migawki nieudany: {err}")
+    return False
 
 
 def tick(cfg, accounts):

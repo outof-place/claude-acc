@@ -191,15 +191,20 @@ func switchEngineRecords() throws {
     defer { try? FileManager.default.removeItem(atPath: home) }
     let now = Kernel.wall()
     writeState(dir, state(lastTick: now - 100, quiet: true, at: now + 3600))
-    #expect(Files.writeAtomic(dir + "/status.json", #"{"generated_at": 1791000000.5}"#))
+    #expect(Files.writeAtomic(dir + "/status.json", "{\"generated_at\": \(now - 99.5)}"))
     let engine = SwitchEngine(.init(home: home, python: ["/nonexistent/python"]))
     engine.resolver = { nil }
     engine.runner = { _, _ in 0 }
     engine.queue.sync { engine.baseline = engine.stamps() }
     engine.queue.sync { engine.slotFired() }
     let record = Files.json(dir + "/accswitch-slot.json", fallback: .null)
-    #expect(record["ran"]?.truthy == false && record["status_at"]?.double == 1_791_000_000.5)
+    #expect(record["ran"]?.truthy == false && record["status_at"]?.double == now - 99.5)
+    #expect(record["checked_at"]?.double == record["at"]?.double)
     #expect(engine.status()["skips"]?.double == 1)
+    // a status.json older than the last tick (it didn't get to write one): nothing to vouch for
+    #expect(Files.writeAtomic(dir + "/status.json", "{\"generated_at\": \(now - 101)}"))
+    engine.queue.sync { engine.slotFired() }
+    #expect(Files.json(dir + "/accswitch-slot.json", fallback: .null)["status_at"] == .null)
 
     #expect(Files.writeAtomic(home + "/Library/Keychains/other.keychain-db", "kc"))
     #expect(engine.queue.sync { engine.changedInputs(engine.stamps()) } == ["keychain"])
@@ -241,4 +246,39 @@ func switchClockAndOffsets() {
     let ahead = SwitchEngine.decide(state: state(lastTick: now + 3600, quiet: true, at: now + 7200), changed: [], now: now, maxGap: 480)
     #expect(ahead.run && ahead.reasons == ["last tick ahead of the clock"])
     #expect(ISODate.epoch("1970-01-01T01:00:00+0100") == 0)
+}
+
+@Test("engine: a tick that doesn't start is a tried slot, not a check: the switcher goes silent; ping never waits")
+func switchEngineDeadTick() throws {
+    let (home, dir) = try switchHome("dead")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let now = Kernel.wall()
+    writeState(dir, state(lastTick: now - 100, quiet: true, at: now + 3600))
+    #expect(Files.writeAtomic(dir + "/status.json", "{\"generated_at\": \(now - 99.5)}"))
+    let engine = SwitchEngine(.init(home: home, python: ["/nonexistent/python"]))  // no runner: Spawn.start fails
+    final class Slow: @unchecked Sendable { var answering = false }
+    let slow = Slow()
+    engine.resolver = {
+        slow.answering = true
+        usleep(1_500_000)  // orcahost.py under load
+        slow.answering = false
+        return nil
+    }
+    engine.queue.sync { engine.baseline = engine.stamps() }
+    engine.queue.sync { engine.slotFired() }  // a skip: a check
+    let checked = Files.json(dir + "/accswitch-slot.json", fallback: .null)["checked_at"]?.double
+    #expect(checked != nil)
+
+    #expect(Files.writeAtomic(dir + "/config.json", "{}"))
+    engine.queue.async { engine.slotFired() }
+    for _ in 0..<100 where !slow.answering { usleep(10_000) }
+    let start = Kernel.monotonic()
+    #expect(engine.status()["runs"] != nil)  // answered while the lookup holds the queue
+    #expect(Kernel.monotonic() - start < 0.2)
+    engine.queue.sync {}
+    let record = Files.json(dir + "/accswitch-slot.json", fallback: .null)
+    #expect(record["ran"]?.truthy == true && record["rc"]?.double == 127)
+    #expect(record["status_at"] == .null && record["checked_at"]?.double == checked)
+    #expect(String(decoding: Files.read(dir + "/launchd.log") ?? [], as: UTF8.self).contains("the tick didn't start"))
+    engine.stop()
 }

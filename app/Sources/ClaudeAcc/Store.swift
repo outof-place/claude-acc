@@ -169,7 +169,7 @@ final class Store {
     private static let tickSnapshotMaxAge: TimeInterval = 180
     private static let switchSlot = CLI.directory + "/accswitch-slot.json"
     @ObservationIgnored private var latestSlot: SwitchSlot?
-    /// acc-cored's last slot, run or skipped: the switcher is alive; nil without acc-cored's ticks.
+    /// acc-cored's last check (a skipped slot, or a tick that ended with 0); nil without acc-cored's ticks.
     private(set) var switchCheckedAt: Double?
 
     /// The minute's reading. With the panel closed the tick's file stands in for the script,
@@ -196,7 +196,7 @@ final class Store {
 
     private func readSwitchSlot() {
         if let data = changedFile(Self.switchSlot) { latestSlot = Self.decode(SwitchSlot.self, from: data) }
-        if latestSlot?.at != switchCheckedAt { switchCheckedAt = latestSlot?.at }
+        if latestSlot?.checkedAt != switchCheckedAt { switchCheckedAt = latestSlot?.checkedAt }
     }
 
     private func show(_ fresh: Snapshot) {

@@ -17,13 +17,16 @@
 // The next slot is scheduled when the tick ends, so two never overlap.
 //
 // Every slot leaves a record in accswitch-slot.json: whether it ran the tick and why, the tick's
-// exit code and time. A skipped slot also names the status.json it vouches for: nothing a tick
-// reads changed since that snapshot, so the menu bar counts it fresh from the slot's time.
+// exit code and time, and `checked_at`, the last slot that was a check: a skip, or a tick that
+// ended with 0 (a tick that didn't start or crashed isn't one, so a dead switcher still goes
+// "silent"). A skipped slot also names the status.json it vouches for (one the latest tick
+// wrote): nothing a tick reads changed since that snapshot, so the menu bar counts it fresh.
 //
 // Shadow mode runs nothing. It watches launchd's own ticks and records, for each, whether this
 // schedule would have run it and whether it changed anything (docs/acc-cored.md).
 import Darwin
 import Dispatch
+import Synchronization
 
 public final class SwitchEngine: @unchecked Sendable {
     public struct Options: Sendable {
@@ -68,8 +71,17 @@ public final class SwitchEngine: @unchecked Sendable {
     }
     /// the tick in flight
     var running: Running?
-    /// the last slot's record (accswitch-slot.json), for `ping`
-    var lastRecord: PyObject?
+    /// the last slot that was a check (a skip, or a tick that ended with 0)
+    var lastHealthy: Double?
+    var hostFailureLogged = false
+    /// what `ping` reads, without waiting for the engine's queue (an orcahost lookup may hold it)
+    struct Published: Sendable {
+        var runs = 0
+        var skips = 0
+        var tickStarted: Double?
+        var lastSlot: String?
+    }
+    let published = Mutex(Published())
     /// tests: the tick's run in place of Python's (argv, its environment), on the engine's queue
     var runner: (([String], [String: String]) -> Int32)?
     /// tests: the host lookup in place of orcahost.py's
@@ -166,15 +178,14 @@ public final class SwitchEngine: @unchecked Sendable {
         }
     }
 
-    /// What the slots did so far, for `ping`.
+    /// What the slots did so far, for `ping`; never waits for the engine's queue.
     public func status() -> PyObject {
-        queue.sync {
-            PyObject([
-                ("runs", .int(runs)), ("skips", .int(skips)),
-                ("tick_running_s", running.map { .double((Kernel.wall() - $0.started).rounded()) } ?? .null),
-                ("last_slot", lastRecord.map { .object($0) } ?? .null),
-            ])
-        }
+        let p = published.withLock { $0 }
+        return PyObject([
+            ("runs", .int(p.runs)), ("skips", .int(p.skips)),
+            ("tick_running_s", p.tickStarted.map { .double((Kernel.wall() - $0).rounded()) } ?? .null),
+            ("last_slot", p.lastSlot.flatMap { try? PyJSON.loads($0) } ?? .null),
+        ])
     }
 
     /// The host as orcahost.py resolves it, asked again when one of the files the choice depends
@@ -183,7 +194,11 @@ public final class SwitchEngine: @unchecked Sendable {
         let inputs = HostResolver.watchStamp(host?.watch ?? [])
         guard host == nil || inputs != hostInputs else { return }
         let found = resolver.map { $0() } ?? HostResolver.dataFiles(python: options.python, home: options.home)
-        if found == nil { Files.append(stateDir + "/launchd.log", "acc-cored: accswitch: orcahost.py didn't answer, the host's files go unwatched until it does\n") }
+        // one line when it starts failing, not one per slot
+        if found == nil, !hostFailureLogged {
+            Files.append(stateDir + "/launchd.log", "acc-cored: accswitch: orcahost.py didn't answer, the host's files go unwatched until it does\n")
+        }
+        hostFailureLogged = found == nil
         host = found
         hostInputs = HostResolver.watchStamp(found?.watch ?? [])
     }
@@ -195,7 +210,7 @@ public final class SwitchEngine: @unchecked Sendable {
         let now = Kernel.wall()
         let lastTick = min(state["last_tick"]?.double ?? 0, now)
         var next = lastTick + options.slot
-        while next < now + 1 { next += options.slot }
+        if next < now + 1 { next += ((now + 1 - next) / options.slot).rounded(.up) * options.slot }
         timer?.cancel()
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(wallDeadline: .now() + (next - now), leeway: .seconds(2))
@@ -234,14 +249,18 @@ public final class SwitchEngine: @unchecked Sendable {
             return
         }
         guard let pid = Spawn.start(argv, env: env, log: stateDir + "/launchd.log", ownGroup: true) else {
+            // a tried slot that isn't a check: the menu bar says "silent" as it did under launchd
+            Files.append(stateDir + "/launchd.log", "acc-cored: accswitch: the tick didn't start (\(argv[0]))\n")
             pending = ["the tick didn't start"]
-            record(ran: false, reasons: run.reasons, rc: 127, seconds: nil)
+            runs += 1
+            record(ran: true, reasons: run.reasons, rc: 127, seconds: nil)
             scheduleSlot()
             return
         }
         var started = run
         started.pid = pid
         running = started
+        published.withLock { $0.tickStarted = run.started }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var status: Int32 = 0
             while waitpid(pid, &status, 0) < 0 && errno == EINTR {}
@@ -256,6 +275,7 @@ public final class SwitchEngine: @unchecked Sendable {
     func tickEnded(_ rc: Int32) {
         guard let run = running else { return }
         running = nil
+        published.withLock { $0.tickStarted = nil }
         runs += 1
         let after = stamps()
         let lastTick = Files.json(stateDir + "/state.json", fallback: .null)["last_tick"]?.double ?? 0
@@ -273,16 +293,30 @@ public final class SwitchEngine: @unchecked Sendable {
         scheduleSlot()
     }
 
-    /// accswitch-slot.json: this slot, and for a skipped one the status.json it vouches for.
+    /// accswitch-slot.json: this slot, the last check, and for a skipped one the status.json it vouches for.
     func record(ran: Bool, reasons: [String], rc: Int32?, seconds: Double?) {
-        let statusAt = ran ? nil : Files.json(stateDir + "/status.json", fallback: .null)["generated_at"]?.double
+        let now = Kernel.wall().rounded()
+        if ran ? rc == 0 : rc == nil { lastHealthy = now }
+        var statusAt: Double?
+        if !ran {
+            // only the latest tick's snapshot: a tick that didn't get to write it left an older one
+            let generated = Files.json(stateDir + "/status.json", fallback: .null)["generated_at"]?.double
+            let lastTick = Files.json(stateDir + "/state.json", fallback: .null)["last_tick"]?.double ?? 0
+            if let generated, generated >= lastTick { statusAt = generated }
+        }
         let rec = PyObject([
-            ("at", .double(Kernel.wall().rounded())), ("ran", .bool(ran)), ("reasons", .array(reasons.map { .string($0) })),
+            ("at", .double(now)), ("ran", .bool(ran)), ("reasons", .array(reasons.map { .string($0) })),
             ("rc", rc.map { .int(Int($0)) } ?? .null), ("tick_s", seconds.map { .double(($0 * 10).rounded() / 10) } ?? .null),
+            ("checked_at", lastHealthy.map { .double($0) } ?? .null),
             ("status_at", statusAt.map { .double($0) } ?? .null), ("runs", .int(runs)), ("skips", .int(skips)),
         ])
-        lastRecord = rec
-        _ = Files.writeAtomic(stateDir + "/accswitch-slot.json", PyJSON.object(rec).dumps())
+        let text = PyJSON.object(rec).dumps()
+        published.withLock {
+            $0.runs = runs
+            $0.skips = skips
+            $0.lastSlot = text
+        }
+        _ = Files.writeAtomic(stateDir + "/accswitch-slot.json", text)
     }
 
     // MARK: shadow

@@ -376,31 +376,40 @@ tick could do something the last one didn't:
 ### The tick is never killed
 
 A tick killed between a token refresh and its Keychain write leaves a used refresh token behind,
-and the server answers its reuse by revoking the account. launchd never kills a tick, and neither
-does acc-cored:
+and the server answers its reuse by revoking the account. acc-cored never signals a tick, and
+launchd sends SIGKILL only after the job's `ExitTimeOut` (90 s in the tick's plist: curl's 20 s and
+the writes fit in it):
 - The tick leads a process group of its own. acc-cored stops without waiting for it, and a tick
   outlives acc-cored (launchd reaps it then). The next slot is scheduled when the tick ends.
 - Its timeout is cooperative. `ACC_TICK_DEADLINE` (100 s after its start) is when the tick stops
   starting work: it reads no further account and starts a refresh only with 30 s left to finish
   it. A tick past the deadline ends cleanly with 1 and leaves the rest to the next slot.
 - From the refresh request to its last Keychain write, SIGTERM, SIGINT and SIGHUP wait until the
-  block ends (`uninterrupted`). SIGKILL can't wait, so nothing sends it.
+  block ends (`uninterrupted`). Terminating signals are delivered first, then SIGINT. The `curl`
+  and `security` children started in the block get a session of their own, so a signal to the
+  whole group (Ctrl-C, a closed terminal or pane, an agent's timeout) doesn't kill them halfway.
 - `tests/test_accswitch_uninterrupted.py` sends SIGTERM at every call of the fake `curl` and
   `security`, at its start and just before it answers, then runs a normal tick. The server never
   sees a used token, and every copy holds a live one. SIGINT and SIGHUP run inside the refresh.
-  SIGKILL right after the server's answer does leave a used token (the control).
+  The same runs again with the signal sent to the tick's whole process group. SIGKILL right
+  after the server's answer does leave a used token (the control).
+- A tick past the deadline in its status snapshot (`survey`) skips the snapshot and ends not
+  quiet: an older `status.json` must not be vouched for.
 
 ### Slots on record
 
 Every slot writes `accswitch-slot.json`: `at`, whether it `ran` the tick and why (`reasons`), the
-tick's exit code (`rc`) and time (`tick_s`), and the counts. The tick's output goes to
-`launchd.log`, as with launchd. `ping` returns the counts, the last slot and how long a running tick
-has run.
+tick's exit code (`rc`) and time (`tick_s`), the counts, and `checked_at`: the last slot that was a
+check, i.e. a skip or a tick that ended with 0. A tick that didn't start (rc 127, with a line in
+`launchd.log`) or crashed is tried, not checked. The tick's output goes to `launchd.log`, as with
+launchd. `ping` returns the counts, the last slot and how long a running tick has run, without
+waiting for the engine's queue (an `orcahost.py` lookup may hold it).
 
 A skipped slot also names the `status.json` it vouches for (`status_at`, its `generated_at`):
-nothing a tick reads changed since that snapshot. The menu bar counts a vouched snapshot fresh
-from the slot's time, so with the panel closed it doesn't run `status --json` itself while ticks
-are skipped. The panel's "Auto-switch checked" counts from the last slot, run or skipped.
+nothing a tick reads changed since that snapshot. It vouches only for the latest tick's snapshot
+(`generated_at` at least `last_tick`). The menu bar counts a vouched snapshot fresh from the slot's
+time, so with the panel closed it doesn't run `status --json` itself while ticks are skipped. The
+panel's "Auto-switch checked" counts from `checked_at`, so a dead switcher still goes silent.
 
 acc-cored never reads, refreshes or copies credentials. The tick stays Python's.
 

@@ -452,10 +452,12 @@ def watched(home=None):
 
 def main(argv):
     h = resolve()
-    fields = dict(h._asdict(), main=main_path(h), runtime=runtime_path(h), running=running(h), watch=watched())
+    fields = dict(h._asdict(), main=main_path(h), runtime=runtime_path(h), running=running(h))
+    if not argv or argv[0] == "watch":  # a second resolve and Info.plist reads: only when asked for
+        fields["watch"] = watched()
     if argv:
         if argv[0] not in fields:
-            print("orcahost.py [%s]" % "|".join(fields), file=sys.stderr)
+            print("orcahost.py [%s]" % "|".join(list(fields) + ["watch"]), file=sys.stderr)
             return 2
         print(fields[argv[0]])
         return 0

@@ -15,14 +15,15 @@ Uruchomienie: /usr/bin/python3 -m unittest tests.test_accswitch_uninterrupted
 import json
 import os
 import shutil
+import subprocess
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 try:
-    from tests.test_e2e import BASE, Env, scoped
+    from tests.test_e2e import BASE, SCRIPT, Env, scoped
 except ImportError:  # uruchomione z katalogu tests
-    from test_e2e import BASE, Env, scoped
+    from test_e2e import BASE, SCRIPT, Env, scoped
 
 TOKEN = "https://api.anthropic.com/v1/oauth/token"
 
@@ -97,14 +98,21 @@ class UninterruptedRefreshTest(unittest.TestCase):
                     f"{where}: wpis {service}",
                 )
 
-    def interrupt_everywhere(self, make, sig, only=None):
+    def interrupt_everywhere(self, make, sig, only=None, group=False):
         points = self.points(make)
 
         def at(n):
             w = self.world(make)
-            w.run("tick", FAKE_SIGNAL_AT=str(n), FAKE_SIGNAL=sig)
+            if group:
+                # sygnał do całej grupy ticku (Ctrl-C, zamknięty terminal, timeout agenta); tick
+                # dostaje własną sesję, żeby nie trafić w proces testów
+                subprocess.run(["/usr/bin/python3", SCRIPT, "tick"], capture_output=True, timeout=60, start_new_session=True,
+                               env=w.env(FAKE_SIGNAL_AT=str(n), FAKE_SIGNAL=sig, FAKE_SIGNAL_GROUP="1"))
+            else:
+                w.run("tick", FAKE_SIGNAL_AT=str(n), FAKE_SIGNAL=sig)
             w.run("tick")  # następny przebieg, bez sygnału: tu wyszłoby ponowne użycie
-            self.assert_no_used_token(w, f"SIG{sig} w punkcie {n} ({points[n - 1]})")
+            where = "grupy" if group else "ticku"
+            self.assert_no_used_token(w, f"SIG{sig} do {where} w punkcie {n} ({points[n - 1]})")
 
         chosen = [n for n in range(1, len(points) + 1) if not only or only(n, points)]
         with ThreadPoolExecutor(4) as pool:
@@ -120,6 +128,12 @@ class UninterruptedRefreshTest(unittest.TestCase):
     def test_sigint_and_sighup_inside_the_refresh(self):
         for sig in ("INT", "HUP"):
             self.interrupt_everywhere(idle_refresh, sig, only=in_refresh)
+
+    def test_a_signal_to_the_whole_group_spares_the_refresh_s_children(self):
+        # curl i security startowane w bloku mają własną sesję: Ctrl-C ich nie zabija
+        self.interrupt_everywhere(idle_refresh, "TERM", group=True)
+        for sig in ("INT", "HUP"):
+            self.interrupt_everywhere(idle_refresh, sig, only=in_refresh, group=True)
 
     def test_a_signal_inside_the_refresh_waits_for_the_writes(self):
         points = self.points(idle_refresh)
@@ -150,6 +164,22 @@ class UninterruptedRefreshTest(unittest.TestCase):
         w.run("tick")
 
         self.assertGreaterEqual(self.server(w).get("reuse_attempts", 0), 1)
+
+    def test_a_snapshot_past_the_deadline_is_skipped_and_the_tick_is_not_quiet(self):
+        # spokojny tick (konto niesie), a termin mija w migawce (survey): bez traceback, bez
+        # migawki i bez spokoju, bo acc-cored poświadczałby starszą migawkę
+        w = Env()
+        self.addCleanup(shutil.rmtree, w.home, True)
+        a = w.account("a@x", session_used=10)
+        w.runtime(a)
+        w.write()
+
+        r = w.run("tick", ACC_TICK_DEADLINE=str(int(time.time()) - 1))
+
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(os.path.exists(os.path.join(w.state_dir, "status.json")))
+        self.assertEqual(w.saved_state()["tick_due"], {"quiet": False, "at": None, "why": ""})
 
     def test_a_refresh_starts_only_with_time_left_before_the_deadline(self):
         w = self.world(idle_refresh)
