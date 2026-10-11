@@ -457,6 +457,50 @@ from `janitor.json` holds it as well. Idle is keyboard and mouse only: a video o
 input counts as idle. A user who comes back during a sweep doesn't stop it. `acc-cored janitor-check`
 prints the live reading and what the engine would do.
 
+## Perf keep
+
+launchd ran `perf.py keep` every 300 s: every check of every applied tweak, whether anything had
+changed or not. `acc-cored run --perf` brings a tweak back when one of its files changes or the
+network does, and runs the full pass only at start and every 30 minutes. Python keeps the knowledge
+and the writes:
+- `perf.py keep-spec` prints what to watch: each applied tweak with its class and files, plus
+  `admit-chain` (settings.json) and `link` (the network).
+- `perf.py keep --only a,b` repairs just those: no deferred undos, no Ultra, and the link and the
+  admit chain only when named.
+- The classes, as decided with the lead (a 30-minute repair delay is fine only for perf or cosmetic
+  tweaks, never for safety or privacy):
+  - **safety:** `claude-hooks-native`, `devguard-budget`, `devguard-max-server`, `security-slim`,
+    `admit-chain`. They come back on an event, every time.
+  - **perf:** the settings.json ones (`node-compile-cache`, `claude-limits`, `subagent-cache-1h`,
+    `fast-npx-hooks`, `rg-threads`, `workflow-size`, `claude-ui`, `tether-profile`), `docker-vm`
+    (Docker's settings) and `git-speed` (`~/.gitconfig`). They come back on the same events.
+  - **periodic**, no cheap event: `bg-helpers` (a helper restarted with a new pid), `docker-idle`,
+    git maintenance in the repositories, Ultra's results, and `claude-hooks-async`. That last one
+    stays out of the events until `pod/claude-async-hooks` ships (v6.1). They come back within
+    30 minutes.
+- **A fight:** a tweak repaired 3 times in 10 minutes has someone reverting it (another tool, a
+  hand edit). A perf tweak then waits an hour instead of fighting, in both keeps. A safety tweak
+  comes back every time and says so in perf.log at most once an hour.
+- **Its own writes:** a repair writes files it watches. Those events land while the run is on, and
+  one more run confirms them: it finds nothing to change and writes nothing.
+- **Events:**
+  - files: a kqueue source per file for writes in place, one per folder for atomic replacements;
+  - a missing folder: waited for from its nearest parent;
+  - a file counts only when its stamp (inode, mtime, size) moved, so a busy folder costs a stat per
+    watched file;
+  - the network: `notify_register_dispatch` on `com.apple.system.config.network_change`, settled
+    for 2 s;
+  - a change to perf.json or perf-state.json (apply, undo, a run) reloads the spec without a run.
+- **Runs:** events within 0.5 s go to one run, and a stream of events doesn't push it back. A run
+  is `taskpolicy -c utility` (a safety repair shouldn't wait behind background throttling), and
+  writes to perf-launchd.log.
+- **One writer:** keep, apply, undo, ultra and record take `perf.lock`, so launchd's keep beside
+  acc-cored's (after a setup.sh run) takes turns.
+- **Fallback:** without a spec (a perf.py from before `keep-spec`), the full pass runs every 300 s,
+  as launchd ran it, so nothing comes back later than before.
+- **Not live:** the switch adds `--perf` and replaces `com.filip.claude-acc.perf`, and switching on
+  is a separate decision.
+
 ## Events for hosts
 
 Hosts that show claude-acc's state (AccKit's `AccStore` in PodNative, Pod Menu) watch the state
@@ -527,10 +571,11 @@ files no topic names added to the state directory, 2.03 and 1.14 ms/s.
 
 ## Switching
 
-`scripts/acc-cored-switch.sh` swaps three launchd jobs for one acc-cored job, and back: devguard,
-the accswitch tick (`com.filip.claude-acc`) and the janitor. Standalone installs only: Pod
-registers its own agents, so where `owner.json` says Pod owns claude-acc, `on` refuses with exit 3
-(`owner.py check`, as setup.sh does), and it exits 1 when none of the three jobs is loaded. A
+`scripts/acc-cored-switch.sh` swaps four launchd jobs for one acc-cored job, and back: devguard,
+the accswitch tick (`com.filip.claude-acc`), the janitor and perf keep (`com.filip.claude-acc.perf`).
+Standalone installs only: Pod registers its own agents, so where `owner.json` says Pod owns
+claude-acc, `on` refuses with exit 3 (`owner.py check`, as setup.sh does), and it exits 1 when none
+of the jobs is loaded. A
 tombstone (handed back to Homebrew, uninstalled) is a standalone install again.
 
     scripts/acc-cored-switch.sh status
@@ -541,7 +586,7 @@ tombstone (handed back to Homebrew, uninstalled) is a standalone install again.
 - **`on`:**
   - It installs the binary as `$STATE/acc-cored` (a temp file, then a rename: overwriting a
     running binary gets its next launch killed) and writes `com.filip.claude-acc.cored.plist`. The
-    job runs `acc-cored run --guard --sched --accswitch --janitor` as `ProcessType Interactive`,
+    job runs `acc-cored run --guard --sched --accswitch --janitor --perf` as `ProcessType Interactive`,
     with `KeepAlive`.
   - It writes the plist and records the jobs it stops in `$STATE/acc-cored-switch.json` first, so
     a Ctrl-C later still leaves `off` what to bring back.
@@ -551,24 +596,25 @@ tombstone (handed back to Homebrew, uninstalled) is a standalone install again.
     held past 150 s by a hung `claude-acc status`, say), the script removes the record and the
     plist again and exits 1: no other job goes and no acc-cored starts (the new binary is in
     place).
-  - Then it boots out the other two and bootstraps acc-cored (one launchd doesn't have loaded
+  - Then it boots out the others and bootstraps acc-cored (one launchd doesn't have loaded
     afterwards exits 1 and points at `off`). The job runs with `--wait-lock` and `ExitTimeOut` 30 s (stopping ends
     Python's guard loop first, up to 10 s).
   - setup.sh boots the tick's job out under the same lock too (past 150 s, without it, as before),
     and only when launchd has it loaded. `setup.sh --uninstall` and `--pod-agents` take acc-cored
     down as well, with its plist and the record: under KeepAlive it would go on ticking accswitch
     beside Pod's agents or after an uninstall.
-  - The three plists stay where setup.sh wrote them.
+  - The replaced jobs' plists stay where setup.sh wrote them.
 - **`off`** is the undo. It boots acc-cored out, bootstraps the recorded jobs from their plists
   again, and removes the plist and the record. Each step is judged by what launchd says afterwards,
   as in `on`. If any of them didn't take (or a job's plist is missing), the record and the plist
   stay and it exits 1, so it can run again.
-- **After a setup.sh run**, the three jobs come back beside acc-cored. The two guards then share
-  `devguard.lock`, the ticks the switcher's lock, and the sweeps `janitor.lock`, so they take turns
-  instead of acting twice. Run `off` and `on` again after it.
+- **After a setup.sh run**, the jobs come back beside acc-cored. The two guards then share
+  `devguard.lock`, the ticks the switcher's lock, the sweeps `janitor.lock`, and the keeps
+  `perf.lock`, so they take turns instead of acting twice. Run `off` and `on` again after it.
 - **With main's Python** (no `tick_due`, no sched cooperation) acc-cored still works:
   - the tick runs in every slot, as launchd ran it;
   - wrappers keep their own loops, and the sched pass stays idle;
+  - perf keep, without `keep-spec`, runs the full pass every 300 s, as launchd did;
   - the guard and the janitor gain fully.
 
 Before the first live switch: measure the stage-3 handover latency (a cold `devguard once` under

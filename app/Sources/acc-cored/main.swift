@@ -19,8 +19,8 @@ let usage = """
            acc-cored janitor-check        the janitor's due time, idle time, builds and battery, and what run --janitor would do
            acc-cored caps-watch [SECONDS] [--report FILE|-]  how often the capped folders change (FSEvents), nothing run;
                the report (`acc.py devguard caps --dry-run`) adds the folders a run matched, as the guard watches them
-           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--accswitch | --accswitch-shadow FILE] [--janitor] [--for SECONDS]
-                         [--wait-lock]   the daemon; --wait-lock waits for a running one instead of exiting
+           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--accswitch | --accswitch-shadow FILE] [--janitor] [--perf]
+                         [--for SECONDS] [--wait-lock]   the daemon; --wait-lock waits for a running one instead of exiting
            acc-cored events [--for SECONDS] TOPIC...   the event stream of a running daemon, one line per frame
     """
 
@@ -297,10 +297,17 @@ case "run":
         engine.start()
         janitorEngine = engine
     }
+    var perfEngine: PerfKeepEngine?
+    if args.contains("--perf") {
+        let engine = PerfKeepEngine(.init(home: home))
+        engine.start()
+        perfEngine = engine
+    }
     let guardRunning = guardEngine
     let schedRunning = schedEngine
     let switchRunning = switchEngine
     let janitorRunning = janitorEngine
+    let perfRunning = perfEngine
     // state files as a stream for hosts that subscribe ({"op": "events"}); nothing watched without them
     let events = EventHub(stateDir: state)
     let control = ControlSocket(path: state + "/acc-cored.sock") { request in
@@ -312,7 +319,7 @@ case "run":
                 ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
                 ("wakes", .int(schedRunning?.wakeCount.load(ordering: .relaxed) ?? 0)),
                 ("accswitch", switchRunning.map { .object($0.status()) } ?? .bool(false)), ("janitor", .bool(janitorRunning != nil)),
-                ("events", .int(events.count)),
+                ("perf", perfRunning.map { .object($0.status()) } ?? .bool(false)), ("events", .int(events.count)),
             ]))
         default:
             return .object(PyObject([("ok", false), ("error", "unknown op")]))
@@ -328,6 +335,7 @@ case "run":
     let stopAll = { (code: Int32) in
         control.stop()
         events.stop()
+        perfRunning?.stop()
         janitorRunning?.stop()
         switchRunning?.stop()
         schedRunning?.stop()

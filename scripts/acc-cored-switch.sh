@@ -1,17 +1,19 @@
 #!/bin/bash
-# Swaps claude-acc's devguard, accswitch-tick and janitor launchd jobs for one acc-cored job, and back.
+# Swaps claude-acc's devguard, accswitch-tick, janitor and perf keep launchd jobs for one acc-cored
+# job, and back.
 #
 #   scripts/acc-cored-switch.sh status
 #   scripts/acc-cored-switch.sh on  [--apply] [--binary PATH]   what it would do; --apply does it
 #   scripts/acc-cored-switch.sh off [--apply]                   the undo: acc-cored out, the jobs back
 #
 # Check-only unless --apply. Standalone installs only (com.filip.claude-acc.*): where Pod owns
-# claude-acc (owner.json), or none of the three jobs is loaded, `on` refuses. `on` installs the binary as $STATE/acc-cored (temp file, then rename: overwriting a running
-# binary gets its next launch killed), writes com.filip.claude-acc.cored.plist, boots out the three
-# jobs (their plists stay where setup.sh wrote them) and bootstraps acc-cored. `off` boots acc-cored
-# out and bootstraps the recorded jobs from those plists again. A later setup.sh brings the three jobs
-# back beside acc-cored: both guards then share devguard.lock, the ticks the switcher's lock, the
-# sweeps janitor.lock, so they take turns rather than act twice; run `off` and `on` again after it.
+# claude-acc (owner.json), or none of the jobs is loaded, `on` refuses. `on` installs the binary as
+# $STATE/acc-cored (temp file, then rename: overwriting a running binary gets its next launch killed),
+# writes com.filip.claude-acc.cored.plist, boots out the jobs (their plists stay where setup.sh wrote
+# them) and bootstraps acc-cored. `off` boots acc-cored out and bootstraps the recorded jobs from
+# those plists again. A later setup.sh brings the jobs back beside acc-cored: both guards then share
+# devguard.lock, the ticks the switcher's lock, the sweeps janitor.lock, the keeps perf.lock, so they
+# take turns rather than act twice; run `off` and `on` again after it.
 # `setup.sh --uninstall` and `--pod-agents` take acc-cored down too (its plist and the record).
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -20,7 +22,7 @@ STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
 DOMAIN="gui/$(id -u)"
 LABEL=com.filip.claude-acc.cored
-REPLACED="com.filip.claude-acc.devguard com.filip.claude-acc com.filip.claude-acc.janitor"
+REPLACED="com.filip.claude-acc.devguard com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.perf"
 RECORD="$STATE/acc-cored-switch.json"
 LAUNCHCTL=${ACC_CORED_LAUNCHCTL:-launchctl}
 # how long the tick job's bootout waits for the switcher's lock (a tick holds it while it runs)
