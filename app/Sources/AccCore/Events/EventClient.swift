@@ -50,7 +50,7 @@ public enum EventClient {
     static func send(_ fd: Int32, _ bytes: [UInt8]) -> Bool {
         var sent = 0
         while sent < bytes.count {
-            let w = bytes.withUnsafeBytes { Darwin.write(fd, $0.baseAddress! + sent, $0.count - sent) }
+            let w = bytes.withUnsafeBytes { Darwin.send(fd, $0.baseAddress! + sent, $0.count - sent, MSG_NOSIGNAL) }
             if w < 0 && errno == EINTR { continue }
             if w <= 0 { return false }
             sent += w
@@ -58,41 +58,58 @@ public enum EventClient {
         return true
     }
 
+    public enum Read: Equatable, Sendable {
+        case frame(Frame)
+        case timeout
+        /// the daemon closed the stream, or sent what isn't a frame
+        case closed
+    }
+
     /// The next frame within `timeout` seconds; nil on a timeout, a close or a malformed frame.
     public static func next(_ fd: Int32, buffer: inout [UInt8], timeout: Double) -> Frame? {
+        if case .frame(let f) = read(fd, buffer: &buffer, timeout: timeout) { return f }
+        return nil
+    }
+
+    /// The next frame, or why there's none: a timeout tells a quiet stream from a closed one.
+    public static func read(_ fd: Int32, buffer: inout [UInt8], timeout: Double) -> Read {
         let deadline = Kernel.monotonic() + timeout
         while true {
             if buffer.count >= 5 {
                 let n = Int(buffer[0]) | Int(buffer[1]) << 8 | Int(buffer[2]) << 16 | Int(buffer[3]) << 24
-                if n >= 1, buffer.count >= 4 + n {
+                // a snapshot is at most a 1 MiB file and its header
+                guard n >= 1, n <= EventHub.maxFile + (1 << 17) else { return .closed }
+                if buffer.count >= 4 + n {
                     let kind = buffer[4]
                     let payload = Array(buffer[5..<(4 + n)])
                     buffer.removeFirst(4 + n)
                     if kind == 3 {
-                        guard payload.count >= 2 else { return nil }
+                        guard payload.count >= 2 else { return .closed }
                         let h = Int(payload[0]) | Int(payload[1]) << 8
-                        guard payload.count >= 2 + h, let header = (try? PyJSON.loads(bytes: Array(payload[2..<(2 + h)])))?.object else { return nil }
-                        return Frame(kind: kind, header: header, data: Array(payload[(2 + h)...]))
+                        guard payload.count >= 2 + h, let header = (try? PyJSON.loads(bytes: Array(payload[2..<(2 + h)])))?.object else { return .closed }
+                        return .frame(Frame(kind: kind, header: header, data: Array(payload[(2 + h)...])))
                     }
-                    return Frame(kind: kind, header: (try? PyJSON.loads(bytes: payload))?.object ?? PyObject(), data: [])
+                    return .frame(Frame(kind: kind, header: (try? PyJSON.loads(bytes: payload))?.object ?? PyObject(), data: []))
                 }
             }
             let left = deadline - Kernel.monotonic()
-            if left <= 0 { return nil }
+            if left <= 0 { return .timeout }
             var p = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
             let r = poll(&p, 1, Int32(max(1, left * 1000)))
             if r < 0 && errno == EINTR { continue }
-            if r <= 0 { return nil }
+            if r == 0 { return .timeout }
+            if r < 0 { return .closed }
             var chunk = [UInt8](repeating: 0, count: 64 * 1024)
             let got = chunk.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
             if got < 0 && errno == EINTR { continue }
-            if got <= 0 { return nil }
+            if got <= 0 { return .closed }
             buffer += chunk[..<got]
         }
     }
 
     /// `acc-cored events`: one line per frame until the daemon closes or `seconds` pass.
     public static func watch(socket path: String, topics: [String], seconds: Double?) {
+        setvbuf(stdout, nil, _IOLBF, 0)  // a line per frame even into a file or a pipe
         guard let fd = connect(path) else {
             print("acc-cored: brak demona na \(path)")
             return
@@ -102,8 +119,12 @@ public enum EventClient {
         let end = seconds.map { Kernel.monotonic() + $0 }
         var buffer: [UInt8] = []
         while end.map({ Kernel.monotonic() < $0 }) ?? true {
-            guard let f = next(fd, buffer: &buffer, timeout: end.map { $0 - Kernel.monotonic() } ?? 3600) else {
-                if end == nil { continue }
+            let f: Frame
+            switch read(fd, buffer: &buffer, timeout: end.map { $0 - Kernel.monotonic() } ?? 3600) {
+            case .frame(let frame): f = frame
+            case .timeout: continue
+            case .closed:
+                print("acc-cored: demon zamknął strumień")
                 return
             }
             let names = [1: "hello", 3: "snapshot", 4: "gone", 5: "error"]

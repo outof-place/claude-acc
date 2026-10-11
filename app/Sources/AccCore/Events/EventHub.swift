@@ -7,17 +7,22 @@
 //                set, replacing the last one (a hidden window keeps only what its menu bar needs)
 //   3 snapshot   server: u16 little-endian header length, header {"topic", "seq"}, then the file's
 //                exact bytes, so a host decodes them with the Decodable it uses on the file
-//   4 gone       server: {"topic"}: the file isn't there
+//   4 gone       server: {"topic"}: the file isn't there (or isn't a regular file of at most 1 MiB)
 //   5 error      server: {"code", "msg"}
 // `seq` is the file's "ino:mtime_ns:size", the same stamp a host computes when it reads the file
-// itself, so `have` works across a fallback to files. Each topic is latest-wins per client: while a
-// client hasn't taken what was sent, newer versions replace older ones instead of queueing, and
-// `maxHz` spaces a topic's frames. The files stay the contract: Python writes them, acc-cored only
-// watches them (its directories for renames, each subscribed file for writes in place), and only
-// while someone subscribes. `pressure` is derived: devguard-state.json's snapshot.pressure.level as
-// {"level": N}, sent when the level changes, so a menu bar doesn't decode 30 KB to badge a ring.
+// itself (from st_mtimespec, in ns), so `have` works across a fallback to files. Each topic is
+// latest-wins per client: while a client hasn't taken what was sent, newer versions replace older
+// ones instead of queueing, and `maxHz` (clamped to 0.001-1000) spaces a topic's frames. The files
+// stay the contract, written atomically (a rename): Python writes them, acc-cored only watches them
+// (their folders for renames, each subscribed file for writes in place), and only while someone
+// subscribes. `pressure` is derived: devguard-state.json's snapshot.pressure.level as {"level": N},
+// sent when the level changes, so a menu bar doesn't decode 30 KB to badge a ring; its seq is
+// devguard-state.json's.
+// A client that hasn't subscribed `subscribeSeconds` after the events line, or whose frames haven't
+// drained for `stallSeconds` (it stopped reading), is dropped.
 import Darwin
 import Dispatch
+import Synchronization
 
 public final class EventHub: @unchecked Sendable {
     /// topic -> file under the state directory
@@ -32,29 +37,59 @@ public final class EventHub: @unchecked Sendable {
 
     public static let version = 1
     public var maxClients = 16
-    /// a client that doesn't read what it gets is dropped past this much unsent
+    /// a client with this much unsent when the socket is full is dropped (one flush of every topic
+    /// at `maxFile` fits)
     public var maxOutbox = 16 << 20
+    /// a client whose frames haven't drained for this long has stopped reading
+    public var stallSeconds = 30.0
+    /// a client that hasn't subscribed this long after the events line
+    public var subscribeSeconds = 10.0
+    /// how often the two above are checked (only while there are clients)
+    var reapEvery = 5.0
     static let maxFrame = 1 << 20
+    /// a state file past this isn't one: sent as gone
+    static let maxFile = 1 << 20
+    /// maxHz is clamped to this: a subnormal rate made 1 / hz infinite
+    static let hzRange = 0.001...1000.0
 
     let stateDir: String
     let queue = DispatchQueue(label: "acc-cored.events", qos: .utility)
+    /// the number of clients, for `ping` without the hub's queue (a slow read may hold it)
+    let clientCount = Atomic<Int>(0)
 
     /// One subscriber; touched only on `queue`.
     final class Client: @unchecked Sendable {
         let fd: Int32
+        let adopted: Double
         var reader: DispatchSourceRead?
         var writer: DispatchSourceWrite?
         var inbox: [UInt8] = []
         var outbox: [UInt8] = []
+        /// how much of `outbox` the socket took
+        var sent = 0
         var topics: Set<String> = []
         var have: [String: String] = [:]
         var maxHz: [String: Double] = [:]
         var lastSent: [String: Double] = [:]
         /// topics whose newest version this client hasn't been sent yet
         var pending: Set<String> = []
+        var subscribed = false
+        /// since when the socket hasn't taken what's unsent
+        var stalledSince: Double?
+        /// one timer at the earliest topic's next turn under maxHz
         var timer: DispatchSourceTimer?
+        var timerAt = Double.infinity
+        /// sources on `fd` not yet cancelled: the descriptor closes after the last one, so no
+        /// source watches a number that a new connection may already hold
+        var sources = 0
+        var closed = false
 
-        init(fd: Int32) { self.fd = fd }
+        init(fd: Int32, at: Double) {
+            self.fd = fd
+            adopted = at
+        }
+
+        var unsent: Int { outbox.count - sent }
     }
 
     struct Version {
@@ -66,7 +101,12 @@ public final class EventHub: @unchecked Sendable {
     /// what each watched topic holds now
     var current: [String: Version] = [:]
     var dirSources: [String: DispatchSourceFileSystemObject] = [:]
+    /// for a missing folder: its nearest existing parent, and the source there
+    var parentSources: [String: (parent: String, source: DispatchSourceFileSystemObject)] = [:]
     var fileSources: [String: DispatchSourceFileSystemObject] = [:]
+    var reaper: DispatchSourceTimer?
+    /// one read buffer for every client: reads run on `queue` only
+    var chunk = [UInt8](repeating: 0, count: 64 * 1024)
     public private(set) var framesSent = 0
 
     public init(stateDir: String) {
@@ -75,22 +115,31 @@ public final class EventHub: @unchecked Sendable {
 
     /// Takes over a connection that asked for events, with what it already sent after its line.
     public func adopt(_ fd: Int32, leftover: [UInt8]) {
-        queue.async {
+        queue.async { [weak self] in
+            guard let self else {
+                close(fd)
+                return
+            }
+            // XNU refuses SO_NOSIGPIPE when the peer is gone already: closed without a write
+            var on: Int32 = 1
+            guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                close(fd)
+                return
+            }
             guard self.clients.count < self.maxClients else {
-                self.sendNow(fd, Self.frame(5, Self.json([("code", "busy"), ("msg", "too many event clients")])))
+                Self.sendNow(fd, Self.frame(5, Self.json([("code", "busy"), ("msg", "too many event clients")])))
                 close(fd)
                 return
             }
             _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
-            var on: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
-            let c = Client(fd: fd)
+            let c = Client(fd: fd, at: Kernel.monotonic())
             self.clients[fd] = c
-            let reader = DispatchSource.makeReadSource(fileDescriptor: fd, queue: self.queue)
-            reader.setEventHandler { [weak self] in self?.readable(c) }
-            reader.setCancelHandler { close(fd) }
+            self.clientCount.store(self.clients.count, ordering: .relaxed)
+            let reader = self.tracked(c, DispatchSource.makeReadSource(fileDescriptor: fd, queue: self.queue))
+            reader.setEventHandler { [weak self, c] in self?.readable(c) }
             c.reader = reader
             reader.resume()
+            self.armReaper()
             self.enqueue(c, Self.frame(1, Self.json([("v", .int(Self.version)), ("topics", .array(Self.topics.map { .string($0) }))])))
             c.inbox = leftover
             self.parse(c)
@@ -99,13 +148,13 @@ public final class EventHub: @unchecked Sendable {
 
     public func stop() {
         queue.sync {
-            for c in clients.values { drop(c) }
+            for c in Array(clients.values) { drop(c) }
             rewatch()
         }
     }
 
     /// The number of event clients, for `ping`.
-    public var count: Int { queue.sync { clients.count } }
+    public var count: Int { clientCount.load(ordering: .relaxed) }
 
     // MARK: frames
 
@@ -125,7 +174,6 @@ public final class EventHub: @unchecked Sendable {
     }
 
     func readable(_ c: Client) {
-        var chunk = [UInt8](repeating: 0, count: 64 * 1024)
         let n = chunk.withUnsafeMutableBytes { Darwin.read(c.fd, $0.baseAddress, $0.count) }
         if n <= 0 {
             if n < 0 && (errno == EAGAIN || errno == EINTR) { return }
@@ -137,26 +185,29 @@ public final class EventHub: @unchecked Sendable {
     }
 
     func parse(_ c: Client) {
-        while c.inbox.count >= 5 {
-            let n = Int(c.inbox[0]) | Int(c.inbox[1]) << 8 | Int(c.inbox[2]) << 16 | Int(c.inbox[3]) << 24
+        var at = 0
+        defer { if at > 0, !c.closed { c.inbox.removeFirst(at) } }
+        while c.inbox.count - at >= 5 {
+            let n = Int(c.inbox[at]) | Int(c.inbox[at + 1]) << 8 | Int(c.inbox[at + 2]) << 16 | Int(c.inbox[at + 3]) << 24
             guard n >= 1, n <= Self.maxFrame else {
                 fail(c, "frame", "a frame of \(n) bytes")
                 return
             }
-            guard c.inbox.count >= 4 + n else { return }
-            let kind = c.inbox[4]
-            let payload = Array(c.inbox[5..<(4 + n)])
-            c.inbox.removeFirst(4 + n)
+            guard c.inbox.count - at >= 4 + n else { return }
+            let kind = c.inbox[at + 4]
+            let payload = Array(c.inbox[(at + 5)..<(at + 4 + n)])
+            at += 4 + n
             guard kind == 2, let request = (try? PyJSON.loads(bytes: payload))?.object else {
                 fail(c, "frame", "only subscribe (2) with a JSON object is understood")
                 return
             }
             subscribe(c, request)
+            if c.closed { return }
         }
     }
 
     func fail(_ c: Client, _ code: String, _ msg: String) {
-        sendNow(c.fd, Self.frame(5, Self.json([("code", .string(code)), ("msg", .string(msg))])))
+        Self.sendNow(c.fd, Self.frame(5, Self.json([("code", .string(code)), ("msg", .string(msg))])))
         drop(c)
     }
 
@@ -167,8 +218,10 @@ public final class EventHub: @unchecked Sendable {
         let unknown = asked.filter { !Self.topics.contains($0) }
         if !unknown.isEmpty {
             enqueue(c, Self.frame(5, Self.json([("code", "topic"), ("msg", .string("unknown: " + unknown.joined(separator: ", ")))])))
+            if c.closed { return }
         }
         c.topics = Set(asked).subtracting(unknown)
+        c.subscribed = true
         // what the client says it holds now: a topic it dropped and asks for again is sent again
         c.have = [:]
         for (topic, seq) in request["have"]?.object ?? PyObject() {
@@ -176,14 +229,19 @@ public final class EventHub: @unchecked Sendable {
         }
         c.maxHz = [:]
         for (topic, hz) in request["maxHz"]?.object ?? PyObject() {
-            if let h = hz.double, h > 0 { c.maxHz[topic] = h }
+            if let h = hz.double, h > 0, h.isFinite {
+                c.maxHz[topic] = min(max(h, Self.hzRange.lowerBound), Self.hzRange.upperBound)
+            }
         }
         c.pending = c.pending.intersection(c.topics)
         rewatch()
+        // a stamp for each (a stat): what the hub remembers may be from before a folder came
+        var moved: Set<String> = []
+        for topic in c.topics { moved.formUnion(refresh(topic)) }
         for topic in c.topics {
-            if current[topic] == nil { refresh(topic) }
             if let v = current[topic], c.have[topic] != v.seq { c.pending.insert(topic) }
         }
+        notify(moved)
         flush(c)
     }
 
@@ -198,29 +256,72 @@ public final class EventHub: @unchecked Sendable {
         Self.files.first { $0.topic == topic }.map { stateDir + "/" + $0.path }
     }
 
-    /// Directory sources for renames and creations, a source per file for writes in place; only
-    /// for what someone subscribes to.
+    /// Folder sources for renames and creations, a source per file for writes in place; only for
+    /// what someone subscribes to.
     func rewatch() {
         let topics = watchedTopics
         let paths = Set(topics.compactMap(path))
         let dirs = Set(paths.map(dirname))
-        for (dir, source) in dirSources where !dirs.contains(dir) {
-            source.cancel()
+        for dir in Array(dirSources.keys) where !dirs.contains(dir) {
+            dirSources[dir]?.cancel()
             dirSources[dir] = nil
         }
-        for dir in dirs where dirSources[dir] == nil {
-            dirSources[dir] = watch(dir, [.write]) { [weak self] _ in self?.changed(in: dir) }
+        for dir in Array(parentSources.keys) where !dirs.contains(dir) {
+            parentSources[dir]?.source.cancel()
+            parentSources[dir] = nil
         }
-        for (file, source) in fileSources where !paths.contains(file) {
-            source.cancel()
+        for file in Array(fileSources.keys) where !paths.contains(file) {
+            fileSources[file]?.cancel()
             fileSources[file] = nil
         }
-        for file in paths where fileSources[file] == nil { watchFile(file) }
         for topic in Array(current.keys) where !topics.contains(topic) { current[topic] = nil }
+        for dir in dirs where dirSources[dir] == nil && parentSources[dir] == nil { armDir(dir) }
+        for file in paths where fileSources[file] == nil { watchFile(file) }
+    }
+
+    /// A folder's source, for renames and creations in it. A missing folder is waited for from its
+    /// nearest existing parent. Every (re)arm watches its files again and re-stamps their topics:
+    /// a folder made, replaced or moved back holds other files than the old descriptors see.
+    func armDir(_ dir: String) {
+        dirSources[dir]?.cancel()
+        dirSources[dir] = nil
+        parentSources[dir]?.source.cancel()
+        parentSources[dir] = nil
+        if let source = watch(dir, [.write, .delete, .rename], { [weak self] events in
+            guard let self else { return }
+            if !events.isDisjoint(with: [.delete, .rename]) {
+                self.armDir(dir)
+            } else {
+                self.changed(in: dir)
+            }
+        }) {
+            dirSources[dir] = source
+        } else {
+            let parent = Self.nearest(dir)
+            if let source = watch(parent, [.write, .delete, .rename], { [weak self] _ in
+                // a folder on the way came or went: arm again (the folder itself, or a nearer parent)
+                guard let self, Files.isDirectory(dir) || Self.nearest(dir) != parent else { return }
+                self.armDir(dir)
+            }) {
+                parentSources[dir] = (parent, source)
+            }
+        }
+        for file in Array(fileSources.keys) where dirname(file) == dir {
+            fileSources[file]?.cancel()
+            fileSources[file] = nil
+        }
+        changed(in: dir)
+    }
+
+    /// The nearest existing folder at or above `dir`'s parent.
+    static func nearest(_ dir: String) -> String {
+        var up = dirname(dir)
+        while up != "/", !Files.isDirectory(up) { up = dirname(up) }
+        return up
     }
 
     func watchFile(_ file: String) {
-        fileSources[file] = watch(file, [.write, .extend, .delete, .rename]) { [weak self] events in
+        fileSources[file] = watch(file, [.write, .extend, .attrib, .delete, .rename]) { [weak self] events in
             guard let self else { return }
             // replaced or removed: this descriptor sees the old file; watch the path again
             if !events.isDisjoint(with: [.delete, .rename]) {
@@ -228,14 +329,15 @@ public final class EventHub: @unchecked Sendable {
                 self.fileSources[file] = nil
                 if self.watchedTopics.compactMap(self.path).contains(file) { self.watchFile(file) }
             }
-            self.changed(in: dirname(file))
+            self.changed(file: file)
         }
     }
 
     func watch(_ path: String, _ mask: DispatchSource.FileSystemEvent, _ handler: @escaping @Sendable (DispatchSource.FileSystemEvent) -> Void)
         -> DispatchSourceFileSystemObject?
     {
-        let fd = open(path, O_EVTONLY | O_CLOEXEC)
+        // O_NONBLOCK: a FIFO in place of a state file doesn't hold the queue in open()
+        let fd = open(path, O_EVTONLY | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else { return nil }
         let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: mask, queue: queue)
         source.setEventHandler { [weak source] in handler(source?.data ?? []) }
@@ -244,20 +346,27 @@ public final class EventHub: @unchecked Sendable {
         return source
     }
 
-    /// Something in `dir` changed: re-stamp its watched topics and send what moved.
+    /// Something in `dir` changed: watch its files that came, re-stamp its topics, send what moved.
     func changed(in dir: String) {
         let topics = watchedTopics
-        // a file the watch missed because it didn't exist yet
         for topic in topics {
             if let p = path(topic), dirname(p) == dir, fileSources[p] == nil { watchFile(p) }
         }
-        var moved: [String] = []
-        for topic in topics where path(topic).map(dirname) == dir {
-            if refresh(topic) { moved.append(topic) }
-        }
-        if moved.contains("devguard"), topics.contains("pressure"), refreshPressure() { moved.append("pressure") }
+        var moved: Set<String> = []
+        for topic in topics where path(topic).map(dirname) == dir { moved.formUnion(refresh(topic)) }
+        notify(moved)
+    }
+
+    /// A write in place: only that file's topic is stamped again.
+    func changed(file: String) {
+        var moved: Set<String> = []
+        for topic in watchedTopics where path(topic) == file { moved.formUnion(refresh(topic)) }
+        notify(moved)
+    }
+
+    func notify(_ moved: Set<String>) {
         guard !moved.isEmpty else { return }
-        for c in clients.values {
+        for c in Array(clients.values) {
             let mine = c.topics.intersection(moved)
             guard !mine.isEmpty else { continue }
             c.pending.formUnion(mine)
@@ -265,18 +374,22 @@ public final class EventHub: @unchecked Sendable {
         }
     }
 
-    /// Reads the topic's file again when its stamp moved; true when it did.
-    @discardableResult
-    func refresh(_ topic: String) -> Bool {
+    /// Stamps the topic's file (a stat) and reads it only when the stamp moved; the topics that moved
+    /// (devguard brings pressure along).
+    func refresh(_ topic: String) -> [String] {
         if topic == "pressure" {
-            if current["devguard"] == nil { refresh("devguard") }
-            return refreshPressure()
+            var moved = refresh("devguard")
+            if !moved.contains("pressure"), refreshPressure() { moved.append("pressure") }
+            return moved
         }
-        guard let p = path(topic) else { return false }
+        guard let p = path(topic) else { return [] }
+        if let old = current[topic], old.seq == Self.stamp(p) { return [] }
         let v = Self.read(p)
-        guard current[topic]?.seq != v.seq else { return false }
+        if let old = current[topic], old.seq == v.seq { return [] }
         current[topic] = v
-        return true
+        var moved = [topic]
+        if topic == "devguard", watchedTopics.contains("pressure"), refreshPressure() { moved.append("pressure") }
+        return moved
     }
 
     /// pressure from devguard's snapshot: a new version only when the level changes
@@ -291,13 +404,32 @@ public final class EventHub: @unchecked Sendable {
         return true
     }
 
-    /// The file's bytes and its stamp from the same descriptor; "" and nil when it isn't there.
+    static func seq(_ st: stat) -> String {
+        let ns = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
+        return "\(st.st_ino):\(ns):\(st.st_size)"
+    }
+
+    /// A state file is a regular file (not followed through a link) of at most `maxFile`.
+    static func isStateFile(_ st: stat) -> Bool {
+        st.st_mode & S_IFMT == S_IFREG && st.st_size <= maxFile
+    }
+
+    /// The file's stamp without reading it; "" when it isn't a state file.
+    static func stamp(_ path: String) -> String {
+        var st = stat()
+        guard lstat(path, &st) == 0, isStateFile(st) else { return "" }
+        return seq(st)
+    }
+
+    /// The file's bytes and its stamp from the same descriptor; "" and nil when it isn't a state
+    /// file (missing, a link, a FIFO that would block the read, a device, past `maxFile`).
     static func read(_ path: String) -> Version {
-        let fd = open(path, O_RDONLY | O_CLOEXEC)
-        guard fd >= 0 else { return Version(seq: "", data: nil) }
+        let gone = Version(seq: "", data: nil)
+        let fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW)
+        guard fd >= 0 else { return gone }
         defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0 else { return Version(seq: "", data: nil) }
+        guard fstat(fd, &st) == 0, isStateFile(st) else { return gone }
         var data = [UInt8](repeating: 0, count: Int(st.st_size))
         var got = 0
         while got < data.count {
@@ -306,8 +438,7 @@ public final class EventHub: @unchecked Sendable {
             if n <= 0 { break }
             got += n
         }
-        let ns = Int64(st.st_mtimespec.tv_sec) * 1_000_000_000 + Int64(st.st_mtimespec.tv_nsec)
-        return Version(seq: "\(st.st_ino):\(ns):\(st.st_size)", data: Array(data[..<got]))
+        return Version(seq: seq(st), data: Array(data[..<got]))
     }
 
     // MARK: sending
@@ -315,7 +446,7 @@ public final class EventHub: @unchecked Sendable {
     /// Sends each pending topic's newest version, as `maxHz` allows; nothing while the last frames
     /// are still on their way, so a slow client gets the latest instead of a queue.
     func flush(_ c: Client) {
-        guard c.outbox.isEmpty, clients[c.fd] === c else { return }
+        guard c.unsent == 0, !c.closed else { return }
         let now = Kernel.monotonic()
         var wait = Double.infinity
         for topic in c.pending.sorted() {
@@ -330,18 +461,28 @@ public final class EventHub: @unchecked Sendable {
             c.lastSent[topic] = now
             framesSent += 1
         }
-        if wait < .infinity && c.timer == nil {
-            let t = DispatchSource.makeTimerSource(queue: queue)
-            t.schedule(deadline: .now() + wait, leeway: .milliseconds(20))
-            t.setEventHandler { [weak self] in
-                c.timer?.cancel()
-                c.timer = nil
+        if wait < .infinity { schedule(c, at: now + wait) }
+        write(c, flushAfter: false)
+    }
+
+    /// The client's one timer goes to the earliest topic's turn: a slower topic doesn't push back a
+    /// faster one's.
+    func schedule(_ c: Client, at: Double) {
+        guard at < c.timerAt else { return }
+        c.timerAt = at
+        let t: DispatchSourceTimer
+        if let timer = c.timer {
+            t = timer
+        } else {
+            t = DispatchSource.makeTimerSource(queue: queue)
+            t.setEventHandler { [weak self, c] in
+                c.timerAt = .infinity
                 self?.flush(c)
             }
-            t.resume()
             c.timer = t
+            t.resume()
         }
-        write(c)
+        t.schedule(deadline: .now() + max(0, at - Kernel.monotonic()), leeway: .milliseconds(20))
     }
 
     func enqueue(_ c: Client, _ frame: [UInt8]) {
@@ -349,22 +490,24 @@ public final class EventHub: @unchecked Sendable {
         write(c)
     }
 
-    /// As much of the outbox as the socket takes now; the rest when it's writable again.
-    func write(_ c: Client) {
-        while !c.outbox.isEmpty {
-            let w = c.outbox.withUnsafeBytes { Darwin.write(c.fd, $0.baseAddress, $0.count) }
+    /// As much of the outbox as the socket takes now; the rest when it's writable again. A drained
+    /// outbox sends what's pending, except when the call comes from flush itself.
+    func write(_ c: Client, flushAfter: Bool = true) {
+        while c.unsent > 0 {
+            let w = c.outbox.withUnsafeBytes { Darwin.send(c.fd, $0.baseAddress! + c.sent, $0.count - c.sent, MSG_NOSIGNAL) }
             if w > 0 {
-                c.outbox.removeFirst(w)
+                c.sent += w
                 continue
             }
             if w < 0 && errno == EINTR { continue }
-            guard w < 0 && errno == EAGAIN, c.outbox.count <= maxOutbox else {
+            guard w < 0 && errno == EAGAIN, c.unsent <= maxOutbox else {
                 drop(c)
                 return
             }
+            if c.stalledSince == nil { c.stalledSince = Kernel.monotonic() }
             if c.writer == nil {
-                let writer = DispatchSource.makeWriteSource(fileDescriptor: c.fd, queue: queue)
-                writer.setEventHandler { [weak self] in
+                let writer = tracked(c, DispatchSource.makeWriteSource(fileDescriptor: c.fd, queue: queue))
+                writer.setEventHandler { [weak self, c] in
                     c.writer?.cancel()
                     c.writer = nil
                     self?.write(c)
@@ -374,20 +517,64 @@ public final class EventHub: @unchecked Sendable {
             }
             return
         }
-        if !c.pending.isEmpty && c.timer == nil { flush(c) }
+        c.outbox.removeAll(keepingCapacity: true)
+        c.sent = 0
+        c.stalledSince = nil
+        if flushAfter, !c.pending.isEmpty { flush(c) }
     }
 
     /// A short frame before a close: best effort, no waiting.
-    func sendNow(_ fd: Int32, _ frame: [UInt8]) {
-        _ = frame.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
+    static func sendNow(_ fd: Int32, _ frame: [UInt8]) {
+        _ = frame.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, MSG_NOSIGNAL) }
+    }
+
+    // MARK: lifetime
+
+    /// A source on the client's descriptor: its cancel closes the descriptor once the client is
+    /// dropped and no other source is left on it.
+    func tracked<S: DispatchSourceProtocol>(_ c: Client, _ source: S) -> S {
+        c.sources += 1
+        source.setCancelHandler { [c] in
+            c.sources -= 1
+            if c.closed, c.sources == 0 { close(c.fd) }
+        }
+        return source
     }
 
     func drop(_ c: Client) {
-        guard clients[c.fd] === c else { return }
+        guard clients[c.fd] === c, !c.closed else { return }
         clients[c.fd] = nil
+        clientCount.store(clients.count, ordering: .relaxed)
+        c.closed = true
         c.timer?.cancel()
+        c.timer = nil
         c.writer?.cancel()
-        c.reader?.cancel()  // closes the descriptor
+        c.writer = nil
+        c.reader?.cancel()
+        c.reader = nil
+        if c.sources == 0 { close(c.fd) }
+        if clients.isEmpty {
+            reaper?.cancel()
+            reaper = nil
+        }
         rewatch()
+    }
+
+    /// Drops clients that never subscribed or stopped reading; runs only while there are clients.
+    func armReaper() {
+        guard reaper == nil else { return }
+        let r = DispatchSource.makeTimerSource(queue: queue)
+        r.schedule(deadline: .now() + reapEvery, repeating: reapEvery, leeway: .milliseconds(200))
+        r.setEventHandler { [weak self] in
+            guard let self else { return }
+            let now = Kernel.monotonic()
+            for c in Array(self.clients.values) {
+                let silent = !c.subscribed && now - c.adopted > self.subscribeSeconds
+                let stalled = c.stalledSince.map { now - $0 > self.stallSeconds } ?? false
+                if silent || stalled { self.drop(c) }
+            }
+        }
+        r.resume()
+        reaper = r
     }
 }
