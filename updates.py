@@ -70,7 +70,8 @@ LOG_MAX_BYTES = 1024 * 1024
 
 HOUR = 3600
 DAY = 24 * HOUR
-# wpis "link" starszy niż to nic już nie mówi: perf.py keep odświeża go dużo częściej
+# wpis "link" starszy niż to nic już nie mówi: perf.py keep z launchd odświeża go co 5 min, a gdy
+# jest starszy (acc-cored odświeża go tylko przy zmianie sieci), updates.py pyta o łącze teraz
 TETHER_FRESH = 15 * 60
 # godzina z launchd/com.filip.claude-acc.updates.plist.template; stąd panel zna termin następnego
 RUN_AT = (4, 30)
@@ -970,22 +971,45 @@ def next_due(cfg, state):
 
 
 def tethered():
-    """Wpis "link" z perf-state.json, gdy Mac jest teraz na tetheringu, a inaczej None.
+    """Łącze, gdy Mac jest teraz na tetheringu, a inaczej None.
 
     Przebieg ściąga setki megabajtów (brew, npm, pip), które na tetheringu idą z pakietu danych
-    telefonu. Wpis stary, bez daty albo popsuty to brak wiedzy, a nie tethering: przebieg rusza.
+    telefonu. Najpierw wpis "link" z perf-state.json; stary, bez daty albo popsuty zastępuje pytanie
+    o łącze teraz (`perf.py link --json`). acc-cored odświeża wpis tylko przy zmianie sieci, więc na
+    tetheringu, który trwa, wpis się starzeje. Bez odpowiedzi to brak wiedzy: przebieg rusza.
     """
     link = load_json(PERF_STATE_PATH, {})
     link = link.get("link") if isinstance(link, dict) else None
+    if not fresh_link(link):
+        link = link_now()
     if not isinstance(link, dict) or link.get("tethered") is not True:
         return None
+    return link
+
+
+def fresh_link(link):
+    if not isinstance(link, dict):
+        return False
     at = link.get("at")
     if isinstance(at, bool) or not isinstance(at, (int, float)):
-        return None
+        return False
     # minuta zapasu na zegar, który cofnął się po zapisie
-    if not -60 <= time.time() - at <= TETHER_FRESH:
+    return -60 <= time.time() - at <= TETHER_FRESH
+
+
+def link_now():
+    """Łącze z `perf.py link --json` (trasa domyślna i jej port, niczego nie zapisuje) albo None.
+    CLAUDE_ACC_LINK_CMD (lista JSON): polecenie w jego miejsce, dla testów."""
+    if os.environ.get("CLAUDE_ACC_LINK_CMD"):
+        cmd = json.loads(os.environ["CLAUDE_ACC_LINK_CMD"])
+    else:
+        cmd = [sys.executable, "-B", os.path.join(os.path.dirname(os.path.abspath(__file__)), "perf.py"), "link", "--json"]
+    try:
+        done = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30, check=False)
+        link = json.loads(done.stdout) if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    return link
+    return link if isinstance(link, dict) else None
 
 
 def next_run(cfg, state):

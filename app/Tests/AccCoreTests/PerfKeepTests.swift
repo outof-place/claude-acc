@@ -37,11 +37,15 @@ private func waitFor(_ seconds: Double = 5, _ done: () -> Bool) async throws {
     while !done(), Kernel.monotonic() < end { try await Task.sleep(nanoseconds: 20_000_000) }
 }
 
-private func spec(_ dir: String, _ tweaks: [(String, String, [String], Bool)], periodic: Double = 1800) -> PyObject {
+private func spec(_ dir: String, _ tweaks: [(String, String, [String], Bool)], periodic: Double = 1800,
+                  every: [String: Double] = [:]) -> PyObject {
     PyObject([
         ("v", 1), ("periodic_s", .double(periodic)), ("config", .array([.string(dir + "/perf-state.json")])),
         ("tweaks", .array(tweaks.map { t in
-            .object(PyObject([("name", .string(t.0)), ("class", .string(t.1)), ("paths", .array(t.2.map { .string($0) })), ("network", .bool(t.3))]))
+            var fields: [(String, PyJSON)] = [("name", .string(t.0)), ("class", .string(t.1)), ("paths", .array(t.2.map { .string($0) })),
+                                               ("network", .bool(t.3))]
+            if let s = every[t.0] { fields.append(("every_s", .double(s))) }
+            return .object(PyObject(fields))
         })),
     ])
 }
@@ -184,6 +188,21 @@ func perfKeepNetworkAndPeriodic() async throws {
     #expect(p.queue.sync { p.periodicTimer } == nil)  // stop cancels it
 }
 
+@Test("a tweak with its own interval (docker-idle's samples) runs alone that often; stop cancels it")
+func perfKeepTweakInterval() async throws {
+    let dir = try tempDir("every")
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let runs = Runs()
+    let e = engine(dir, runs) { $0.minPeriodic = 0.2 }
+    e.specReader = { spec(dir, [("docker-idle", "periodic", [], false), ("claude-ui", "perf", [], false)], every: ["docker-idle": 0.3]) }
+    e.start()
+    try await waitFor { runs.all.count >= 3 }
+    e.stop()
+    #expect(runs.onlys.first == "(all)")
+    #expect(Set(runs.onlys.dropFirst()) == ["docker-idle"])
+    #expect(e.queue.sync { e.everyTimer } == nil)
+}
+
 @Test("without a spec (a perf.py before keep-spec), the full pass runs at launchd's interval")
 func perfKeepWithoutASpec() async throws {
     let dir = try tempDir("nospec")
@@ -226,6 +245,14 @@ func pathWatchReportsOnlyItsPaths() async throws {
     #expect(Files.writeAtomic(here, "3"))  // the watch follows the new inode
     try await waitFor { seen.all.count > before }
     #expect(seen.all.last == [here])
+    // an in-place write after the replace: no folder event, only the watch on the new inode sees it
+    let inPlace = seen.all.count
+    let fd = open(here, O_WRONLY | O_APPEND)
+    #expect(fd >= 0)
+    #expect("4".withCString { write(fd, $0, 1) } == 1)
+    close(fd)
+    try await waitFor { seen.all.count > inPlace }
+    #expect(seen.all.count > inPlace)
     queue.sync { watch.stop() }
     #expect(queue.sync { watch.fileSources.isEmpty && watch.dirSources.isEmpty && watch.parentSources.isEmpty })
 }

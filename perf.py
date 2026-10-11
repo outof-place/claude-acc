@@ -2755,19 +2755,30 @@ KEEP_CLASS = {
     "rg-threads": "perf",
     "workflow-size": "perf",
     "claude-ui": "perf",
-    "docker-vm": "perf",
+    # docker-vm: tylko pełny przebieg. Jego plik leży w kontenerze grupy Dockera (Group Containers),
+    # a open() tam z acc-cored to monit TCC albo EPERM, po którym obserwacja wisiałaby na rodzicu
     "git-speed": "perf",
     "tether-profile": "perf",
 }
 # pliki poza ustawieniami samej poprawki (settings_path albo path), które ją cofają
 KEEP_EXTRA = {
-    "security-slim": (lambda item: os.path.join(item.claude_dir or CLAUDE_DIR, "plugins", "installed_plugins.json"),),
+    "security-slim": (
+        lambda item: os.path.join(item.claude_dir or CLAUDE_DIR, "plugins", "installed_plugins.json"),
+        # wygenerowany marketplace: hooks.json wskazuje te pliki ścieżką bezwzględną, więc ich brak
+        # (Mole wyczyścił już raz katalog stanu) psuje hook
+        lambda item: os.path.join(item.hooks_dir(), "hooks.json"),
+        lambda item: os.path.join(item.hooks_dir(), "sec_slim.py"),
+        lambda item: os.path.join(item.hooks_dir(), "patterns.py"),
+    ),
     "rg-threads": (lambda item: item.value,),
     "git-speed": (lambda item: os.path.join(HOME, ".gitconfig"),),
 }
 # poprawki, które zależą od sieci (zmiana ścieżki domyślnej): link to łącze dla updates.py
 KEEP_NETWORK = ("tether-profile", "link")
 KEEP_PERIODIC = 1800
+# poprawki bez zdarzenia, którym 30 min to za rzadko: docker-idle liczy próbki połączeń do progu 2 h
+# (24 próbki co 5 min, jak z launchd, a nie 4)
+KEEP_EVERY = {"docker-idle": 300}
 # tyle napraw jednej poprawki w tylu sekundach znaczy, że ktoś ją cofa: przerwa na tyle sekund
 KEEP_FIGHT = (3, 600, 3600)
 
@@ -2784,16 +2795,24 @@ def keep_paths(item):
 
 
 def keep_spec(state):
-    """Co obserwuje acc-cored: włączone poprawki z klasą, plikami i zależnością od sieci, plus hook
-    admit obok łańcucha fasthooks (admit-chain, w settings.json) i łącze (link, od sieci)."""
+    """Co obserwuje acc-cored: włączone poprawki z klasą, plikami, zależnością od sieci i własnym
+    odstępem (KEEP_EVERY), plus hook admit obok łańcucha fasthooks (admit-chain: settings.json
+    z CLAUDE_CONFIG_DIR, znacznik i pod-hook-client, jak w admitchain.broken) i łącze (link, od sieci)."""
+    import admitchain
+
     tweaks = []
     for item in TWEAKS:
         if item.root or item.name not in state.get("applied", {}):
             continue
         cls = KEEP_CLASS.get(item.name, "periodic")
-        tweaks.append({"name": item.name, "class": cls, "paths": keep_paths(item) if cls != "periodic" else [],
-                       "network": item.name in KEEP_NETWORK})  # fmt: skip
-    tweaks.append({"name": "admit-chain", "class": "safety", "paths": [CLAUDE_SETTINGS], "network": False})
+        entry = {"name": item.name, "class": cls, "paths": keep_paths(item) if cls != "periodic" else [],
+                 "network": item.name in KEEP_NETWORK}  # fmt: skip
+        if item.name in KEEP_EVERY:
+            entry["every_s"] = KEEP_EVERY[item.name]
+        tweaks.append(entry)
+    chain = admitchain.paths()
+    tweaks.append({"name": "admit-chain", "class": "safety", "paths": [chain["settings"], chain["marker"], chain["client"]],
+                   "network": False})  # fmt: skip
     tweaks.append({"name": "link", "class": "perf", "paths": [], "network": True})
     return {"v": 1, "periodic_s": KEEP_PERIODIC, "config": [CONFIG_PATH, STATE_PATH], "tweaks": tweaks}
 
@@ -2812,7 +2831,11 @@ def keep_backed_off(state, name, now):
 def keep_fight(state, name, now):
     """Naprawa poprawki: przy KEEP_FIGHT[0] naprawach w KEEP_FIGHT[1] s ktoś ją cofa (inne narzędzie,
     ręczna edycja). Poprawka wydajności czeka wtedy KEEP_FIGHT[2] s, zamiast się z nim przepychać;
-    poprawka bezpieczeństwa (safety) nie czeka nigdy i mówi o tym w logu najwyżej raz na KEEP_FIGHT[2] s."""
+    poprawka bezpieczeństwa (safety) nie czeka nigdy i mówi o tym w logu najwyżej raz na KEEP_FIGHT[2] s.
+    Liczą się tylko poprawki z plików: tę od sieci zmienia zmiana sieci, a okresową nowy pid albo
+    stan Dockera, nikt jej nie cofa."""
+    if name in KEEP_NETWORK or KEEP_CLASS.get(name, "periodic") == "periodic":
+        return
     count, window, pause = KEEP_FIGHT
     repairs = state.setdefault("keep_repairs", {})
     recent = [t for t in repairs.get(name, []) if now - t < window] + [now]
@@ -4426,8 +4449,13 @@ def cmd_keep(cfg, args, system=None):
     z nowym pid, ktoś nadpisał settings.json, zapis do Dockera czekał na jego zamknięcie;
     kończy też cofnięcia, które musiały poczekać. `--only a,b`: tylko te poprawki (acc-cored po
     zdarzeniu na ich plikach albo zmianie sieci), bez cofnięć w toku i Ultry."""
-    system = system or System()
     only = keep_only(args)
+    if only is not None:
+        unknown = only - {item.name for item in TWEAKS} - {"link", "admit-chain"}
+        if not only or unknown:
+            print(f"keep --only: {'nieznane ' + ','.join(sorted(unknown)) if unknown else 'pusta lista'}", file=sys.stderr)
+            return 2
+    system = system or System()
     now = time.time()
     state = load_state()
     # łącze dla updates.py: na tetheringu zaplanowane aktualizacje czekają
@@ -4595,7 +4623,7 @@ def cmd_keep_launchd(cfg, args):
     wprost, więc prawdziwy settings.json zostaje poza nimi."""
     rc = cmd_keep(cfg, args)
     only = keep_only(args)
-    if only is not None and "admit-chain" not in only:
+    if rc == 2 or (only is not None and "admit-chain" not in only):
         return rc
     try:
         import admitchain

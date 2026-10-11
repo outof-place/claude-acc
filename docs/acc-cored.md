@@ -464,23 +464,32 @@ changed or not. `acc-cored run --perf` brings a tweak back when one of its files
 network does, and runs the full pass only at start and every 30 minutes. Python keeps the knowledge
 and the writes:
 - `perf.py keep-spec` prints what to watch: each applied tweak with its class and files, plus
-  `admit-chain` (settings.json) and `link` (the network).
+  `admit-chain` (the files `admitchain.broken()` checks: settings.json under `CLAUDE_CONFIG_DIR`,
+  the `chains-claude-acc` marker and `pod-hook-client`) and `link` (the network).
 - `perf.py keep --only a,b` repairs just those: no deferred undos, no Ultra, and the link and the
-  admit chain only when named.
+  admit chain only when named. An unknown name or an empty list exits 2.
 - The classes, as decided with the lead (a 30-minute repair delay is fine only for perf or cosmetic
   tweaks, never for safety or privacy):
-  - **safety:** `claude-hooks-native`, `devguard-budget`, `devguard-max-server`, `security-slim`,
-    `admit-chain`. They come back on an event, every time.
+  - **safety:** `claude-hooks-native`, `devguard-budget`, `devguard-max-server`, `security-slim`
+    (also its generated hooks: `hooks.json` points at them by absolute path), `admit-chain`. They
+    come back on an event, every time.
   - **perf:** the settings.json ones (`node-compile-cache`, `claude-limits`, `subagent-cache-1h`,
-    `fast-npx-hooks`, `rg-threads`, `workflow-size`, `claude-ui`, `tether-profile`), `docker-vm`
-    (Docker's settings) and `git-speed` (`~/.gitconfig`). They come back on the same events.
-  - **periodic**, no cheap event: `bg-helpers` (a helper restarted with a new pid), `docker-idle`,
-    git maintenance in the repositories, Ultra's results, and `claude-hooks-async`. That last one
-    stays out of the events until `pod/claude-async-hooks` ships (v6.1). They come back within
-    30 minutes.
+    `fast-npx-hooks`, `rg-threads`, `workflow-size`, `claude-ui`, `tether-profile`) and `git-speed`
+    (`~/.gitconfig`). They come back on the same events.
+  - **periodic**, no cheap event: `bg-helpers` (a helper restarted with a new pid), `docker-vm`
+    (its file lies in Docker's group container, where an `open()` from acc-cored means a TCC
+    prompt or EPERM), git maintenance in the repositories, Ultra's results, and
+    `claude-hooks-async`. That last one stays out of the events until `pod/claude-async-hooks`
+    ships (v6.1). They come back within 30 minutes. `docker-idle` runs alone every 5 minutes, as
+    under launchd: it counts connection samples up to its 2-hour threshold.
 - **A fight:** a tweak repaired 3 times in 10 minutes has someone reverting it (another tool, a
   hand edit). A perf tweak then waits an hour instead of fighting, in both keeps. A safety tweak
-  comes back every time and says so in perf.log at most once an hour.
+  comes back every time and says so in perf.log at most once an hour. Only tweaks repaired from
+  their files count: a network change switches `tether-profile`, and a new pid isn't someone
+  undoing `bg-helpers`.
+- **The link for updates.py:** acc-cored refreshes `link` only on a network change, so on a tether
+  that lasts the entry ages past updates.py's 15 minutes. updates.py then asks `perf.py link
+  --json` live before a scheduled run.
 - **Its own writes:** a repair writes files it watches. Those events land while the run is on, and
   one more run confirms them: it finds nothing to change and writes nothing.
 - **Events:**

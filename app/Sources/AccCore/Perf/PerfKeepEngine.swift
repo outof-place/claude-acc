@@ -37,6 +37,8 @@ public final class PerfKeepEngine: @unchecked Sendable {
         var cls: String
         var paths: [String]
         var network: Bool
+        /// its own interval (`every_s`, docker-idle's samples): a run of just the tweak this often
+        var every: Double?
     }
 
     let options: Options
@@ -54,6 +56,8 @@ public final class PerfKeepEngine: @unchecked Sendable {
     var debounceTimer: DispatchSourceTimer?
     var periodicTimer: DispatchSourceTimer?
     var periodicEvery = 0.0
+    var everyTimer: DispatchSourceTimer?
+    var everyInterval = 0.0
     var networkToken: Int32?
     public let runs = Atomic<Int>(0)
     public let fails = Atomic<Int>(0)
@@ -84,6 +88,8 @@ public final class PerfKeepEngine: @unchecked Sendable {
             debounceTimer = nil
             periodicTimer?.cancel()
             periodicTimer = nil
+            everyTimer?.cancel()
+            everyTimer = nil
             watch.stop()
             if let networkToken { notify_cancel(networkToken) }
             networkToken = nil
@@ -111,14 +117,16 @@ public final class PerfKeepEngine: @unchecked Sendable {
         tweaks = (spec["tweaks"]?.array ?? []).compactMap { t in
             guard let name = t["name"]?.string else { return nil }
             return Tweak(name: name, cls: t["class"]?.string ?? "periodic", paths: t["paths"]?.array?.compactMap(\.string) ?? [],
-                         network: t["network"]?.truthy ?? false)
+                         network: t["network"]?.truthy ?? false, every: t["every_s"]?.double)
         }
         watch.set(Set(tweaks.filter { $0.cls != "periodic" }.flatMap(\.paths) + config))
         schedulePeriodic()
+        scheduleEvery()
     }
 
     static func liveSpec(_ options: Options) -> PyObject? {
-        guard let out = Spawn.output(options.python + ["perf", "keep-spec"], timeout: 60) else { return nil }
+        // under launchd's ExitTimeOut (30 s): stop() waits for the queue, a spec read included
+        guard let out = Spawn.output(options.python + ["perf", "keep-spec"], timeout: 20) else { return nil }
         return (try? PyJSON.loads(bytes: out))?.object
     }
 
@@ -158,6 +166,28 @@ public final class PerfKeepEngine: @unchecked Sendable {
         t.resume()
         periodicTimer = t
         periodicEvery = periodic
+    }
+
+    /// One timer at the shortest own interval; each tick runs every tweak that has one.
+    func scheduleEvery() {
+        let interval = tweaks.compactMap(\.every).min().map { max(options.minPeriodic, $0) }
+        guard let interval, !stopped else {
+            everyTimer?.cancel()
+            everyTimer = nil
+            return
+        }
+        guard everyTimer == nil || everyInterval != interval else { return }
+        everyTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(wallDeadline: .now() + interval, repeating: interval, leeway: .seconds(Int(min(60, interval / 10))))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            for tweak in self.tweaks where tweak.every != nil { self.pending.insert(tweak.name) }
+            self.kick(after: 0)
+        }
+        t.resume()
+        everyTimer = t
+        everyInterval = interval
     }
 
     // MARK: runs

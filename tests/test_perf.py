@@ -2356,6 +2356,51 @@ class KeepNativeTest(Isolated):
         bg = {t["name"]: t for t in perf.keep_spec(perf.load_state())["tweaks"]}["bg-helpers"]
         self.assertEqual((bg["class"], bg["paths"]), ("periodic", []))
 
+    def test_the_spec_watches_the_admit_chain_s_own_files_and_the_slim_hooks(self):
+        # admitchain.broken() checks settings.json (CLAUDE_CONFIG_DIR), the marker and pod-hook-client
+        home, config = os.path.join(self.dir, "home"), os.path.join(self.dir, "config")
+        with mock.patch.dict(os.environ, {"HOME": home, "CLAUDE_CONFIG_DIR": config}):
+            chain = {t["name"]: t for t in perf.keep_spec(perf.load_state())["tweaks"]}["admit-chain"]
+        fasthooks = os.path.join(home, ".claude", "hooks", "fasthooks")
+        self.assertEqual(chain["paths"], [os.path.join(config, "settings.json"), os.path.join(fasthooks, "chains-claude-acc"),
+                                          os.path.join(fasthooks, "pod-hook-client")])  # fmt: skip
+        slim = perf.tweak("security-slim")
+        hooks = os.path.join(self.dir, "plugins", "security-slim", "hooks")
+        self.assertEqual(perf.keep_paths(slim)[-3:], [os.path.join(hooks, n) for n in ("hooks.json", "sec_slim.py", "patterns.py")])
+        # docker-vm's file lies in Docker's group container: the full pass only, no watch
+        self.assertEqual(perf.KEEP_CLASS.get("docker-vm", "periodic"), "periodic")
+        # docker-idle samples every 5 min, as under launchd
+        spec = perf.keep_spec({"applied": {"docker-idle": {}}})
+        idle = {t["name"]: t for t in spec["tweaks"]}["docker-idle"]
+        self.assertEqual((idle["class"], idle["every_s"]), ("periodic", 300))
+
+    def test_only_names_tweaks_it_knows(self):
+        for only in ("claude-limits,nope", "", ","):
+            with self.subTest(only=only):
+                code, _ = self.run_cmd(perf.cmd_keep, "--only", only, system=FakeSystem({}))
+                self.assertEqual(code, 2)
+        code, _ = self.run_cmd(perf.cmd_keep, "--only", "admit-chain,link", system=FakeSystem({}))
+        self.assertEqual(code, 0)
+
+    def test_keep_takes_the_state_lock(self):
+        # main() takes perf.lock before `keep` runs: one writer of perf-state.json at a time
+        ran = mock.Mock(return_value=0)
+        with mock.patch.dict(perf.COMMANDS, {"keep": ran}), mock.patch.object(perf, "keep_lock", side_effect=RuntimeError("held")):
+            self.assertEqual(perf.main(["keep", "--only", "link"]), 1)
+        ran.assert_not_called()
+
+    def test_network_and_periodic_tweaks_never_count_as_a_fight(self):
+        # a Wi-Fi/tether/Wi-Fi switch every 90 s changes tether-profile each time; a new pid, bg-helpers
+        t0 = 1_800_000_000.0
+        state = {}
+        for name in ("tether-profile", "link", "bg-helpers", "docker-idle"):
+            for i in range(5):
+                perf.keep_fight(state, name, t0 + 90 * i)
+        self.assertEqual(state.get("keep_backoff", {}), {})
+        for i in range(3):
+            perf.keep_fight(state, "claude-limits", t0 + 60 * i)
+        self.assertIn("claude-limits", state["keep_backoff"])
+
     def test_only_runs_just_the_named_tweaks(self):
         self.revert()
         self.run_cmd(perf.cmd_keep, "--only", "claude-limits", system=FakeSystem({}, tethered=True))

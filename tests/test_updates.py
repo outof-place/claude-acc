@@ -128,10 +128,16 @@ class Env:
             "CLAUDE_ACC_PYTHON_RELEASES": f"file://{self.home}/python-releases.json",
             "CLAUDE_ACC_PYTHON_FTP": f"file://{self.home}/ftp",
             "PLAYWRIGHT_BROWSERS_PATH": os.path.join(self.home, "ms-playwright"),
+            # the link asked live (perf.py link) is a file here: no test reads this Mac's network
+            "CLAUDE_ACC_LINK_CMD": json.dumps(["/bin/cat", os.path.join(self.home, "fake/live-link.json")]),
         }
         return subprocess.run(
             ["/usr/bin/python3", SCRIPT, *args], env=env, capture_output=True, text=True, timeout=120
         )
+
+    def set_live_link(self, link):
+        with open(os.path.join(self.home, "fake/live-link.json"), "w") as f:
+            json.dump(link, f)
 
     def world(self):
         with open(os.path.join(self.home, "fake/world.json")) as f:
@@ -320,6 +326,19 @@ class UpdatesTest(unittest.TestCase):
                 env.run("run")
                 self.assertGreater(len(env.calls()), before)
                 self.assertIn("last_run", env.state())
+
+    def test_a_stale_entry_asks_the_link_now(self):
+        # acc-cored refreshes the entry only on a network change: on a tether that lasts, it ages
+        env = Env(self)
+        tether = {"tethered": True, "port": "iPhone USB", "iface": "en8", "gateway": "172.20.10.1"}
+        env.set_link(dict(tether, at=time.time() - 40 * 60))
+        env.set_live_link(dict(tether, at=time.time()))
+        done = env.run("run")
+        self.assertEqual(done.stdout.strip(), "aktualizacja odłożona: Mac na tetheringu")
+        self.assertEqual(env.calls(), [])
+        env.set_live_link(dict(tether, tethered=False, at=time.time()))
+        env.run("run")
+        self.assertIn("brew update --quiet", env.calls())
 
     def test_update_by_hand_runs_while_tethered(self):
         env = Env(self)
