@@ -68,7 +68,15 @@ case "$cmd" in
     else
       echo "would: write $AGENTS/$LABEL.plist and $RECORD (replaced:$stopped)"
     fi
-    for job in $stopped; do step "$LAUNCHCTL" bootout "$DOMAIN/$job"; done
+    for job in $stopped; do
+      if [ "$job" = com.filip.claude-acc ]; then
+        # under the switcher's own lock: no tick is between a token refresh and its Keychain write
+        # when launchd stops the job (-k keeps the lock file the ticks use)
+        step /usr/bin/lockf -k -t 150 "$STATE/lock" "$LAUNCHCTL" bootout "$DOMAIN/$job"
+      else
+        step "$LAUNCHCTL" bootout "$DOMAIN/$job"
+      fi
+    done
     step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$LABEL.plist"
     [ -n "$APPLY" ] || echo "(check only: add --apply)"
     ;;

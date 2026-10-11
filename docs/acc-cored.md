@@ -474,7 +474,10 @@ registers its own agents.
     job runs `acc-cored run --guard --sched --accswitch --janitor` as `ProcessType Interactive`,
     with `KeepAlive`.
   - It boots out whichever of the three jobs are loaded, records them in
-    `$STATE/acc-cored-switch.json`, and bootstraps acc-cored.
+    `$STATE/acc-cored-switch.json`, and bootstraps acc-cored. The tick's job goes under the
+    switcher's own lock (`lockf -k $STATE/lock`), so no tick is between a token refresh and its
+    Keychain write when launchd stops it. The job runs with `--wait-lock` and `ExitTimeOut` 30 s
+    (stopping ends Python's guard loop first, up to 10 s).
   - The three plists stay where setup.sh wrote them.
 - **`off`** is the undo. It boots acc-cored out, bootstraps the recorded jobs from their plists
   again, and removes the plist and the record.

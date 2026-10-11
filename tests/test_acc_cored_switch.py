@@ -77,6 +77,26 @@ class SwitchTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
         self.assertFalse(os.path.exists(os.path.join(self.state, "acc-cored-switch.json")))
 
+    def test_the_tick_job_goes_only_while_no_tick_holds_the_switcher_s_lock(self):
+        # a tick mid token refresh holds $STATE/lock: launchd's bootout must not land then
+        import fcntl
+        import time
+
+        lock = open(os.path.join(self.state, "lock"), "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        env = dict(os.environ, HOME=self.home, ACC_CORED_LAUNCHCTL=os.path.join(HERE, "fakes-launchctl", "launchctl"),
+                   FAKE_LOADED=self.loaded, FAKE_LOG=os.path.join(self.tmp, "calls.log"))  # fmt: skip
+        proc = subprocess.Popen([SCRIPT, "on", "--apply", "--binary", self.binary], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.5)
+        self.assertIn("com.filip.claude-acc", self.loaded_jobs())
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn("com.filip.claude-acc", self.loaded_jobs())
+        self.assertTrue(os.path.exists(os.path.join(self.state, "lock")))  # the ticks' lock file stays
+
     def test_on_brings_back_only_what_it_stopped(self):
         with open(self.loaded, "w") as f:
             f.write("com.filip.claude-acc.devguard\n")  # the tick and the janitor weren't loaded
