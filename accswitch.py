@@ -337,16 +337,37 @@ def kc_read_many(keys, batch=8):
                     proc.wait()
 
 
+# `security -i` czyta polecenie przez fgets do bufora 4096 bajtów: dłuższa linia idzie dalej jako drugie
+# polecenie, a pierwsze zapisałoby ucięty sekret (zmierzone na /usr/bin/security, macOS 27)
+SECURITY_LINE_MAX = 4095
+
+
 def kc_write(service, account, contents, timeout=30):
+    """Zapis wpisu przez stdin `security -i` z danymi szesnastkowo (-X), jak credits.py i runenv.py:
+    sekret nie trafia do argumentów procesu (ps widzi tylko `security -i`), a zapis szesnastkowy nie
+    wymaga ucieczek w linii polecenia.
+
+    Wpis, którego linia nie przeniesie (blob z wieloma mcpOAuth dłuższy niż SECURITY_LINE_MAX po
+    zamianie na szesnastkowy albo nazwa z cudzysłowem, backslashem, końcem linii), idzie jak przed
+    1.31.13, w argumentach: ucięty zapis albo odmowa zgubiłyby świeżo wydaną parę tokenów."""
     _KC_SEEN.pop((service, account), None)  # po nieudanym albo przerwanym zapisie nie wiadomo, co tam leży
+    secret = contents.encode().hex()
+    line = f'add-generic-password -U -s "{service}" -a "{account}" -X {secret}'
+    if len(line.encode()) <= SECURITY_LINE_MAX and not any(c in service + account for c in '"\\\n\r\0'):
+        argv, stdin = ["security", "-i"], line + "\n"
+    else:
+        log(f"zapis do Keychain ({service}) w argumentach `security`: {len(contents.encode())} B, linia `security -i` go nie przeniesie")
+        argv, stdin, secret = ["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], None, contents
     try:
-        r = spawn(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], timeout=timeout)
+        r = spawn(argv, input=stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
-        # tekst TimeoutExpired niesie argumenty, a w nich sekret (-w): main() wpisałby go do logu i na
-        # stderr, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
+        # TimeoutExpired niesie argumenty i to, co proces zdążył wypisać: main() wpisałby jego tekst do
+        # logu i na stderr, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
         raise RuntimeError(f"zapis do Keychain nieudany ({service}): brak odpowiedzi po {timeout:.0f} s") from None
-    if r.returncode != 0:
-        raise RuntimeError(f"zapis do Keychain nieudany ({service}): {r.stderr.strip()}")
+    # `security` nie powtarza polecenia przy błędzie, ale komunikat i tak idzie do logu: bez sekretu
+    error = (r.stderr or "").replace(secret, "<sekret>").strip()
+    if r.returncode != 0 or "error" in error.lower():
+        raise RuntimeError(f"zapis do Keychain nieudany ({service}): {error[:200]}")
     _KC_SEEN[(service, account)] = contents
 
 

@@ -31,7 +31,8 @@ def run(args):
             open(os.path.join(_store.ROOT, "slow-write-started"), "w").close()
             time.sleep(3)
         kc = _store.load("keychain.json", {})
-        kc[key] = opt("-w")
+        # -X: dane szesnastkowo, jak w `security -i` z claude-acc (sekret nie idzie w argumentach)
+        kc[key] = bytes.fromhex(opt("-X")).decode() if "-X" in args else opt("-w")
         _store.save("keychain.json", kc)
         return 0
     if cmd == "delete-generic-password":
@@ -45,10 +46,22 @@ def run(args):
     return 1
 
 
+
+
+def lines(data):
+    """Jak fgets do bufora 4096 bajtów w `security -i`: z dłuższej linii pierwsze 4095 bajtów to jedno
+    polecenie, a reszta następne (zmierzone na /usr/bin/security, macOS 27, nieznanym poleceniem)."""
+    while data:
+        cut = data.find(b"\n") + 1 or len(data)
+        cut = min(cut, 4095)
+        yield data[:cut].rstrip(b"\n").decode()
+        data = data[cut:]
+
+
 if sys.argv[1] == "-i":
     # tryb interaktywny: polecenia z stdin, linia po linii, jak `security -i`
     code = 0
-    for line in sys.stdin.read().splitlines():
+    for line in lines(sys.stdin.buffer.read()):
         if line.strip():
             code = run(shlex.split(line)) or code
     sys.exit(code)

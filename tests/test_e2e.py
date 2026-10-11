@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from unittest import mock
 
 # prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
@@ -1160,6 +1161,11 @@ class KeychainMemoTest(unittest.TestCase):
             self.addCleanup(cache.clear)
         # these tests write (and time out writes): never through the real `security` (login keychain)
         self.assertEqual(accswitch.tool("security"), os.path.join(FAKES, "security"))
+        # log() writes under STATE_DIR, taken from HOME at import: in this process, the real one
+        for name, value in (("STATE_DIR", self.w.state_dir), ("LOG_PATH", os.path.join(self.w.state_dir, "switch.log"))):
+            patcher = mock.patch.object(accswitch, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def behind_our_back(self, value):
         """Inny proces (sesja Claude Code, Orca) zapisuje wpis."""
@@ -1188,6 +1194,69 @@ class KeychainMemoTest(unittest.TestCase):
         self.assertNotIn("rt-secret-value", str(caught.exception))
         self.assertIn("brak odpowiedzi po 1 s", str(caught.exception))
         self.assertTrue(caught.exception.__suppress_context__)  # a traceback leaves TimeoutExpired out
+
+    def test_a_write_keeps_the_secret_off_every_command_line(self):
+        # the secret goes through `security -i`'s stdin, hex-encoded (-X): ps sees `security -i` only
+        import threading
+
+        # tokens made here: no other command line (this test's own shell) can carry them
+        access, refresh = f"at-{uuid.uuid4().hex}", f"rt-{uuid.uuid4().hex}"
+        secret = json.dumps({"claudeAiOauth": {"accessToken": access, "refreshToken": refresh}})
+        os.environ["FAKE_SLOW_WRITE_SERVICE"] = "svc"  # the fake holds the write 3 s: ps looks meanwhile
+        done = []
+        writer = threading.Thread(target=lambda: done.append(self.acc.kc_write("svc", "u", secret)))
+        writer.start()
+        started = os.path.join(self.w.fake, "slow-write-started")
+        for _ in range(100):
+            if os.path.exists(started):
+                break
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(started))
+        ps = subprocess.run(["/bin/ps", "-A", "-ww", "-o", "args="], capture_output=True, text=True, check=False).stdout
+        writer.join(10)
+        self.assertEqual(done, [None])
+        self.assertIn("fakes/security -i", ps)  # the write was there to see
+        with open(os.path.join(self.w.fake, "security-argv.log")) as f:
+            argv = f.read()
+        self.assertIn("-i\n", argv)
+        for needle in (access, refresh, secret.encode().hex()):
+            self.assertNotIn(needle, ps)
+            self.assertNotIn(needle, argv)
+        with open(os.path.join(self.w.fake, "keychain.json")) as f:
+            self.assertEqual(json.load(f)["svc|u"], secret)
+        # a failed write says so without the secret
+        os.environ.pop("FAKE_SLOW_WRITE_SERVICE")
+        os.environ["FAKE_FAIL_WRITE_SERVICE"] = "svc"
+        with self.assertRaises(RuntimeError) as caught:
+            self.acc.kc_write("svc", "u", secret)
+        self.assertIn("fake failure", str(caught.exception))
+        self.assertNotIn(refresh, str(caught.exception))
+
+    def test_a_write_one_security_i_line_cannot_carry_goes_through_argv_and_says_so(self):
+        # `security -i` reads 4095 bytes per command: a longer line would run on as a second
+        # command after a first one that writes a cut secret (the fake splits the same way)
+        token = uuid.uuid4().hex
+        argv_log = os.path.join(self.w.fake, "security-argv.log")
+        cases = [  # 43 + 2 * 2026 = 4095: the longest line `security -i` reads whole
+            ("svc", "u", (token * 64)[:2026], "-i"),
+            ("svc", "uu", (token * 64)[:2026], "add-generic-password"),  # 4096 bytes
+            ("svc", "u", (token * 64)[:2027], "add-generic-password"),
+            ("svc", "\u0142", (token * 64)[:2026], "add-generic-password"),  # 4095 characters, 4096 bytes
+            ('s"vc', "u", token, "add-generic-password"),  # a quote the line can't carry
+        ]
+        for service, account, secret, via in cases:
+            with self.subTest(service=service, account=account, length=len(secret)):
+                open(argv_log, "w").close()
+                self.acc.kc_write(service, account, secret)
+                with open(argv_log) as f:
+                    self.assertTrue(f.read().startswith(via))
+                with open(os.path.join(self.w.fake, "keychain.json")) as f:
+                    self.assertEqual(json.load(f)[f"{service}|{account}"], secret)
+                self.assertEqual(self.acc.kc_peek(service, account), secret)
+        with open(os.path.join(self.w.state_dir, "switch.log")) as f:
+            logged = f.read()
+        self.assertEqual(logged.count("w argumentach `security`"), 4)
+        self.assertNotIn(token, logged)
 
     def test_write_is_remembered_and_a_failed_write_forgets_the_entry(self):
         acc = self.acc
