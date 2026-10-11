@@ -265,28 +265,107 @@ func capsSampledPeak() throws {
     }
 }
 
-@Test("a shallow folder (a link right before another wildcard) counts only its own entries; deep ones below it count whole")
+@Test("a shallow folder (a link right before another wildcard) counts only its own subfolders; deep ones below it count whole")
 func capsShallow() throws {
     let (home, watch, queue) = try capsHome("shallow", caps: #"[{"path": "HOME/caps/*/*/builds", "max_gb": 10}]"#)
     defer { try? FileManager.default.removeItem(atPath: home) }
     Files.mkdirs(home + "/far/t1/s0/builds")
+    Files.mkdirs(home + "/far/t1/s1/src")
     Files.mkdirs(home + "/caps")
     let t1 = Files.realpath(home + "/far/t1")
     let now = Kernel.wall()
     queue.sync {
         _ = watch.due(now: now)
         watch.started(now: now)
-        watch.finished(PyObject([("busy", 0), ("folders", .array([.string(t1 + "/s0/builds")])), ("shallow", .array([.string(t1)]))]))
+        // s0/builds is there, s1/builds not yet
+        watch.finished(PyObject([("busy", 0), ("folders", .array([.string(t1 + "/s0/builds"), .string(t1 + "/s1/builds")])),
+                                 ("shallow", .array([.string(t1)]))]))
         #expect(watch.due(now: now + 1))  // new roots: the stream re-arms, and that counts as a change once
         watch.started(now: now + 1)
         #expect(!watch.due(now: now + 600))
         #expect(watch.shallow == [t1])
         watch.event(t1 + "/s1/src", flags: 0)  // an edit in the worktree
+        // a file right in a first-level folder, and one in the shallow folder: FSEvents names the
+        // folder, but no folder on the way to a capped one came, nor a subfolder
+        #expect(Files.writeAtomic(t1 + "/s0/top.swift", "x"))
+        watch.event(t1 + "/s0", flags: 0)
+        #expect(Files.writeAtomic(t1 + "/s1/top.swift", "x"))
+        watch.event(t1 + "/s1", flags: 0)
+        #expect(Files.writeAtomic(t1 + "/README", "x"))
+        watch.event(t1, flags: 0)
         #expect(!watch.dirty)
         watch.event(t1 + "/s0/builds/run2", flags: 0)  // under a deep folder found in it
         #expect(watch.dirty)
         watch.started(now: now + 600)
+        Files.mkdirs(t1 + "/s1/builds")  // a capped folder made on the way
+        watch.event(t1 + "/s1", flags: 0)
+        #expect(watch.dirty)
+        watch.started(now: now + 1200)
+        Files.mkdirs(t1 + "/s2")
         watch.event(t1, flags: 0)  // a new subfolder in it
+        #expect(watch.dirty)
+        watch.started(now: now + 1800)
+        #expect(rename(t1 + "/s2", t1 + "/s3") == 0)  // renamed
+        watch.event(t1, flags: 0)
+        #expect(watch.dirty)
+        watch.stop()
+    }
+}
+
+@Test("a shallow folder with no deep one found under it yet is a root of its own; a dangling one counts when it's made")
+func capsShallowAlone() throws {
+    let (home, watch, queue) = try capsHome("alone", caps: #"[{"path": "HOME/caps/*/*/builds", "max_gb": 10}]"#)
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(home + "/far/t1")
+    Files.mkdirs(home + "/caps")
+    let far = Files.realpath(home + "/far")
+    let t1 = far + "/t1", later = far + "/later2"  // l1 -> far/t1, and l2 -> far/later2, not made yet
+    let now = Kernel.wall()
+    queue.sync {
+        _ = watch.due(now: now)
+        watch.started(now: now)
+        watch.finished(PyObject([("busy", 0), ("folders", .array([])), ("shallow", .array([.string(t1), .string(later)]))]))
+        #expect(watch.due(now: now + 1))
+        watch.started(now: now + 1)
+        #expect(watch.shallow == [t1, later])
+        #expect(watch.roots.contains(t1))  // no deep folder covers it
+        #expect(watch.roots.contains(far))  // the dangling one's nearest folder
+        #expect(Files.writeAtomic(t1 + "/README", "x"))
+        watch.event(t1, flags: 0)  // a file in it
+        #expect(Files.writeAtomic(far + "/notes.txt", "x"))
+        watch.event(far, flags: 0)  // a file beside the dangling one
+        #expect(!watch.dirty)
+        Files.mkdirs(t1 + "/s2")
+        watch.event(t1, flags: 0)
+        #expect(watch.dirty)
+        watch.started(now: now + 600)
+        Files.mkdirs(later)
+        watch.event(far, flags: 0)  // the dangling one made
+        #expect(watch.dirty)
+        watch.stop()
+    }
+}
+
+@Test("above a static prefix not made yet, only a folder on the way counts, not a file written there")
+func capsPrefixNotMadeYet() throws {
+    let (home, watch, queue) = try capsHome("notyet", caps: #"[{"path": "HOME/cache/perf/*/builds", "max_gb": 10}]"#)
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(home + "/cache")
+    let cache = Files.realpath(home + "/cache")
+    let now = Kernel.wall()
+    queue.sync {
+        _ = watch.due(now: now)
+        watch.started(now: now)
+        watch.finished(PyObject([("busy", 0)]))
+        #expect(!watch.due(now: now + 600))
+        #expect(watch.roots == [cache])
+        #expect(Files.writeAtomic(cache + "/other.json", "x"))
+        watch.event(cache, flags: 0)
+        Files.mkdirs(cache + "/elsewhere")
+        watch.event(cache, flags: 0)
+        #expect(!watch.dirty)
+        Files.mkdirs(cache + "/perf")
+        watch.event(cache, flags: 0)
         #expect(watch.dirty)
         watch.stop()
     }

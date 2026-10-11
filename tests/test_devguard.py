@@ -390,6 +390,12 @@ class CapsCommandTest(unittest.TestCase):
         self.assertEqual(got["shallow"], [t1])
         self.assertEqual(sorted(got["folders"]), [os.path.join(t1, "s0", "builds"), os.path.join(t1, "s1", "builds")])
         self.assertNotIn(t1, got["folders"])
+        # a link to a file: nothing will be under it (a dangling one may become a folder, below)
+        with open(os.path.join(far, "notes.txt"), "w") as f:
+            f.write("x")
+        os.symlink(os.path.join(far, "notes.txt"), os.path.join(tmp, "caps", "notes"))
+        self.assertFalse([f for f in report("*", "builds")["folders"] if "notes" in f])
+        self.assertEqual(report("*")["shallow"], [t1])
         # a link whose target isn't there yet, and one on the fixed part
         os.symlink(os.path.join(far, "later"), os.path.join(tmp, "caps", "wt2"))
         self.assertIn(os.path.join(os.path.realpath(far), "later", "builds"), report("*", "builds")["folders"])

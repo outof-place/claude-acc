@@ -107,11 +107,17 @@ memory pressure (a Dispatch memory-pressure source).
       gives `repo/out/builds`), even before those folders exist or while the link dangles, and not
       the whole linked folder, so an edit elsewhere in it doesn't wake the caps.
     - A link right before another wildcard (`caps/*/*/builds`, `l1 -> a worktree`) has no fixed
-      part: its target is watched shallow (only its own entries, a new subfolder, count), and each
-      folder found under it is reported as above.
-    - For a folder not made yet, its nearest existing parent is the root, and an entry made or
-      removed directly in that parent counts too (it may be the folder on its way). An edit in a
-      sibling subfolder doesn't.
+      part: its target is watched shallow, and each folder found under it is reported as above.
+      FSEvents (without per-file events) names a folder on every file written in it, so an event
+      naming a shallow folder counts only when its subfolders and links changed since the run
+      started: one made, removed or renamed. A file such as `t1/README` doesn't count.
+    - Above a watched folder (the stream sees those events under a shallow root, or at the nearest
+      existing parent of a folder not made yet), an event counts only when the next folder on the
+      way came or went since the run started: one stat. A file written in `t1/s0` with
+      `t1/s0/builds` there, a file in `t1/s1` before `t1/s1/builds` exists, or a write in a
+      `~/.cache` that has no `perf` folder yet, doesn't count; `mkdir t1/s1/builds` does.
+    - A link to a file is skipped: nothing can be made under it. A dangling link still counts, since
+      it may become a folder.
     - A folder under another watched path adds no root. Once the watch is due, further events
       cost a flag check.
     - The paths and their roots are computed again at every interval, so a folder made later (in

@@ -5,7 +5,10 @@
 //   exists), or janitor.json does. The folders are the globs' static prefixes and the folders the
 //   last run's globs matched, both as real paths: a symlinked folder lives where its link points.
 //   A link right before another wildcard (caps/*/*/builds, l1 -> a worktree) is watched shallow:
-//   only its own entries count (a new subfolder), and the folders found under it are watched deep;
+//   only its own subfolders count (one made, removed or renamed), and the folders found under it
+//   are watched deep. Above a watched folder only a folder on the way that came or went counts:
+//   FSEvents names a folder on every file written in it, and a worktree's src/*.ts is written all
+//   day;
 // - free space on a watched volume dropped since the last run by at least the tightest folder's
 //   headroom (what it may still grow before a run removes something), and never by less than a
 //   floor (a tenth of the smallest cap, the floor itself at most 1 GiB): a file growing behind an
@@ -39,6 +42,12 @@ public final class CapsWatch {
     /// covers them
     public private(set) var shallow: [String] = []
     var shallowFolders: [String] = []
+    /// each watched path's deepest existing folder when the last run started (itself, when it was
+    /// there): an event above it counts only when the next folder on the way came or went
+    var armedDeepest: [String: String] = [:]
+    /// each shallow folder's subfolders and links when the last run started: an event naming it
+    /// counts only when they changed
+    var armedEntries: [String: [String]] = [:]
     var patterns: [String] = []
     var folders: [String] = []
     var smallestGB = 10.0
@@ -112,6 +121,9 @@ public final class CapsWatch {
         prefixes = watched.filter { p in !watched.contains { q in q != p && p.pyStarts(q + "/") } }
         slashed = prefixes.map { $0 + "/" }
         shallow = shallowFolders.filter { s in !prefixes.contains { s == $0 || s.pyStarts($0 + "/") } }
+        // a path new since the last run started whose root was one already: its look from now on
+        for p in prefixes + shallow where armedDeepest[p] == nil { armedDeepest[p] = Self.deepest(p) }
+        for s in shallow where armedEntries[s] == nil { armedEntries[s] = Self.entries(s) }
         let wanted = Self.roots(of: prefixes + shallow)
         if wanted != roots || rearm || stream == nil {  // a stream that didn't start is tried again
             roots = wanted
@@ -129,6 +141,10 @@ public final class CapsWatch {
         dirty = false
         lastRun = now
         freeAtStart = volumes?(roots) ?? Self.freeSpace(roots)
+        armedDeepest = [:]
+        for p in prefixes + shallow { armedDeepest[p] = Self.deepest(p) }
+        armedEntries = [:]
+        for s in shallow { armedEntries[s] = Self.entries(s) }
     }
 
     /// The run's report (`devguard caps`'s JSON line); a run that said nothing counts as busy.
@@ -191,22 +207,67 @@ public final class CapsWatch {
     static func roots(of paths: [String]) -> [String] {
         var roots: [String] = []
         for p in paths {
-            var dir = p
-            while dir != "/", !Files.isDirectory(dir) { dir = dirname(dir) }
+            let dir = deepest(p)
             if !roots.contains(dir) { roots.append(dir) }
         }
         return roots
     }
 
+    /// The deepest existing directory of a path: the path itself when it's there.
+    static func deepest(_ path: String) -> String {
+        var dir = path
+        while dir != "/", !Files.isDirectory(dir) { dir = dirname(dir) }
+        return dir
+    }
+
+    /// A folder's subfolders and links (what a wildcard after it goes on through), hidden ones too,
+    /// sorted by bytes; [] when it can't be read.
+    static func entries(_ path: String) -> [String] {
+        guard let dir = opendir(path) else { return [] }
+        defer { closedir(dir) }
+        var names: [String] = []
+        while let e = readdir(dir) {
+            let name = withUnsafeBytes(of: e.pointee.d_name) { String(decoding: $0.prefix(Int(e.pointee.d_namlen)), as: UTF8.self) }
+            if name == "." || name == ".." { continue }
+            var kind = Int32(e.pointee.d_type)
+            if kind == DT_UNKNOWN {
+                var st = stat()
+                guard lstat(path + "/" + name, &st) == 0 else { continue }
+                kind = st.st_mode & S_IFMT == S_IFDIR ? DT_DIR : st.st_mode & S_IFMT == S_IFLNK ? DT_LNK : DT_REG
+            }
+            if kind == DT_DIR || kind == DT_LNK { names.append(name) }
+        }
+        return names.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }
+    }
+
+    /// Whether the folder on the way from an event's folder (`below`, with its slash) to `target` came
+    /// or went since the run started: the next component is a folder now, and wasn't then, or the
+    /// other way round. One stat. Unknown then: it did.
+    func wayChanged(_ target: String, below: String) -> Bool {
+        guard let then = armedDeepest[target] else { return true }
+        let rest = target.utf8.dropFirst(below.utf8.count)
+        let next = below + String(Substring(rest.prefix { $0 != 0x2F }))
+        let was = then.pyEq(next) || then.pyStarts(next + "/")
+        return Files.isDirectory(next) != was
+    }
+
     /// `acc-cored caps-watch`: the seconds (from the start) in which something under the capped
-    /// folders changed, over `seconds`; nothing is run.
-    public static func observe(home: String, seconds: Double) -> (prefixes: [String], changes: [Int]) {
+    /// folders changed, over `seconds`; nothing is run. With a run's report (`acc.py devguard caps
+    /// --dry-run`), the folders it matched and the shallow ones are watched too, as the guard does
+    /// after that run.
+    public static func observe(home: String, seconds: Double, report: PyObject? = nil)
+        -> (prefixes: [String], shallow: [String], changes: [Int]) {
         let queue = DispatchQueue(label: "acc-cored.caps-watch")
         let watch = CapsWatch(home: home, queue: queue)
         let start = Kernel.wall()
         queue.sync {
             _ = watch.due(now: start)
             watch.started(now: start)
+            if let report {
+                watch.finished(report)
+                _ = watch.due(now: start)
+                watch.started(now: start)
+            }
         }
         var changes: [Int] = []
         while Kernel.wall() - start < seconds {
@@ -220,7 +281,7 @@ public final class CapsWatch {
             }
         }
         queue.sync { watch.stop() }
-        return (queue.sync { watch.prefixes }, changes)
+        return queue.sync { (watch.prefixes, watch.shallow, changes) }
     }
 
     // MARK: FSEvents
@@ -265,7 +326,7 @@ public final class CapsWatch {
     }
 
     /// One event: a change under a watched folder, or above it (a folder on the way made or
-    /// removed), a root that moved, or a sign that events were lost.
+    /// removed), a shallow folder's subfolders, a root that moved, or a sign that events were lost.
     func event(_ path: String, flags: FSEventStreamEventFlags) {
         if flags & FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged) != 0 {
             dirty = true
@@ -281,15 +342,28 @@ public final class CapsWatch {
         }
         let p = Self.trimSlashes(path)
         let ps = p + "/"
-        for (prefix, slash) in zip(prefixes, slashed) where p == prefix || p.pyStarts(slash) || prefix.pyStarts(ps) {
-            dirty = true
-            return
+        for (prefix, slash) in zip(prefixes, slashed) {
+            // above it: FSEvents names a folder on every file written in it, so only a folder on the
+            // way that came or went counts
+            if p == prefix || p.pyStarts(slash) || prefix.pyStarts(ps) && wayChanged(prefix, below: ps) {
+                dirty = true
+                return
+            }
         }
-        // a shallow folder: an entry made or removed in it (the event names the folder), or one on
-        // the way to it; an edit deeper inside isn't the caps' business
-        for s in shallow where p == s || s.pyStarts(ps) {
-            dirty = true
-            return
+        // a shallow folder: its subfolders made, removed or renamed (the event names the folder, also
+        // for a file written in it), or a folder on the way to it; an edit deeper inside isn't the
+        // caps' business
+        for s in shallow {
+            if p == s {
+                // unknown then: they changed
+                guard let then = armedEntries[s], then.elementsEqual(Self.entries(s), by: { $0.pyEq($1) }) else {
+                    dirty = true
+                    return
+                }
+            } else if s.pyStarts(ps), wayChanged(s, below: ps) {
+                dirty = true
+                return
+            }
         }
     }
 }
