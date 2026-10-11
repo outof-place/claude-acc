@@ -104,9 +104,16 @@ memory pressure (a Dispatch memory-pressure source).
       matched (a folder under the glob may be a link to elsewhere), or their nearest existing
       parent. A link anywhere along a glob that leaves its static prefix is reported too: the
       link's real target plus the glob's fixed part after it (`wt1 -> repo` with `caps/*/out/builds`
-      gives `repo/out/builds`), even before those folders exist, and not the whole linked folder,
-      so an edit elsewhere in it doesn't wake the caps. A folder under another watched path adds no
-      root. Once the watch is due, further events cost a flag check.
+      gives `repo/out/builds`), even before those folders exist or while the link dangles, and not
+      the whole linked folder, so an edit elsewhere in it doesn't wake the caps.
+    - A link right before another wildcard (`caps/*/*/builds`, `l1 -> a worktree`) has no fixed
+      part: its target is watched shallow (only its own entries, a new subfolder, count), and each
+      folder found under it is reported as above.
+    - For a folder not made yet, its nearest existing parent is the root, and an entry made or
+      removed directly in that parent counts too (it may be the folder on its way). An edit in a
+      sibling subfolder doesn't.
+    - A folder under another watched path adds no root. Once the watch is due, further events
+      cost a flag check.
     - The paths and their roots are computed again at every interval, so a folder made later (in
       any letter case) re-arms the stream. A root replaced by a rename is reported (`WatchRoot`).
     - A lost-events flag counts as a change.

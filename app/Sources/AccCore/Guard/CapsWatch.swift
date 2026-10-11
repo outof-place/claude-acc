@@ -3,7 +3,9 @@
 // every 10 minutes), but its outcome changes only when:
 // - something under a capped folder changes (FSEvents on the folders, or the nearest parent that
 //   exists), or janitor.json does. The folders are the globs' static prefixes and the folders the
-//   last run's globs matched, both as real paths: a symlinked folder lives where its link points;
+//   last run's globs matched, both as real paths: a symlinked folder lives where its link points.
+//   A link right before another wildcard (caps/*/*/builds, l1 -> a worktree) is watched shallow:
+//   only its own entries count (a new subfolder), and the folders found under it are watched deep;
 // - free space on a watched volume dropped since the last run by at least the tightest folder's
 //   headroom (what it may still grow before a run removes something), and never by less than a
 //   floor (a tenth of the smallest cap, the floor itself at most 1 GiB): a file growing behind an
@@ -33,6 +35,10 @@ public final class CapsWatch {
     public private(set) var prefixes: [String] = []
     /// `prefixes` with a slash each, made once per interval: an event allocates nothing per prefix
     var slashed: [String] = []
+    /// folders watched for their own entries only (the last run's `shallow`), unless a deep prefix
+    /// covers them
+    public private(set) var shallow: [String] = []
+    var shallowFolders: [String] = []
     var patterns: [String] = []
     var folders: [String] = []
     var smallestGB = 10.0
@@ -89,6 +95,7 @@ public final class CapsWatch {
             patterns = caps.compactMap { $0["path"]?.string }
             smallestGB = caps.map { $0["max_gb"]?.double ?? 10 }.min() ?? 10
             folders = []
+            shallowFolders = []
             dirty = true
         }
         if patterns.isEmpty {  // check_caps returns at once without caps
@@ -104,7 +111,8 @@ public final class CapsWatch {
         // a folder under another watched path adds nothing but a root (and a run when it comes or goes)
         prefixes = watched.filter { p in !watched.contains { q in q != p && p.pyStarts(q + "/") } }
         slashed = prefixes.map { $0 + "/" }
-        let wanted = Self.roots(of: prefixes)
+        shallow = shallowFolders.filter { s in !prefixes.contains { s == $0 || s.pyStarts($0 + "/") } }
+        let wanted = Self.roots(of: prefixes + shallow)
         if wanted != roots || rearm || stream == nil {  // a stream that didn't start is tried again
             roots = wanted
             rearm = false
@@ -133,6 +141,7 @@ public final class CapsWatch {
         busy = report["busy"]?.int ?? 0
         retryAt = report["retry_at"]?.double
         folders = report["folders"]?.array?.compactMap(\.string) ?? folders
+        shallowFolders = report["shallow"]?.array?.compactMap(\.string) ?? shallowFolders
         headroom = report["headroom"]?.double
     }
 
@@ -273,6 +282,12 @@ public final class CapsWatch {
         let p = Self.trimSlashes(path)
         let ps = p + "/"
         for (prefix, slash) in zip(prefixes, slashed) where p == prefix || p.pyStarts(slash) || prefix.pyStarts(ps) {
+            dirty = true
+            return
+        }
+        // a shallow folder: an entry made or removed in it (the event names the folder), or one on
+        // the way to it; an edit deeper inside isn't the caps' business
+        for s in shallow where p == s || s.pyStarts(ps) {
             dirty = true
             return
         }
