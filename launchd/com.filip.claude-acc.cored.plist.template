@@ -11,6 +11,7 @@
     <string>--sched</string>
     <string>--accswitch</string>
     <string>--janitor</string>
+    <string>--wait-lock</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
