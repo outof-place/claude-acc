@@ -393,6 +393,24 @@ the writes fit in it):
   sees a used token, and every copy holds a live one. SIGINT and SIGHUP run inside the refresh.
   The same runs again with the signal sent to the tick's whole process group. SIGKILL right
   after the server's answer does leave a used token (the control).
+- A Keychain write that fails after the refresh (#155: a SecurityAgent prompt timing out, a locked
+  keychain, rc ≠ 0) leaves the new pair only in the tick's memory. It never goes to a file (a
+  secret on disk). Instead:
+  - every write is retried after 1, 2, 4, 8 and 16 s, for at most 45 s from the first attempt:
+    with curl's 20 s that's still inside `ExitTimeOut`;
+  - the runtime entries are written even when the account's copy failed, so the pair outlives the
+    tick there, and the next tick's read-back hands it to the account's copy;
+  - a write still failing is said loudly (log, stderr, a notification), without the token, and the
+    account is marked as needing a new login;
+  - the state keeps a 12-character hash of each refresh token the server used up (the last 64).
+    No tick sends such a token again, also not after `needs_login`'s 6 h retry, and read-back
+    never copies such a pair from runtime over the account's copy. A runtime entry left with one
+    gets the account's live pair instead;
+  - a `security` timeout says so without its arguments: the text of `TimeoutExpired` held the
+    `-w` secret, and `main()` logged it.
+- `tests/test_accswitch_kc_retry.py` covers these with the fake `security` (`FAKE_FAIL_WRITE_TIMES`,
+  `FAKE_FAIL_WRITE_ALL`, services by comma), and checks that no token the server ever issued is in
+  the log, the state files or a tick's output.
 - A tick past the deadline in its status snapshot (`survey`) skips the snapshot and ends not
   quiet: an older `status.json` must not be vouched for.
 

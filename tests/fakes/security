@@ -32,9 +32,16 @@ def _run(cmd, opt, key, args):
             return 0
         return 44
     if cmd == "add-generic-password":
-        if os.environ.get("FAKE_FAIL_WRITE_SERVICE") == opt("-s"):
-            print("security: SecKeychainItemModifyContent: fake failure", file=sys.stderr)
-            return 1
+        # FAKE_FAIL_WRITE_SERVICE: usługa albo kilka po przecinku (FAKE_FAIL_WRITE_ALL: każda);
+        # FAKE_FAIL_WRITE_TIMES=N: pada tylko N pierwszych zapisów
+        failing = os.environ.get("FAKE_FAIL_WRITE_SERVICE", "").split(",")
+        if os.environ.get("FAKE_FAIL_WRITE_ALL") or opt("-s") in failing:
+            times = os.environ.get("FAKE_FAIL_WRITE_TIMES")
+            count = _store.load("failed-writes.json", 0)
+            if times is None or count < int(times):
+                _store.save("failed-writes.json", count + 1)
+                print("security: SecKeychainItemModifyContent: fake failure", file=sys.stderr)
+                return 1
         if os.environ.get("FAKE_SLOW_WRITE_SERVICE") == opt("-s"):
             open(os.path.join(_store.ROOT, "slow-write-started"), "w").close()
             time.sleep(3)
