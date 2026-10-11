@@ -109,6 +109,28 @@ func perfKeepConfirmsItsOwnWrite() async throws {
     e.stop()
 }
 
+@Test("a stream of events doesn't push the run back: it starts while the stream goes on")
+func perfKeepAStreamDoesNotWait() async throws {
+    let dir = try tempDir("stream")
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let settings = dir + "/settings.json"
+    #expect(Files.writeAtomic(settings, "{}"))
+    let runs = Runs()
+    let e = engine(dir, runs)  // debounce 0.1 s
+    e.specReader = { spec(dir, [("claude-limits", "perf", [settings], false)]) }
+    e.start()
+    try await waitFor { runs.all.count == 1 }
+    // a write every 30 ms for 1.5 s, closer together than the debounce
+    var ranDuring = false
+    for i in 0..<50 {
+        #expect(Files.writeAtomic(settings, "{\"n\": \(i)}"))
+        try await Task.sleep(nanoseconds: 30_000_000)
+        if runs.all.count > 1 { ranDuring = true }
+    }
+    #expect(ranDuring)
+    e.stop()
+}
+
 @Test("a change to the config reloads the spec without a run; the new tweak's file then counts")
 func perfKeepReloadsItsSpec() async throws {
     let dir = try tempDir("spec")
@@ -196,8 +218,10 @@ func pathWatchReportsOnlyItsPaths() async throws {
     Files.mkdirs(dir + "/sub")
     #expect(Files.writeAtomic(later, "1"))
     try await waitFor { seen.all.contains([later]) }
+    #expect(seen.all.contains([later]))  // the folder made later, through its parent's watch
     #expect(Files.writeAtomic(here, "2"))  // temp file, then rename over it
     try await waitFor { seen.all.contains([here]) }
+    #expect(seen.all.contains([here]))
     let before = seen.all.count
     #expect(Files.writeAtomic(here, "3"))  // the watch follows the new inode
     try await waitFor { seen.all.count > before }
