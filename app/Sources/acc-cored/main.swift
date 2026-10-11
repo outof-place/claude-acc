@@ -16,9 +16,10 @@ let usage = """
            acc-cored orca-read            the host's four reads over its socket, timed
            acc-cored sched-replay F.jsonl [--show N]   the scheduler's housekeeping on parity fixtures
            acc-cored sched-scan [--sims-since T] [--sims-only]   native_scan() as JSON (parity)
+           acc-cored janitor-check        the janitor's due time, idle time, builds and battery, and what run --janitor would do
            acc-cored caps-watch [SECONDS] [--report FILE|-]  how often the capped folders change (FSEvents), nothing run;
                the report (`acc.py devguard caps --dry-run`) adds the folders a run matched, as the guard watches them
-           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--accswitch | --accswitch-shadow FILE] [--for SECONDS] [--wait-lock]
+           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--accswitch | --accswitch-shadow FILE] [--janitor] [--for SECONDS] [--wait-lock]
                                    the daemon
     """
 
@@ -236,6 +237,9 @@ case "caps-watch":
     print("watching", prefixes.map { $0.pyReplace(home, "~") })
     if !shallow.isEmpty { print("shallow", shallow.map { $0.pyReplace(home, "~") }) }
     print("seconds with a change: \(changes.count) of \(Int(seconds)); first \(changes.prefix(20))")
+case "janitor-check":
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    print(JanitorEngine.describe(home: home))
 case "run":
     // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
     // A peer gone mid-write (a wrapper whose call timed out, a host that quit) is EPIPE here, never
@@ -286,9 +290,16 @@ case "run":
         engine.start()
         switchEngine = engine
     }
+    var janitorEngine: JanitorEngine?
+    if args.contains("--janitor") {
+        let engine = JanitorEngine(.init(home: home))
+        engine.start()
+        janitorEngine = engine
+    }
     let guardRunning = guardEngine
     let schedRunning = schedEngine
     let switchRunning = switchEngine
+    let janitorRunning = janitorEngine
     let control = ControlSocket(path: state + "/acc-cored.sock") { request in
         switch request["op"]?.string {
         case "sched.final":
@@ -297,7 +308,7 @@ case "run":
             return .object(PyObject([
                 ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
                 ("wakes", .int(schedRunning?.wakeCount.load(ordering: .relaxed) ?? 0)),
-                ("accswitch", switchRunning.map { .object($0.status()) } ?? .bool(false)),
+                ("accswitch", switchRunning.map { .object($0.status()) } ?? .bool(false)), ("janitor", .bool(janitorRunning != nil)),
             ]))
         default:
             return .object(PyObject([("ok", false), ("error", "unknown op")]))
@@ -311,6 +322,7 @@ case "run":
     signal(SIGINT, SIG_IGN)
     let stopAll = { (code: Int32) in
         control.stop()
+        janitorRunning?.stop()
         switchRunning?.stop()
         schedRunning?.stop()
         guardRunning?.stop()
