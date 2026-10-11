@@ -460,8 +460,10 @@ prints the live reading and what the engine would do.
 ## Switching
 
 `scripts/acc-cored-switch.sh` swaps three launchd jobs for one acc-cored job, and back: devguard,
-the accswitch tick (`com.filip.claude-acc`) and the janitor. Standalone installs only; Pod
-registers its own agents.
+the accswitch tick (`com.filip.claude-acc`) and the janitor. Standalone installs only: Pod
+registers its own agents, so where `owner.json` says Pod owns claude-acc, `on` refuses with exit 3
+(`owner.py check`, as setup.sh does), and it exits 1 when none of the three jobs is loaded. A
+tombstone (handed back to Homebrew, uninstalled) is a standalone install again.
 
     scripts/acc-cored-switch.sh status
     scripts/acc-cored-switch.sh on  [--apply] [--binary PATH]
@@ -481,8 +483,8 @@ registers its own agents.
     held past 150 s by a hung `claude-acc status`, say), the script removes the record and the
     plist again and exits 1: no other job goes and no acc-cored starts (the new binary is in
     place).
-  - Then it boots out the other two and bootstraps acc-cored (a failed bootstrap exits 1 and
-    points at `off`). The job runs with `--wait-lock` and `ExitTimeOut` 30 s (stopping ends
+  - Then it boots out the other two and bootstraps acc-cored (one launchd doesn't have loaded
+    afterwards exits 1 and points at `off`). The job runs with `--wait-lock` and `ExitTimeOut` 30 s (stopping ends
     Python's guard loop first, up to 10 s).
   - setup.sh boots the tick's job out under the same lock too (past 150 s, without it, as before),
     and only when launchd has it loaded. `setup.sh --uninstall` and `--pod-agents` take acc-cored
@@ -490,8 +492,9 @@ registers its own agents.
     beside Pod's agents or after an uninstall.
   - The three plists stay where setup.sh wrote them.
 - **`off`** is the undo. It boots acc-cored out, bootstraps the recorded jobs from their plists
-  again, and removes the plist and the record. If any of that fails (or a job's plist is missing),
-  the record and the plist stay and it exits 1, so it can run again.
+  again, and removes the plist and the record. Each step is judged by what launchd says afterwards,
+  as in `on`. If any of them didn't take (or a job's plist is missing), the record and the plist
+  stay and it exits 1, so it can run again.
 - **After a setup.sh run**, the three jobs come back beside acc-cored. The two guards then share
   `devguard.lock`, the ticks the switcher's lock, and the sweeps `janitor.lock`, so they take turns
   instead of acting twice. Run `off` and `on` again after it.

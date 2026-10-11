@@ -5,8 +5,8 @@
 #   scripts/acc-cored-switch.sh on  [--apply] [--binary PATH]   what it would do; --apply does it
 #   scripts/acc-cored-switch.sh off [--apply]                   the undo: acc-cored out, the jobs back
 #
-# Check-only unless --apply. Standalone installs only (com.filip.claude-acc.*); Pod registers its own
-# agents. `on` installs the binary as $STATE/acc-cored (temp file, then rename: overwriting a running
+# Check-only unless --apply. Standalone installs only (com.filip.claude-acc.*): where Pod owns
+# claude-acc (owner.json), or none of the three jobs is loaded, `on` refuses. `on` installs the binary as $STATE/acc-cored (temp file, then rename: overwriting a running
 # binary gets its next launch killed), writes com.filip.claude-acc.cored.plist, boots out the three
 # jobs (their plists stay where setup.sh wrote them) and bootstraps acc-cored. `off` boots acc-cored
 # out and bootstraps the recorded jobs from those plists again. A later setup.sh brings the three jobs
@@ -59,8 +59,15 @@ case "$cmd" in
   on)
     [ -x "$BINARY" ] || { echo "no acc-cored binary at $BINARY (cd app && swift build -c release --product acc-cored)" >&2; exit 1; }
     [ -f "$RECORD" ] && { echo "already switched ($RECORD); run off first" >&2; exit 1; }
+    # Pod runs its own agents where it owns claude-acc: acc-cored beside them would guard, tick and
+    # sweep twice (owner.py says so, exit 3, as it does for setup.sh)
+    /usr/bin/python3 -B "$SRC/owner.py" check || exit $?
     stopped=""
     for job in $REPLACED; do loaded "$job" && stopped="$stopped $job"; done
+    if [ -z "$stopped" ]; then
+      echo "none of $REPLACED is loaded: nothing for acc-cored to replace (setup.sh not run, or another installer's agents)" >&2
+      exit 1
+    fi
     step cp "$BINARY" "$STATE/acc-cored.new" || exit 1
     step mv -f "$STATE/acc-cored.new" "$STATE/acc-cored" || exit 1
     # the record first: a Ctrl-C after the tick's bootout still leaves `off` what to bring back
@@ -90,7 +97,9 @@ case "$cmd" in
     for job in $stopped; do
       [ "$job" = com.filip.claude-acc ] || step "$LAUNCHCTL" bootout "$DOMAIN/$job"
     done
-    if ! step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$LABEL.plist"; then
+    # whether it started is what launchd says afterwards, as for the tick
+    step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$LABEL.plist"
+    if [ -n "$APPLY" ] && ! loaded $LABEL; then
       echo "acc-cored didn't start: $0 off --apply brings the jobs back" >&2
       exit 1
     fi
@@ -102,12 +111,19 @@ case "$cmd" in
     else
       jobs=$REPLACED
     fi
-    # every step counts: on any failure the record and the plist stay, so `off` can run again
+    # every step counts, judged by what launchd says afterwards (as in `on`), not by an exit code: on
+    # any failure the record and the plist stay, so `off` can run again
     failed=0
-    if loaded $LABEL; then step "$LAUNCHCTL" bootout "$DOMAIN/$LABEL" || failed=1; fi
+    if loaded $LABEL; then
+      step "$LAUNCHCTL" bootout "$DOMAIN/$LABEL"
+      [ -z "$APPLY" ] || ! loaded $LABEL || failed=1
+    fi
     for job in $jobs; do
       if [ -f "$AGENTS/$job.plist" ]; then
-        loaded "$job" || step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$job.plist" || failed=1
+        if ! loaded "$job"; then
+          step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$job.plist"
+          [ -z "$APPLY" ] || loaded "$job" || failed=1
+        fi
       else
         echo "missing $AGENTS/$job.plist: run setup.sh to write it again" >&2
         failed=1

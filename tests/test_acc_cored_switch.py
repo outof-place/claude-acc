@@ -136,12 +136,64 @@ class SwitchTest(unittest.TestCase):
         self.assertTrue(os.path.exists(self.record()))
         self.assertEqual(self.run_switch("off", "--apply").returncode, 0)
         self.assertEqual(sorted(self.loaded_jobs()), sorted(JOBS))
-        # a copy that fails: nothing goes
-        os.chmod(self.state, 0o500)
-        self.addCleanup(os.chmod, self.state, 0o755)
+        # a copy that fails (a binary it can't read, $STATE writable): nothing goes, nothing is written
+        os.chmod(self.binary, 0o111)
+        self.addCleanup(os.chmod, self.binary, 0o755)
         done = self.run_switch("on", "--apply", "--binary", self.binary)
-        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertEqual(self.loaded_jobs(), JOBS)
+        self.assertFalse(os.path.exists(self.record()))
+        self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "acc-cored.new")))
+
+    def test_on_refuses_where_pod_owns_claude_acc_or_nothing_is_loaded(self):
+        # Pod's own agents run the jobs there: acc-cored beside them would act twice
+        with open(os.path.join(self.state, "owner.json"), "w") as f:
+            json.dump({"owner": "pod", "version": "1.31.8", "app": "/Applications/Pod.app", "at": 1}, f)
+        for loaded in (["codes.pod.app.acc.tick"], JOBS):
+            with open(self.loaded, "w") as f:
+                f.write("\n".join(loaded) + "\n")
+            for args in (["on", "--apply"], ["on"]):
+                done = self.run_switch(*args, "--binary", self.binary)
+                self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+                self.assertEqual(self.loaded_jobs(), loaded)
+                self.assertFalse(os.path.exists(self.record()))
+                self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+                self.assertFalse(os.path.exists(os.path.join(self.state, "acc-cored")))
+        # a tombstone (handed back to Homebrew) is a standalone install again
+        with open(os.path.join(self.state, "owner.json"), "w") as f:
+            json.dump({"owner": "brew", "version": "1.31.8", "app": None, "at": 1}, f)
+        self.assertEqual(self.run_switch("on", "--binary", self.binary).returncode, 0)
+        # none of the three loaded, and no owner: nothing to replace
+        with open(self.loaded, "w") as f:
+            f.write("codes.pod.app.acc.tick\n")
+        done = self.run_switch("on", "--apply", "--binary", self.binary)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("nothing for acc-cored to replace", done.stderr)
+        self.assertEqual(self.loaded_jobs(), ["codes.pod.app.acc.tick"])
+        self.assertFalse(os.path.exists(self.record()))
+        self.assertFalse(os.path.exists(os.path.join(self.state, "acc-cored")))
+
+    def test_off_keeps_the_record_when_acc_cored_stays_or_a_plist_is_gone(self):
+        self.assertEqual(self.run_switch("on", "--apply", "--binary", self.binary).returncode, 0)
+        done = self.run_switch("off", "--apply", FAKE_FAIL="bootout:com.filip.claude-acc.cored")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("com.filip.claude-acc.cored", self.loaded_jobs())
+        self.assertTrue(os.path.exists(self.record()))
+        self.assertTrue(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+        # a bootout that fails after acc-cored went: launchd says it went, so off finishes
+        done = self.run_switch("off", "--apply", FAKE_FAIL="bootout:com.filip.claude-acc.cored:after")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(sorted(self.loaded_jobs()), sorted(JOBS))
+        self.assertFalse(os.path.exists(self.record()))
+        # the tick's plist gone meanwhile: off says so and keeps the record
+        self.assertEqual(self.run_switch("on", "--apply", "--binary", self.binary).returncode, 0)
+        os.unlink(os.path.join(self.agents, "com.filip.claude-acc.plist"))
+        done = self.run_switch("off", "--apply")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("missing " + os.path.join(self.agents, "com.filip.claude-acc.plist"), done.stderr)
+        self.assertTrue(os.path.exists(self.record()))
+        self.assertEqual(sorted(self.loaded_jobs()), sorted(["com.filip.claude-acc.devguard", "com.filip.claude-acc.janitor"]))
 
     def test_a_bootout_that_fails_after_the_job_went_counts_by_launchd(self):
         # rc != 0, but launchd no longer has the job: the switch goes on, and the record names it
@@ -200,6 +252,16 @@ bootout_job com.filip.claude-acc.perf gui/{uid}/com.filip.claude-acc.perf
         # perf isn't loaded: a look, no bootout, and no wait for the switcher's lock
         self.assertIn(f"print gui/{uid}/com.filip.claude-acc.perf", calls)
         self.assertNotIn(f"bootout gui/{uid}/com.filip.claude-acc.perf", calls)
+
+    def test_the_fake_boots_out_a_plist_too(self):
+        # setup.sh boots jobs out by plist (gui/UID x.plist): the fake drops those as launchd does
+        fake = os.path.join(HERE, "fakes-launchctl", "launchctl")
+        env = dict(os.environ, FAKE_LOADED=self.loaded, FAKE_LOG=os.path.join(self.tmp, "calls.log"))
+        uid = os.getuid()
+        plist = os.path.join(self.agents, "com.filip.claude-acc.janitor.plist")
+        self.assertEqual(subprocess.run([fake, "bootout", f"gui/{uid}", plist], env=env).returncode, 0)
+        self.assertNotIn("com.filip.claude-acc.janitor", self.loaded_jobs())
+        self.assertEqual(subprocess.run([fake, "print", f"gui/{uid}/com.filip.claude-acc.janitor"], env=env).returncode, 1)
 
     def test_on_brings_back_only_what_it_stopped(self):
         with open(self.loaded, "w") as f:
