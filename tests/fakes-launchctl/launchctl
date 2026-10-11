@@ -1,8 +1,18 @@
 #!/bin/bash
 # fake launchctl: loaded labels live in $FAKE_LOADED, one per line; every call goes to $FAKE_LOG
 echo "$*" >> "$FAKE_LOG"
+# FAKE_FAIL=op:label fails that call (exit 5); op:label:after does it first, then fails (exit 36)
+if [ -n "${FAKE_FAIL:-}" ]; then
+  if [ "$1" = bootstrap ]; then label=$(basename "$3" .plist); else label=${2#*/*/}; fi
+  case "$FAKE_FAIL" in
+    "$1:$label") echo "$1 failed: 5" >&2; exit 5 ;;
+    "$1:$label:after") after=36 ;;
+  esac
+fi
 case "$1" in
-  print) grep -qx "${2#*/*/}" "$FAKE_LOADED" ;;
+  print) grep -qx "${2#*/*/}" "$FAKE_LOADED"; exit $? ;;
   bootout) grep -vx "${2#*/*/}" "$FAKE_LOADED" > "$FAKE_LOADED.t"; mv "$FAKE_LOADED.t" "$FAKE_LOADED" ;;
   bootstrap) basename "$3" .plist >> "$FAKE_LOADED" ;;
 esac
+[ -n "${after:-}" ] && exit "$after"
+exit 0

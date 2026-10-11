@@ -473,17 +473,25 @@ registers its own agents.
     running binary gets its next launch killed) and writes `com.filip.claude-acc.cored.plist`. The
     job runs `acc-cored run --guard --sched --accswitch --janitor` as `ProcessType Interactive`,
     with `KeepAlive`.
+  - It writes the plist and records the jobs it stops in `$STATE/acc-cored-switch.json` first, so
+    a Ctrl-C later still leaves `off` what to bring back.
   - The tick's job goes first, under the switcher's own lock (`lockf -k -t 150 $STATE/lock`), so
-    no tick is between a token refresh and its Keychain write when launchd stops it. If the lock
-    stays held past 150 s (a hung `claude-acc status`, say), the script stops there: no other job
-    goes, no record, no acc-cored, and it exits 1.
-  - Then it records the jobs it stops in `$STATE/acc-cored-switch.json`, boots out the other two,
-    and bootstraps acc-cored (a failed bootstrap exits 1 and points at `off`). The job runs with
-    `--wait-lock` and `ExitTimeOut` 30 s (stopping ends Python's guard loop first, up to 10 s).
-  - setup.sh boots the tick's job out under the same lock too (past 150 s, without it, as before).
+    no tick is between a token refresh and its Keychain write when launchd stops it. Whether it
+    went is what launchd says afterwards, not bootout's exit code. If it's still loaded (the lock
+    held past 150 s by a hung `claude-acc status`, say), the script removes the record and the
+    plist again and exits 1: no other job goes and no acc-cored starts (the new binary is in
+    place).
+  - Then it boots out the other two and bootstraps acc-cored (a failed bootstrap exits 1 and
+    points at `off`). The job runs with `--wait-lock` and `ExitTimeOut` 30 s (stopping ends
+    Python's guard loop first, up to 10 s).
+  - setup.sh boots the tick's job out under the same lock too (past 150 s, without it, as before),
+    and only when launchd has it loaded. `setup.sh --uninstall` and `--pod-agents` take acc-cored
+    down as well, with its plist and the record: under KeepAlive it would go on ticking accswitch
+    beside Pod's agents or after an uninstall.
   - The three plists stay where setup.sh wrote them.
 - **`off`** is the undo. It boots acc-cored out, bootstraps the recorded jobs from their plists
-  again, and removes the plist and the record.
+  again, and removes the plist and the record. If any of that fails (or a job's plist is missing),
+  the record and the plist stay and it exits 1, so it can run again.
 - **After a setup.sh run**, the three jobs come back beside acc-cored. The two guards then share
   `devguard.lock`, the ticks the switcher's lock, and the sweeps `janitor.lock`, so they take turns
   instead of acting twice. Run `off` and `on` again after it.

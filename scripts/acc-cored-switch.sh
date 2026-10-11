@@ -12,6 +12,7 @@
 # out and bootstraps the recorded jobs from those plists again. A later setup.sh brings the three jobs
 # back beside acc-cored: both guards then share devguard.lock, the ticks the switcher's lock, the
 # sweeps janitor.lock, so they take turns rather than act twice; run `off` and `on` again after it.
+# `setup.sh --uninstall` and `--pod-agents` take acc-cored down too (its plist and the record).
 set -u
 cd "$(dirname "$0")/.." || exit 1
 SRC=$(pwd)
@@ -62,26 +63,30 @@ case "$cmd" in
     for job in $REPLACED; do loaded "$job" && stopped="$stopped $job"; done
     step cp "$BINARY" "$STATE/acc-cored.new" || exit 1
     step mv -f "$STATE/acc-cored.new" "$STATE/acc-cored" || exit 1
+    # the record first: a Ctrl-C after the tick's bootout still leaves `off` what to bring back
+    if [ -n "$APPLY" ]; then
+      sed "s#__HOME__#$HOME#g" "$SRC/launchd/$LABEL.plist.template" > "$AGENTS/$LABEL.plist" || exit 1
+      echo "+ wrote $AGENTS/$LABEL.plist"
+      /usr/bin/python3 -I -c 'import json, sys, time; json.dump({"at": time.time(), "replaced": sys.argv[2:]}, open(sys.argv[1], "w"))' \
+        "$RECORD" $stopped || exit 1
+    else
+      echo "would: write $AGENTS/$LABEL.plist and $RECORD (replaced:$stopped)"
+    fi
     # the tick job first, under the switcher's own lock: no tick is between a token refresh and its
     # Keychain write when launchd stops the job (-k keeps the lock file the ticks use). If the lock
     # stays held (a hung `claude-acc status`, say), nothing else changes: a record saying "replaced"
-    # with launchd's tick still loaded beside acc-cored would tick twice
+    # with launchd's tick still loaded beside acc-cored would tick twice. Whether it went is what
+    # launchd says afterwards, not bootout's exit code.
     case " $stopped " in
       *" com.filip.claude-acc "*)
-        if ! step /usr/bin/lockf -k -t "$LOCK_WAIT" "$STATE/lock" "$LAUNCHCTL" bootout "$DOMAIN/com.filip.claude-acc"; then
-          echo "the accswitch tick job didn't go (the switcher's lock held over $LOCK_WAIT s?): nothing else changed" >&2
+        if ! step /usr/bin/lockf -k -t "$LOCK_WAIT" "$STATE/lock" "$LAUNCHCTL" bootout "$DOMAIN/com.filip.claude-acc" &&
+          [ -n "$APPLY" ] && loaded com.filip.claude-acc; then
+          rm -f "$AGENTS/$LABEL.plist" "$RECORD"
+          echo "the accswitch tick job didn't go (the switcher's lock held over $LOCK_WAIT s?): nothing else changed, but the new binary is in place" >&2
           exit 1
         fi
         ;;
     esac
-    if [ -n "$APPLY" ]; then
-      sed "s#__HOME__#$HOME#g" "$SRC/launchd/$LABEL.plist.template" > "$AGENTS/$LABEL.plist"
-      echo "+ wrote $AGENTS/$LABEL.plist"
-      /usr/bin/python3 -I -c 'import json, sys, time; json.dump({"at": time.time(), "replaced": sys.argv[2:]}, open(sys.argv[1], "w"))' \
-        "$RECORD" $stopped
-    else
-      echo "would: write $AGENTS/$LABEL.plist and $RECORD (replaced:$stopped)"
-    fi
     for job in $stopped; do
       [ "$job" = com.filip.claude-acc ] || step "$LAUNCHCTL" bootout "$DOMAIN/$job"
     done
@@ -97,14 +102,21 @@ case "$cmd" in
     else
       jobs=$REPLACED
     fi
-    loaded $LABEL && step "$LAUNCHCTL" bootout "$DOMAIN/$LABEL"
+    # every step counts: on any failure the record and the plist stay, so `off` can run again
+    failed=0
+    if loaded $LABEL; then step "$LAUNCHCTL" bootout "$DOMAIN/$LABEL" || failed=1; fi
     for job in $jobs; do
       if [ -f "$AGENTS/$job.plist" ]; then
-        loaded "$job" || step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$job.plist"
+        loaded "$job" || step "$LAUNCHCTL" bootstrap "$DOMAIN" "$AGENTS/$job.plist" || failed=1
       else
         echo "missing $AGENTS/$job.plist: run setup.sh to write it again" >&2
+        failed=1
       fi
     done
+    if [ "$failed" -ne 0 ] && [ -n "$APPLY" ]; then
+      echo "off didn't finish (see above): $RECORD and $LABEL.plist stay; run off --apply again" >&2
+      exit 1
+    fi
     step rm -f "$AGENTS/$LABEL.plist" "$RECORD"
     [ -n "$APPLY" ] || echo "(check only: add --apply)"
     ;;

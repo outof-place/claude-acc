@@ -36,10 +36,13 @@ class SwitchTest(unittest.TestCase):
             f.write("#!/bin/sh\n")
         os.chmod(self.binary, 0o755)
 
-    def run_switch(self, *args):
+    def run_switch(self, *args, **extra):
         env = dict(os.environ, HOME=self.home, ACC_CORED_LAUNCHCTL=os.path.join(HERE, "fakes-launchctl", "launchctl"),
-                   FAKE_LOADED=self.loaded, FAKE_LOG=os.path.join(self.tmp, "calls.log"))  # fmt: skip
+                   FAKE_LOADED=self.loaded, FAKE_LOG=os.path.join(self.tmp, "calls.log"), **extra)  # fmt: skip
         return subprocess.run([SCRIPT, *args], env=env, capture_output=True, text=True)
+
+    def record(self):
+        return os.path.join(self.state, "acc-cored-switch.json")
 
     def loaded_jobs(self):
         with open(self.loaded) as f:
@@ -112,6 +115,91 @@ class SwitchTest(unittest.TestCase):
         self.assertEqual(self.loaded_jobs(), JOBS)
         self.assertFalse(os.path.exists(os.path.join(self.state, "acc-cored-switch.json")))
         self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+
+    def test_off_keeps_the_record_when_a_job_doesn_t_come_back(self):
+        self.assertEqual(self.run_switch("on", "--apply", "--binary", self.binary).returncode, 0)
+        done = self.run_switch("off", "--apply", FAKE_FAIL="bootstrap:com.filip.claude-acc")
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn("run off --apply again", done.stderr)
+        self.assertTrue(os.path.exists(self.record()))
+        self.assertTrue(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+        self.assertNotIn("com.filip.claude-acc", self.loaded_jobs())
+        again = self.run_switch("off", "--apply")  # the record still names the tick: it comes back
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(sorted(self.loaded_jobs()), sorted(JOBS))
+        self.assertFalse(os.path.exists(self.record()))
+
+    def test_on_reports_a_failed_bootstrap_or_copy(self):
+        done = self.run_switch("on", "--apply", "--binary", self.binary, FAKE_FAIL="bootstrap:com.filip.claude-acc.cored")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("off --apply brings the jobs back", done.stderr)
+        self.assertTrue(os.path.exists(self.record()))
+        self.assertEqual(self.run_switch("off", "--apply").returncode, 0)
+        self.assertEqual(sorted(self.loaded_jobs()), sorted(JOBS))
+        # a copy that fails: nothing goes
+        os.chmod(self.state, 0o500)
+        self.addCleanup(os.chmod, self.state, 0o755)
+        done = self.run_switch("on", "--apply", "--binary", self.binary)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.loaded_jobs(), JOBS)
+
+    def test_a_bootout_that_fails_after_the_job_went_counts_by_launchd(self):
+        # rc != 0, but launchd no longer has the job: the switch goes on, and the record names it
+        done = self.run_switch("on", "--apply", "--binary", self.binary, FAKE_FAIL="bootout:com.filip.claude-acc:after")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        with open(self.record()) as f:
+            self.assertIn("com.filip.claude-acc", json.load(f)["replaced"])
+        self.assertEqual(self.loaded_jobs(), ["com.filip.claude-acc.cored"])
+
+    def setup_functions(self):
+        with open(os.path.join(ROOT, "setup.sh")) as f:
+            text = f.read()
+        out = []
+        for name in ("bootout_job", "drop_cored"):
+            start = text.index(name + "() {")
+            out.append(text[start:text.index("\n}\n", start) + 3])
+        return text, "\n".join(out)
+
+    def test_setup_takes_acc_cored_down_on_uninstall_and_for_pod(self):
+        text, functions = self.setup_functions()
+        at = text.index("    --uninstall)\n")  # the branch that acts (an earlier pass only notes the flag)
+        uninstall = text[at:text.index(";;", at)]
+        self.assertIn("drop_cored", uninstall)
+        self.assertIn('bootout_job "$job"', uninstall)
+        pod = text.index('if [ -n "$POD_AGENTS" ]; then\n  drop_cored\nfi\nfor job in $JOBS; do')
+        self.assertGreater(pod, 0)
+        # the functions themselves, against the fake launchctl
+        for name in ("com.filip.claude-acc.cored.plist",):
+            with open(os.path.join(self.agents, name), "w") as f:
+                f.write("<plist/>")
+        with open(self.record(), "w") as f:
+            f.write("{}")
+        with open(self.loaded, "a") as f:
+            f.write("com.filip.claude-acc.cored\n")
+        fake = os.path.join(self.tmp, "bin")
+        os.makedirs(fake)
+        os.symlink(os.path.join(HERE, "fakes-launchctl", "launchctl"), os.path.join(fake, "launchctl"))
+        env = dict(os.environ, HOME=self.home, STATE=self.state, AGENTS=self.agents, PATH=fake + ":/usr/bin:/bin",
+                   FAKE_LOADED=self.loaded, FAKE_LOG=os.path.join(self.tmp, "calls.log"))  # fmt: skip
+        uid = os.getuid()
+        script = functions + f"""
+set -euo pipefail
+drop_cored
+bootout_job com.filip.claude-acc gui/{uid}/com.filip.claude-acc
+bootout_job com.filip.claude-acc.perf gui/{uid}/com.filip.claude-acc.perf
+"""
+        done = subprocess.run(["/bin/bash", "-c", script], env=env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.agents, "com.filip.claude-acc.cored.plist")))
+        self.assertFalse(os.path.exists(self.record()))
+        self.assertNotIn("com.filip.claude-acc.cored", self.loaded_jobs())
+        self.assertNotIn("com.filip.claude-acc", self.loaded_jobs())
+        self.assertTrue(os.path.exists(os.path.join(self.state, "lock")))  # the tick went under the lock
+        with open(os.path.join(self.tmp, "calls.log")) as f:
+            calls = f.read().splitlines()
+        # perf isn't loaded: a look, no bootout, and no wait for the switcher's lock
+        self.assertIn(f"print gui/{uid}/com.filip.claude-acc.perf", calls)
+        self.assertNotIn(f"bootout gui/{uid}/com.filip.claude-acc.perf", calls)
 
     def test_on_brings_back_only_what_it_stopped(self):
         with open(self.loaded, "w") as f:
