@@ -306,7 +306,7 @@ public final class GuardEngine: @unchecked Sendable {
         shaper.forget()
         let argv = options.python + ["devguard", "run"]
         loopStartedAt = now
-        pythonLoop = loopStarter?(argv) ?? Spawn.start(argv, log: GuardPaths.state(options.home) + "/devguard-launchd.log")
+        pythonLoop = loopStarter.map { $0(argv) } ?? Spawn.start(argv, log: GuardPaths.state(options.home) + "/devguard-launchd.log")
         if pythonLoop == nil {
             backOff(now, ran: 0)
             GuardLog.write("acc-cored: pętla Pythona nie wystartowała (\(argv[0])), następna próba za \(Int(loopRestartAt - now)) s")

@@ -299,6 +299,35 @@ func pythonLoopBackoff() throws {
     engine.stop()
 }
 
+@Test("engine: a Python loop that doesn't start backs off like one that ends at once: 10 s, then 20 s")
+func pythonLoopStartFails() throws {
+    let home = try scratchHome("loopfail")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(GuardPaths.state(home))
+    #expect(Files.writeAtomic(GuardPaths.state(home) + "/devguard.json", #"{"mode": "enforce", "interval_seconds": "5", "notify": false}"#))
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    final class Starts: @unchecked Sendable { var n = 0 }
+    let starts = Starts()
+    engine.loopStarter = { _ in
+        starts.n += 1
+        return nil
+    }
+    engine.probesFactory = { pressureWorld(home: home, now: 1_791_000_000, compressedGB: 1) }
+    engine.runner = { _ in 0 }
+
+    engine.benchTick()
+    #expect(starts.n == 1)
+    let first = engine.queue.sync { engine.loopRestartAt - Kernel.wall() }
+    #expect(first > 8 && first <= 10)
+    engine.queue.sync { engine.loopRestartAt = 0 }
+    engine.benchTick()
+    #expect(starts.n == 2)
+    let second = engine.queue.sync { engine.loopRestartAt - Kernel.wall() }
+    #expect(second > 18 && second <= 20)
+    #expect(engine.queue.sync { engine.pythonLoop == nil })
+    engine.stop()
+}
+
 @Test("engine: a Python loop that ignores SIGTERM is killed after 10 s with what it started")
 func pythonLoopKill() throws {
     let home = try scratchHome("loopkill")
