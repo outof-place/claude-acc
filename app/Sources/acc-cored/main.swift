@@ -36,10 +36,6 @@ func value(_ flag: String, in args: [String]) -> String? {
     return args[i + 1]
 }
 
-// a peer gone mid-write (a wrapper whose call timed out, a host that quit) is EPIPE, never the
-// daemon's death: guard, sched, accswitch and janitor share this process. Children get every
-// signal back at its default (Spawn's posix_spawnattr_setsigdefault).
-signal(SIGPIPE, SIG_IGN)
 var args = Array(CommandLine.arguments.dropFirst())
 guard let command = args.first else { fail(usage) }
 args.removeFirst()
@@ -222,6 +218,11 @@ case "sched-scan":
     ])).dumps())
 case "run":
     // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
+    // A peer gone mid-write (a wrapper whose call timed out, a host that quit) is EPIPE here, never
+    // the death of every engine in this process. Children get every signal back at its default
+    // (Spawn's posix_spawnattr_setsigdefault), and the commands that print keep the default too,
+    // so `acc-cored events | head` ends with its reader.
+    signal(SIGPIPE, SIG_IGN)
     let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
     let state = GuardPaths.state(home)
     let shadow = value("--shadow-guard", in: args)

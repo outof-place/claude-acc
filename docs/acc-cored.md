@@ -221,7 +221,8 @@ may still answer: acc-cored refreshes the mark on every pass.
 
 The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
 checked (`LOCAL_PEERCRED`). A peer that closes before its answer (a wrapper whose call timed out)
-costs nothing: SIGPIPE is ignored, sends use `MSG_NOSIGNAL`, and a client XNU refuses
+costs nothing: `run` ignores SIGPIPE (the commands that print keep the default, so a `| head`
+ends them), sends use `MSG_NOSIGNAL`, and a client XNU refuses
 `SO_NOSIGPIPE` for (EINVAL: the peer closed before `accept`) is closed without a write. Unchecked,
 ~60 such clients killed the daemon (exit 141), and with it every engine in it.
 
