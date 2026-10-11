@@ -312,6 +312,25 @@ func capsShallow() throws {
         #expect(rename(t1 + "/s2", t1 + "/s3") == 0)  // renamed
         watch.event(t1, flags: 0)
         #expect(watch.dirty)
+        Files.mkdirs(home + "/far/x")
+        Files.mkdirs(home + "/far/y")
+        watch.started(now: now + 2400)
+        #expect(symlink(home + "/far/y", t1 + "/lk") == 0)  // a new link
+        watch.event(t1, flags: 0)
+        #expect(watch.dirty)
+        watch.started(now: now + 3000)
+        #expect(unlink(t1 + "/lk") == 0 && symlink(home + "/far/x", t1 + "/lk") == 0)  // retargeted, as `ln -sfn`
+        watch.event(t1, flags: 0)
+        #expect(watch.dirty)
+        watch.started(now: now + 3600)
+        #expect(unlink(t1 + "/lk") == 0)
+        Files.mkdirs(t1 + "/lk")  // a link swapped for a folder of its name
+        watch.event(t1, flags: 0)
+        #expect(watch.dirty)
+        watch.started(now: now + 4200)
+        #expect(rmdir(t1 + "/lk") == 0 && symlink(home + "/far/x", t1 + "/lk") == 0)  // and back
+        watch.event(t1, flags: 0)
+        #expect(watch.dirty)
         watch.stop()
     }
 }
