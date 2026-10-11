@@ -30,6 +30,11 @@ public enum Kernel {
     }
 
     /// Wall clock in seconds, as Python's time.time().
+    /// Seconds on a clock that a wall-clock change doesn't move (deadlines, idle times)
+    public static func monotonic() -> Double {
+        Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1e9
+    }
+
     public static func wall() -> Double {
         var spec = timespec()
         clock_gettime(CLOCK_REALTIME, &spec)

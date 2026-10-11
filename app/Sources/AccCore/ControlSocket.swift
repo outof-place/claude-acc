@@ -67,7 +67,7 @@ public final class ControlSocket: @unchecked Sendable {
 
     /// Clients silent for `idleSeconds` are closed.
     func closeIdle() {
-        let now = Kernel.wall()
+        let now = Kernel.monotonic()
         for (fd, at) in lastSeen where now - at > idleSeconds { drop(fd) }
     }
 
@@ -121,14 +121,14 @@ public final class ControlSocket: @unchecked Sendable {
             source.setEventHandler { [weak self] in self?.read(client) }
             source.setCancelHandler { close(client) }
             clients[client] = (source, [])
-            lastSeen[client] = Kernel.wall()
+            lastSeen[client] = Kernel.monotonic()
             source.resume()
         }
     }
 
     /// The whole answer within `writeSeconds` (poll for room on EAGAIN), else false.
     func send(_ out: [UInt8], to fd: Int32) -> Bool {
-        let deadline = Kernel.wall() + writeSeconds
+        let deadline = Kernel.monotonic() + writeSeconds
         var sent = 0
         while sent < out.count {
             let w = out.withUnsafeBytes { Darwin.write(fd, $0.baseAddress! + sent, $0.count - sent) }
@@ -138,7 +138,7 @@ public final class ControlSocket: @unchecked Sendable {
             }
             if w < 0 && errno == EINTR { continue }
             guard w < 0 && errno == EAGAIN else { return false }
-            let left = deadline - Kernel.wall()
+            let left = deadline - Kernel.monotonic()
             if left <= 0 { return false }
             var p = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
             _ = poll(&p, 1, Int32(max(1, left * 1000)))
@@ -148,7 +148,7 @@ public final class ControlSocket: @unchecked Sendable {
 
     func read(_ fd: Int32) {
         guard var entry = clients[fd] else { return }
-        lastSeen[fd] = Kernel.wall()
+        lastSeen[fd] = Kernel.monotonic()
         var chunk = [UInt8](repeating: 0, count: 64 * 1024)
         let n = chunk.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
         if n <= 0 {

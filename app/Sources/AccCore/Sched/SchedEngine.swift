@@ -172,7 +172,7 @@ public final class SchedEngine: @unchecked Sendable {
         let probes = LiveSchedProbes(stateDir: stateDir, snapshot: snapshot?())
         let now = probes.now
         guard var state = Self.loadState(statePath, cfg, now: now, day: probes.day()) else {
-            idle()  // a state of another version, or unreadable: Python's to handle; nothing written
+            standBack()  // a state of another version, or unreadable: Python's to handle; nothing written
             return
         }
         if !cfg.mismatched.isEmpty {
@@ -181,7 +181,7 @@ public final class SchedEngine: @unchecked Sendable {
                 state["cored"] = nil
                 Self.saveState(statePath, &state, now: now)
             }
-            idle()
+            standBack()
             return
         }
         let running = (state["running"]?.array ?? []).compactMap(\.object)
@@ -205,14 +205,8 @@ public final class SchedEngine: @unchecked Sendable {
         }
         state["running"] = .array(updated.map { .object($0) })
         let result = Sched.tick(&state, cfg, probes)
-        let admitted = Set(result.admitted.map(\.0))
-        for job in (state["queue"]?.array ?? []).compactMap(\.object) where job["wake"] == .string("usr1") {
-            let due = admitted.contains(job["id"] ?? .null) || (job["cancelled"]?.truthy ?? false)
-            // signal_job's checks: a pid above 1 that is still the job's wrapper (pids get reused)
-            guard due, let p = job["pid"]?.int, p > 1, p <= Int(Int32.max) else { continue }
-            let pid = pid_t(p)
-            if SchedNative.isWrapper(pid), kill(pid, SIGUSR1) == 0 { wakes += 1 }
-        }
+        let waiting = (state["queue"]?.array ?? []).compactMap(\.object)
+        wakes += Self.wake(waiting, admitted: Set(result.admitted.map(\.0))) { kill($0, SIGUSR1) == 0 }
         state["cored"] = mark(now)
         Self.saveState(statePath, &state, now: now)
         if !ticking {
@@ -224,6 +218,28 @@ public final class SchedEngine: @unchecked Sendable {
             tickTimer = t
         }
         scheduleSamples()
+    }
+
+    /// SIGUSR1 to the queued wrappers that wait for it (`wake: usr1`) and are due (admitted or
+    /// cancelled), with signal_job's checks: a pid above 1 that is still a scheduler wrapper (pids
+    /// get reused). The count of signals sent.
+    static func wake(_ queued: [PyObject], admitted: Set<PyJSON>, isWrapper: (pid_t) -> Bool = SchedNative.isWrapper,
+                     signal: (pid_t) -> Bool) -> Int {
+        var sent = 0
+        for job in queued where job["wake"] == .string("usr1") {
+            let due = admitted.contains(job["id"] ?? .null) || (job["cancelled"]?.truthy ?? false)
+            guard due, let p = job["pid"]?.int, p > 1, p <= Int(Int32.max) else { continue }
+            let pid = pid_t(p)
+            if isWrapper(pid), signal(pid) { sent += 1 }
+        }
+        return sent
+    }
+
+    /// The pass stands back (a state of another version, a config read otherwise): the wrappers
+    /// watch their own jobs again, so these watches go, and with them the samples.
+    func standBack() {
+        watches.removeAll()
+        idle()
     }
 
     func mark(_ now: Double) -> PyJSON {

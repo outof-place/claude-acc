@@ -191,11 +191,16 @@ may still answer: acc-cored refreshes the mark on every pass.
 - **When acc-cored stands back:** it doesn't run a pass, and writes nothing, in three cases. A state
   of another version or an unreadable one (sched.py may be newer than the daemon; a fresh state
   would wipe the queue) is one. A `config.json` value of another type than its default is another
-  (`"stall_s": "600"` is 600 to Python's `float()`); then the mark is taken away. The third is
-  `sched/lock` held by Python: that pass is tried again in 100 ms, and the samples go on.
+  (`"stall_s": "600"` is 600 to Python's `float()`); then the mark is taken away. In both cases
+  the wrappers watch their own jobs again, so acc-cored drops its watches and stops sampling. The
+  third is `sched/lock` held by Python: that pass is tried again in 100 ms, and the samples go on.
 - **One daemon:** `run` takes `$STATE/acc-cored.lock` first. A second instance exits instead of
-  taking the socket.
+  taking the socket. With `--wait-lock` (launchd's job, whose KeepAlive would restart an exiting
+  one every 10 s) it waits for the lock instead.
 - **Signals:** SIGUSR1 goes only to a pid above 1 that is still the job's wrapper (`is_wrapper`).
+  A `child_pgid` is a process group only when it's an int above 1 (`group_id`, on both sides):
+  `killpg(-N)` is `kill(N)`, `killpg(0)` the sender's own group, and 1 is launchd. That applies to
+  the orphan's SIGTERM in `reap`, `safety`'s SIGSTOP and SIGCONT, and `kill_child`.
 
 The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
 checked (`LOCAL_PEERCRED`).

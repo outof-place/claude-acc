@@ -1960,6 +1960,27 @@ class StateTest(Paths):
         self.assertEqual(st["running"], [])
         self.assertIsNotNone(sleeper.wait(timeout=5))  # sierota zabita
 
+    def test_a_child_pgid_that_names_no_group_is_never_signalled(self):
+        # killpg(-N) to kill(N), killpg(0) własna grupa, 1 to launchd: stan piszą wszystkie wrappery,
+        # więc zła wartość nie może nikogo dosięgnąć (reap, safety, kill_child; acc-cored tak samo)
+        sleeper = subprocess.Popen(["sleep", "30"], preexec_fn=os.setpgrp)
+        self.addCleanup(lambda: sleeper.poll() is None and sleeper.kill())
+        bad = [-sleeper.pid, 0, 1, True, 3.7, str(sleeper.pid)]
+        st = self.state()
+        st["running"] = [{"id": f"dead{i}", "where": "local", "pid": 999999, "child_pgid": v}
+                         for i, v in enumerate(bad)]
+        with mock.patch.object(S.os, "killpg") as killpg:
+            S.reap(st)
+            for v in bad:
+                self.assertFalse(S.kill_child({"pid": os.getpid(), "child_pgid": v}))
+            st["running"] = [{"id": f"run{i}", "where": "local", "pid": os.getpid(), "child_pgid": v,
+                              "started_at": i} for i, v in enumerate(bad)]
+            st["memory"] = {"swap_growth_2m_gb": 99, "level_pct": 10, "pressure": "critical"}
+            S.safety(st, self.cfg)
+        killpg.assert_not_called()
+        self.assertIsNone(sleeper.poll())
+        self.assertEqual([S.group_id(v) for v in bad + [sleeper.pid]], [None] * len(bad) + [sleeper.pid])
+
 
 FAKE_DEPOT_API = r"""#!%s
 # podróbka CLI Depot dla `sched.py depot`: odpowiedzi z $FAKE_DEPOT_DATA, wywołania do $FAKE_DEPOT_CALLS

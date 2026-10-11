@@ -2581,7 +2581,7 @@ def reap(state):
         if alive(job.get("pid")):
             keep.append(job)
             continue
-        pgid = job.get("child_pgid")
+        pgid = group_id(job.get("child_pgid"))
         if pgid and alive(pgid):
             import signal
 
@@ -3218,7 +3218,7 @@ def safety(state, cfg):
     mem = state["memory"]
     growth = mem.get("swap_growth_2m_gb", 0)
     local = [
-        j for j in state["running"] if j["where"] == "local" and j.get("child_pgid")
+        j for j in state["running"] if j["where"] == "local" and group_id(j.get("child_pgid"))
     ]
     paused = [j for j in local if j.get("paused")]
     swapping = (growth > cfg["pause_swap_gb"] and mem["level_pct"] < 25) or mem.get(
@@ -3668,6 +3668,7 @@ def run_local(entry, job, command, argv, cfg):
         env["GOFLAGS"] = goflags_with(ours_p, extra)
     target = job_argv(shell_argv(command) if command is not None else argv, cfg)
     env[NESTED_ENV] = entry["id"]
+    pinged = cored_ping()  # przed startem: wolne gniazdo nie odbiera jobowi próbek
     try:
         child = subprocess.Popen(target, env=env, preexec_fn=os.setpgrp)
     except OSError as err:
@@ -3677,7 +3678,6 @@ def run_local(entry, job, command, argv, cfg):
     jid = entry["id"]
     spawned_at = time.time()
     cored = False
-    pinged = cored_ping()
     with Locked():
         state = load_state(cfg)
         me = next((j for j in state["running"] if j["id"] == jid), None)
@@ -4742,11 +4742,17 @@ def signal_job(job, sig):
     return True
 
 
+def group_id(value):
+    """child_pgid ze stanu jako grupa procesów albo None. killpg(-N) to kill(N), killpg(0) to własna
+    grupa, a 1 to launchd: stan, który pisze też inny proces, nie może wskazać obcego."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 1 else None
+
+
 def kill_child(job):
     """SIGKILL grupie procesów komendy, jeśli jej lider to wciąż dziecko wrappera."""
     import signal
 
-    pgid = job.get("child_pgid")
+    pgid = group_id(job.get("child_pgid"))
     if not pgid or not alive(pgid) or proc_bsd(pgid, BSD_PPID) != job.get("pid"):
         return False
     for sig in (signal.SIGCONT, signal.SIGKILL):

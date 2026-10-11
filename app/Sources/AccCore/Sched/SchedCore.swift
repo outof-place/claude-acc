@@ -21,7 +21,7 @@ public protocol SchedProbes: AnyObject {
     func alive(_ pid: PyJSON?) -> Bool
     /// descendants(pid) through proc_listpids(PROC_PPID_ONLY)
     func descendants(_ pid: pid_t) -> Set<pid_t>
-    /// os.killpg, errors ignored
+    /// os.killpg, errors ignored (the group comes through Sched.groupID)
     func killpg(_ pgid: pid_t, _ signal: Int32) -> Bool
     /// time.strftime("%Y-%m-%d") at `now`
     func day() -> String
@@ -75,6 +75,13 @@ public struct SchedConfig: Sendable {
 }
 
 public enum Sched {
+    /// group_id(): a child_pgid that names a process group above 1, else nil. killpg(-N) is kill(N),
+    /// killpg(0) this process's own group, and 1 is launchd: the state is written by others too.
+    static func groupID(_ value: PyJSON?) -> pid_t? {
+        guard case .int(let n)? = value, n > 1, n <= Int(Int32.max) else { return nil }
+        return pid_t(n)
+    }
+
     public static let GB = 1_073_741_824.0
     public static let stageText = ["normal", "tight", "brake", "emergency"]
     public static let longLivedFamilies = ["dev", "metro", "watchers", "simulators", "headless", "lsp", "docker"]
@@ -98,8 +105,8 @@ public enum Sched {
                 keep.append(job)
                 continue
             }
-            if let pgid = job["child_pgid"], pgid.truthy, probes.alive(pgid), let g = pgid.int {
-                for sig in [SIGCONT, SIGTERM] { _ = probes.killpg(pid_t(clamping: g), sig) }
+            if let g = Sched.groupID(job["child_pgid"]), probes.alive(.int(Int(g))) {
+                for sig in [SIGCONT, SIGTERM] { _ = probes.killpg(g, sig) }
             }
         }
         state["running"] = .array(keep)
@@ -379,7 +386,7 @@ public enum Sched {
         let mem = state["memory"]?.object ?? PyObject()
         let growth = PyNum(mem["swap_growth_2m_gb"]) ?? .int(0)
         var running = (state["running"]?.array ?? []).compactMap(\.object)
-        let localIdx = running.indices.filter { running[$0]["where"] == .string("local") && (running[$0]["child_pgid"]?.truthy ?? false) }
+        let localIdx = running.indices.filter { running[$0]["where"] == .string("local") && Sched.groupID(running[$0]["child_pgid"]) != nil }
         let pausedIdx = localIdx.filter { running[$0]["paused"]?.truthy ?? false }
         let level = PyNum(mem["level_pct"]) ?? .int(0)
         let swapping = (growth.value > cfg.num("pause_swap_gb").value && level.value < 25) || mem["pressure"] == .string("critical")
@@ -393,7 +400,7 @@ public enum Sched {
             for i in heavy.dropFirst() where PyNum.or(running[i]["started_at"], .int(0)).value > PyNum.or(running[victim]["started_at"], .int(0)).value {
                 victim = i
             }
-            guard let pgid = running[victim]["child_pgid"]?.int, probes.killpg(pid_t(clamping: pgid), SIGSTOP) else { return }
+            guard let pgid = Sched.groupID(running[victim]["child_pgid"]), probes.killpg(pgid, SIGSTOP) else { return }
             running[victim]["paused"] = true
             running[victim]["paused_at"] = .double(probes.now)
             running[victim]["pause_reason"] = .string("swap +\(GuardText.fixed(growth.value, 1)) GB in 2 min")
@@ -406,7 +413,7 @@ public enum Sched {
                 job = i
             }
             if probes.now - PyNum.or(running[job]["paused_at"], .int(0)).value >= 30 {
-                if let pgid = running[job]["child_pgid"]?.int { _ = probes.killpg(pid_t(clamping: pgid), SIGCONT) }
+                if let pgid = Sched.groupID(running[job]["child_pgid"]) { _ = probes.killpg(pgid, SIGCONT) }
                 running[job]["paused"] = false
                 running[job]["pause_reason"] = .null
             }

@@ -225,9 +225,15 @@ case "run":
     // one daemon per user: a second one would take the control socket and flip the sched mark
     Files.mkdirs(state)
     let instance = open(state + "/acc-cored.lock", O_WRONLY | O_CREAT | O_CLOEXEC, 0o600)
-    guard instance >= 0, flock(instance, LOCK_EX | LOCK_NB) == 0 else {
-        print("acc-cored już działa")
-        exit(0)
+    guard instance >= 0 else { fail("acc-cored: brak \(state)/acc-cored.lock") }
+    if flock(instance, LOCK_EX | LOCK_NB) != 0 {
+        // launchd (KeepAlive) would start an exiting second one every 10 s: it waits for the lock
+        guard args.contains("--wait-lock") else {
+            print("acc-cored już działa")
+            exit(0)
+        }
+        print("acc-cored już działa, czekam na jego koniec")
+        while flock(instance, LOCK_EX) != 0 && errno == EINTR {}
     }
     var guardEngine: GuardEngine?
     if args.contains("--guard") || shadow != nil {
