@@ -78,7 +78,7 @@ memory pressure (a Dispatch memory-pressure source).
   `$`) are spelled out for ICU in `PyRegex`.
 - **Handed to Python:** a tick with a plan Python's loop would hand to `execute()`, or whose memory
   brake is due. acc-cored saves the state as it was before that tick and releases `devguard.lock`.
-  It then runs `acc.py devguard once` (killed after 120 s) and reloads the state Python saved. It
+  It then runs `acc.py devguard once` (killed after 300 s) and reloads the state Python saved. It
   takes the lock back without waiting: if another guard took it meanwhile (launchd's `devguard
   run`, a manual one), native neither saves nor runs the caps, and waits as after Python's loop
   (below), so neither the queue nor a stop hangs on the lock. The tick's own log lines and

@@ -349,6 +349,9 @@ public final class GuardEngine: @unchecked Sendable {
         loopRestartAt = 0
         state = Files.json(statePath, fallback: .object(state)).object ?? state
         savedStamp = Files.stamp(statePath)
+        // what native pinned in a tick whose handover then lost the lock goes back too (after our
+        // own loop there's nothing left: runPythonLoop restored it all)
+        shaper.restoreAll()
         shaper.forget()
         return true
     }
