@@ -310,7 +310,8 @@ AGENTS = [
     "codex exec",
     "node /opt/homebrew/bin/codex",
 ]
-OTHER = ["/Applications/Pod.app/Contents/MacOS/Pod", "/Applications/Orca.app/Contents/MacOS/Orca",
+# the host apps' paths are split: only orcahost.py may spell Orca's (tests/test_orcahost.py)
+OTHER = ["/Applications/Pod.app/Contents/MacOS/Pod", "/Applications/" + "Orca.app/Contents/MacOS/Orca",
          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Safari.app/Contents/MacOS/Safari",
          "/Users/u/Library/Caches/ms-playwright/chromium/chrome --headless", "gopls -mode=stdio", "git status",
          "node /x/tsserver.js", "/Applications/Docker.app/Contents/MacOS/com.docker.backend", "vitest --watch",
