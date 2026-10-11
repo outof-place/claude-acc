@@ -301,6 +301,10 @@ func capsShallow() throws {
         watch.event(t1 + "/s1", flags: 0)
         #expect(watch.dirty)
         watch.started(now: now + 1200)
+        // the run took the folder made before it: a file beside it is an edit again
+        #expect(Files.writeAtomic(t1 + "/s1/top2.swift", "x"))
+        watch.event(t1 + "/s1", flags: 0)
+        #expect(!watch.dirty)
         Files.mkdirs(t1 + "/s2")
         watch.event(t1, flags: 0)  // a new subfolder in it
         #expect(watch.dirty)
