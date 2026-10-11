@@ -2368,7 +2368,8 @@ def caps_report(sweep):
     """Raport przebiegu limitów dla acc-cored. Zajęte to tylko to, co może się zwolnić bez śladu
     w katalogach: wpis w użyciu, wpis, którego nie dało się przenieść, i pomiar du, który padł.
     "Chronione" i "w gicie" trwają, więc wieczne "zajęte" wyłączałoby bramkę na zawsze.
-    folders to katalogi dopasowane przez globy (rzeczywiste ścieżki), które acc-cored też obserwuje;
+    folders to katalogi dopasowane przez globy i miejsca za dowiązaniami, które wychodzą z prefiksu
+    globu (rzeczywiste ścieżki, cap_spots), a acc-cored też je obserwuje;
     headroom (bajty), ile najciaśniejszy z nich może urosnąć, zanim przebieg coś by usunął: mniejszy
     ubytek wolnego miejsca nie zmieni wyniku."""
     if sweep is None:

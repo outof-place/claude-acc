@@ -82,6 +82,7 @@ func declinablePlans() throws {
 private final class Calls: @unchecked Sendable {
     var once = 0
     var caps = 0
+    var free: Int64 = 100 << 30
 }
 
 @Test("engine: a runaway's brake goes to Python once per gap, caps only when enforcing and after a change")
@@ -148,9 +149,22 @@ func engineHandovers() throws {
         seen = engine.queue.sync { engine.capsWatch.dirty }
     }
     #expect(seen)
+    engine.queue.sync { engine.capsWatch.volumes = { _ in ["data": calls.free] } }
     now += 700
     engine.benchTick()
     #expect(calls.caps == 2)
+
+    // the Trash emptied, then a capped file grows behind an open descriptor (no event), both
+    // within one caps interval: free space sampled on every tick doesn't let one hide the other
+    now += 2
+    calls.free += 4 << 30
+    engine.benchTick()
+    now += 2
+    calls.free -= 2 << 30
+    engine.benchTick()
+    now += 700
+    engine.benchTick()
+    #expect(calls.caps == 3)
 }
 
 

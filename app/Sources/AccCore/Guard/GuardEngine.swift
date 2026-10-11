@@ -257,7 +257,10 @@ public final class GuardEngine: @unchecked Sendable {
             save()
         }
         // check_caps runs in Python's loop on every enforcing tick (`enforce and qos`); its caps_at
-        // goes to the file now, so a Python loop taking over doesn't run the caps again at once
+        // goes to the file now, so a Python loop taking over doesn't run the caps again at once.
+        // Free space is sampled on every tick: growth and space freed within one caps interval
+        // would otherwise hide each other
+        if enforce, cfg.number("caps_minutes") > 0 { capsWatch.sample() }
         if enforce, capsDue(cfg, now: probes.now) {
             save()
             runCaps()

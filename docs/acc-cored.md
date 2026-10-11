@@ -101,16 +101,26 @@ memory pressure (a Dispatch memory-pressure source).
   changes only in these cases, so at each interval `CapsWatch` lets a run through only then:
   - something under a capped folder changed, or `janitor.json` did.
     - FSEvents watch the real paths of the globs' static prefixes and of the folders the last run
-      matched (a folder under the glob may be a link to elsewhere, and a linked directory one level
-      up is reported before its folder exists), or their nearest existing parent. A folder under
-      another watched path adds no root. Once the watch is due, further events cost a flag check.
+      matched (a folder under the glob may be a link to elsewhere), or their nearest existing
+      parent. A link anywhere along a glob that leaves its static prefix is reported too: the
+      link's real target plus the glob's fixed part after it (`wt1 -> repo` with `caps/*/out/builds`
+      gives `repo/out/builds`), even before those folders exist, and not the whole linked folder,
+      so an edit elsewhere in it doesn't wake the caps. A folder under another watched path adds no
+      root. Once the watch is due, further events cost a flag check.
     - The paths and their roots are computed again at every interval, so a folder made later (in
       any letter case) re-arms the stream. A root replaced by a rename is reported (`WatchRoot`).
     - A lost-events flag counts as a change.
-  - free space on a watched volume dropped since the last run by more than the tightest folder's
-    headroom (`limit − total`, from the last run's report; at least a tenth of the smallest cap, at
-    most 1 GiB): a file growing behind an open descriptor gets no event until it's closed. The drop
-    counts from the highest free space seen since the run, so space freed meanwhile doesn't hide it;
+  - free space on a watched volume dropped since the last run by at least a threshold: a file
+    growing behind an open descriptor gets no event until it's closed.
+    - The threshold is the tightest folder's headroom from the last run's report, compared as a
+      Double, and never less than a floor: a tenth of the smallest cap, the floor itself at most
+      1 GiB.
+    - A folder's headroom is its limit minus the running total at the last entry the run keeps by
+      size (an index past `keep`, the total still within the limit): growth of what stays changes
+      the next run only past that. With no entry kept by size (all within `keep`, or the rest
+      removed), it's the limit itself, a finite stand-in for "no growth matters".
+    - Free space is sampled on every guard tick (a statfs per root), and the drop counts from the
+      highest free space seen since the run, so space freed meanwhile doesn't hide it;
   - the time the last run reported passed: an entry skipped as fresh (a write in progress) may go;
   - the last run skipped an entry in use or one it couldn't move, or `du` failed on one (no total;
     exit 1 with a total, an unreadable subfolder, is a size): no event says that changed, so the

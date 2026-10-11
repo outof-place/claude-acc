@@ -4,11 +4,12 @@
 // - something under a capped folder changes (FSEvents on the folders, or the nearest parent that
 //   exists), or janitor.json does. The folders are the globs' static prefixes and the folders the
 //   last run's globs matched, both as real paths: a symlinked folder lives where its link points;
-// - free space on a watched volume dropped since the last run by more than the tightest folder's
-//   headroom (what it may still grow before a run removes something; at least a tenth of the
-//   smallest cap, at most 1 GiB): a file growing behind an open descriptor shows up there, while
-//   FSEvents reports it only when it's closed. The drop counts from the highest free space since
-//   the run, so space freed meanwhile doesn't hide the growth;
+// - free space on a watched volume dropped since the last run by at least the tightest folder's
+//   headroom (what it may still grow before a run removes something), and never by less than a
+//   floor (a tenth of the smallest cap, the floor itself at most 1 GiB): a file growing behind an
+//   open descriptor shows up there, while FSEvents reports it only when it's closed. Free space is
+//   sampled on every guard tick, and the drop counts from the highest free space since the run, so
+//   space freed meanwhile doesn't hide the growth;
 // - an entry skipped as fresh (a write in progress) may go: the time the last run reported;
 // - an entry skipped as busy (in use, can't be moved, du failed) may be free: no event says so,
 //   so such a run is followed by the next one at the usual interval.
@@ -30,6 +31,8 @@ public final class CapsWatch {
     var lastRun = 0.0
     /// the real paths watched: the caps' static prefixes and the folders the last run matched
     public private(set) var prefixes: [String] = []
+    /// `prefixes` with a slash each, made once per interval: an event allocates nothing per prefix
+    var slashed: [String] = []
     var patterns: [String] = []
     var folders: [String] = []
     var smallestGB = 10.0
@@ -100,6 +103,7 @@ public final class CapsWatch {
         for p in placed.compactMap({ $0 }).map(Files.realpath) + folders where !watched.contains(p) { watched.append(p) }
         // a folder under another watched path adds nothing but a root (and a run when it comes or goes)
         prefixes = watched.filter { p in !watched.contains { q in q != p && p.pyStarts(q + "/") } }
+        slashed = prefixes.map { $0 + "/" }
         let wanted = Self.roots(of: prefixes)
         if wanted != roots || rearm || stream == nil {  // a stream that didn't start is tried again
             roots = wanted
@@ -137,12 +141,21 @@ public final class CapsWatch {
         stopStream()
     }
 
+    /// One guard tick's look at free space (a statfs per root): the peak goes up, and a drop past
+    /// the threshold marks the watch dirty now, not at the next interval, where space freed
+    /// meanwhile would hide it.
+    public func sample() {
+        guard !dirty, !freeAtStart.isEmpty else { return }
+        if spaceDropped() { dirty = true }
+    }
+
     /// A drop of free space on a watched volume, from the highest free space since the run started,
-    /// larger than the tightest folder's headroom (and at least a tenth of the smallest cap, at most
+    /// of at least the tightest folder's headroom and the floor (a tenth of the smallest cap, at most
     /// 1 GiB): what one file growing under a cap enough to change a run looks like.
     func spaceDropped() -> Bool {
         let floor = min(1, smallestGB / 10) * Double(1 << 30)
-        let threshold = Int64(max(floor, headroom ?? 0))
+        // in Double: a cap of 1e10 GB or Infinity gives a headroom no Int64 holds (NaN gives the floor)
+        let threshold = max(floor, headroom ?? 0)
         let now = volumes?(roots) ?? Self.freeSpace(roots)
         var dropped = false
         for (volume, free) in now {
@@ -150,7 +163,7 @@ public final class CapsWatch {
             // space freed since the run would hide growth of the same size: count from the peak
             let peak = max(before, free)
             freeAtStart[volume] = peak
-            if peak - free >= threshold { dropped = true }
+            if Double(peak - free) >= threshold { dropped = true }
         }
         return dropped
     }
@@ -258,7 +271,8 @@ public final class CapsWatch {
             return
         }
         let p = Self.trimSlashes(path)
-        for prefix in prefixes where p == prefix || p.pyStarts(prefix + "/") || prefix.pyStarts(p + "/") {
+        let ps = p + "/"
+        for (prefix, slash) in zip(prefixes, slashed) where p == prefix || p.pyStarts(slash) || prefix.pyStarts(ps) {
             dirty = true
             return
         }
