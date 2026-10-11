@@ -2430,6 +2430,11 @@ class KeepNativeTest(Isolated):
         self.assertTrue(self.limits_on())
         self.assertNotIn("claude-limits", perf.load_state().get("keep_backoff", {}))
 
+    def retry_at(self, at):
+        """keep-spec's `retry` as acc-cored would read it at `at`."""
+        with mock.patch.object(perf.time, "time", return_value=at):
+            return perf.keep_spec(perf.load_state())["retry"]
+
     def keep_at(self, at, name="devguard-budget"):
         """Jeden przebieg `keep --only name` o czasie `at`; czy poprawka jest na miejscu."""
         with mock.patch.object(perf.time, "time", return_value=at):
@@ -2443,14 +2448,14 @@ class KeepNativeTest(Isolated):
         for _ in range(30):
             self.revert()
             if not self.keep_at(t + 1):
-                retry = perf.keep_spec(perf.load_state())["retry"]
+                retry = self.retry_at(t + 1)
                 self.assertEqual(list(retry), ["devguard-budget"])
                 self.assertTrue(self.keep_at(retry["devguard-budget"]))
                 t = retry["devguard-budget"]
             else:
                 t += 1
             repaired.append(t)
-            self.assertEqual(perf.keep_spec(perf.load_state())["retry"], {})  # nothing waits after a repair
+            self.assertEqual(self.retry_at(t), {})  # nothing waits after a repair
         gaps = [round(repaired[i + 1] - repaired[i]) for i in range(len(repaired) - 1)]  # no pairwise on 3.9
         # three quick repairs start the fight; then 20, 40, 80, 160 s and the 5-minute ceiling
         self.assertEqual(gaps[:7], [1, 1, 20, 40, 80, 160, 300])
@@ -2473,10 +2478,10 @@ class KeepNativeTest(Isolated):
         # to repair, and nothing waits any more
         self.revert()
         self.assertFalse(self.keep_at(t0 + 5))
-        self.assertIn("devguard-budget", perf.keep_spec(perf.load_state())["retry"])
+        self.assertIn("devguard-budget", self.retry_at(t0 + 5))
         self.write(self.files["devguard-budget"], {"budget_percent": 25})
         self.assertTrue(self.keep_at(t0 + 30))
-        self.assertEqual(perf.keep_spec(perf.load_state())["retry"], {})
+        self.assertEqual(self.retry_at(t0 + 30), {})
         # nobody reverts for the whole ceiling: the next revert is repaired at once, and the count starts over
         self.revert()
         self.assertTrue(self.keep_at(t0 + 2 + 301))
@@ -2486,6 +2491,19 @@ class KeepNativeTest(Isolated):
         _, out = self.run_cmd(perf.cmd_status, "--json", system=FakeSystem({}))
         fights = json.loads(out)["fights"]
         self.assertEqual((fights["current"], fights["last"]["name"]), ({}, "devguard-budget"))
+
+    def test_a_turn_whose_repair_raises_leaves_no_retry_in_the_past(self):
+        # apply raising at its turn leaves `waiting`: a spec with that past turn would arm a timer
+        # at 0 on every reload, one more `keep --only` each time
+        t0 = 1_800_000_000.0
+        for i in range(3):
+            self.revert()
+            self.assertTrue(self.keep_at(t0 + i))
+        self.revert()
+        self.assertFalse(self.keep_at(t0 + 5))
+        with mock.patch.object(perf.tweak("devguard-budget"), "apply", side_effect=OSError(28, "No space left on device")):
+            self.keep_at(t0 + 25)
+        self.assertEqual(self.retry_at(t0 + 26), {})
 
     def test_pod_stripping_async_from_its_hooks_is_a_fight_with_a_name(self):
         # the real one (2026-10-11): Pod's applyManagedHooks writes its status hooks anew at every Pod or

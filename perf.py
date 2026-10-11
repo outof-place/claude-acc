@@ -2819,9 +2819,11 @@ def keep_spec(state):
                    "network": False})  # fmt: skip
     tweaks.append({"name": "link", "class": "perf", "paths": [], "network": True})
     # poprawka bezpieczeństwa w walce, której naprawa czeka na swój termin: acc-cored budzi się na niego
-    # jednym timerem jednorazowym, uzbrojonym tylko wtedy
+    # jednym timerem jednorazowym, uzbrojonym tylko wtedy. Termin, który minął (naprawa w nim rzuciła
+    # i `waiting` zostało), nie uzbraja niczego: inaczej każde przeładowanie spec dałoby dodatkowy przebieg
+    now = time.time()
     retry = {name: fight["next"] for name, fight in state.get("keep_fights", {}).items()
-             if fight.get("waiting") and fight.get("next")}  # fmt: skip
+             if fight.get("waiting") and fight.get("next") and fight["next"] > now}  # fmt: skip
     return {"v": 1, "periodic_s": KEEP_PERIODIC, "config": [CONFIG_PATH, STATE_PATH], "tweaks": tweaks, "retry": retry}
 
 
