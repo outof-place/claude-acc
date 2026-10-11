@@ -2781,6 +2781,10 @@ KEEP_PERIODIC = 1800
 KEEP_EVERY = {"docker-idle": 300}
 # tyle napraw jednej poprawki w tylu sekundach znaczy, że ktoś ją cofa: przerwa na tyle sekund
 KEEP_FIGHT = (3, 600, 3600)
+# poprawka bezpieczeństwa w walce wraca coraz rzadziej: pierwszy odstęp i sufit (s). Odstęp rośnie
+# dwukrotnie z każdą naprawą (20, 40, 80, 160, 300), więc stan ustalony to ≤12 napraw na godzinę, jak
+# keep z launchd co 300 s; cisza przez cały sufit kończy walkę
+KEEP_SAFETY_BACKOFF = (20, 300)
 
 
 def keep_paths(item):
@@ -2814,44 +2818,114 @@ def keep_spec(state):
     tweaks.append({"name": "admit-chain", "class": "safety", "paths": [chain["settings"], chain["marker"], chain["client"]],
                    "network": False})  # fmt: skip
     tweaks.append({"name": "link", "class": "perf", "paths": [], "network": True})
-    return {"v": 1, "periodic_s": KEEP_PERIODIC, "config": [CONFIG_PATH, STATE_PATH], "tweaks": tweaks}
+    # poprawka bezpieczeństwa w walce, której naprawa czeka na swój termin: acc-cored budzi się na niego
+    # jednym timerem jednorazowym, uzbrojonym tylko wtedy
+    retry = {name: fight["next"] for name, fight in state.get("keep_fights", {}).items()
+             if fight.get("waiting") and fight.get("next")}  # fmt: skip
+    return {"v": 1, "periodic_s": KEEP_PERIODIC, "config": [CONFIG_PATH, STATE_PATH], "tweaks": tweaks, "retry": retry}
 
 
 def keep_backed_off(state, name, now):
-    """Poprawka na przerwie po przepychance (keep_fight); minione przerwy znikają ze stanu."""
+    """Poprawka na przerwie po przepychance (keep_fight); minione przerwy znikają ze stanu, a z nimi
+    walka poprawki wydajności."""
     until = state.get("keep_backoff", {}).get(name)
     if until is None:
         return False
     if until > now:
         return True
     del state["keep_backoff"][name]
+    state.get("keep_fights", {}).pop(name, None)
     return False
 
 
-def keep_fight(state, name, now):
-    """Naprawa poprawki: przy KEEP_FIGHT[0] naprawach w KEEP_FIGHT[1] s ktoś ją cofa (inne narzędzie,
-    ręczna edycja). Poprawka wydajności czeka wtedy KEEP_FIGHT[2] s, zamiast się z nim przepychać;
-    poprawka bezpieczeństwa (safety) nie czeka nigdy i mówi o tym w logu najwyżej raz na KEEP_FIGHT[2] s.
-    Liczą się tylko poprawki z plików: tę od sieci zmienia zmiana sieci, a okresową nowy pid albo
-    stan Dockera, nikt jej nie cofa."""
-    if name in KEEP_NETWORK or KEEP_CLASS.get(name, "periodic") == "periodic":
-        return
+def keep_waiting(state, name, now):
+    """Poprawka bezpieczeństwa w walce przed swoim terminem: naprawa czeka (acc-cored budzi się na
+    termin z keep_spec, keep z launchd przychodzi i tak co 300 s)."""
+    fight = state.get("keep_fights", {}).get(name)
+    if not fight or not fight.get("next") or now >= fight["next"]:
+        return False
+    fight["waiting"] = True
+    return True
+
+
+def keep_can_fight(name):
+    """O poprawkę można się przepychać tylko w plikach: tę od sieci zmienia zmiana sieci, a poprawki
+    bez plików (nowy pid, stan Dockera) nikt nie cofa."""
+    item = tweak(name)
+    return item is not None and name not in KEEP_NETWORK and bool(keep_paths(item))
+
+
+def keep_reverter(name, changed):
+    """Kto cofa poprawkę, gdy widać to po samej naprawie, albo None. Hooki statusu hosta bez async:
+    menedżer hooków Pod albo Orki (applyManagedHooks) przy każdym starcie wpisuje je od nowa bez async."""
+    if name == "claude-hooks-async":
+        hosts = sorted({line.split(": ", 1)[-1] for line in changed} & set(HOST_HOOKS.values()))
+        if hosts:
+            return f"{'/'.join(hosts)} (applyManagedHooks)"
+    return None
+
+
+def keep_fight(state, name, now, changed=()):
+    """Naprawa poprawki; True, gdy trwa walka (wtedy bez linii w logu na każdą naprawę).
+
+    KEEP_FIGHT[0] napraw w KEEP_FIGHT[1] s znaczy, że ktoś ją cofa (inne narzędzie, ręczna edycja):
+    walka. Jedna walka to jedna linia w logu, z nazwą tego, kto cofa, gdy ją znamy (keep_reverter).
+    Poprawka wydajności czeka wtedy KEEP_FIGHT[2] s, zamiast się przepychać. Poprawka bezpieczeństwa
+    wraca, ale coraz rzadziej (KEEP_SAFETY_BACKOFF), a cisza przez cały sufit kończy walkę."""
+    if not keep_can_fight(name):
+        return False
+    first, cap = KEEP_SAFETY_BACKOFF
+    fights = state.setdefault("keep_fights", {})
+    fight = fights.get(name)
+    if fight and fight.get("next"):
+        if fight.get("waiting") or now - fight["last"] < cap:
+            fight["gap"] = min(fight["gap"] * 2, cap)
+            fight.update(repairs=fight["repairs"] + 1, last=now, next=now + fight["gap"], waiting=False)
+            state["keep_last_fight"] = dict(fight, name=name)
+            return True
+        del fights[name]  # nikt nie cofał przez cały sufit: ta naprawa liczy się od zera
     count, window, pause = KEEP_FIGHT
     repairs = state.setdefault("keep_repairs", {})
     recent = [t for t in repairs.get(name, []) if now - t < window] + [now]
     repairs[name] = recent
     if len(recent) < count:
-        return
-    if KEEP_CLASS.get(name) == "safety":
-        said = state.setdefault("keep_fight_said", {})
-        if now - said.get(name, 0) >= pause:
-            said[name] = now
-            log(f"keep {name}: ktoś cofa tę poprawkę ({count}× w {window // 60} min); "
-                "bezpieczeństwo wraca za każdym razem")  # fmt: skip
-        return
-    state.setdefault("keep_backoff", {})[name] = now + pause
+        return False
     repairs[name] = []
-    log(f"keep {name}: ktoś cofa tę poprawkę ({count}× w {window // 60} min): przerwa na {pause // 60} min")
+    by = keep_reverter(name, changed)
+    who = f" ({by})" if by else ""
+    if KEEP_CLASS.get(name) == "safety":
+        fights[name] = {"since": now, "repairs": len(recent), "last": now, "gap": first, "next": now + first, "by": by}
+        log(f"keep {name}: walka, ktoś cofa tę poprawkę{who} ({count}× w {window // 60} min); wraca coraz "
+            f"rzadziej, od {first} s do co {cap // 60} min")  # fmt: skip
+    else:
+        fights[name] = {"since": now, "repairs": len(recent), "last": now, "until": now + pause, "by": by}
+        state.setdefault("keep_backoff", {})[name] = now + pause
+        log(f"keep {name}: walka, ktoś cofa tę poprawkę{who} ({count}× w {window // 60} min): przerwa na {pause // 60} min")
+    state["keep_last_fight"] = dict(fights[name], name=name)
+    return True
+
+
+def keep_quiet(state, name, now):
+    """Poprawka bez zmiany w walce poprawki bezpieczeństwa: jej termin minął bez niczego do naprawy, więc
+    już nie czeka, a gdy nikt nie cofał przez cały sufit, walka się skończyła (znacznik ostatniej
+    zostaje w keep_last_fight)."""
+    fight = state.get("keep_fights", {}).get(name)
+    if not fight or not fight.get("next"):
+        return
+    fight["waiting"] = False
+    if now - fight["last"] >= KEEP_SAFETY_BACKOFF[1]:
+        del state["keep_fights"][name]
+
+
+def keep_fights_view(state, now):
+    """Dla `perf status --json`: walki, które trwają, i znacznik ostatniej."""
+    cap = KEEP_SAFETY_BACKOFF[1]
+    current = {}
+    for name, fight in state.get("keep_fights", {}).items():
+        on = fight.get("waiting") or now - fight.get("last", 0) < cap if fight.get("next") else now < fight.get("until", 0)
+        if on:
+            current[name] = {k: fight.get(k) for k in ("since", "repairs", "by", "next", "until") if fight.get(k) is not None}
+    return {"current": current, "last": state.get("keep_last_fight")}
 
 
 def keep_lock(wait=60.0):
@@ -4259,6 +4333,7 @@ def cmd_status(cfg, args, system=None):
             "bench": state["bench"],
             "ultra": ultra_state(state),
             "link": state.get("link"),
+            "fights": keep_fights_view(state, time.time()),
         }
         print(json.dumps(out, ensure_ascii=False))
         return 0
@@ -4271,6 +4346,9 @@ def cmd_status(cfg, args, system=None):
             f"Łącze ({ago(link['at'])}): {link.get('port') or '?'} ({link.get('iface')}, "
             f"brama {link.get('gateway')}), {kind}"
         )
+    for name, fight in keep_fights_view(state, time.time())["current"].items():
+        by = f", cofa {fight['by']}" if fight.get("by") else ""
+        print(f"Walka: {name}, {fight['repairs']} napraw od {ago(fight['since'])}{by}")
     print("Poprawki:")
     for entry in tweaks:
         mark = "x" if entry["applied"] else " "
@@ -4478,7 +4556,7 @@ def cmd_keep(cfg, args, system=None):
         old = state["applied"].get(item.name)
         if old is None or item.root or (only is not None and item.name not in only):
             continue
-        if keep_backed_off(state, item.name, now):
+        if keep_backed_off(state, item.name, now) or keep_waiting(state, item.name, now):
             continue
         try:
             record, changed = item.apply(cfg, system, old)
@@ -4501,9 +4579,10 @@ def cmd_keep(cfg, args, system=None):
         ):
             record["active"] = False
         state["applied"][item.name] = record
-        if changed:
+        if not changed:
+            keep_quiet(state, item.name, now)
+        elif not keep_fight(state, item.name, now, changed):
             log(f"keep {item.name}: {', '.join(changed)}")
-            keep_fight(state, item.name, now)
     ultra = ultra_state(state)
     if ultra["on"] and only is None:
         # aktualizacja claude-acc dokłada poprawki do Ultry: włączona Ultra je przejmuje

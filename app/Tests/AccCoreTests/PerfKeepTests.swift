@@ -38,9 +38,10 @@ private func waitFor(_ seconds: Double = 5, _ done: () -> Bool) async throws {
 }
 
 private func spec(_ dir: String, _ tweaks: [(String, String, [String], Bool)], periodic: Double = 1800,
-                  every: [String: Double] = [:]) -> PyObject {
+                  every: [String: Double] = [:], retry: [String: Double] = [:]) -> PyObject {
     PyObject([
         ("v", 1), ("periodic_s", .double(periodic)), ("config", .array([.string(dir + "/perf-state.json")])),
+        ("retry", .object(PyObject(retry.map { ($0.key, PyJSON.double($0.value)) }))),
         ("tweaks", .array(tweaks.map { t in
             var fields: [(String, PyJSON)] = [("name", .string(t.0)), ("class", .string(t.1)), ("paths", .array(t.2.map { .string($0) })),
                                                ("network", .bool(t.3))]
@@ -201,6 +202,29 @@ func perfKeepTweakInterval() async throws {
     #expect(runs.onlys.first == "(all)")
     #expect(Set(runs.onlys.dropFirst()) == ["docker-idle"])
     #expect(e.queue.sync { e.everyTimer } == nil)
+}
+
+@Test("a safety tweak waiting in a fight runs at its turn, from one one-shot timer that's armed only then")
+func perfKeepRetryInAFight() async throws {
+    let dir = try tempDir("retry")
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    let runs = Runs()
+    let e = engine(dir, runs)
+    let tweaks = [("devguard-budget", "safety", [dir + "/devguard.json"], false)]
+    let turn = Kernel.wall() + 0.4
+    e.specReader = { spec(dir, tweaks, retry: ["devguard-budget": turn]) }
+    e.start()
+    try await waitFor { runs.all.count >= 2 }
+    #expect(runs.onlys == ["(all)", "devguard-budget"])
+    #expect(Kernel.wall() >= turn)
+    #expect(e.queue.sync { e.retryTimer } == nil)  // fired once, not a tick
+    // no tweak waiting: no timer at all
+    e.specReader = { spec(dir, tweaks) }
+    e.queue.sync { e.loadSpec() }
+    #expect(e.queue.sync { e.retryTimer } == nil)
+    try await Task.sleep(nanoseconds: 600_000_000)
+    #expect(runs.all.count == 2)
+    e.stop()
 }
 
 @Test("without a spec (a perf.py before keep-spec), the full pass runs at launchd's interval")

@@ -483,10 +483,19 @@ and the writes:
     ships (v6.1). They come back within 30 minutes. `docker-idle` runs alone every 5 minutes, as
     under launchd: it counts connection samples up to its 2-hour threshold.
 - **A fight:** a tweak repaired 3 times in 10 minutes has someone reverting it (another tool, a
-  hand edit). A perf tweak then waits an hour instead of fighting, in both keeps. A safety tweak
-  comes back every time and says so in perf.log at most once an hour. Only tweaks repaired from
-  their files count: a network change switches `tether-profile`, and a new pid isn't someone
-  undoing `bg-helpers`.
+  hand edit). Only tweaks with files can fight: a network change switches `tether-profile`, and a
+  new pid isn't someone undoing `bg-helpers`.
+  - A perf tweak then waits an hour instead of fighting, in both keeps.
+  - A safety tweak comes back, but ever more rarely: 20 s after the repair that started the fight,
+    then 40, 80, 160 s and at most every 5 minutes. That's at most 12 repairs an hour, as launchd's
+    keep every 300 s. A repair before its turn waits: `keep-spec` lists it under `retry`, and
+    acc-cored arms one one-shot timer for the earliest turn, only while one waits (no tick). Nobody
+    reverting for a whole 5 minutes ends the fight.
+  - One fight is one line in perf.log, not one per repair, with the reverter's name where the repair
+    shows it: status hooks of Pod or Orca losing `async` are `applyManagedHooks` (it writes them anew
+    at every Pod or runtime start).
+  - `perf status --json` has `fights`: the current ones (repairs, since, the reverter, the next turn
+    or the pause's end) and the last one.
 - **The link for updates.py:** acc-cored refreshes `link` only on a network change, so on a tether
   that lasts the entry ages past updates.py's 15 minutes. updates.py then asks `perf.py link
   --json` live before a scheduled run.

@@ -58,6 +58,9 @@ public final class PerfKeepEngine: @unchecked Sendable {
     var periodicEvery = 0.0
     var everyTimer: DispatchSourceTimer?
     var everyInterval = 0.0
+    /// a safety tweak in a fight waiting for its turn (`retry` in the spec): name -> wall time
+    var retry: [String: Double] = [:]
+    var retryTimer: DispatchSourceTimer?
     var networkToken: Int32?
     public let runs = Atomic<Int>(0)
     public let fails = Atomic<Int>(0)
@@ -90,6 +93,8 @@ public final class PerfKeepEngine: @unchecked Sendable {
             periodicTimer = nil
             everyTimer?.cancel()
             everyTimer = nil
+            retryTimer?.cancel()
+            retryTimer = nil
             watch.stop()
             if let networkToken { notify_cancel(networkToken) }
             networkToken = nil
@@ -120,8 +125,13 @@ public final class PerfKeepEngine: @unchecked Sendable {
                          network: t["network"]?.truthy ?? false, every: t["every_s"]?.double)
         }
         watch.set(Set(tweaks.filter { $0.cls != "periodic" }.flatMap(\.paths) + config))
+        retry = [:]
+        for (name, at) in spec["retry"]?.object ?? PyObject() {
+            if let at = at.double { retry[name] = at }
+        }
         schedulePeriodic()
         scheduleEvery()
+        scheduleRetry()
     }
 
     static func liveSpec(_ options: Options) -> PyObject? {
@@ -188,6 +198,25 @@ public final class PerfKeepEngine: @unchecked Sendable {
         t.resume()
         everyTimer = t
         everyInterval = interval
+    }
+
+    /// A safety tweak in a fight waits for its turn, which grows from 20 s to 5 min (perf.py
+    /// KEEP_SAFETY_BACKOFF): one one-shot timer at the earliest, armed only while one waits. No tick.
+    func scheduleRetry() {
+        retryTimer?.cancel()
+        retryTimer = nil
+        guard !stopped, let at = retry.values.min() else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(wallDeadline: .now() + max(0, at - Kernel.wall()), leeway: .milliseconds(200))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.retryTimer = nil
+            let now = Kernel.wall()
+            for (name, at) in self.retry where at <= now + 0.5 { self.pending.insert(name) }
+            self.kick(after: 0)
+        }
+        t.resume()
+        retryTimer = t
     }
 
     // MARK: runs
