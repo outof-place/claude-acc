@@ -238,7 +238,7 @@ func eventLimits() throws {
 @Test("a slow reader that keeps taking stays past stallSeconds and gets the whole frame")
 func eventSlowReader() throws {
     let p = try Pair("slow") { hub in
-        hub.stallSeconds = 0.5
+        hub.stallSeconds = 1.5  // the frame takes ~3.7 s: still several stall periods, and room for a busy Mac
         hub.reapEvery = 0.1
     }
     let body = "{\"pad\": \"" + String(repeating: "y", count: 300_000) + "\"}"
@@ -258,6 +258,24 @@ func eventSlowReader() throws {
     }
     #expect(Kernel.monotonic() - start > 1)
     #expect(got.count >= body.utf8.count)
+    #expect(p.hub.count == 1)
+}
+
+@Test("a client with a receive buffer below the send low-water mark (SO_RCVBUF 1024) gets the whole frame")
+func eventSmallReceiveBuffer() throws {
+    let p = try Pair("rcvbuf") { hub in
+        hub.stallSeconds = 3
+        hub.reapEvery = 0.1
+    }
+    var size: Int32 = 1024
+    #expect(setsockopt(p.fd, SOL_SOCKET, SO_RCVBUF, &size, socklen_t(MemoryLayout<Int32>.size)) == 0)
+    let body = "{\"pad\": \"" + String(repeating: "z", count: 64_000) + "\"}"
+    p.write("status.json", body)
+    _ = p.next()
+    #expect(EventClient.subscribe(p.fd, topics: ["accounts"]))
+    let f = p.next(10)
+    #expect(f?.kind == 3)
+    #expect(f?.data.count == body.utf8.count)
     #expect(p.hub.count == 1)
 }
 

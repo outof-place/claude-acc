@@ -491,7 +491,15 @@ stream on its control socket, so a host can subscribe instead:
   stays). The reaper looks every 5 s, so that's 10-15 s and 30-35 s. 16 event clients at most;
   the 17th gets `busy`.
 - A snapshot's frame is built once per version and shared by every client it goes to: 16 clients
-  that don't read, on 12 topics of 1 MiB, took the daemon to 31 MB, not 225 MB.
+  that don't read, on 12 topics of 1 MiB and the same version, took the daemon to 31 MB, not
+  225 MB. A slow reader holds the version it's on, though: with each of 16 clients joining after
+  another change of all 12 files, it's 220-252 MB again, the worst case `maxOutbox` bounds (16 ×
+  16 MiB). The hub also holds each watched file twice (its frame and its last data), ~50 KB in
+  practice.
+- A client with a small `SO_RCVBUF` (1024) still gets everything: the hub sets `SO_SNDLOWAT` to 1,
+  since after a drain such a client never leaves the default 2048 bytes of room.
+- `acc-cored events` restores SIGPIPE's default (a parent may pass on SIG_IGN), and checks once a
+  second whether stdout's reader went (POLLHUP), so `| head -1` ends it even while no frame comes.
 - The files stay the contract, written atomically (a rename, as every writer does today: an
   in-place write can be sent half done). Python writes them, and acc-cored only watches them, and
   only while someone subscribes. It watches their folders for renames and each subscribed file

@@ -41,7 +41,7 @@ public final class EventHub: @unchecked Sendable {
     /// a client with this much unsent when the socket is full is dropped (one flush of every topic
     /// at `maxFile` fits)
     public var maxOutbox = 16 << 20
-    /// a client whose frames haven't drained for this long has stopped reading
+    /// a client that took nothing for this long while frames waited has stopped reading
     public var stallSeconds = 30.0
     /// a client that hasn't subscribed this long after the events line
     public var subscribeSeconds = 10.0
@@ -131,6 +131,9 @@ public final class EventHub: @unchecked Sendable {
                 close(fd)
                 return
             }
+            // the writer source fires once SO_SNDLOWAT bytes fit (2048 by default); a client with a
+            // smaller SO_RCVBUF never leaves that much room after a drain, and would stall for good
+            _ = setsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &on, socklen_t(MemoryLayout<Int32>.size))
             guard self.clients.count < self.maxClients else {
                 Self.sendNow(fd, Self.frame(5, Self.json([("code", "busy"), ("msg", "too many event clients")])))
                 close(fd)

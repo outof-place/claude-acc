@@ -156,6 +156,22 @@ class CoredSchedTest(unittest.TestCase):
         self.assertIn("hello", done.stdout)
         self.assertLess(time.time() - start, 5)
 
+    def test_events_ends_with_its_reader_under_an_ignored_sigpipe_and_no_frames(self):
+        # a parent that ignores SIGPIPE passes it on (restore_signals=False keeps Python's SIG_IGN);
+        # no file changes, so no frame comes after the first ones: the once-a-second look at stdout
+        # (POLLHUP) ends it
+        self.start_cored()
+        cli = subprocess.Popen([BUILT, "events", "owner"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               restore_signals=False)  # fmt: skip
+        self.addCleanup(lambda: cli.poll() is None and cli.kill())
+        self.assertIn(b"hello", cli.stdout.readline())
+        time.sleep(0.5)
+        cli.stdout.close()
+        start = time.time()
+        cli.wait(timeout=10)
+        self.assertLess(time.time() - start, 3)
+        self.assertIn(cli.returncode, (0, -13))  # the look, or the next line's SIGPIPE
+
     def test_short_jobs_get_their_peak(self):
         self.start_cored()
         jobs = [self.job(300, 0.3, 0) for _ in range(4)]

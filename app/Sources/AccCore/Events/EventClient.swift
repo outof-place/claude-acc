@@ -107,7 +107,14 @@ public enum EventClient {
         }
     }
 
-    /// `acc-cored events`: one line per frame until the daemon closes or `seconds` pass.
+    /// stdout's reader closed: macOS gives a pipe whose reader is gone POLLHUP (and no POLLOUT).
+    static func stdoutGone() -> Bool {
+        var p = pollfd(fd: STDOUT_FILENO, events: Int16(POLLOUT), revents: 0)
+        return poll(&p, 1, 0) == 1 && p.revents & Int16(POLLHUP | POLLERR) != 0
+    }
+
+    /// `acc-cored events`: one line per frame until the daemon closes, `seconds` pass, or stdout's
+    /// reader goes.
     public static func watch(socket path: String, topics: [String], seconds: Double?) {
         setvbuf(stdout, nil, _IOLBF, 0)  // a line per frame even into a file or a pipe
         guard let fd = connect(path) else {
@@ -120,9 +127,12 @@ public enum EventClient {
         var buffer: [UInt8] = []
         while end.map({ Kernel.monotonic() < $0 }) ?? true {
             let f: Frame
-            switch read(fd, buffer: &buffer, timeout: end.map { $0 - Kernel.monotonic() } ?? 3600) {
+            // a wake a second: a reader gone while no frame comes (`| head` that has its line) ends it too
+            switch read(fd, buffer: &buffer, timeout: min(1, end.map { $0 - Kernel.monotonic() } ?? 1)) {
             case .frame(let frame): f = frame
-            case .timeout: continue
+            case .timeout:
+                if stdoutGone() { return }
+                continue
             case .closed:
                 print("acc-cored: demon zamknął strumień")
                 return

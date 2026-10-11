@@ -343,6 +343,9 @@ case "run":
     if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stopAll(0) } }
     dispatchMain()
 case "events":
+    // a parent that ignores SIGPIPE (perl's $SIG{PIPE}="IGNORE", then exec) passes that on: then
+    // `| head -1` would leave this writing into EPIPE forever
+    signal(SIGPIPE, SIG_DFL)
     let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
     let seconds = value("--for", in: args).flatMap { Double($0) }
     let topics = args.enumerated().filter { $0.element != "--for" && ($0.offset == 0 || args[$0.offset - 1] != "--for") }.map(\.element)
