@@ -66,6 +66,9 @@ if url.endswith("/v1/oauth/token"):
         reply(400, {"error": "invalid_grant"})
     server.setdefault("consumed", {})[token] = owner
     access, refresh = _store.issue(server, owner)
+    if server.get("gateway_error"):
+        # serwer zużył token i wydał parę, ale bramka odpowiedziała błędem (502, 504)
+        reply(server["gateway_error"], {"error": "bad gateway"})
     if server.get("drop_answer"):
         # serwer zużył token i wydał parę, ale odpowiedź nie doszła (curl: timeout, kod 28)
         _store.save("server.json", server)

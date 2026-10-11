@@ -333,6 +333,57 @@ class KeychainWriteRetryTest(unittest.TestCase):
         self.assertEqual(self.server(w).get("reuse_attempts", 0), 0)
         self.assert_no_token_anywhere(w, r, again)
 
+    def test_a_gateway_error_after_the_request_went_out_keeps_the_marker(self):
+        # a 502/504 can come from a gateway after the origin rotated the token: like no answer, the
+        # marker stays and the account is parked; only a 4xx or a request that never left clears it
+        w = self.world()
+        self.set_server(w, gateway_error=502)
+        r = w.run("tick")
+        self.assertIn(self.old["refreshToken"], self.server(w)["consumed"])
+        self.assertIn("HTTP 502 po wysłaniu refresh tokenu", r.stderr)
+        self.assertIn("a@x", w.saved_state()["needs_login"])
+        self.assertIn(mark(self.old["refreshToken"]), w.saved_state()["consumed_tokens"]["a@x"])
+        self.set_server(w, gateway_error=0)
+        w.state(needs_login={"a@x": int(time.time()) - 7 * 3600})
+        again = w.run("tick")
+        self.assertEqual(len(w.calls(TOKEN)), 1)
+        self.assertEqual(self.server(w).get("reuse_attempts", 0), 0)
+        self.assert_no_token_anywhere(w, r, again)
+
+    def test_a_foreign_login_in_the_runtime_never_blocks_a_switch(self):
+        # base holds a login from outside Orca that expires later than a@x's scoped entry, so it's the
+        # freshest runtime: overwriting it is what a switch asks, and only a@x's own pair may block it
+        w = Env()
+        self.addCleanup(shutil.rmtree, w.home, True)
+        a = w.account("a@x", session_used=97)
+        b = w.account("b@x", session_used=10)
+        w.server["access"]["at-z"] = "z@x"
+        w.server["refresh"]["rt-z"] = "z@x"
+        w.runtime(a, services=(scoped(w.config_dir),))
+        w.runtime({"claudeAiOauth": {"accessToken": "at-z", "refreshToken": "rt-z",
+                                     "expiresAt": int((time.time() + 20 * 3600) * 1000)}}, services=(BASE,))  # fmt: skip
+        w.write()
+        w.state(active_email="a@x")
+        r = w.run("tick")
+        self.assertNotIn("nie przełączam", r.stdout + r.stderr)
+        self.assertEqual(w.saved_state().get("active_email"), "b@x", r.stdout + r.stderr)
+        self.assertEqual(w.entry(scoped(w.config_dir))["claudeAiOauth"], b["claudeAiOauth"])
+
+    def test_a_pair_left_only_in_another_config_dir_parks_the_account(self):
+        # the read-back reads only the managed dir's entries: a pair that survived only in another
+        # config dir never comes back to the account copy, so the account stands for a re-login
+        w = Env()
+        self.addCleanup(shutil.rmtree, w.home, True)
+        self.old = w.account("a@x", expires_in=-30 * 60)["claudeAiOauth"]
+        w.runtime({"claudeAiOauth": self.old}, services=(BASE, scoped(w.config_dir), scoped(w.other_dir)))
+        w.write()
+        failing = ",".join([BASE, scoped(w.config_dir), MANAGED])
+        r = w.run("tick", FAKE_FAIL_WRITE_SERVICE=failing, ACC_KC_RETRY_BUDGET="0")
+        # the new pair is there, and nowhere the read-back looks
+        self.assertNotEqual(w.entry(scoped(w.other_dir))["claudeAiOauth"]["refreshToken"], self.old["refreshToken"])
+        self.assertIn("a@x", w.saved_state().get("needs_login", {}), r.stdout + r.stderr)
+        self.assertNotIn("następny przebieg przepisze ją do kopii", r.stdout + r.stderr)
+
     def test_a_request_that_never_left_drops_the_marker(self):
         # offline (curl couldn't connect): the server never saw the token, so it isn't used up
         w = self.world()
@@ -433,7 +484,7 @@ class KeychainWriteUnitTest(unittest.TestCase):
             caught.exception.__suppress_context__
         )  # the traceback leaves TimeoutExpired out
 
-    def test_propagate_writes_every_entry_when_the_log_cannot_be_written(self):
+    def test_every_config_dir_holding_the_old_token_gets_the_new_pair(self):
         old = {"accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 1}
         new = {"accessToken": "at-new", "refreshToken": "rt-new", "expiresAt": 2}
         self.w.runtime(
@@ -442,18 +493,13 @@ class KeychainWriteUnitTest(unittest.TestCase):
         )
         self.w.write()
         cfg = {"config_dir": self.w.config_dir, "other_config_dirs": [self.w.other_dir]}
-        with mock.patch.object(
-            self.acc, "log", side_effect=OSError(28, "No space left on device")
-        ):
-            written, failed = self.acc.propagate(
-                "rt-old", json.dumps({"claudeAiOauth": new}), cfg
-            )
-        self.assertEqual(failed, [])
-        self.assertEqual(len(written), 3)
+        copies, unread = self.acc.runtime_copies("rt-old", new, cfg)
+        self.assertEqual(unread, [])
+        self.assertEqual(self.acc.write_all(copies, time.monotonic() + 5), {})
         for service in (BASE, scoped(self.w.config_dir), scoped(self.w.other_dir)):
             self.assertEqual(self.w.entry(service)["claudeAiOauth"], new)
 
-    def test_propagate_counts_an_entry_it_cannot_read_as_failed(self):
+    def test_an_entry_that_cannot_be_read_is_listed_not_raised(self):
         # a read that times out, or a `security` that can't start, never escapes ensure_fresh: the
         # entry is reported as left with the used token, and the next tick heals it
         old = {"accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 1}
@@ -472,10 +518,71 @@ class KeychainWriteUnitTest(unittest.TestCase):
             return read(service, account)
 
         with mock.patch.object(self.acc, "kc_read", side_effect=flaky):
-            written, failed = self.acc.propagate("rt-old", json.dumps({"claudeAiOauth": new}), cfg)
-        self.assertEqual(written, [BASE])
-        self.assertEqual(sorted(failed), sorted([stuck, broken]))
-        self.assertEqual(self.w.entry(BASE)["claudeAiOauth"], new)
+            try:
+                copies, unread = self.acc.runtime_copies("rt-old", new, cfg)
+            except (subprocess.TimeoutExpired, OSError) as err:
+                self.fail(f"runtime_copies let {err!r} escape")
+        self.assertEqual([service for service, _, _ in copies], [BASE])
+        self.assertEqual(sorted(unread), sorted([stuck, broken]))
+
+    def test_curl_that_never_starts_or_hangs_says_whether_the_request_left(self):
+        # after the write-ahead: an OSError (fork) means nothing left, so the marker may go; a curl
+        # hung past its own max-time may have sent it
+        for error, sent in ((OSError(35, "Resource temporarily unavailable"), False), (subprocess.TimeoutExpired(["curl"], 40), True)):
+            with self.subTest(error=type(error).__name__), mock.patch.object(self.acc, "spawn", side_effect=error):
+                try:
+                    got = self.acc.http_sent("https://x.invalid/t", "d")
+                except (OSError, subprocess.TimeoutExpired) as err:
+                    self.fail(f"http_sent let {err!r} escape")
+                self.assertEqual(got, (0, None, sent))
+
+    def test_the_first_round_of_writes_stays_inside_the_budget(self):
+        # N hung writes at 30 s each would outlive launchd's ExitTimeOut: the first round takes what
+        # is left of the budget, at least 5 s (a SecurityAgent prompt needs a moment)
+        seen = []
+        with mock.patch.object(self.acc, "kc_write", side_effect=lambda *a, timeout: seen.append(timeout)):
+            self.acc.write_all([("s1", "u", "x"), ("s2", "u", "x"), ("s3", "u", "x")], time.monotonic() + 2)
+        self.assertEqual(seen, [5, 5, 5])
+        seen.clear()
+        with mock.patch.object(self.acc, "kc_write", side_effect=lambda *a, timeout: seen.append(timeout)):
+            self.acc.write_all([("s1", "u", "x")], time.monotonic() + 600)
+        self.assertEqual(seen, [30])
+
+    def test_an_unanswered_profile_call_leaves_the_owner_unknown_and_says_so(self):
+        # owner_of: a 429, the network or a server error is "don't know" (the run is blind), a 401
+        # is someone else's dead token, and no token asks nothing
+        self.acc._BLIND.clear()
+        self.addCleanup(self.acc._BLIND.clear)
+        creds = '{"claudeAiOauth": {"accessToken": "at-x"}}'
+        for status, blind in ((0, True), (429, True), (503, True), (401, False)):
+            with self.subTest(status=status), mock.patch.object(self.acc, "profile_request", return_value=(status, None)):
+                self.acc._BLIND.clear()
+                self.assertIsNone(self.acc.owner_of(creds, []))
+                self.assertEqual("profil" in self.acc._BLIND, blind)
+        self.acc._BLIND.clear()
+        with mock.patch.object(self.acc, "profile_request") as asked:
+            self.assertIsNone(self.acc.owner_of("{}", []))
+        asked.assert_not_called()
+        self.assertNotIn("profil", self.acc._BLIND)
+
+    def test_loud_survives_a_stderr_it_cannot_write(self):
+        broken = mock.Mock()
+        broken.write.side_effect = OSError(28, "No space left on device")
+        with mock.patch.object(sys, "stderr", broken):
+            try:
+                self.acc.loud("a line")
+            except OSError as err:
+                self.fail(f"loud() let {err!r} escape")
+
+    def test_a_stale_entry_that_cannot_be_read_stays_listed(self):
+        self.w.write()
+        self.w.state(stale_runtime={BASE: "a@x"})
+        with mock.patch.object(self.acc, "kc_read", side_effect=subprocess.TimeoutExpired(["security"], 30)):
+            try:
+                self.acc.heal_stale_runtime([], {"config_dir": self.w.config_dir})
+            except subprocess.TimeoutExpired:
+                self.fail("a hung read escaped heal_stale_runtime")
+        self.assertEqual(self.acc.load_state()["stale_runtime"], {BASE: "a@x"})
 
     def test_the_in_process_state_paths_are_the_test_s(self):
         self.assertEqual(self.acc.STATE_DIR, self.w.state_dir)
