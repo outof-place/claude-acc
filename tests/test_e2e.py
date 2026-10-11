@@ -1177,6 +1177,16 @@ class KeychainMemoTest(unittest.TestCase):
         self.assertEqual(acc.kc_peek("svc", "u"), "B")
         self.assertEqual(acc.tool("security"), os.path.join(FAKES, "security"))
 
+    def test_a_write_that_times_out_says_nothing_of_the_secret(self):
+        # `security` waiting on a SecurityAgent prompt: TimeoutExpired's text holds the whole argv,
+        # -w and the token pair with it, and main() logs str(err) to switch.log and stderr
+        os.environ["FAKE_SLOW_WRITE_SERVICE"] = "svc"
+        with self.assertRaises(RuntimeError) as caught:
+            self.acc.kc_write("svc", "u", "rt-secret-value", timeout=1)
+        self.assertNotIn("rt-secret-value", str(caught.exception))
+        self.assertIn("brak odpowiedzi po 1 s", str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)  # a traceback leaves TimeoutExpired out
+
     def test_write_is_remembered_and_a_failed_write_forgets_the_entry(self):
         acc = self.acc
         acc.kc_write("svc", "u", "C")

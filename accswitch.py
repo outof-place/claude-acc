@@ -337,9 +337,14 @@ def kc_read_many(keys, batch=8):
                     proc.wait()
 
 
-def kc_write(service, account, contents):
+def kc_write(service, account, contents, timeout=30):
     _KC_SEEN.pop((service, account), None)  # po nieudanym albo przerwanym zapisie nie wiadomo, co tam leży
-    r = spawn(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], timeout=30)
+    try:
+        r = spawn(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # tekst TimeoutExpired niesie argumenty, a w nich sekret (-w): main() wpisałby go do logu i na
+        # stderr, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
+        raise RuntimeError(f"zapis do Keychain nieudany ({service}): brak odpowiedzi po {timeout:.0f} s") from None
     if r.returncode != 0:
         raise RuntimeError(f"zapis do Keychain nieudany ({service}): {r.stderr.strip()}")
     _KC_SEEN[(service, account)] = contents
