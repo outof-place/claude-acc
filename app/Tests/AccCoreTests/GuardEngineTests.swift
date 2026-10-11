@@ -13,37 +13,45 @@ private func plan(_ action: String, _ code: String) -> Plan {
 func heldPlanDoesNotMaskOthers() throws {
     var policy = HandoverPolicy()
     let shutdown = plan("shutdown", "simulator_idle"), stop = plan("stop", "idle")
-    let first = try #require(policy.next(actable: [shutdown, stop], brakeDue: false, now: 100, brakeGap: 20))
+    let first = try #require(policy.next(actable: [shutdown, stop], brakeDue: false, now: 100, brakeGap: 20, stage: 2))
     #expect(first.plan === shutdown && !first.brake)
-    policy.record(first, acted: false, now: 100)
-    let second = try #require(policy.next(actable: [shutdown, stop], brakeDue: true, now: 102, brakeGap: 20))
+    policy.record(first, acted: false, now: 100, stage: 2)
+    let second = try #require(policy.next(actable: [shutdown, stop], brakeDue: true, now: 102, brakeGap: 20, stage: 2))
     #expect(second.plan === stop && second.brake)
-    #expect(policy.next(actable: [shutdown], brakeDue: false, now: 102, brakeGap: 20) == nil)
-    #expect(policy.next(actable: [shutdown], brakeDue: true, now: 102, brakeGap: 20)?.brake == true)
-    #expect(policy.next(actable: [shutdown], brakeDue: false, now: 160.5, brakeGap: 20)?.plan === shutdown)
+    #expect(policy.next(actable: [shutdown], brakeDue: false, now: 102, brakeGap: 20, stage: 2) == nil)
+    #expect(policy.next(actable: [shutdown], brakeDue: true, now: 102, brakeGap: 20, stage: 2)?.brake == true)
+    #expect(policy.next(actable: [shutdown], brakeDue: false, now: 160.5, brakeGap: 20, stage: 2)?.plan === shutdown)
 }
 
 @Test("a declined plan that acted is not held, and one Python always runs is tried on the next tick")
 func noHoldWithoutReason() {
     var policy = HandoverPolicy()
     let shutdown = plan("shutdown", "simulator_cap"), stop = plan("stop", "pressure")
-    policy.record(.init(plan: shutdown, brake: false), acted: true, now: 0)
-    policy.record(.init(plan: stop, brake: false), acted: false, now: 0)
-    #expect(policy.next(actable: [shutdown], brakeDue: false, now: 2, brakeGap: 20)?.plan === shutdown)
-    #expect(policy.next(actable: [stop], brakeDue: false, now: 2, brakeGap: 20)?.plan === stop)
+    policy.record(.init(plan: shutdown, brake: false), acted: true, now: 0, stage: 2)
+    policy.record(.init(plan: stop, brake: false), acted: false, now: 0, stage: 2)
+    #expect(policy.next(actable: [shutdown], brakeDue: false, now: 2, brakeGap: 20, stage: 2)?.plan === shutdown)
+    #expect(policy.next(actable: [stop], brakeDue: false, now: 2, brakeGap: 20, stage: 2)?.plan === stop)
     #expect(policy.heldUntil.isEmpty)
 }
 
 @Test("after a brake handover the brake waits the gap of the stage it is at now, whatever Python did")
 func brakeBackoff() throws {
     var policy = HandoverPolicy()
-    let h = try #require(policy.next(actable: [], brakeDue: true, now: 0, brakeGap: 20))
+    let h = try #require(policy.next(actable: [], brakeDue: true, now: 0, brakeGap: 20, stage: 2))
     #expect(h.brake && h.plan == nil)
-    policy.record(h, acted: false, now: 0)
-    #expect(policy.next(actable: [], brakeDue: true, now: 2, brakeGap: 20) == nil)
-    // pressure climbs to stage 3 (5 s): the wait shortens at once
-    #expect(policy.next(actable: [], brakeDue: true, now: 6, brakeGap: 5)?.brake == true)
-    #expect(policy.next(actable: [], brakeDue: true, now: 20, brakeGap: 20)?.brake == true)
+    policy.record(h, acted: false, now: 0, stage: 2)
+    #expect(policy.next(actable: [], brakeDue: true, now: 2, brakeGap: 20, stage: 2) == nil)
+    // pressure climbs to stage 3: a higher stage goes at once (stage 2 found no victim, or brakeDue
+    // would still wait for brake_at), and after a stage-3 brake its own 5 s gap holds
+    #expect(policy.next(actable: [], brakeDue: true, now: 2, brakeGap: 5, stage: 3)?.brake == true)
+    #expect(policy.next(actable: [], brakeDue: true, now: 6, brakeGap: 20, stage: 2) == nil)
+    #expect(policy.next(actable: [], brakeDue: true, now: 20, brakeGap: 20, stage: 2)?.brake == true)
+    var three = policy
+    three.record(.init(plan: nil, brake: true), acted: false, now: 2, stage: 3)
+    #expect(three.next(actable: [], brakeDue: true, now: 4, brakeGap: 5, stage: 3) == nil)
+    #expect(three.next(actable: [], brakeDue: true, now: 7, brakeGap: 5, stage: 3)?.brake == true)
+    // back to stage 2: its own 20 s from the last brake
+    #expect(three.next(actable: [], brakeDue: true, now: 10, brakeGap: 20, stage: 2) == nil)
 }
 
 @Test("a server with an app open in a Simulator is declinable; a pool shutdown is; a warn and a plain stop aren't")
@@ -146,13 +154,16 @@ func brakeEscalation() throws {
 
     engine.benchTick()  // 25 of 48 GB compressed: stage 2, a brake
     #expect(w.once == 1)
-    w.now += 6
-    w.compressed = 30  // 62%: stage 3, whose gap is 5 s
+    w.now += 2
+    w.compressed = 30  // 62%: stage 3 two seconds later, with no victim at stage 2: Python reaps at once
     engine.benchTick()
     #expect(w.once == 2)
     w.now += 2
-    engine.benchTick()
+    engine.benchTick()  // stage 3's own 5 s gap
     #expect(w.once == 2)
+    w.now += 4
+    engine.benchTick()
+    #expect(w.once == 3)
 }
 
 @Test("engine: a config of the wrong type runs Python's own loop, and a fixed one stops it")
@@ -210,4 +221,120 @@ func hostRetry() throws {
     engine.benchTick()
     settle()
     #expect(calls.n == 2)
+}
+
+/// Whether another descriptor can take devguard.lock now (the guard's own fd holds it otherwise).
+private func lockFree(_ home: String) -> Bool {
+    let fd = open(GuardPaths.state(home) + "/devguard.lock", O_WRONLY | O_CREAT | O_CLOEXEC, 0o644)
+    defer { close(fd) }
+    guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return false }
+    flock(fd, LOCK_UN)
+    return true
+}
+
+@Test("engine: Python's loop gets the lock and gives it back; stop() ends the loop before the lock goes")
+func pythonLoopLock() throws {
+    let home = try scratchHome("looplock")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let config = GuardPaths.state(home) + "/devguard.json"
+    Files.mkdirs(GuardPaths.state(home))
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "caps_minutes": 0, "notify": false}"#))
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    engine.loopStarter = { _ in Spawn.start(["/bin/sleep", "30"]) }
+    engine.probesFactory = { pressureWorld(home: home, now: 1_791_000_000, compressedGB: 1) }
+    engine.runner = { _ in 0 }
+    #expect(engine.start())
+    #expect(!lockFree(home))
+
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "runtimes": "node", "caps_minutes": 0, "notify": false}"#))
+    engine.benchTick()
+    let first = try #require(engine.queue.sync { engine.pythonLoop })
+    #expect(lockFree(home))  // Python's loop takes it
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "caps_minutes": 0, "notify": false}"#))
+    engine.benchTick()
+    #expect(kill(first, 0) != 0 && !lockFree(home))
+
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "runtimes": "node", "caps_minutes": 0, "notify": false}"#))
+    engine.benchTick()
+    let second = try #require(engine.queue.sync { engine.pythonLoop })
+    engine.stop()
+    #expect(kill(second, 0) != 0)  // no orphan keeps the lock
+    #expect(lockFree(home))
+}
+
+@Test("engine: a Python loop that ends at once is started again after 10 s, then 20 s; native QoS flags are dropped")
+func pythonLoopBackoff() throws {
+    let home = try scratchHome("loopwait")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    Files.mkdirs(GuardPaths.state(home))
+    // interval_seconds as a string: mismatched, and Python's loop dies on it (time.sleep("5"))
+    #expect(Files.writeAtomic(GuardPaths.state(home) + "/devguard.json", #"{"mode": "enforce", "interval_seconds": "5", "notify": false}"#))
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    final class Starts: @unchecked Sendable { var n = 0 }
+    let starts = Starts()
+    engine.loopStarter = { _ in
+        starts.n += 1
+        return Spawn.start(["/usr/bin/true"])
+    }
+    engine.probesFactory = { pressureWorld(home: home, now: 1_791_000_000, compressedGB: 1) }
+    engine.runner = { _ in 0 }
+    engine.queue.sync { engine.shaper.background[99_999] = (1, true) }
+
+    engine.benchTick()
+    #expect(starts.n == 1)
+    #expect(engine.queue.sync { engine.shaper.background.isEmpty })
+    #expect(engine.queue.sync { engine.interval(GuardConfig.load(path: GuardPaths.state(home) + "/devguard.json")) } == 5)
+    usleep(200_000)
+    for _ in 0..<5 { engine.benchTick() }  // it ended: 10 s before the next start, not 0.5 s
+    #expect(starts.n == 1)
+    let wait = engine.queue.sync { engine.loopRestartAt - Kernel.wall() }
+    #expect(wait > 8 && wait <= 10)
+    engine.queue.sync { engine.loopRestartAt = 0 }
+    engine.benchTick()
+    #expect(starts.n == 2)
+    usleep(200_000)
+    engine.benchTick()
+    let longer = engine.queue.sync { engine.loopRestartAt - Kernel.wall() }
+    #expect(longer > 18 && longer <= 20)
+    engine.stop()
+}
+
+@Test("engine: a Python loop that ignores SIGTERM is killed after 10 s with what it started")
+func pythonLoopKill() throws {
+    let home = try scratchHome("loopkill")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let config = GuardPaths.state(home) + "/devguard.json"
+    Files.mkdirs(GuardPaths.state(home))
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "runtimes": "node", "notify": false}"#))
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    engine.loopStarter = { _ in Spawn.start(["/bin/sh", "-c", "trap '' TERM; /bin/sleep 60 & wait"]) }
+    engine.probesFactory = { pressureWorld(home: home, now: 1_791_000_000, compressedGB: 1) }
+    engine.runner = { _ in 0 }
+    engine.benchTick()
+    let pid = try #require(engine.queue.sync { engine.pythonLoop })
+    var grandchild: pid_t = 0
+    for _ in 0..<50 where grandchild == 0 {
+        usleep(20_000)
+        grandchild = Proc.children(of: pid).first ?? 0
+    }
+    #expect(grandchild > 0)
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "notify": false}"#))
+    let start = Kernel.wall()
+    engine.benchTick()
+    #expect(Kernel.wall() - start >= 9.5)
+    #expect(kill(pid, 0) != 0 && kill(grandchild, 0) != 0)
+}
+
+@Test("brake settings of another type hand the guard to Python, as a string interval does")
+func brakeTypes() {
+    let cfg = { (text: String) -> [String] in
+        let path = "/tmp/acc-cored-brake-\(getpid()).json"
+        defer { unlink(path) }
+        _ = Files.writeAtomic(path, text)
+        return GuardConfig.load(path: path).mismatched
+    }
+    #expect(cfg(#"{"brake": {"emergency_cooldown_seconds": "5"}}"#) == ["brake.emergency_cooldown_seconds"])
+    #expect(cfg(#"{"brake": "fast"}"#) == ["brake"])
+    #expect(cfg(#"{"brake": {"emergency_cooldown_seconds": 5, "unknown": "x"}}"#).isEmpty)
+    #expect(cfg(#"{"interval_seconds": "5"}"#) == ["interval_seconds"])
 }

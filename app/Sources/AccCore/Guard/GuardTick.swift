@@ -333,7 +333,7 @@ public func decide(_ cfg: GuardConfig, _ world: GuardWorld, _ state: PyObject) -
     }
     for (app, list) in byApp {
         var group: [Unit] = []
-        for u in list where !group.contains(where: { $0.key == u.key }) { group.append(u) }
+        for u in list where !group.contains(where: { $0.key.pyEq(u.key) }) { group.append(u) }
         if group.count < 2 { continue }
         let keep = pyMax(group) { Key4(a: $0.attended, b: $0.watched, c: $0.lastWatched.value, d: Double($0.start)) }!
         for unit in group {
