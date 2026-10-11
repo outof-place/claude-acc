@@ -83,9 +83,11 @@ public final class LiveSchedProbes: SchedProbes {
 
 /// sched.py's process readers without ctypes.
 public enum SchedNative {
-    /// proc_listpids(kind, arg)
+    /// proc_listpids(kind, arg), the buffer sized by a first call, as all_pids() does
     static func listpids(_ kind: Int32, _ arg: UInt32) -> [pid_t] {
-        var buffer = [pid_t](repeating: 0, count: 2048)
+        let need = proc_listpids(UInt32(kind), arg, nil, 0)
+        guard need > 0 else { return [] }
+        var buffer = [pid_t](repeating: 0, count: Int(need) / MemoryLayout<pid_t>.size + 256)
         let n = buffer.withUnsafeMutableBytes { proc_listpids(UInt32(kind), arg, $0.baseAddress, Int32($0.count)) }
         guard n > 0 else { return [] }
         return buffer.prefix(Int(n) / MemoryLayout<pid_t>.size).filter { $0 > 0 }
@@ -93,6 +95,7 @@ public enum SchedNative {
 
     /// descendants(root) through PROC_PPID_ONLY
     public static func descendants(_ root: pid_t) -> Set<pid_t> {
+        guard root > 0 else { return [] }
         var seen: Set<pid_t> = []
         var todo = [root]
         while let pid = todo.popLast() {
@@ -103,7 +106,18 @@ public enum SchedNative {
 
     /// job_pids(root): the tree under root and its whole process group
     public static func jobPids(_ root: pid_t) -> Set<pid_t> {
-        descendants(root).union(listpids(PROC_PGRP_ONLY, UInt32(root)))
+        guard root > 0 else { return [] }
+        return descendants(root).union(listpids(PROC_PGRP_ONLY, UInt32(root)))
+    }
+
+    /// is_wrapper(pid): still `sched.py run` (or `acc.py sched …`) and not a reused pid
+    public static func isWrapper(_ pid: pid_t) -> Bool {
+        guard pid > 1, let args = Args.read(pid) else { return false }
+        let argv = args.argv.prefix(5).map(Text.decode)
+        for (i, a) in argv.prefix(4).enumerated() {
+            if a.pyEnds("sched.py") || (a.pyEnds("acc.py") && i + 1 < argv.count && argv[i + 1].pyEq("sched")) { return true }
+        }
+        return false
     }
 
     /// pids_usage(pids): (GB, CPU s) of the ones still alive (rusage v0's footprint and times)

@@ -15,6 +15,7 @@ let usage = """
            acc-cored guard-bench [N]      N ticks back to back, CPU per phase
            acc-cored orca-read            the host's four reads over its socket, timed
            acc-cored sched-replay F.jsonl [--show N]   the scheduler's housekeeping on parity fixtures
+           acc-cored sched-scan [--sims-since T] [--sims-only]   native_scan() as JSON (parity)
            acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS]   the daemon
     """
 
@@ -208,12 +209,26 @@ case "sched-replay":
     }
     print("same \(same), different \(different)")
     exit(different == 0 ? 0 : 1)
+case "sched-scan":
+    // native_scan() as JSON: what builds and simulators the scheduler counts (parity)
+    let since = value("--sims-since", in: args).flatMap { Double($0) }
+    let r = SchedNative.scan(simsSince: since, builds: !args.contains("--sims-only"))
+    print(PyJSON.object(PyObject([
+        ("gb", .double(r.gb)), ("active", .bool(r.active)), ("pids", .array(r.pids.sorted().map { .int(Int($0)) })),
+    ])).dumps())
 case "run":
     // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
     let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
     let state = GuardPaths.state(home)
     let shadow = value("--shadow-guard", in: args)
     let seconds = value("--for", in: args).flatMap { Double($0) }
+    // one daemon per user: a second one would take the control socket and flip the sched mark
+    Files.mkdirs(state)
+    let instance = open(state + "/acc-cored.lock", O_WRONLY | O_CREAT | O_CLOEXEC, 0o600)
+    guard instance >= 0, flock(instance, LOCK_EX | LOCK_NB) == 0 else {
+        print("acc-cored już działa")
+        exit(0)
+    }
     var guardEngine: GuardEngine?
     if args.contains("--guard") || shadow != nil {
         let engine = GuardEngine(.init(home: home, shadow: shadow != nil, shadowPath: shadow))
@@ -226,7 +241,8 @@ case "run":
     var schedEngine: SchedEngine?
     if args.contains("--sched") {
         let engine = SchedEngine(stateDir: state)
-        if let guardEngine { engine.snapshot = { guardEngine.latestSnapshot() } }
+        // the snapshot the wrappers read is devguard-state.json's: a shadow guard's is its own
+        if let guardEngine, shadow == nil { engine.snapshot = { guardEngine.latestSnapshot() } }
         engine.start()
         schedEngine = engine
     }
@@ -244,7 +260,10 @@ case "run":
             return .object(PyObject([("ok", false), ("error", "unknown op")]))
         }
     }
-    _ = control.start()
+    if !control.start() {
+        // without it no wrapper attaches (they ping it first): a path over 104 bytes, or no room
+        FileHandle.standardError.write(Data("acc-cored: gniazdo \(state)/acc-cored.sock nie wstało\n".utf8))
+    }
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)
     let stopAll = { (code: Int32) in

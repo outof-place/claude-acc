@@ -51,6 +51,27 @@ public struct SchedConfig: Sendable {
 
     public subscript(key: String) -> PyJSON { raw[key] ?? .null }
     public func num(_ key: String) -> PyNum { PyNum(raw[key]) ?? .int(0) }
+
+    /// The keys of another type than their default, which the native pass would read otherwise
+    /// than Python (`"stall_s": "600"` is 600 to float() and 0 here): a number for a number, a
+    /// string for a string, a list for a list, a dict for a dict; flags and None defaults take
+    /// anything. With any of them acc-cored leaves the scheduler to the wrappers.
+    public var mismatched: [String] {
+        var out: [String] = []
+        for (key, def) in Self.defaults {
+            guard let value = raw[key] else { continue }
+            let ok: Bool
+            switch def {
+            case .int, .double: ok = PyNum(value) != nil
+            case .string: ok = value.string != nil && !value.isRaw
+            case .array: ok = value.array != nil
+            case .object: ok = value.object != nil
+            default: ok = true
+            }
+            if !ok { out.append(key) }
+        }
+        return out
+    }
 }
 
 public enum Sched {

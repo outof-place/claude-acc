@@ -8,6 +8,12 @@
 // wrapper blocks in wait4 meanwhile and asks for the job's final peak over the control socket.
 // Wrappers that don't know acc-cored keep their own loops; while none of the jobs is ours,
 // acc-cored only watches the directory. With no job left the timers stop.
+//
+// The mark ("cored": pid, at, proto) is what a wrapper trusts: it pings the socket before it
+// attaches, and while attached it treats a mark older than CORED_STALE_S as acc-cored gone (sched.py).
+// So a pass that can't run (sched/lock held by Python: retried in 100 ms, sampling goes on) or
+// mustn't (a state of another version or unreadable, a config the native pass reads otherwise:
+// nothing written) lets the wrappers fall back on their own within seconds.
 import Darwin
 import Dispatch
 
@@ -28,6 +34,9 @@ public final class SchedEngine: @unchecked Sendable {
     public var snapshot: (@Sendable () -> PyObject?)?
     public private(set) var passes = 0
     public private(set) var wakes = 0
+    /// sched.py's CORED_PROTO: what the mark and the socket mean; a wrapper of another one ignores us
+    public static let proto = 1
+    var retryPending = false
 
     public init(stateDir: String) { self.stateDir = stateDir }
 
@@ -124,8 +133,17 @@ public final class SchedEngine: @unchecked Sendable {
         }
     }
 
+    /// A write in the directory: a pass when idle; while ticking, the watches only (a new job's first
+    /// sample must not wait for the next pass, or a short job gets none). state.json is replaced
+    /// atomically, so it reads without the lock.
     func kick() {
-        if !ticking { pass() }
+        if !ticking {
+            pass()
+            return
+        }
+        guard let state = Files.json(statePath, fallback: .null).object, state["version"] == .int(1) else { return }
+        updateWatches((state["running"]?.array ?? []).compactMap(\.object), now: Kernel.wall())
+        scheduleSamples()
     }
 
     /// One pass: under sched/lock, the heartbeats of our jobs, then the housekeeping, the wakes and
@@ -133,8 +151,17 @@ public final class SchedEngine: @unchecked Sendable {
     func pass() {
         let fd = open(lockPath, O_RDWR | O_CREAT | O_CLOEXEC, 0o644)
         guard fd >= 0 else { return }
-        guard GuardEngine.flockRetrying(fd, LOCK_EX) else {
+        // Python's heartbeat took the lock without waiting; a pass that would wait stops the
+        // samples too (same queue), so it tries again in 100 ms instead
+        guard GuardEngine.flockRetrying(fd, LOCK_EX | LOCK_NB) else {
             close(fd)
+            if !retryPending {
+                retryPending = true
+                queue.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    self?.retryPending = false
+                    self?.pass()
+                }
+            }
             return
         }
         defer {
@@ -144,15 +171,27 @@ public final class SchedEngine: @unchecked Sendable {
         let cfg = SchedConfig.load(path: configPath)
         let probes = LiveSchedProbes(stateDir: stateDir, snapshot: snapshot?())
         let now = probes.now
-        var state = Self.loadState(statePath, cfg, now: now, day: probes.day())
+        guard var state = Self.loadState(statePath, cfg, now: now, day: probes.day()) else {
+            idle()  // a state of another version, or unreadable: Python's to handle; nothing written
+            return
+        }
+        if !cfg.mismatched.isEmpty {
+            // a config the native pass would read otherwise: the wrappers keep their own loops
+            if state["cored"] != nil {
+                state["cored"] = nil
+                Self.saveState(statePath, &state, now: now)
+            }
+            idle()
+            return
+        }
         let running = (state["running"]?.array ?? []).compactMap(\.object)
         let queued = (state["queue"]?.array ?? []).compactMap(\.object)
         let ours = running.contains { $0["monitor"] == .string("cored") } || queued.contains { $0["wake"] == .string("usr1") }
         updateWatches(running, now: now)
         guard ours else {
             // the mark new wrappers look for (sched.cored_pid): written once, not every pass
-            if state["cored"]?["pid"] != .int(Int(getpid())) {
-                state["cored"] = .object(PyObject([("pid", .int(Int(getpid()))), ("at", .double(now))]))
+            if state["cored"]?["pid"] != .int(Int(getpid())) || state["cored"]?["proto"] != .int(Self.proto) {
+                state["cored"] = mark(now)
                 Self.saveState(statePath, &state, now: now)
             }
             idle()
@@ -169,9 +208,12 @@ public final class SchedEngine: @unchecked Sendable {
         let admitted = Set(result.admitted.map(\.0))
         for job in (state["queue"]?.array ?? []).compactMap(\.object) where job["wake"] == .string("usr1") {
             let due = admitted.contains(job["id"] ?? .null) || (job["cancelled"]?.truthy ?? false)
-            if due, let pid = job["pid"]?.int, kill(pid_t(clamping: pid), SIGUSR1) == 0 { wakes += 1 }
+            // signal_job's checks: a pid above 1 that is still the job's wrapper (pids get reused)
+            guard due, let p = job["pid"]?.int, p > 1, p <= Int(Int32.max) else { continue }
+            let pid = pid_t(p)
+            if SchedNative.isWrapper(pid), kill(pid, SIGUSR1) == 0 { wakes += 1 }
         }
-        state["cored"] = .object(PyObject([("pid", .int(Int(getpid()))), ("at", .double(now))]))
+        state["cored"] = mark(now)
         Self.saveState(statePath, &state, now: now)
         if !ticking {
             ticking = true
@@ -182,6 +224,10 @@ public final class SchedEngine: @unchecked Sendable {
             tickTimer = t
         }
         scheduleSamples()
+    }
+
+    func mark(_ now: Double) -> PyJSON {
+        .object(PyObject([("pid", .int(Int(getpid()))), ("at", .double(now)), ("proto", .int(Self.proto))]))
     }
 
     func idle() {
@@ -198,14 +244,17 @@ public final class SchedEngine: @unchecked Sendable {
     func updateWatches(_ running: [PyObject], now: Double) {
         var seen: Set<String> = []
         for job in running where job["monitor"] == .string("cored") {
-            guard let id = job["id"]?.string, let pgid = job["child_pgid"]?.int, let wrapper = job["pid"]?.int else { continue }
+            guard let id = job["id"]?.string, let pgid = job["child_pgid"]?.int, pgid > 1, let wrapper = job["pid"]?.int, wrapper > 1
+            else { continue }
             seen.insert(id)
             if watches[id] == nil {
                 let started = job["child_started_at"]?.double ?? job["started_at"]?.double ?? now
                 let native = job["lang"] == .string("native") && (job["exclusive"]?.truthy ?? false)
                 let w = JobWatch(
                     id: id, pgid: pid_t(clamping: pgid), wrapper: pid_t(clamping: wrapper), started: started, native: native,
-                    simsSince: job["tool"] == .string("portivo-mobile") ? started : nil)
+                    simsSince: job["native_tool"] == .string("portivo-mobile") ? started : nil)
+                // a restart of acc-cored mid-job: the peak so far is in the entry
+                w.peak = job["mem_peak_gb"]?.double ?? 0
                 w.sample(now: now)
                 watches[id] = w
             }
@@ -287,16 +336,26 @@ public final class SchedEngine: @unchecked Sendable {
         queue.sync {
             guard let w = watches[id] else { return .object(PyObject([("ok", false)])) }
             if w.goneAt == nil { w.sample(now: Kernel.wall()) }
-            return .object(PyObject([("ok", true), ("peak_gb", .double(w.peak)), ("cpu_s", .double(w.cpu)), ("now_gb", .double(w.nowGB))]))
+            // the entry's peak too: an earlier instance (or the wrapper's own loop) may have seen more
+            let entry = (Files.json(statePath, fallback: .null)["running"]?.array ?? []).first { $0["id"]?.string == id }
+            let peak = max(w.peak, entry?["mem_peak_gb"]?.double ?? 0)
+            return .object(PyObject([("ok", true), ("peak_gb", .double(peak)), ("cpu_s", .double(w.cpu)), ("now_gb", .double(w.nowGB))]))
         }
     }
 
     // MARK: state.json
 
-    /// load_state(cfg)
-    static func loadState(_ path: String, _ cfg: SchedConfig, now: Double, day: String) -> PyObject {
-        var state = Files.json(path, fallback: .null).object ?? PyObject()
-        if state["version"] != .int(1) { state = emptyState(cfg, now: now, day: day) }
+    /// load_state(cfg), except that a state acc-cored can't take as is (unreadable, or another
+    /// version: sched.py may be newer than this daemon) is nil rather than a fresh one: writing a
+    /// fresh one would wipe every queued and running job
+    static func loadState(_ path: String, _ cfg: SchedConfig, now: Double, day: String) -> PyObject? {
+        var state: PyObject
+        if Files.exists(path) {
+            guard let read = Files.json(path, fallback: .null).object, read["version"] == .int(1) else { return nil }
+            state = read
+        } else {
+            state = emptyState(cfg, now: now, day: day)
+        }
         var internalState = state["_internal"]?.object ?? PyObject([("swap", .array([])), ("avail", .array([]))])
         if state["today"]?["date"] != .string(day) {
             state["today"] = newToday(day)

@@ -490,17 +490,39 @@ def alive(pid):
 # się co CORED_WAKE_S po swoje (log postoju, limit klasy) i żeby sprawdzić, czy acc-cored dalej działa
 CORED_SOCK = os.path.join(STATE_DIR, "acc-cored.sock")
 CORED_WAKE_S = 5.0
+# znaczenie znaku i gniazda; acc-cored innej wersji to dla wrappera brak acc-cored
+CORED_PROTO = 1
+# znak starszy niż tyle przy podłączonym wrapperze: acc-cored stoi (zatrzymany, zawieszony na blokadzie),
+# więc wrapper wraca do własnych pętli; przebieg acc-cored odświeża znak co sekundę
+CORED_STALE_S = 3.0
 
 
-def cored_pid(state):
-    """pid acc-cored, gdy robi pracę kolejki (zostawia znak w stanie) i żyje; inaczej None.
+def cored_mark(state):
+    """pid acc-cored ze znaku w stanie, gdy to żywy acc-cored tej samej wersji; inaczej None.
     SCHED_NO_CORED=1 zostawia wrapper przy własnych pętlach."""
     if os.environ.get("SCHED_NO_CORED"):
         return None
-    pid = (state.get("cored") or {}).get("pid")
-    if not isinstance(pid, int) or pid <= 0 or not alive(pid):
+    mark = state.get("cored") or {}
+    pid = mark.get("pid")
+    if mark.get("proto") != CORED_PROTO or not isinstance(pid, int) or pid <= 1 or not alive(pid):
         return None
     return pid if proc_name(pid) == "acc-cored" else None
+
+
+def cored_ping():
+    """Czy gniazdo acc-cored odpowiada: bez jobów znak w stanie bywa stary (acc-cored pisze go wtedy
+    raz), więc przed podłączeniem o życie pytamy gniazdo, poza blokadą schedulera."""
+    if os.environ.get("SCHED_NO_CORED") or not os.path.exists(CORED_SOCK):
+        return False
+    return cored_call({"op": "ping"}, timeout=0.2) is not None
+
+
+def cored_live(state):
+    """Czy podłączony wrapper może dalej polegać na acc-cored: żywy znak, odświeżony w CORED_STALE_S."""
+    if not cored_mark(state):
+        return False
+    at = (state.get("cored") or {}).get("at")
+    return isinstance(at, (int, float)) and time.time() - at <= CORED_STALE_S
 
 
 def cored_waker():
@@ -3422,6 +3444,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
     timeout = float(opts.get("timeout") or 0)
     start = time.time()
     target = None
+    pinged = cored_ping()
     with Locked():
         state = load_state(cfg)
         reap(state)
@@ -3440,7 +3463,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
         entry["route"], target = decide_route(state, job, gb, wall, cfg, cache)
         entry["routed_at"] = time.time()
         waker = None
-        if cored_pid(state):
+        if pinged and cored_mark(state):
             # gotowy na SIGUSR1, zanim acc-cored zobaczy wpis: domyślna akcja zabiłaby wrapper
             waker = cored_waker()
             entry["wake"] = "usr1"
@@ -3490,7 +3513,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                 if me is None:
                     me = entry
                     state["queue"].append(me)
-                if me.get("wake") and not cored_pid(state):
+                if me.get("wake") and not cored_live(state):
                     me["wake"] = None  # acc-cored zniknął: znowu co 0,5 s
                 if time.time() - me.get("routed_at", 0) > 15:
                     me["route"], target = decide_route(
@@ -3654,12 +3677,13 @@ def run_local(entry, job, command, argv, cfg):
     jid = entry["id"]
     spawned_at = time.time()
     cored = False
+    pinged = cored_ping()
     with Locked():
         state = load_state(cfg)
         me = next((j for j in state["running"] if j["id"] == jid), None)
         if me is not None:
             me["child_pgid"] = child.pid
-            if cored_pid(state):
+            if pinged and cored_mark(state):
                 me["monitor"] = "cored"
                 me["child_started_at"] = spawned_at
                 cored = True
@@ -3748,7 +3772,7 @@ def wait_cored(child, jid, cfg, watch, started):
             return status, rusage, float(final.get("peak_gb") or 0.0), float(final.get("cpu_s") or 0.0)
         kq.control(None, 1, CORED_WAKE_S)
         state = load_state(cfg)
-        if not cored_pid(state):
+        if not cored_live(state):
             return None
         me = next((j for j in state["running"] if j["id"] == jid), None) or {}
         stalled = me.get("stalled_s")

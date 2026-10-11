@@ -173,8 +173,11 @@ so ten wrappers do the same housekeeping ten times.
   then admits itself, as before.
 - **Idle:** with no job left the timers stop, and acc-cored only watches the `sched` directory.
 
-The wrapper (`sched.py`) cooperates only when acc-cored marks the state (`"cored": {"pid": ...}`)
-and that pid is a live `acc-cored`. `SCHED_NO_CORED=1` keeps the old loops.
+The wrapper (`sched.py`) cooperates only when acc-cored marks the state (`"cored": {"pid", "at",
+"proto"}`), that pid is a live `acc-cored` of the same `proto`, and its socket answers a ping
+(asked outside `sched/lock`). `SCHED_NO_CORED=1` keeps the old loops. While attached, a wrapper
+treats a mark older than 3 s as acc-cored gone. That covers a stopped or wedged daemon, whose socket
+may still answer: acc-cored refreshes the mark on every pass.
 - **Queued:** the wrapper marks its entry `"wake": "usr1"` and waits in a kqueue for the signal
   (`EVFILT_SIGNAL`, with a no-op handler so a late signal can't kill it and the job's disposition
   stays default). It still wakes every 5 s for its own checks (timeout, reroute).
@@ -184,7 +187,15 @@ and that pid is a live `acc-cored`. `SCHED_NO_CORED=1` keeps the old loops.
   (`sched.final`).
 - **Fallback:** if acc-cored disappears, a queued wrapper drops its mark and polls again. A running
   one goes back to its own loop, starting from the last peak acc-cored saved. When acc-cored stops,
-  it removes its mark.
+  it removes its mark. A restarted acc-cored takes over with the peak the entry holds.
+- **When acc-cored stands back:** it doesn't run a pass, and writes nothing, in three cases. A state
+  of another version or an unreadable one (sched.py may be newer than the daemon; a fresh state
+  would wipe the queue) is one. A `config.json` value of another type than its default is another
+  (`"stall_s": "600"` is 600 to Python's `float()`); then the mark is taken away. The third is
+  `sched/lock` held by Python: that pass is tried again in 100 ms, and the samples go on.
+- **One daemon:** `run` takes `$STATE/acc-cored.lock` first. A second instance exits instead of
+  taking the socket.
+- **Signals:** SIGUSR1 goes only to a pid above 1 that is still the job's wrapper (`is_wrapper`).
 
 The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
 checked (`LOCAL_PEERCRED`).
@@ -224,6 +235,12 @@ The queue frees faster too. Three jobs waited on memory that freed 10 s in. The 
 
 The test jobs are sleeping processes. A real build's tree is larger, so a wrapper's own sampling
 costs more there (2.5 to 5 ms/s per job, see [What the loops cost](#what-the-loops-cost)).
+
+Two timings change:
+- `safety` and `refresh_memory` now run once a second in total, not once a second per wrapper. A
+  cascade of pauses under swap growth is therefore slower, one job a second at most.
+- A running wrapper enforces `class_timeout_s` when it wakes, every 5 s. Its SIGKILL can come up to
+  about 5 s later than with the wrapper's own 4 Hz loop.
 
 ## Switching
 
