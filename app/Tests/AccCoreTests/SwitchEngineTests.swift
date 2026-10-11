@@ -284,11 +284,40 @@ func switchEngineChecks() throws {
     let record = Files.json(dir + "/accswitch-slot.json", fallback: .null)
     #expect(record["checked_at"]?.double == record["at"]?.double)
 
-    // a start that fails, slot after slot: one log line, not one per slot
+    // a start that fails, slot after slot: one log line, not one per slot; a tick that runs ends the
+    // streak, and the next failure is logged again
     engine.runner = nil
     for _ in 0..<3 { engine.queue.sync { engine.slotFired() } }
-    let log = String(decoding: Files.read(dir + "/launchd.log") ?? [], as: UTF8.self)
-    #expect(log.components(separatedBy: "the tick didn't start").count == 2)
+    let failures = { String(decoding: Files.read(dir + "/launchd.log") ?? [], as: UTF8.self).components(separatedBy: "the tick didn't start").count - 1 }
+    #expect(failures() == 1)
+    engine.runner = { _, _ in 0 }
+    engine.queue.sync { engine.slotFired() }
+    engine.runner = nil
+    for _ in 0..<2 { engine.queue.sync { engine.slotFired() } }
+    #expect(failures() == 2)
+    engine.stop()
+}
+
+@Test("engine: a tick that really starts ends the streak of failed starts; the next failure is logged again")
+func switchEngineStartStreak() throws {
+    let (home, dir) = try switchHome("streak")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    writeState(dir, state(lastTick: Kernel.wall() - 100, quiet: false))  // not quiet: every slot runs
+    let python = dir + "/py"  // missing: the start fails; a link to /usr/bin/true: it starts and ends
+    let engine = SwitchEngine(.init(home: home, python: [python]))
+    engine.resolver = { nil }
+    let failures = {
+        String(decoding: Files.read(dir + "/launchd.log") ?? [], as: UTF8.self).components(separatedBy: "the tick didn't start").count - 1
+    }
+    for _ in 0..<2 { engine.queue.sync { engine.slotFired() } }
+    #expect(failures() == 1)
+    #expect(symlink("/usr/bin/true", python) == 0)
+    engine.queue.sync { engine.slotFired() }
+    for _ in 0..<200 where engine.queue.sync(execute: { engine.running != nil }) { usleep(20_000) }
+    #expect(engine.queue.sync { engine.running == nil })
+    unlink(python)
+    engine.queue.sync { engine.slotFired() }
+    #expect(failures() == 2)
     engine.stop()
 }
 

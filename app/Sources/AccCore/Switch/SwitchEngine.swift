@@ -11,9 +11,10 @@
 //
 // Nothing here ever signals a tick: a tick killed between a token refresh and its Keychain write
 // leaves a used refresh token behind, and the server answers its reuse by revoking the account
-// (launchd's SIGTERM at a bootout waits out that stretch: `uninterrupted`, ExitTimeOut 90 s). The tick leads a group of its own (it outlives acc-cored, launchd reaps
-// it then), and its timeout is cooperative: `ACC_TICK_DEADLINE` tells it when to stop starting
-// work, and it starts a refresh only with time left to finish it (accswitch.py `in_time`).
+// (launchd's SIGTERM at a bootout waits out that stretch: `uninterrupted`, ExitTimeOut 90 s). The
+// tick leads a group of its own (it outlives acc-cored, launchd reaps it then), and its timeout is
+// cooperative: `ACC_TICK_DEADLINE` tells it when to stop starting work, and it starts a refresh only
+// with time left to finish it (accswitch.py `in_time`).
 // The next slot is scheduled when the tick ends, so two never overlap.
 //
 // Every slot leaves a record in accswitch-slot.json: whether it ran the tick and why, the tick's
@@ -247,6 +248,7 @@ public final class SwitchEngine: @unchecked Sendable {
         var env = Spawn.currentEnv()
         env["ACC_TICK_DEADLINE"] = String(Int(run.started + options.tickDeadline))
         if let runner {
+            startFailLogged = false  // a tick that runs ends the streak of failed starts
             running = run
             tickEnded(runner(argv, env))
             return
