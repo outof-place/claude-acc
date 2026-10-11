@@ -39,7 +39,13 @@ final class RootHelper {
     @ObservationIgnored private var failures = 0
     @ObservationIgnored private var retryAt = -Double.infinity
     @ObservationIgnored var panelOpen = false {
-        didSet { if panelOpen, !oldValue { retryAt = -.infinity } }  // opening the panel tries again now
+        didSet {
+            guard panelOpen, !oldValue else { return }
+            retryAt = -.infinity  // opening the panel tries again now
+            // closed, the last reading came from Store's minute poll: the card counts one older than
+            // 15 s as no fan control, so it opens on a fresh one
+            if owns { sample() }
+        }
     }
 
     /// A hold is renewed this often, so a hold without an end outlasts the helper's 24 h cap.
@@ -296,7 +302,9 @@ final class RootHelper {
         let reading = read()
         let rpm = reading.fans.isEmpty ? 0 : reading.fans.map(\.rpm).reduce(0, +) / Double(reading.fans.count)
         let tenth = { (value: Double?) in ((value ?? 0) * 10).rounded() / 10 }
-        history.append([reading.at.rounded(), tenth(reading.cpu), tenth(reading.gpu), rpm.rounded()])
+        let row = [reading.at.rounded(), tenth(reading.cpu), tenth(reading.gpu), rpm.rounded()]
+        // a row's second names its point in the chart: a second reading within it replaces the first
+        if history.last?.first == row[0] { history[history.count - 1] = row } else { history.append(row) }
         // 20 minutes back whatever the pace: a row every 5 s open, one a minute closed
         history.removeAll { $0[0] < reading.at.rounded() - Self.historySpan }
         if history.count > 240 { history.removeFirst(history.count - 240) }

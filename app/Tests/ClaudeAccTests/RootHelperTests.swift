@@ -174,12 +174,14 @@ func rootHelperReadsFansWhenLookedAt() async throws {
     #expect(helper.closedReading()?.cpu == 91)
     #expect(reads == 1)
 
+    // opening the panel reads at once: the card counts a reading older than 15 s as no fan control
     helper.panelOpen = true
-    await helper.tick()
     #expect(reads == 2)
+    await helper.tick()
+    #expect(reads == 3)
     // open, the label takes the tick's reading
     #expect(helper.closedReading() != nil)
-    #expect(reads == 2)
+    #expect(reads == 3)
 }
 
 @Test("the chart's history keeps 20 minutes whatever the pace of the readings")
@@ -198,4 +200,24 @@ func rootHelperHistorySpan() async throws {
     // seven readings 5 minutes apart: the newest and the four within 20 minutes of it
     let history = try #require(helper.fanState?.history)
     #expect(history.map { $0[0] } == [1_800_000_600, 1_800_000_900, 1_800_001_200, 1_800_001_500, 1_800_001_800])
+}
+
+@Test("two readings in the same second make one chart row, the later one")
+func rootHelperOneRowPerSecond() async throws {
+    let machine = try Machine()
+    defer { machine.server.cancel() }
+    var cpu = 60.0
+    let helper = machine.podMenu {
+        var reading = Reading()
+        reading.at = 1_800_000_000.2
+        reading.cpu = cpu
+        cpu += 1
+        return reading
+    }
+    await helper.tick()
+    _ = helper.closedReading()
+    _ = helper.closedReading()
+    let history = try #require(helper.fanState?.history)
+    #expect(history.count == 1)
+    #expect(history.first?[1] == 61)
 }

@@ -363,8 +363,9 @@ final class Store {
     func panelAppeared() {
         panelOpen = true
         RootHelper.shared.panelOpen = true
-        // what came in while it was closed
+        // what came in while it was closed; the root helper's fans were read just now
         if let latestSnapshot { snapshot = latestSnapshot }
+        if RootHelper.shared.owns, let fresh = RootHelper.shared.fanState { latestFan = fresh }
         fanState = latestFan
         guardState = latestGuard
         refreshDisk(force: true)
