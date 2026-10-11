@@ -457,6 +457,46 @@ from `janitor.json` holds it as well. Idle is keyboard and mouse only: a video o
 input counts as idle. A user who comes back during a sweep doesn't stop it. `acc-cored janitor-check`
 prints the live reading and what the engine would do.
 
+## Events for hosts
+
+Hosts that show claude-acc's state (AccKit's `AccStore` in PodNative, Pod Menu) watch the state
+directory and read files again on every rename in it. `acc-cored run` serves the same files as a
+stream on its control socket, so a host can subscribe instead:
+- The line `{"op":"events","v":1}` turns the connection into frames: a u32 little-endian length
+  of what follows, a u8 kind, then the payload.
+  - 1 hello (server): `{"v": 1, "topics": [...]}`.
+  - 2 subscribe (client): `{"topics": [...], "have": {topic: seq}, "maxHz": {topic: hz}}`. It is
+    the whole set and replaces the last one, and `have` says what the client holds now.
+  - 3 snapshot (server): a u16 little-endian header length, the header `{"topic", "seq"}`, then
+    the file's exact bytes. A host decodes them with the same `Decodable` it uses on the file.
+  - 4 gone (server): `{"topic"}`, the file isn't there.
+  - 5 error (server): `{"code", "msg"}`. An unknown topic is reported and the rest still flows.
+    A frame that isn't a subscribe ends the stream.
+- `seq` is the file's `ino:mtime_ns:size`, the stamp a host computes when it reads the file itself,
+  so `have` holds across a fallback to the files.
+- Topics:
+  - `accounts` (status.json), `accountsSlot` (accswitch-slot.json), `devguard`, `sched`
+    (sched/state.json), `depot` (sched/depot.json), `awake`, `services` (pod-services.json),
+    `owner`, `menuBar` (menubar.json), `janitor`, `fans` and `hotspot` (their state files);
+  - `pressure`, derived: devguard-state.json's `snapshot.pressure.level` as `{"level": N}`, sent
+    only when the level changes.
+- Latest-wins per topic and client: while a client hasn't taken what was sent, newer versions
+  replace the waiting ones instead of queueing. `maxHz` spaces a topic's frames. A client that
+  leaves 16 MiB unread is dropped. 16 event clients at most.
+- The files stay the contract: Python writes them, and acc-cored only watches them, and only while
+  someone subscribes. It watches their directories for renames and each subscribed file for
+  writes in place.
+- `acc-cored events [--for SECONDS] TOPIC...` prints one line per frame of a running daemon, and
+  `ping` counts the event clients.
+- A host should give the hello 1 s at most (a hung daemon accepts connections it never answers)
+  and read the files when the socket is missing or drops.
+
+Cost, measured 2026-10-11 with a release build: a scratch HOME, `run` with no engine, one client
+on every topic for 60 s. The files were written at the live rates counted that day (sched 32/min,
+hotspot 30, devguard 11 at 30 KB, fans 10). The client got exactly one frame per write (83), plus
+10 pressure frames. The daemon used about 0.8 ms/s (the whole process, start included), the client
+under 0.17 ms/s (below `time`'s 10 ms resolution).
+
 ## Switching
 
 `scripts/acc-cored-switch.sh` swaps three launchd jobs for one acc-cored job, and back: devguard,

@@ -3,6 +3,7 @@
 // Requests are answered on the socket's own queue; a handler that needs an engine's queue syncs.
 // A client gets `maxClients` at most, `idleSeconds` without a line before it is closed, and
 // `writeSeconds` to take an answer; with no descriptor left (EMFILE) the listener rests a second.
+// The line {"op": "events"} hands the connection to `upgrade` (EventHub), with what followed it.
 import Darwin
 import Dispatch
 
@@ -20,6 +21,10 @@ public final class ControlSocket: @unchecked Sendable {
     public var maxClients = 32
     public var idleSeconds = 30.0
     public var writeSeconds = 1.0
+    /// takes a connection that asked for events, and the bytes after its line
+    public var upgrade: (@Sendable (Int32, [UInt8]) -> Void)?
+    /// connections given to `upgrade`: their read source goes without closing them
+    var handedOver: Set<Int32> = []
 
     public init(path: String, handler: @escaping Handler) {
         self.path = path
@@ -125,7 +130,9 @@ public final class ControlSocket: @unchecked Sendable {
             _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK)
             let source = DispatchSource.makeReadSource(fileDescriptor: client, queue: queue)
             source.setEventHandler { [weak self] in self?.read(client) }
-            source.setCancelHandler { close(client) }
+            source.setCancelHandler { [weak self] in
+                if self?.handedOver.remove(client) == nil { close(client) }
+            }
             clients[client] = (source, [])
             lastSeen[client] = Kernel.monotonic()
             source.resume()
@@ -172,7 +179,16 @@ public final class ControlSocket: @unchecked Sendable {
             let line = Array(entry.1[..<nl])
             entry.1.removeSubrange(...nl)
             let answer: PyJSON
-            if let request = (try? PyJSON.loads(bytes: line))?.object {
+            if let request = (try? PyJSON.loads(bytes: line))?.object, request["op"] == .string("events"), let upgrade {
+                // from here on the connection speaks frames, on the event hub's queue
+                let rest = entry.1
+                handedOver.insert(fd)
+                clients[fd]?.0.cancel()
+                clients[fd] = nil
+                lastSeen[fd] = nil
+                upgrade(fd, rest)
+                return
+            } else if let request = (try? PyJSON.loads(bytes: line))?.object {
                 answer = handler(request)
             } else {
                 answer = .object(PyObject([("ok", false), ("error", "not a JSON object")]))
