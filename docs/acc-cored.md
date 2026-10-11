@@ -206,6 +206,18 @@ may still answer: acc-cored refreshes the mark on every pass.
   older than `kern.boottime`, with no signal: nothing of it lives, and its pid and group belong to
   other processes now. It never signals its own process group either. An unknown boot time (0)
   makes nothing stale.
+- **pids reused within one boot** (they wrap here every ~25 minutes, ~4000 a minute):
+  - a wrapper counts as alive only while its pid started no later than its entry was made
+    (`owned`: the process's start, `pbi_start_tvsec`, at most `enqueued_at` + 1 s). Otherwise its
+    entry goes, as for a dead wrapper;
+  - a job's group is signalled (reap's SIGCONT + SIGTERM, safety's SIGSTOP and SIGCONT) only while
+    its leader started no later than `child_started_at` + 1 s (`group_of`). Every wrapper writes
+    `child_started_at` now, not only those acc-cored watches; an entry without it, or without a
+    numeric `started_at`, gets no signal;
+  - acc-cored puts no watch on an entry from before the boot or on a group that isn't the job's.
+  - Cost: one `proc_pidinfo` per entry and pass, microseconds. A wall-clock step back between a
+    wrapper's start and its entry can make it look reused: its queued entry goes and the wrapper
+    queues again on its next tick (a running one runs on, unwatched).
 
 The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
 checked (`LOCAL_PEERCRED`). A peer that closes before its answer (a wrapper whose call timed out)
@@ -219,7 +231,8 @@ costs nothing: SIGPIPE is ignored, sends use `MSG_NOSIGNAL`, and a client XNU re
   (local and Depot, small, native, paused, stalled, passed heads, starving heads, simulators), plus
   memory readings, guard snapshots and configs. Each one runs through sched.py's own five functions.
   `record` reads the live state and readings without writing anything. The fixtures carry the boot
-  time and the reaper's own group, and `child_pgid` takes odd values too: negative, 0, 1, `true`,
+  time, the reaper's own group and the processes' start times (some a pid or group reused after
+  the entry, some unreadable), and `child_pgid` takes odd values too: negative, 0, 1, `true`,
   2**40, a string, the reaper's own group.
 - `acc-cored sched-replay` runs the native pass on every fixture. The state, the admissions and the
   signals sent must match.
@@ -230,7 +243,9 @@ costs nothing: SIGPIPE is ignored, sends use `MSG_NOSIGNAL`, and a client XNU re
 
 Results on 2026-10-10:
 - fuzz: 10,500 of 10,500 fixtures identical (again after the review fixes, 2026-10-11), and
-  12,000 of 12,000 with the reboot and own-group rules (seeds 7 and 11, Python 3.14);
+  12,000 of 12,000 with the reboot and own-group rules (seeds 7 and 11, Python 3.14), and again
+  12,000 of 12,000 with the start-time rules (seed 7: 4,630 live wrappers whose pid was reused,
+  688 reused groups, 747 expected signals);
 - live: 10 of 10 recorded passes identical (6 on 2026-10-10, 4 on 2026-10-11, one job running).
 
 ### Cost

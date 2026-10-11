@@ -16,7 +16,7 @@ let usage = """
            acc-cored orca-read            the host's four reads over its socket, timed
            acc-cored sched-replay F.jsonl [--show N]   the scheduler's housekeeping on parity fixtures
            acc-cored sched-scan [--sims-since T] [--sims-only]   native_scan() as JSON (parity)
-           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS]   the daemon
+           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS] [--wait-lock]   the daemon
     """
 
 func json(_ value: Any) -> String {
@@ -237,7 +237,9 @@ case "run":
             exit(0)
         }
         print("acc-cored już działa, czekam na jego koniec")
-        while flock(instance, LOCK_EX) != 0 && errno == EINTR {}
+        while flock(instance, LOCK_EX) != 0 {
+            guard errno == EINTR else { fail("acc-cored: blokada \(state)/acc-cored.lock: errno \(errno)") }
+        }
     }
     var guardEngine: GuardEngine?
     if args.contains("--guard") || shadow != nil {
@@ -265,6 +267,7 @@ case "run":
         case "ping":
             return .object(PyObject([
                 ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
+                ("wakes", .int(schedRunning?.wakeCount.load(ordering: .relaxed) ?? 0)),
             ]))
         default:
             return .object(PyObject([("ok", false), ("error", "unknown op")]))

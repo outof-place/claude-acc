@@ -1944,15 +1944,21 @@ class StateTest(Paths):
                                     "units": units}}, f)
         self.assertEqual(S.devserver_reserve_gb(), 5.0)  # 4 (max_server_gb) + 1
 
+    def sleeper(self):
+        """sleep 30 w swojej grupie; sprzątany razem z wait(), bez zombie."""
+        p = subprocess.Popen(["sleep", "30"], preexec_fn=os.setpgrp)
+        self.addCleanup(lambda: (p.poll() is None and p.kill(), p.wait()))
+        return p
+
     def test_today_rolls_over_and_reap(self):
         st = self.state()
         st["today"]["date"] = "2000-01-01"
         st["today"]["jobs_local"] = 9
-        sleeper = subprocess.Popen(["sleep", "30"], preexec_fn=os.setpgrp)
-        self.addCleanup(lambda: sleeper.poll() is None and sleeper.kill())
+        sleeper = self.sleeper()
         st["running"].append(
-            {"id": "dead", "where": "local", "pid": 999999, "child_pgid": sleeper.pid}
-        )
+            {"id": "dead", "where": "local", "pid": 999999, "child_pgid": sleeper.pid,
+             "started_at": time.time(), "child_started_at": time.time()}
+        )  # fmt: skip
         S.save_state(st)
         st = S.load_state(self.cfg)
         self.assertEqual(st["today"]["jobs_local"], 0)
@@ -1963,18 +1969,18 @@ class StateTest(Paths):
     def test_a_child_pgid_that_names_no_group_is_never_signalled(self):
         # killpg(-N) to kill(N), killpg(0) własna grupa, 1 to launchd: stan piszą wszystkie wrappery,
         # więc zła wartość nie może nikogo dosięgnąć (reap, safety, kill_child; acc-cored tak samo)
-        sleeper = subprocess.Popen(["sleep", "30"], preexec_fn=os.setpgrp)
-        self.addCleanup(lambda: sleeper.poll() is None and sleeper.kill())
+        sleeper = self.sleeper()
         bad = [-sleeper.pid, 0, 1, True, 3.7, str(sleeper.pid)]
         st = self.state()
-        st["running"] = [{"id": f"dead{i}", "where": "local", "pid": 999999, "child_pgid": v}
-                         for i, v in enumerate(bad)]
+        # everything else would let a signal through: only the value of child_pgid stops it
+        st["running"] = [{"id": f"dead{i}", "where": "local", "pid": 999999, "child_pgid": v, "started_at": time.time(),
+                          "child_started_at": time.time()} for i, v in enumerate(bad)]  # fmt: skip
         with mock.patch.object(S.os, "killpg") as killpg:
             S.reap(st)
             for v in bad:
                 self.assertFalse(S.kill_child({"pid": os.getpid(), "child_pgid": v}))
             st["running"] = [{"id": f"run{i}", "where": "local", "pid": os.getpid(), "child_pgid": v,
-                              "started_at": i} for i, v in enumerate(bad)]
+                              "started_at": i, "child_started_at": time.time()} for i, v in enumerate(bad)]  # fmt: skip
             st["memory"] = {"swap_growth_2m_gb": 99, "level_pct": 10, "pressure": "critical"}
             S.safety(st, self.cfg)
         killpg.assert_not_called()
@@ -1984,18 +1990,17 @@ class StateTest(Paths):
     def test_reap_spares_entries_from_before_the_boot_and_its_own_group(self):
         # po restarcie Maca pid i grupa starego wpisu należą do obcych procesów; własnej grupy
         # sprzątający nie rusza; ponad pid_t group_id daje None, a nie OverflowError z os.kill
-        sleepers = [subprocess.Popen(["sleep", "30"], preexec_fn=os.setpgrp) for _ in range(2)]
-        for p in sleepers:
-            self.addCleanup(lambda p=p: p.poll() is None and p.kill())
-        old, own = sleepers
+        old, own = self.sleeper(), self.sleeper()
         boot = S.boot_time()
         self.assertTrue(0 < boot < time.time())
+        now = time.time()
         st = self.state()
+        # child_started_at everywhere: only the rule under test stops each signal
         st["running"] = [
-            {"id": "stale", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": boot - 60},
+            {"id": "stale", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": boot - 60, "child_started_at": now},
             {"id": "stale-alive", "where": "local", "pid": os.getpid(), "started_at": boot - 60},
-            {"id": "own", "where": "local", "pid": 999999, "child_pgid": own.pid, "started_at": time.time()},
-            {"id": "wide", "where": "local", "pid": 999999, "child_pgid": 2**40, "started_at": time.time()},
+            {"id": "own", "where": "local", "pid": 999999, "child_pgid": own.pid, "started_at": now, "child_started_at": now},
+            {"id": "wide", "where": "local", "pid": 999999, "child_pgid": 2**40, "started_at": now, "child_started_at": now},
         ]  # fmt: skip
         st["queue"] = [{"id": "q-stale", "pid": os.getpid(), "enqueued_at": boot - 1},
                        {"id": "q-live", "pid": os.getpid(), "enqueued_at": time.time()}]  # fmt: skip
@@ -2007,10 +2012,54 @@ class StateTest(Paths):
         self.assertEqual([S.group_id(v) for v in (2**40, 2**31, 2**31 - 1)], [None, None, 2**31 - 1])
         # ten sam wpis z tego startu dostaje sygnał: chroniła go reguła startu, nie co innego
         st["running"] = [{"id": "orphan", "where": "local", "pid": 999999, "child_pgid": old.pid,
-                          "started_at": time.time()}]  # fmt: skip
+                          "started_at": time.time(), "child_started_at": time.time()}]  # fmt: skip
         S.reap(st)
         self.assertIsNotNone(old.wait(timeout=5))
         self.assertIsNone(own.poll())
+
+    def test_a_pid_or_group_reused_within_this_boot_gets_no_signal(self):
+        # pidy zawijają się tu co ~25 minut: pid martwego wrappera i grupa jego dziecka bywają już
+        # obce; start procesu (proc_start) późniejszy niż wpis to zdradza
+        reused_wrapper, reused_group, orphan, mine = (self.sleeper() for _ in range(4))
+        now = time.time()
+        st = self.state()
+        st["running"] = [
+            {"id": "w", "where": "local", "pid": reused_wrapper.pid, "enqueued_at": now - 3600, "started_at": now - 3500,
+             "child_pgid": reused_group.pid, "child_started_at": now - 3500},
+            {"id": "o", "where": "local", "pid": 999999, "enqueued_at": now - 10, "started_at": now - 5,
+             "child_pgid": orphan.pid, "child_started_at": now},
+        ]  # fmt: skip
+        st["queue"] = [{"id": "q", "pid": reused_wrapper.pid, "enqueued_at": now - 3600},
+                       {"id": "q2", "pid": mine.pid, "enqueued_at": now}]  # fmt: skip
+        self.assertTrue(S.alive(reused_wrapper.pid))
+        S.reap(st)
+        self.assertEqual(st["running"], [])  # the reused wrapper's entry went too
+        self.assertEqual([j["id"] for j in st["queue"]], ["q2"])
+        self.assertIsNotNone(orphan.wait(timeout=5))  # the real orphan, of this boot, still goes
+        self.assertIsNone(reused_group.poll())
+        self.assertIsNone(reused_wrapper.poll())
+        self.assertIsNone(S.group_of({"child_pgid": mine.pid}))  # no child_started_at: nothing to check by
+        # without a numeric started_at the entry goes without a signal, whatever its group
+        st["running"] = [{"id": "n", "where": "local", "pid": 999999, "child_pgid": mine.pid, "child_started_at": now}]
+        with mock.patch.object(S.os, "killpg") as killpg:
+            S.reap(st)
+        killpg.assert_not_called()
+        self.assertEqual(st["running"], [])
+
+        # safety: SIGSTOP only to a group that is still the job's; the youngest here is a reused one
+        a, b, c = self.sleeper(), self.sleeper(), self.sleeper()
+        st["running"] = [
+            {"id": "a", "where": "local", "pid": os.getpid(), "enqueued_at": now, "started_at": now - 30,
+             "child_pgid": a.pid, "child_started_at": now},
+            {"id": "b", "where": "local", "pid": os.getpid(), "enqueued_at": now, "started_at": now - 20,
+             "child_pgid": b.pid, "child_started_at": now},
+            {"id": "c", "where": "local", "pid": os.getpid(), "enqueued_at": now, "started_at": now - 10,
+             "child_pgid": c.pid, "child_started_at": now - 3600},
+        ]  # fmt: skip
+        st["memory"] = {"swap_growth_2m_gb": 99, "level_pct": 10, "pressure": "critical"}
+        with mock.patch.object(S.os, "killpg") as killpg:
+            S.safety(st, self.cfg)
+        killpg.assert_called_once_with(b.pid, signal.SIGSTOP)
 
 
 FAKE_DEPOT_API = r"""#!%s
@@ -2285,6 +2334,17 @@ class RunTest(unittest.TestCase):
         self.assertEqual(st["running"], [])
         self.assertEqual(st["today"]["jobs_local"], 1)
         self.assertIsNotNone(st["idle_since"])
+
+    def test_a_running_entry_names_its_child_s_start_without_acc_cored(self):
+        # reap i safety sygnalizują grupę dziecka tylko, gdy jej lider nie jest młodszy niż wpis mówi
+        p = self.start("cd apps/charter-service && go test ./internal/moneyfmt/", sleep="1.5")
+        self.wait_for(lambda: any(j.get("child_pgid") for j in self.state()["running"]))
+        job = next(j for j in self.state()["running"] if j.get("child_pgid"))
+        self.assertNotEqual(job.get("monitor"), "cored")
+        self.assertIsInstance(job.get("child_started_at"), float)
+        self.assertLessEqual(S.proc_start(job["child_pgid"]), job["child_started_at"] + 1)
+        self.assertEqual(S.group_of(job), job["child_pgid"])
+        self.assertEqual(self.done(p)[0], 0)
 
     def test_not_go_runs_plain(self):
         rc, out, _ = self.done(self.start("echo hello && exit 4"))

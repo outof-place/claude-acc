@@ -87,6 +87,41 @@ class CoredSchedTest(unittest.TestCase):
         with open(os.path.join(self.state, "sched", "state.json")) as f:
             return json.load(f)
 
+    def ping(self):
+        import socket
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(3)
+            c.connect(os.path.join(self.state, "acc-cored.sock"))
+            c.sendall(b'{"op": "ping"}\n')
+            return json.loads(c.recv(65536))
+
+    def test_a_queued_wrapper_is_woken_when_admitted(self):
+        # wake: usr1: the wrapper sleeps in kqueue up to CORED_WAKE_S (5 s); acc-cored's SIGUSR1 after
+        # the pass that admits it starts the job at once
+        def memory(level, pressure):
+            with open(os.path.join(self.home, "mem.json"), "w") as f:
+                json.dump({"level": level, "ram_gb": 48, "swap_gb": 0, "pressure": pressure}, f)
+
+        memory(2, "critical")
+        self.start_cored()
+        job = self.job(100, 0.2, 0)
+        waiting = False
+        for _ in range(100):
+            try:
+                waiting = any(j.get("wake") == "usr1" for j in self.sched_state()["queue"])
+            except (OSError, ValueError):
+                pass
+            if waiting:
+                break
+            time.sleep(0.05)
+        self.assertTrue(waiting, "the job never queued with wake: usr1")
+        time.sleep(1.5)
+        self.assertIsNone(job.poll())
+        memory(80, "normal")
+        self.assertEqual(job.wait(30), 0)
+        self.assertGreaterEqual(self.ping()["wakes"], 1)
+
     def test_short_jobs_get_their_peak(self):
         self.start_cored()
         jobs = [self.job(300, 0.3, 0) for _ in range(4)]

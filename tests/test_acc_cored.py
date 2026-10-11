@@ -36,7 +36,7 @@ def python_312():
 class ReadersTest(unittest.TestCase):
     def run_check(self, script, *args):
         done = subprocess.run(
-            [sys.executable, "-I", os.path.join(HERE, "acc_cored", script), BUILT, *args], capture_output=True, text=True
+            [sys.executable, "-I", "-B", os.path.join(HERE, "acc_cored", script), BUILT, *args], capture_output=True, text=True
         )
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
@@ -79,7 +79,7 @@ class SchedReplayTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "sched.jsonl")
             made = subprocess.run(
-                [python, "-I", os.path.join(HERE, "acc_cored", "sched_replay.py"), "fuzz", ROOT, "--n", "300",
+                [python, "-I", "-B", os.path.join(HERE, "acc_cored", "sched_replay.py"), "fuzz", ROOT, "--n", "300",
                  "--seed", "7", "--out", out],
                 capture_output=True, text=True,
             )  # fmt: skip

@@ -27,6 +27,8 @@ public protocol SchedProbes: AnyObject {
     func bootTime() -> Double
     /// os.getpgrp(): the reaper's own process group
     func ownGroup() -> pid_t
+    /// proc_start(pid): the process's start (pbi_start_tvsec, wall seconds), nil when it's gone
+    func startTime(_ pid: pid_t) -> Double?
     /// time.strftime("%Y-%m-%d") at `now`
     func day() -> String
 }
@@ -86,6 +88,42 @@ public enum Sched {
         return pid_t(n)
     }
 
+    static func number(_ v: PyJSON?) -> Double? {
+        switch v {
+        case .int(let i)?: Double(i)
+        case .double(let d)?: d
+        default: nil
+        }
+    }
+
+    /// pid_of(value): an int pid within pid_t above 0
+    static func pidOf(_ value: PyJSON?) -> pid_t? {
+        guard case .int(let n)? = value, n > 0, n <= Int(Int32.max) else { return nil }
+        return pid_t(n)
+    }
+
+    /// owned(job): the wrapper lives and is still the job's: its pid started no later than the
+    /// entry was made (+1 s, the kernel's start is in seconds). pids wrap here every ~25 min.
+    static func owned(_ job: PyJSON, _ probes: SchedProbes) -> Bool {
+        guard let pid = pidOf(job["pid"]), probes.alive(.int(Int(pid))) else { return false }
+        guard let at = number(job["enqueued_at"]) else { return true }
+        guard let start = probes.startTime(pid) else { return false }
+        return start <= at + 1
+    }
+
+    /// group_of(job): child_pgid while it's still the job's group (the leader no younger than
+    /// child_started_at + 1 s); without child_started_at, no group to signal
+    static func groupOf(_ job: PyJSON, _ probes: SchedProbes) -> pid_t? {
+        groupOf(job, start: probes.startTime)
+    }
+
+    static func groupOf(_ job: PyJSON, start: (pid_t) -> Double?) -> pid_t? {
+        guard let g = Sched.groupID(job["child_pgid"]), let at = number(job["child_started_at"]),
+              let begun = start(g), begun <= at + 1
+        else { return nil }
+        return g
+    }
+
     /// stale(job, key, boot): an entry from before this boot (its time in `key`)
     static func stale(_ job: PyJSON, _ key: String, _ boot: Double) -> Bool {
         let at: Double
@@ -118,16 +156,17 @@ public enum Sched {
         var keep: [PyJSON] = []
         for job in state["running"]?.array ?? [] {
             if stale(job, "started_at", boot) { continue }  // from before a reboot: no signal to anyone
-            if probes.alive(job["pid"]) {
+            if owned(job, probes) {
                 keep.append(job)
                 continue
             }
-            if let g = Sched.groupID(job["child_pgid"]), g != probes.ownGroup(), probes.alive(.int(Int(g))) {
+            // a pid or group reused within this boot isn't the job's; nor is an entry without started_at
+            if let g = groupOf(job, probes), g != probes.ownGroup(), number(job["started_at"]) != nil {
                 for sig in [SIGCONT, SIGTERM] { _ = probes.killpg(g, sig) }
             }
         }
         state["running"] = .array(keep)
-        state["queue"] = .array((state["queue"]?.array ?? []).filter { !stale($0, "enqueued_at", boot) && probes.alive($0["pid"]) })
+        state["queue"] = .array((state["queue"]?.array ?? []).filter { !stale($0, "enqueued_at", boot) && owned($0, probes) })
     }
 
     /// reserve_target(job, now)
@@ -403,7 +442,8 @@ public enum Sched {
         let mem = state["memory"]?.object ?? PyObject()
         let growth = PyNum(mem["swap_growth_2m_gb"]) ?? .int(0)
         var running = (state["running"]?.array ?? []).compactMap(\.object)
-        let localIdx = running.indices.filter { running[$0]["where"] == .string("local") && Sched.groupID(running[$0]["child_pgid"]) != nil }
+        // only a group that is still the job's (group_of): SIGSTOP to someone else's is worse than swap
+        let localIdx = running.indices.filter { running[$0]["where"] == .string("local") && groupOf(.object(running[$0]), probes) != nil }
         let pausedIdx = localIdx.filter { running[$0]["paused"]?.truthy ?? false }
         let level = PyNum(mem["level_pct"]) ?? .int(0)
         let swapping = (growth.value > cfg.num("pause_swap_gb").value && level.value < 25) || mem["pressure"] == .string("critical")

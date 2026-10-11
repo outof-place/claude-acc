@@ -16,6 +16,7 @@
 // nothing written) lets the wrappers fall back on their own within seconds.
 import Darwin
 import Dispatch
+import Synchronization
 
 public final class SchedEngine: @unchecked Sendable {
     let stateDir: String
@@ -34,6 +35,8 @@ public final class SchedEngine: @unchecked Sendable {
     public var snapshot: (@Sendable () -> PyObject?)?
     public private(set) var passes = 0
     public private(set) var wakes = 0
+    /// `wakes` for ping, which doesn't wait for this engine's queue
+    public let wakeCount = Atomic<Int>(0)
     /// sched.py's CORED_PROTO: what the mark and the socket mean; a wrapper of another one ignores us
     public static let proto = 1
     var retryPending = false
@@ -207,6 +210,7 @@ public final class SchedEngine: @unchecked Sendable {
         let result = Sched.tick(&state, cfg, probes)
         let waiting = (state["queue"]?.array ?? []).compactMap(\.object)
         wakes += Self.wake(waiting, admitted: Set(result.admitted.map(\.0))) { kill($0, SIGUSR1) == 0 }
+        wakeCount.store(wakes, ordering: .relaxed)
         state["cored"] = mark(now)
         Self.saveState(statePath, &state, now: now)
         if !ticking {
@@ -256,12 +260,18 @@ public final class SchedEngine: @unchecked Sendable {
         }
     }
 
-    /// One watch per running job we monitor; a watch outlives its entry for 30 s (the final peak)
-    func updateWatches(_ running: [PyObject], now: Double) {
+    /// One watch per running job we monitor; a watch outlives its entry for 30 s (the final peak).
+    /// Only on a group that is still the job's: an entry from before a reboot, or one whose group
+    /// was reused, would sample someone else's processes until reap drops it.
+    func updateWatches(_ running: [PyObject], now: Double, start: (pid_t) -> Double? = SchedNative.startTime,
+                       boot: Double = SchedNative.bootTime()) {
         var seen: Set<String> = []
         for job in running where job["monitor"] == .string("cored") {
             guard let id = job["id"]?.string, let pgid = job["child_pgid"]?.int, pgid > 1, let wrapper = job["pid"]?.int, wrapper > 1
             else { continue }
+            if watches[id] == nil, Sched.stale(.object(job), "started_at", boot) || Sched.groupOf(.object(job), start: start) == nil {
+                continue
+            }
             seen.insert(id)
             if watches[id] == nil {
                 let started = job["child_started_at"]?.double ?? job["started_at"]?.double ?? now

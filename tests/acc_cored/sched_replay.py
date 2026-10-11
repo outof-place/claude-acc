@@ -36,7 +36,7 @@ def serve(S, fixture):
     now = fixture["now"]
     kills = []
     real = (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-            S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp)  # fmt: skip
+            S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_start)  # fmt: skip
     alive = set(fixture["alive"])
     desc = {int(k): set(v) for k, v in fixture.get("descendants", {}).items()}
     tmp = None
@@ -60,6 +60,7 @@ def serve(S, fixture):
         S.os.killpg = killpg
         S.boot_time = lambda: fixture.get("boottime", 0.0)
         S.os.getpgrp = lambda: fixture.get("pgrp", -1)
+        S.proc_start = lambda pid: fixture.get("starts", {}).get(str(pid))
         S.time.time = lambda: now
         S.time.strftime = lambda fmt, *a: (
             fixture["day"] if fmt == "%Y-%m-%d" and not a else real[7](fmt, *a)
@@ -81,7 +82,7 @@ def serve(S, fixture):
         S.update_queue_view(state, cfg)
     finally:
         (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-         S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp) = real  # fmt: skip
+         S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_start) = real  # fmt: skip
         if tmp:
             os.unlink(tmp.name)
     return {
@@ -114,6 +115,7 @@ def record(src, ticks, every, out):
                 "alive": sorted(p for p in pids if S.alive(p)),
                 "descendants": {str(j["pid"]): sorted(S.descendants(j["pid"])) for j in state["running"] if j.get("pid")},
                 "max_server_gb": max_server, "boottime": S.boot_time(), "pgrp": os.getpgrp(),
+                "starts": {str(p): S.proc_start(p) for p in pids if S.pid_of(p) and S.proc_start(p) is not None},
             }  # fmt: skip
             fixture["expect"] = serve(S, fixture)
             f.write(json.dumps(fixture, ensure_ascii=False) + "\n")
@@ -151,6 +153,8 @@ def fuzz_fixture(rng):
                      mem_now_gb=rng.choice([0.0, round(rng.random() * 8, 2)]), mem_peak_gb=round(rng.random() * 9, 2),
                      paused=rng.random() < 0.15, stalled_s=rng.choice([None, None, None, 650]),
                      child_pgid=rng.choice([None, next(pid), next(pid), -next(pid), 0, 1, True, 2**40, "77"]))  # fmt: skip
+            if rng.random() < 0.8:  # entries from before child_started_at was always written lack it
+                j["child_started_at"] = j["started_at"] + rng.random() * 2
             if rng.random() < 0.2:
                 j["native_done"] = True
             if rng.random() < 0.2:
@@ -167,6 +171,18 @@ def fuzz_fixture(rng):
         for r in running if r.get("child_pgid") and rng.random() < 0.7
     ]
     groups = [r["child_pgid"] for r in running if isinstance(r.get("child_pgid"), int) and not isinstance(r.get("child_pgid"), bool)]
+    # start times (whole seconds, as the kernel gives them): mostly the job's own, some a pid or a
+    # group reused after the entry was made, some unreadable
+    starts = {}
+    for j in running + queue:
+        if rng.random() < 0.95:
+            mine = j["enqueued_at"] - rng.random() * 5
+            starts[str(j["pid"])] = float(int(mine if rng.random() < 0.85 else j["enqueued_at"] + 2 + rng.random() * 600))
+    for r in running:
+        g = r.get("child_pgid")
+        if isinstance(g, int) and not isinstance(g, bool) and g > 0 and rng.random() < 0.95:
+            at = r.get("child_started_at", r["started_at"])
+            starts[str(g)] = float(int(at - rng.random() if rng.random() < 0.85 else at + 2 + rng.random() * 600))
     ram = rng.choice([16.0, 24.0, 48.0, 64.0])
     state = {
         "version": 1, "updated_at": now - 1, "idle_since": None, "host": {"ram_gb": ram},
@@ -213,6 +229,7 @@ def fuzz_fixture(rng):
         "max_server_gb": rng.choice([None, 4, 5.5]), "killpg_fails": rng.random() < 0.1,
         # entries from before a reboot, and a job's group that is the reaper's own
         "boottime": rng.choice([0.0, now - 1e6, now - rng.random() * 2400]), "pgrp": rng.choice([-1, -1] + groups),
+        "starts": starts,
     }  # fmt: skip
 
 

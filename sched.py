@@ -2594,20 +2594,59 @@ def stale(job, key, boot):
     return isinstance(at, (int, float)) and not isinstance(at, bool) and 0 < at < boot
 
 
+def proc_start(pid):
+    """Start procesu (pbi_start_tvsec, sekundy zegara ściennego) albo None, gdy go nie ma."""
+    return proc_bsd(pid, BSD_START, 8)
+
+
+def pid_of(value):
+    """Pid z wpisu: int w zakresie pid_t powyżej 0, inaczej None (os.kill rzuca na innych typach)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2**31 else None
+
+
+def number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def owned(job):
+    """Wrapper joba żyje i to wciąż on: jego pid wystartował nie później niż powstał wpis (+1 s,
+    start jądra jest w sekundach). Pidy zawijają się tu co ~25 minut: pid martwego wrappera bywa
+    już obcym procesem, a wpis żyłby razem z nim (rezerwa, SIGSTOP grupy, SIGTERM przy jego końcu).
+    Wpis bez enqueued_at (sprzed tej reguły) liczy się jak dotąd: wystarczy, że pid żyje."""
+    pid = pid_of(job.get("pid"))
+    if not pid or not alive(pid):
+        return False
+    if not number(job.get("enqueued_at")):
+        return True
+    start = proc_start(pid)
+    return start is not None and start <= job["enqueued_at"] + 1
+
+
+def group_of(job):
+    """child_pgid joba, jeśli to wciąż jego grupa: lider wystartował nie później niż child_started_at
+    (+1 s). Bez child_started_at nie ma czym tego sprawdzić, więc i sygnału nie ma."""
+    pgid = group_id(job.get("child_pgid"))
+    if not pgid or not number(job.get("child_started_at")):
+        return None
+    start = proc_start(pgid)
+    return pgid if start is not None and start <= job["child_started_at"] + 1 else None
+
+
 def reap(state):
     """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM. Wpis sprzed
     restartu Maca znika bez sygnałów: nikt z niego nie żyje, a jego pid i grupa są dziś czyjeś.
-    Własnej grupy procesów sprzątający nie dotyka."""
+    Pid wrappera albo grupa użyte ponownie w tym samym starcie (owned, group_of) też nie dostają
+    sygnału, wpis bez liczbowego started_at również. Własnej grupy procesów sprzątający nie dotyka."""
     boot = boot_time()
     keep = []
     for job in state["running"]:
         if stale(job, "started_at", boot):
             continue
-        if alive(job.get("pid")):
+        if owned(job):
             keep.append(job)
             continue
-        pgid = group_id(job.get("child_pgid"))
-        if pgid and pgid != os.getpgrp() and alive(pgid):
+        pgid = group_of(job)
+        if pgid and pgid != os.getpgrp() and number(job.get("started_at")):
             import signal
 
             for sig in (signal.SIGCONT, signal.SIGTERM):
@@ -2616,7 +2655,7 @@ def reap(state):
                 except OSError:
                     pass
     state["running"] = keep
-    state["queue"] = [j for j in state["queue"] if not stale(j, "enqueued_at", boot) and alive(j.get("pid"))]
+    state["queue"] = [j for j in state["queue"] if not stale(j, "enqueued_at", boot) and owned(j)]
 
 
 # rezerwa po rozgrzewce: job, który przebiegł max(60 s, połowę prognozy czasu), najwyżej 300 s,
@@ -3242,9 +3281,8 @@ def safety(state, cfg):
 
     mem = state["memory"]
     growth = mem.get("swap_growth_2m_gb", 0)
-    local = [
-        j for j in state["running"] if j["where"] == "local" and group_id(j.get("child_pgid"))
-    ]
+    # tylko grupa, która wciąż jest joba (group_of): SIGSTOP obcej byłby gorszy niż swap
+    local = [j for j in state["running"] if j["where"] == "local" and group_of(j)]
     paused = [j for j in local if j.get("paused")]
     swapping = (growth > cfg["pause_swap_gb"] and mem["level_pct"] < 25) or mem.get(
         "pressure"
@@ -3708,9 +3746,10 @@ def run_local(entry, job, command, argv, cfg):
         me = next((j for j in state["running"] if j["id"] == jid), None)
         if me is not None:
             me["child_pgid"] = child.pid
+            # zawsze: reap i safety sygnalizują grupę tylko, gdy jej lider nie jest młodszy
+            me["child_started_at"] = spawned_at
             if pinged and cored_mark(state):
                 me["monitor"] = "cored"
-                me["child_started_at"] = spawned_at
                 cored = True
             save_state(state)
 

@@ -22,17 +22,24 @@ func wakeTargets() throws {
     // a "wrapper": argv[1] ends with sched.py, as is_wrapper reads it; it records the SIGUSR1 it gets
     #expect(Files.writeAtomic(dir + "/sched.py", "trap 'echo usr1 >> \(dir)/got' USR1\nwhile :; do sleep 0.05; done\n"))
     // Spawn.start resets every signal to its default: an ignored SIGUSR1 can't be trapped by sh
-    let spawn = { (argv: [String]) in Spawn.start(argv) }
-    let wrapper = try #require(spawn(["/bin/sh", dir + "/sched.py"]))
-    let other = try #require(spawn(["/bin/sleep", "30"]))
-    let idle = try #require(spawn(["/bin/sh", dir + "/sched.py"]))
+    // the cleanup comes first: a spawn that fails mustn't leave the earlier ones running
+    final class Kids: @unchecked Sendable { var pids: [pid_t] = [] }
+    let kids = Kids()
     defer {
-        for p in [wrapper, other, idle] {
+        for p in kids.pids {
             kill(p, SIGKILL)
             var status: Int32 = 0
             waitpid(p, &status, 0)
         }
     }
+    let spawn = { (argv: [String]) -> pid_t? in
+        let pid = Spawn.start(argv)
+        if let pid { kids.pids.append(pid) }
+        return pid
+    }
+    let wrapper = try #require(spawn(["/bin/sh", dir + "/sched.py"]))
+    let other = try #require(spawn(["/bin/sleep", "30"]))
+    let idle = try #require(spawn(["/bin/sh", dir + "/sched.py"]))
     usleep(200_000)  // the shells read their scripts and set the trap
     let entry = { (id: String, pid: PyJSON) in PyObject([("id", .string(id)), ("pid", pid), ("wake", "usr1")]) }
     let queued = [
@@ -81,32 +88,52 @@ func wakeGuardsAlone() {
     #expect(n == 2)
 }
 
-@Test("reap signals only a dead wrapper's live group from this boot: no stale entry, own group or non-group")
+@Test("reap signals only a dead wrapper's own group from this boot: no stale, reused, own or non-group")
 func reapSignals() throws {
     let boot = 1_000_000.0, fresh = boot + 60, own = 777
-    let run = { (id: String, pid: Int, pgid: PyJSON, at: Double) -> PyJSON in
-        .object(PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(pid)), ("child_pgid", pgid),
-                          ("started_at", .double(at))]))
+    // start times as the kernel gives them: the job's own pid and group started before its entry
+    var starts: [(String, PyJSON)] = []
+    let run = { (id: String, pid: Int, pgid: PyJSON, at: Double?, pidStart: Double?, groupStart: Double?, childStart: Bool) -> PyJSON in
+        var o = PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(pid)), ("child_pgid", pgid)])
+        let t = at ?? fresh
+        o["enqueued_at"] = .double(t - 10)
+        if let at { o["started_at"] = .double(at) }
+        if childStart { o["child_started_at"] = .double(t + 1) }
+        if let pidStart { starts.append((String(pid), .double(pidStart))) }
+        if let groupStart, let g = pgid.int, g > 0 { starts.append((String(g), .double(groupStart))) }
+        return .object(o)
     }
-    let queued = { (id: String, pid: Int, at: Double) -> PyJSON in
-        .object(PyObject([("id", .string(id)), ("pid", .int(pid)), ("enqueued_at", .double(at))]))
+    let mine = { (at: Double) in (at - 15, at + 0.5) }  // (the wrapper's start, the leader's start)
+    let queued = { (id: String, pid: Int, at: Double, start: Double?) -> PyJSON in
+        if let start { starts.append((String(pid), .double(start))) }
+        return .object(PyObject([("id", .string(id)), ("pid", .int(pid)), ("enqueued_at", .double(at))]))
     }
     let before = PyObject([
         ("running", .array([
-            run("orphan", 101, .int(201), fresh),  // a dead wrapper, its group alive: SIGCONT + SIGTERM
-            run("stale", 102, .int(202), boot - 60),  // from before the boot: group 202 is someone else's now
-            run("stale-alive", 103, .int(203), boot - 60),  // pid 103 alive, but another process now
-            run("own", 104, .int(own), fresh),  // the reaper's own process group
-            run("negative", 105, .int(-205), fresh), run("zero", 106, .int(0), fresh), run("one", 107, .int(1), fresh),
-            run("flag", 108, .bool(true), fresh), run("wide", 109, .int(1 << 40), fresh), run("text", 110, "211", fresh),
-            run("live", 111, .int(212), fresh),
+            run("orphan", 101, .int(201), fresh, nil, mine(fresh).1, true),  // a dead wrapper, its own group: SIGCONT + SIGTERM
+            run("stale", 102, .int(202), boot - 60, nil, mine(boot - 60).1, true),  // from before the boot
+            run("stale-alive", 103, .int(203), boot - 60, mine(boot - 60).0, mine(boot - 60).1, true),
+            run("own", 104, .int(own), fresh, nil, mine(fresh).1, true),  // the reaper's own process group
+            run("negative", 105, .int(-205), fresh, nil, nil, true), run("zero", 106, .int(0), fresh, nil, nil, true),
+            run("one", 107, .int(1), fresh, nil, mine(fresh).1, true), run("flag", 108, .bool(true), fresh, nil, nil, true),
+            run("wide", 109, .int(1 << 40), fresh, nil, nil, true), run("text", 110, "211", fresh, nil, nil, true),
+            run("live", 111, .int(212), fresh, mine(fresh).0, mine(fresh).1, true),
+            // pids wrap every ~25 min: the wrapper's pid lives but started after the entry, and so did its group
+            run("reused-wrapper", 112, .int(213), fresh, fresh + 600, fresh + 600, true),
+            run("reused-group", 113, .int(214), fresh, nil, fresh + 600, true),  // a dead wrapper, someone else's group
+            run("no-child-start", 114, .int(215), fresh, nil, mine(fresh).1, false),  // nothing to check the group by
+            run("no-started-at", 115, .int(216), nil, nil, mine(fresh).1, true),
         ])),
-        ("queue", .array([queued("q-stale", 301, boot - 1), queued("q-live", 302, fresh), queued("q-dead", 303, fresh)])),
+        ("queue", .array([
+            queued("q-stale", 301, boot - 1, boot - 5), queued("q-live", 302, fresh, fresh - 3), queued("q-dead", 303, fresh, nil),
+            queued("q-reused", 304, fresh, fresh + 600),
+        ])),
     ])
-    // every group above is alive (kill(-205, 0) probes group 205, 1 is launchd), so only the checks
-    // keep them from a signal
-    let alive: [PyJSON] = [201, 202, 103, 203, own, 205, -205, 1, 211, 111, 212, 1 << 40, 301, 302].map { .int($0) }
-    let probes = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("boottime", .double(boot)), ("pgrp", .int(own))]))
+    // every pid and group above is alive (kill(-205, 0) probes group 205, 1 is launchd), so only the
+    // checks keep them from a signal
+    let alive: [PyJSON] = [201, 202, 103, 203, own, 205, -205, 1, 211, 111, 212, 1 << 40, 112, 213, 214, 215, 216, 301, 302, 304].map { .int($0) }
+    let probes = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("boottime", .double(boot)), ("pgrp", .int(own)),
+                                               ("starts", .object(PyObject(starts)))]))
     var state = before
     Sched.reap(&state, probes)
     let ids = { (key: String) in (state[key]?.array ?? []).map { $0["id"]?.string ?? "" } }
@@ -116,12 +143,68 @@ func reapSignals() throws {
 
     // an unknown boot time (0) makes nothing stale: the same old entry is then signalled, so the
     // boot rule is what spared group 202 above
-    let blind = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("pgrp", .int(own))]))
+    let blind = RecordedSchedProbes(PyObject([("alive", .array(alive)), ("pgrp", .int(own)), ("starts", .object(PyObject(starts)))]))
     state = before
     Sched.reap(&state, blind)
     let groups = blind.kills.compactMap { $0.array?.first?.int }
     #expect(groups == [201, 201, 202, 202])
     #expect(ids("running") == ["stale-alive", "live"])
+}
+
+@Test("safety pauses the youngest heavy job whose group is still its own: never a reused or unchecked group")
+func safetySignals() {
+    let now = 1_000_000.0
+    let job = { (id: String, pgid: Int, started: Double, childStart: Double?) -> PyJSON in
+        var o = PyObject([("id", .string(id)), ("where", "local"), ("pid", .int(1)), ("child_pgid", .int(pgid)), ("started_at", .double(started))])
+        if let childStart { o["child_started_at"] = .double(childStart) }
+        return .object(o)
+    }
+    var state = PyObject([
+        ("running", .array([
+            job("a", 401, now - 30, now - 30), job("b", 402, now - 20, now - 20),
+            job("c", 403, now - 10, now - 3600),  // the youngest, but its group started after the job's child: reused
+            job("d", 404, now - 5, nil),  // no child_started_at: no way to check
+        ])),
+        ("memory", .object(PyObject([("swap_growth_2m_gb", 99), ("level_pct", 10), ("pressure", "critical")]))),
+        ("today", .object(PyObject([("pauses", 0)]))),
+    ])
+    let starts = PyObject([("401", .double(now - 30)), ("402", .double(now - 20)), ("403", .double(now - 10)), ("404", .double(now - 5))])
+    let probes = RecordedSchedProbes(PyObject([("now", .double(now)), ("starts", .object(starts))]))
+    Sched.safety(&state, SchedConfig(raw: SchedConfig.defaults), probes)
+    #expect(probes.kills == [.array([.int(402), .int(Int(SIGSTOP))])])
+    #expect(state["running"]?.array?[1]["paused"]?.truthy == true)
+}
+
+@Test("the live boot time is now minus the time since boot; a process starts after it; a missing one has no start")
+func liveBootAndStart() {
+    let boot = SchedNative.bootTime()
+    let wall = Kernel.wall()
+    let up = Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9
+    #expect(boot > 0 && boot < wall)
+    #expect(abs((wall - boot) - up) < 5)
+    let me = SchedNative.startTime(getpid())
+    #expect(me.map { $0 >= boot - 1 && $0 <= wall } == true)
+    #expect(SchedNative.startTime(pid_t(Int32.max)) == nil)
+}
+
+@Test("no watch on an entry from before the boot or on a group that isn't the job's")
+func watchesOnlyOwnGroups() throws {
+    var template = Array("/tmp/acc-cored-watch-XXXXXX".utf8CString)
+    let dir = try #require(template.withUnsafeMutableBufferPointer { mkdtemp($0.baseAddress) }.map { String(cString: $0) })
+    defer { try? FileManager.default.removeItem(atPath: dir) }
+    Files.mkdirs(dir + "/sched")
+    let engine = SchedEngine(stateDir: dir)
+    let now = Kernel.wall()
+    let job = { (id: String, started: Double, childStart: Double) in
+        PyObject([("id", .string(id)), ("monitor", "cored"), ("pid", .int(Int(getpid()))), ("child_pgid", .int(Int(getpid()))),
+                  ("started_at", .double(started)), ("child_started_at", .double(childStart))])
+    }
+    engine.queue.sync {
+        engine.updateWatches([job("old", 100, 100), job("reused", now, now - 3600), job("mine", now, now)], now: now,
+                             start: { _ in now - 1 }, boot: 1000)
+    }
+    #expect(engine.queue.sync { Set(engine.watches.keys) } == ["mine"])
+    engine.queue.sync { engine.standBack() }
 }
 
 @Test("a pass that stands back (a config read otherwise) drops its watches and their samples")

@@ -71,13 +71,11 @@ public final class LiveSchedProbes: SchedProbes {
 
     public func killpg(_ pgid: pid_t, _ signal: Int32) -> Bool { Darwin.killpg(pgid, signal) == 0 }
 
-    public func bootTime() -> Double {
-        var tv = timeval()
-        var size = MemoryLayout<timeval>.size
-        return sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 ? Double(tv.tv_sec) : 0
-    }
+    public func bootTime() -> Double { SchedNative.bootTime() }
 
     public func ownGroup() -> pid_t { getpgrp() }
+
+    public func startTime(_ pid: pid_t) -> Double? { SchedNative.startTime(pid) }
 
     public func day() -> String {
         var t = time_t(now)
@@ -149,6 +147,18 @@ public enum SchedNative {
         var buffer = [CChar](repeating: 0, count: 64)
         let n = proc_name(pid, &buffer, 64)
         return n > 0 ? cText(buffer) : ""
+    }
+
+    /// kern.boottime in seconds (wall clock), 0 when the kernel doesn't answer
+    public static func bootTime() -> Double {
+        var tv = timeval()
+        var size = MemoryLayout<timeval>.size
+        return sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 ? Double(tv.tv_sec) : 0
+    }
+
+    /// pbi_start_tvsec, nil when the process is gone
+    public static func startTime(_ pid: pid_t) -> Double? {
+        bsd(pid).map { Double($0.pbi_start_tvsec) }
     }
 
     static func bsd(_ pid: pid_t) -> proc_bsdinfo? {
