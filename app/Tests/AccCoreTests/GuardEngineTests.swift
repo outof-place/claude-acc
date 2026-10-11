@@ -6,7 +6,8 @@ import Testing
 // Which tick goes to Python (`acc.py devguard once`) and the waits after a handover.
 
 // GuardEngine.init and loop() set GuardLog's and GuardContext's statics: in parallel these tests raced
-// (SIGSEGV in GuardLog.hold, 3 in ~25 runs), so they run one at a time.
+// (SIGSEGV in GuardLog.hold, 3 in ~25 runs), so they run one at a time. Every test that builds a
+// GuardEngine goes in this suite: one in another suite races these again.
 @Suite("the guard engine", .serialized)
 struct GuardEngineTests {
 
@@ -399,8 +400,11 @@ func pythonLoopRecovers() throws {
     #expect(lockFree(home))
     // what Python's loop saved last
     #expect(Files.writeAtomic(statePath, #"{"brake_at": 1790999990.0, "warned": {"x": 1}, "writer": 1, "saved_at": 1790999990.0}"#))
-    // what native pinned before Python's loop: forgotten on the way back, as Python restored it
-    engine.queue.sync { engine.shaper.background[99_999] = (1, true) }
+    // what native pinned before Python's loop: forgotten on the way back, as Python restored it. A
+    // live pid with its real start, or the next tick drops it anyway; `false` means nothing calls
+    // setpriority on the test process
+    let me = getpid(), myStart = try #require(Usage.of(me)?.start)
+    engine.queue.sync { engine.shaper.background[me] = (myStart, false) }
 
     // another guard holds the lock meanwhile: native waits, it doesn't tick beside it
     let other = open(GuardPaths.state(home) + "/devguard.lock", O_WRONLY | O_CLOEXEC)
@@ -416,7 +420,7 @@ func pythonLoopRecovers() throws {
     #expect(engine.queue.sync { engine.ticks } == ticks + 1)
     #expect(!lockFree(home))
     #expect(engine.queue.sync { !engine.pythonMode && engine.loopShortRuns == 0 })
-    #expect(engine.queue.sync { engine.shaper.background[99_999] == nil })
+    #expect(engine.queue.sync { engine.shaper.background[me] == nil })
     let saved = Files.json(statePath, fallback: .null)
     #expect(saved["brake_at"]?.double == 1_790_999_990 && saved["warned"]?["x"]?.double == 1)
 }
@@ -459,9 +463,11 @@ func handOverLockTaken() throws {
         return 0
     }
     #expect(engine.start())
+    // start() runs the first tick on the engine's queue: a runaway, so the brake goes to Python and
+    // the runner takes the lock meanwhile. This tick waits behind it, then must not wait for the lock
     let done = DispatchSemaphore(value: 0)
     DispatchQueue.global().async {
-        engine.benchTick()  // a runaway: the brake goes to Python
+        engine.benchTick()
         done.signal()
     }
     let finished = done.wait(timeout: .now() + 3) == .success
@@ -483,7 +489,7 @@ func handOverLockTaken() throws {
     #expect(engine.queue.sync { engine.ticks } == ticks + 1 && !engine.queue.sync { engine.pythonMode })
     #expect(!lockFree(home))
     let start = Kernel.wall()
-    engine.stop()
+    engine.stop()  // after the recovery; stop() with the lock still held is the same path as above
     #expect(Kernel.wall() - start < 2)
 }
 
@@ -499,17 +505,21 @@ func pythonLoopEndLine() throws {
     engine.loopStarter = { _ in Spawn.start(next.argv) }
     engine.probesFactory = { pressureWorld(home: home, now: 1_791_000_000, compressedGB: 1) }
     engine.runner = { _ in 0 }
-    engine.benchTick()
-    usleep(300_000)
-    engine.benchTick()
+    // ticks until the line is there, not a fixed wait: a loaded Mac may keep `sh` alive a while
+    let logged = { (line: String) -> Bool in
+        for _ in 0..<100 {
+            engine.benchTick()
+            if String(decoding: Files.read(GuardPaths.state(home) + "/devguard.log") ?? [], as: UTF8.self).contains(line) {
+                return true
+            }
+            usleep(50_000)
+        }
+        return false
+    }
+    #expect(logged("pętla Pythona skończyła się (kod 3)"))
     next.argv = ["/bin/sh", "-c", "kill -9 $$"]
     engine.queue.sync { engine.loopRestartAt = 0 }
-    engine.benchTick()
-    usleep(300_000)
-    engine.benchTick()
-    let log = String(decoding: Files.read(GuardPaths.state(home) + "/devguard.log") ?? [], as: UTF8.self)
-    #expect(log.contains("pętla Pythona skończyła się (kod 3)"))
-    #expect(log.contains("pętla Pythona skończyła się (sygnał 9)"))
+    #expect(logged("pętla Pythona skończyła się (sygnał 9)"))
     engine.stop()
 }
 
