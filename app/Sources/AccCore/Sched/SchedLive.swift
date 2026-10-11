@@ -75,7 +75,7 @@ public final class LiveSchedProbes: SchedProbes {
 
     public func ownGroup() -> pid_t { getpgrp() }
 
-    public func startTime(_ pid: pid_t) -> Double? { SchedNative.startTime(pid) }
+    public func startMicros(_ pid: pid_t) -> Int? { SchedNative.startMicros(pid) }
 
     public func day() -> String {
         var t = time_t(now)
@@ -156,9 +156,9 @@ public enum SchedNative {
         return sysctlbyname("kern.boottime", &tv, &size, nil, 0) == 0 ? Double(tv.tv_sec) : 0
     }
 
-    /// pbi_start_tvsec, nil when the process is gone
-    public static func startTime(_ pid: pid_t) -> Double? {
-        bsd(pid).map { Double($0.pbi_start_tvsec) }
+    /// The process's start stamp in µs (pbi_start_tvsec, pbi_start_tvusec), nil when it's gone
+    public static func startMicros(_ pid: pid_t) -> Int? {
+        bsd(pid).map { Int($0.pbi_start_tvsec) * 1_000_000 + Int($0.pbi_start_tvusec) }
     }
 
     static func bsd(_ pid: pid_t) -> proc_bsdinfo? {

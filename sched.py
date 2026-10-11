@@ -2594,9 +2594,17 @@ def stale(job, key, boot):
     return isinstance(at, (int, float)) and not isinstance(at, bool) and 0 < at < boot
 
 
-def proc_start(pid):
-    """Start procesu (pbi_start_tvsec, sekundy zegara ściennego) albo None, gdy go nie ma."""
-    return proc_bsd(pid, BSD_START, 8)
+def proc_start_us(pid):
+    """Start procesu w mikrosekundach (pbi_start_tvsec, pbi_start_tvusec) albo None, gdy go nie ma.
+    Jądro stempluje go raz, przy fork: zmiana zegara go nie rusza, a pid użyty ponownie ma inny.
+    Razem z pid to tożsamość procesu."""
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(BSDINFO_SIZE)
+    if k.libc.proc_pidinfo(pid, PROC_PIDTBSDINFO, k.ctypes.c_uint64(0), buf, BSDINFO_SIZE) != BSDINFO_SIZE:
+        return None
+    sec = int.from_bytes(buf.raw[BSD_START : BSD_START + 8], "little")
+    usec = int.from_bytes(buf.raw[BSD_START + 8 : BSD_START + 16], "little")
+    return sec * 1_000_000 + usec
 
 
 def pid_of(value):
@@ -2609,27 +2617,29 @@ def number(value):
 
 
 def owned(job):
-    """Wrapper joba żyje i to wciąż on: jego pid wystartował nie później niż powstał wpis (+1 s,
-    start jądra jest w sekundach). Pidy zawijają się tu co ~25 minut: pid martwego wrappera bywa
-    już obcym procesem, a wpis żyłby razem z nim (rezerwa, SIGSTOP grupy, SIGTERM przy jego końcu).
-    Wpis bez enqueued_at (sprzed tej reguły) liczy się jak dotąd: wystarczy, że pid żyje."""
+    """Wrapper joba żyje i to wciąż on: jego pid ma ten start (µs, proc_start_us), który wrapper zapisał
+    we wpisie (pid_start_us). Pidy zawijają się tu co ~25 minut, więc pid martwego wrappera bywa już
+    obcym procesem, a wpis żyłby razem z nim (rezerwa, SIGSTOP grupy, SIGTERM przy jego końcu).
+    Porównanie z zegarem ściennym (enqueued_at) myliło się o 1-2 s i po cofnięciu zegara, a wtedy reap
+    zabijał żywy job; stempel jądra się nie zmienia. Wpis bez pid_start_us (sprzed tej reguły) liczy
+    się jak dotąd: wystarczy, że pid żyje."""
     pid = pid_of(job.get("pid"))
     if not pid or not alive(pid):
         return False
-    if not number(job.get("enqueued_at")):
+    mine = job.get("pid_start_us")
+    if not isinstance(mine, int) or isinstance(mine, bool):
         return True
-    start = proc_start(pid)
-    return start is not None and start <= job["enqueued_at"] + 1
+    return proc_start_us(pid) == mine
 
 
 def group_of(job):
-    """child_pgid joba, jeśli to wciąż jego grupa: lider wystartował nie później niż child_started_at
-    (+1 s). Bez child_started_at nie ma czym tego sprawdzić, więc i sygnału nie ma."""
+    """child_pgid joba, jeśli to wciąż jego grupa: lider ma ten start, który wrapper zapisał przy
+    uruchomieniu (child_start_us). Bez niego nie ma czym tego sprawdzić, więc i sygnału nie ma."""
     pgid = group_id(job.get("child_pgid"))
-    if not pgid or not number(job.get("child_started_at")):
+    mine = job.get("child_start_us")
+    if not pgid or not isinstance(mine, int) or isinstance(mine, bool):
         return None
-    start = proc_start(pgid)
-    return pgid if start is not None and start <= job["child_started_at"] + 1 else None
+    return pgid if proc_start_us(pgid) == mine else None
 
 
 def reap(state):
@@ -3448,6 +3458,8 @@ def new_entry(job, command, argv, opts):
         # pamięć poza drzewem procesów (natywny, Docker): rezerwa zostaje przy prognozie
         "outside": bool(job.get("outside") or job.get("floor_gb")),
         "pid": os.getpid(),
+        # tożsamość wrappera dla owned(): pid po ponownym użyciu ma inny start
+        "pid_start_us": proc_start_us(os.getpid()),
         "via": opts.get("via", "cli"),
         "enqueued_at": time.time(),
     }
@@ -3746,7 +3758,8 @@ def run_local(entry, job, command, argv, cfg):
         me = next((j for j in state["running"] if j["id"] == jid), None)
         if me is not None:
             me["child_pgid"] = child.pid
-            # zawsze: reap i safety sygnalizują grupę tylko, gdy jej lider nie jest młodszy
+            # zawsze: reap i safety sygnalizują grupę tylko, gdy jej lider to wciąż to dziecko
+            me["child_start_us"] = proc_start_us(child.pid)
             me["child_started_at"] = spawned_at
             if pinged and cored_mark(state):
                 me["monitor"] = "cored"

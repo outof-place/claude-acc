@@ -36,7 +36,7 @@ def serve(S, fixture):
     now = fixture["now"]
     kills = []
     real = (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-            S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_start)  # fmt: skip
+            S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_start_us)  # fmt: skip
     alive = set(fixture["alive"])
     desc = {int(k): set(v) for k, v in fixture.get("descendants", {}).items()}
     tmp = None
@@ -60,7 +60,7 @@ def serve(S, fixture):
         S.os.killpg = killpg
         S.boot_time = lambda: fixture.get("boottime", 0.0)
         S.os.getpgrp = lambda: fixture.get("pgrp", -1)
-        S.proc_start = lambda pid: fixture.get("starts", {}).get(str(pid))
+        S.proc_start_us = lambda pid: fixture.get("starts", {}).get(str(pid))
         S.time.time = lambda: now
         S.time.strftime = lambda fmt, *a: (
             fixture["day"] if fmt == "%Y-%m-%d" and not a else real[7](fmt, *a)
@@ -82,7 +82,7 @@ def serve(S, fixture):
         S.update_queue_view(state, cfg)
     finally:
         (S.probe_memory, S.devguard_snapshot, S.native_scan, S.alive, S.descendants, S.os.killpg, S.time.time,
-         S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_start) = real  # fmt: skip
+         S.time.strftime, S.DEVGUARD_CONFIG, S.boot_time, S.os.getpgrp, S.proc_start_us) = real  # fmt: skip
         if tmp:
             os.unlink(tmp.name)
     return {
@@ -115,7 +115,7 @@ def record(src, ticks, every, out):
                 "alive": sorted(p for p in pids if S.alive(p)),
                 "descendants": {str(j["pid"]): sorted(S.descendants(j["pid"])) for j in state["running"] if j.get("pid")},
                 "max_server_gb": max_server, "boottime": S.boot_time(), "pgrp": os.getpgrp(),
-                "starts": {str(p): S.proc_start(p) for p in pids if S.pid_of(p) and S.proc_start(p) is not None},
+                "starts": {str(p): S.proc_start_us(p) for p in pids if S.pid_of(p) and S.proc_start_us(p) is not None},
             }  # fmt: skip
             fixture["expect"] = serve(S, fixture)
             f.write(json.dumps(fixture, ensure_ascii=False) + "\n")
@@ -155,6 +155,8 @@ def fuzz_fixture(rng):
                      child_pgid=rng.choice([None, next(pid), next(pid), -next(pid), 0, 1, True, 2**40, "77"]))  # fmt: skip
             if rng.random() < 0.8:  # entries from before child_started_at was always written lack it
                 j["child_started_at"] = j["started_at"] + rng.random() * 2
+            if rng.random() < 0.8:  # and child_start_us
+                j["child_start_us"] = int(j.get("child_started_at", j["started_at"]) * 1e6) - rng.randint(0, 9999)
             if rng.random() < 0.2:
                 j["native_done"] = True
             if rng.random() < 0.2:
@@ -171,18 +173,20 @@ def fuzz_fixture(rng):
         for r in running if r.get("child_pgid") and rng.random() < 0.7
     ]
     groups = [r["child_pgid"] for r in running if isinstance(r.get("child_pgid"), int) and not isinstance(r.get("child_pgid"), bool)]
-    # start times (whole seconds, as the kernel gives them): mostly the job's own, some a pid or a
-    # group reused after the entry was made, some unreadable
+    # the processes' start stamps (µs, as the kernel gives them): mostly the one the entry names, some
+    # a pid or a group reused since, some unreadable; some entries from before pid_start_us
     starts = {}
     for j in running + queue:
+        if rng.random() < 0.85:
+            j["pid_start_us"] = int(j["enqueued_at"] * 1e6) - rng.randint(0, 5_000_000)
         if rng.random() < 0.95:
-            mine = j["enqueued_at"] - rng.random() * 5
-            starts[str(j["pid"])] = float(int(mine if rng.random() < 0.85 else j["enqueued_at"] + 2 + rng.random() * 600))
+            mine = j.get("pid_start_us", int(j["enqueued_at"] * 1e6))
+            starts[str(j["pid"])] = mine if rng.random() < 0.85 else mine + rng.randint(1, 600_000_000)
     for r in running:
         g = r.get("child_pgid")
         if isinstance(g, int) and not isinstance(g, bool) and g > 0 and rng.random() < 0.95:
-            at = r.get("child_started_at", r["started_at"])
-            starts[str(g)] = float(int(at - rng.random() if rng.random() < 0.85 else at + 2 + rng.random() * 600))
+            mine = r.get("child_start_us", int(r["started_at"] * 1e6))
+            starts[str(g)] = mine if rng.random() < 0.85 else mine + rng.randint(1, 600_000_000)
     ram = rng.choice([16.0, 24.0, 48.0, 64.0])
     state = {
         "version": 1, "updated_at": now - 1, "idle_since": None, "host": {"ram_gb": ram},

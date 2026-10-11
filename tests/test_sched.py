@@ -1957,7 +1957,7 @@ class StateTest(Paths):
         sleeper = self.sleeper()
         st["running"].append(
             {"id": "dead", "where": "local", "pid": 999999, "child_pgid": sleeper.pid,
-             "started_at": time.time(), "child_started_at": time.time()}
+             "started_at": time.time(), "child_start_us": S.proc_start_us(sleeper.pid)}
         )  # fmt: skip
         S.save_state(st)
         st = S.load_state(self.cfg)
@@ -1973,14 +1973,15 @@ class StateTest(Paths):
         bad = [-sleeper.pid, 0, 1, True, 3.7, str(sleeper.pid)]
         st = self.state()
         # everything else would let a signal through: only the value of child_pgid stops it
+        stamp = S.proc_start_us(sleeper.pid)
         st["running"] = [{"id": f"dead{i}", "where": "local", "pid": 999999, "child_pgid": v, "started_at": time.time(),
-                          "child_started_at": time.time()} for i, v in enumerate(bad)]  # fmt: skip
+                          "child_start_us": stamp} for i, v in enumerate(bad)]  # fmt: skip
         with mock.patch.object(S.os, "killpg") as killpg:
             S.reap(st)
             for v in bad:
                 self.assertFalse(S.kill_child({"pid": os.getpid(), "child_pgid": v}))
             st["running"] = [{"id": f"run{i}", "where": "local", "pid": os.getpid(), "child_pgid": v,
-                              "started_at": i, "child_started_at": time.time()} for i, v in enumerate(bad)]  # fmt: skip
+                              "started_at": i, "child_start_us": stamp} for i, v in enumerate(bad)]  # fmt: skip
             st["memory"] = {"swap_growth_2m_gb": 99, "level_pct": 10, "pressure": "critical"}
             S.safety(st, self.cfg)
         killpg.assert_not_called()
@@ -1995,12 +1996,14 @@ class StateTest(Paths):
         self.assertTrue(0 < boot < time.time())
         now = time.time()
         st = self.state()
-        # child_started_at everywhere: only the rule under test stops each signal
+        # the children's real start stamps everywhere: only the rule under test stops each signal
         st["running"] = [
-            {"id": "stale", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": boot - 60, "child_started_at": now},
+            {"id": "stale", "where": "local", "pid": 999999, "child_pgid": old.pid, "started_at": boot - 60,
+             "child_start_us": S.proc_start_us(old.pid)},
             {"id": "stale-alive", "where": "local", "pid": os.getpid(), "started_at": boot - 60},
-            {"id": "own", "where": "local", "pid": 999999, "child_pgid": own.pid, "started_at": now, "child_started_at": now},
-            {"id": "wide", "where": "local", "pid": 999999, "child_pgid": 2**40, "started_at": now, "child_started_at": now},
+            {"id": "own", "where": "local", "pid": 999999, "child_pgid": own.pid, "started_at": now,
+             "child_start_us": S.proc_start_us(own.pid)},
+            {"id": "wide", "where": "local", "pid": 999999, "child_pgid": 2**40, "started_at": now, "child_start_us": 1},
         ]  # fmt: skip
         st["queue"] = [{"id": "q-stale", "pid": os.getpid(), "enqueued_at": boot - 1},
                        {"id": "q-live", "pid": os.getpid(), "enqueued_at": time.time()}]  # fmt: skip
@@ -2012,35 +2015,42 @@ class StateTest(Paths):
         self.assertEqual([S.group_id(v) for v in (2**40, 2**31, 2**31 - 1)], [None, None, 2**31 - 1])
         # ten sam wpis z tego startu dostaje sygnał: chroniła go reguła startu, nie co innego
         st["running"] = [{"id": "orphan", "where": "local", "pid": 999999, "child_pgid": old.pid,
-                          "started_at": time.time(), "child_started_at": time.time()}]  # fmt: skip
+                          "started_at": time.time(), "child_start_us": S.proc_start_us(old.pid)}]  # fmt: skip
         S.reap(st)
         self.assertIsNotNone(old.wait(timeout=5))
         self.assertIsNone(own.poll())
 
     def test_a_pid_or_group_reused_within_this_boot_gets_no_signal(self):
         # pidy zawijają się tu co ~25 minut: pid martwego wrappera i grupa jego dziecka bywają już
-        # obce; start procesu (proc_start) późniejszy niż wpis to zdradza
+        # obce. Tożsamość to start procesu w µs (proc_start_us), stempel jądra z chwili fork: inny
+        # start to inny proces, a zmiana zegara (enqueued_at z innej epoki) go nie rusza
         reused_wrapper, reused_group, orphan, mine = (self.sleeper() for _ in range(4))
+        stamp = S.proc_start_us
         now = time.time()
         st = self.state()
         st["running"] = [
-            {"id": "w", "where": "local", "pid": reused_wrapper.pid, "enqueued_at": now - 3600, "started_at": now - 3500,
-             "child_pgid": reused_group.pid, "child_started_at": now - 3500},
+            {"id": "w", "where": "local", "pid": reused_wrapper.pid, "pid_start_us": stamp(reused_wrapper.pid) - 1,
+             "enqueued_at": now, "started_at": now, "child_pgid": reused_group.pid,
+             "child_start_us": stamp(reused_group.pid) - 1},
             {"id": "o", "where": "local", "pid": 999999, "enqueued_at": now - 10, "started_at": now - 5,
-             "child_pgid": orphan.pid, "child_started_at": now},
+             "child_pgid": orphan.pid, "child_start_us": stamp(orphan.pid)},
+            # the clock stepped back an hour after it started: still its own wrapper, kept
+            {"id": "m", "where": "local", "pid": mine.pid, "pid_start_us": stamp(mine.pid), "enqueued_at": now - 3600,
+             "started_at": now - 3600},
         ]  # fmt: skip
-        st["queue"] = [{"id": "q", "pid": reused_wrapper.pid, "enqueued_at": now - 3600},
-                       {"id": "q2", "pid": mine.pid, "enqueued_at": now}]  # fmt: skip
+        st["queue"] = [{"id": "q", "pid": reused_wrapper.pid, "pid_start_us": stamp(reused_wrapper.pid) + 1, "enqueued_at": now},
+                       {"id": "q2", "pid": mine.pid, "pid_start_us": stamp(mine.pid), "enqueued_at": now + 3600},
+                       {"id": "q-old", "pid": mine.pid, "enqueued_at": now}]  # fmt: skip
         self.assertTrue(S.alive(reused_wrapper.pid))
         S.reap(st)
-        self.assertEqual(st["running"], [])  # the reused wrapper's entry went too
-        self.assertEqual([j["id"] for j in st["queue"]], ["q2"])
-        self.assertIsNotNone(orphan.wait(timeout=5))  # the real orphan, of this boot, still goes
+        self.assertEqual([j["id"] for j in st["running"]], ["m"])  # the reused wrapper's entry went
+        self.assertEqual([j["id"] for j in st["queue"]], ["q2", "q-old"])  # no stamp (older entry): alive is enough
+        self.assertIsNotNone(orphan.wait(timeout=5))  # the real orphan still goes
         self.assertIsNone(reused_group.poll())
         self.assertIsNone(reused_wrapper.poll())
-        self.assertIsNone(S.group_of({"child_pgid": mine.pid}))  # no child_started_at: nothing to check by
+        self.assertIsNone(S.group_of({"child_pgid": mine.pid}))  # no child_start_us: nothing to check by
         # without a numeric started_at the entry goes without a signal, whatever its group
-        st["running"] = [{"id": "n", "where": "local", "pid": 999999, "child_pgid": mine.pid, "child_started_at": now}]
+        st["running"] = [{"id": "n", "where": "local", "pid": 999999, "child_pgid": mine.pid, "child_start_us": stamp(mine.pid)}]
         with mock.patch.object(S.os, "killpg") as killpg:
             S.reap(st)
         killpg.assert_not_called()
@@ -2049,18 +2059,17 @@ class StateTest(Paths):
         # safety: SIGSTOP only to a group that is still the job's; the youngest here is a reused one
         a, b, c = self.sleeper(), self.sleeper(), self.sleeper()
         st["running"] = [
-            {"id": "a", "where": "local", "pid": os.getpid(), "enqueued_at": now, "started_at": now - 30,
-             "child_pgid": a.pid, "child_started_at": now},
-            {"id": "b", "where": "local", "pid": os.getpid(), "enqueued_at": now, "started_at": now - 20,
-             "child_pgid": b.pid, "child_started_at": now},
-            {"id": "c", "where": "local", "pid": os.getpid(), "enqueued_at": now, "started_at": now - 10,
-             "child_pgid": c.pid, "child_started_at": now - 3600},
+            {"id": "a", "where": "local", "pid": os.getpid(), "started_at": now - 30, "child_pgid": a.pid,
+             "child_start_us": stamp(a.pid)},
+            {"id": "b", "where": "local", "pid": os.getpid(), "started_at": now - 20, "child_pgid": b.pid,
+             "child_start_us": stamp(b.pid)},
+            {"id": "c", "where": "local", "pid": os.getpid(), "started_at": now - 10, "child_pgid": c.pid,
+             "child_start_us": stamp(c.pid) + 1},
         ]  # fmt: skip
         st["memory"] = {"swap_growth_2m_gb": 99, "level_pct": 10, "pressure": "critical"}
         with mock.patch.object(S.os, "killpg") as killpg:
             S.safety(st, self.cfg)
         killpg.assert_called_once_with(b.pid, signal.SIGSTOP)
-
 
 FAKE_DEPOT_API = r"""#!%s
 # podróbka CLI Depot dla `sched.py depot`: odpowiedzi z $FAKE_DEPOT_DATA, wywołania do $FAKE_DEPOT_CALLS
@@ -2342,7 +2351,8 @@ class RunTest(unittest.TestCase):
         job = next(j for j in self.state()["running"] if j.get("child_pgid"))
         self.assertNotEqual(job.get("monitor"), "cored")
         self.assertIsInstance(job.get("child_started_at"), float)
-        self.assertLessEqual(S.proc_start(job["child_pgid"]), job["child_started_at"] + 1)
+        self.assertEqual(job.get("child_start_us"), S.proc_start_us(job["child_pgid"]))
+        self.assertEqual(job.get("pid_start_us"), S.proc_start_us(p.pid))  # the wrapper's own stamp
         self.assertEqual(S.group_of(job), job["child_pgid"])
         self.assertEqual(self.done(p)[0], 0)
 

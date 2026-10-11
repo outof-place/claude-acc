@@ -27,8 +27,9 @@ public protocol SchedProbes: AnyObject {
     func bootTime() -> Double
     /// os.getpgrp(): the reaper's own process group
     func ownGroup() -> pid_t
-    /// proc_start(pid): the process's start (pbi_start_tvsec, wall seconds), nil when it's gone
-    func startTime(_ pid: pid_t) -> Double?
+    /// proc_start_us(pid): the process's start stamp in µs (pbi_start_tvsec, pbi_start_tvusec), set
+    /// once at fork: a clock change doesn't move it, a reused pid has another; nil when it's gone
+    func startMicros(_ pid: pid_t) -> Int?
     /// time.strftime("%Y-%m-%d") at `now`
     func day() -> String
 }
@@ -102,24 +103,23 @@ public enum Sched {
         return pid_t(n)
     }
 
-    /// owned(job): the wrapper lives and is still the job's: its pid started no later than the
-    /// entry was made (+1 s, the kernel's start is in seconds). pids wrap here every ~25 min.
+    /// owned(job): the wrapper lives and is still the job's: its pid has the start stamp the wrapper
+    /// wrote (pid_start_us). pids wrap here every ~25 min; a wall-clock comparison was off by 1-2 s
+    /// and after a clock step, and reap then killed a live job. An entry without it: alive will do.
     static func owned(_ job: PyJSON, _ probes: SchedProbes) -> Bool {
         guard let pid = pidOf(job["pid"]), probes.alive(.int(Int(pid))) else { return false }
-        guard let at = number(job["enqueued_at"]) else { return true }
-        guard let start = probes.startTime(pid) else { return false }
-        return start <= at + 1
+        guard case .int(let mine)? = job["pid_start_us"] else { return true }
+        return probes.startMicros(pid) == mine
     }
 
-    /// group_of(job): child_pgid while it's still the job's group (the leader no younger than
-    /// child_started_at + 1 s); without child_started_at, no group to signal
+    /// group_of(job): child_pgid while its leader is still the job's child (child_start_us); without
+    /// that stamp, no group to signal
     static func groupOf(_ job: PyJSON, _ probes: SchedProbes) -> pid_t? {
-        groupOf(job, start: probes.startTime)
+        groupOf(job, start: probes.startMicros)
     }
 
-    static func groupOf(_ job: PyJSON, start: (pid_t) -> Double?) -> pid_t? {
-        guard let g = Sched.groupID(job["child_pgid"]), let at = number(job["child_started_at"]),
-              let begun = start(g), begun <= at + 1
+    static func groupOf(_ job: PyJSON, start: (pid_t) -> Int?) -> pid_t? {
+        guard let g = Sched.groupID(job["child_pgid"]), case .int(let mine)? = job["child_start_us"], start(g) == mine
         else { return nil }
         return g
     }

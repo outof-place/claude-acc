@@ -57,7 +57,7 @@ public final class RecordedSchedProbes: SchedProbes {
     public func day() -> String { f["day"]?.string ?? "" }
     public func bootTime() -> Double { f["boottime"]?.double ?? 0 }
     public func ownGroup() -> pid_t { pid_t(clamping: f["pgrp"]?.int ?? -1) }
-    public func startTime(_ pid: pid_t) -> Double? { f["starts"]?[String(pid)]?.double }
+    public func startMicros(_ pid: pid_t) -> Int? { f["starts"]?[String(pid)]?.int }
 }
 
 extension Sched {
