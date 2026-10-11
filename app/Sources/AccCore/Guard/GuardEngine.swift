@@ -3,7 +3,8 @@
 // memory pressure. Everything that acts stays Python's: a tick whose plan or brake is due is handed
 // to `acc.py devguard once` (which reads the Mac again and acts on its own reading), the caps to
 // `acc.py devguard caps`. In shadow mode nothing is handed over and the state goes to a file of its own.
-// A devguard.json value of a type the native tick would read differently hands every tick over.
+// A devguard.json value of a type the native tick would read differently hands the guard to Python's
+// own loop (`devguard run`, QoS shaping and caps included) until the file reads natively again.
 import Darwin
 import Dispatch
 
@@ -12,13 +13,15 @@ import Dispatch
 /// - a plan Python may decline on its own reading (`declinable`) that it did decline: `holdSeconds`,
 ///   while the plans under it and the brake still go;
 /// - a brake, whatever its outcome (no victim, or a state Python couldn't save): brake()'s own gap
-///   (`emergency_cooldown_seconds` at stage 3, else `brake_cooldown_seconds`).
+///   for the stage it is at now (`emergency_cooldown_seconds` at stage 3, else
+///   `brake_cooldown_seconds`), so pressure climbing to stage 3 shortens the wait at once.
 /// Every other plan is tried again on the next tick: Python's reading may differ for a moment
 /// (pressure flickering), and it acts as soon as it agrees.
 public struct HandoverPolicy {
     public static let holdSeconds = 60.0
     public private(set) var heldUntil: [String: Double] = [:]
-    public private(set) var brakeHeldUntil = 0.0
+    /// when the last brake went to Python
+    public private(set) var lastBrake = -Double.infinity
 
     public init() {}
 
@@ -30,18 +33,25 @@ public struct HandoverPolicy {
 
     static func key(_ plan: Plan) -> String { plan.key + "|" + plan.action + "|" + plan.code }
 
-    /// The first actable plan that isn't held, and the brake when it's due and not waiting.
-    public func next(actable: [Plan], brakeDue: Bool, now: Double) -> Handover? {
+    /// The first actable plan that isn't held, and the brake when it's due and its gap (for the
+    /// stage the tick is at) has passed since the last brake handover.
+    public func next(actable: [Plan], brakeDue: Bool, now: Double, brakeGap: Double) -> Handover? {
         let plan = actable.first { (heldUntil[Self.key($0)] ?? 0) <= now }
-        let brake = brakeDue && brakeHeldUntil <= now
+        let brake = brakeDue && now - lastBrake >= brakeGap
         return plan != nil || brake ? Handover(plan: plan, brake: brake) : nil
     }
 
     /// After Python's tick: `acted` when it stopped, restarted, shut down or warned something.
-    public mutating func record(_ handover: Handover, acted: Bool, brakeGap: Double, now: Double) {
+    public mutating func record(_ handover: Handover, acted: Bool, now: Double) {
         heldUntil = heldUntil.filter { $0.value > now }
         if let plan = handover.plan, !acted, declinable(plan) { heldUntil[Self.key(plan)] = now + Self.holdSeconds }
-        if handover.brake { brakeHeldUntil = now + brakeGap }
+        if handover.brake { lastBrake = now }
+    }
+
+    /// brake()'s gap at a stage: emergency_cooldown_seconds at 3, brake_cooldown_seconds below
+    public static func brakeGap(_ cfg: GuardConfig, stage: Int) -> Double {
+        let s = LastResort.settings(cfg)
+        return (stage >= 3 ? s["emergency_cooldown_seconds"] : s["brake_cooldown_seconds"])?.double ?? 0
     }
 }
 
@@ -75,6 +85,13 @@ public final class GuardEngine: @unchecked Sendable {
     var hostStamp = ""
     /// orcahost.py failed (a timeout under load): when to ask again
     var hostRetryAt = 0.0
+    /// orcahost.py runs off the guard's queue (20 s timeout): one at a time
+    var resolving = false
+    /// tests: the host lookup in place of orcahost.py
+    var resolver: (@Sendable () -> OrcaClient?)?
+    /// Python's own loop while devguard.json doesn't read natively, and the pid of a test stand-in
+    var pythonLoop: pid_t?
+    var loopStarter: (([String]) -> pid_t?)?
     var shaper = QoSShaper()
     let procCache = ProcCache()
     var lastTick = 0.0
@@ -164,16 +181,23 @@ public final class GuardEngine: @unchecked Sendable {
     func loop(reschedule: Bool = true) {
         let cfg = Profile.measure("config") { GuardConfig.load(path: configPath) }
         Profile.measure("merge") { mergeForeign() }
-        if probesFactory == nil { Profile.measure("host") { refreshHost() } }
-        let probes = probesFactory?() ?? LiveProbes(home: options.home, orca: client, cache: procCache)
-        let enforce = !options.shadow && cfg["mode"] == .string("enforce")
+        if probesFactory == nil || resolver != nil { Profile.measure("host") { refreshHost() } }
         let mismatched = cfg.mismatched
         if mismatched != mismatchLogged {
             mismatchLogged = mismatched
             if !mismatched.isEmpty {
-                GuardLog.write("acc-cored: devguard.json ma wartości innego typu niż domyślne (\(mismatched.joined(separator: ", "))): każdy przebieg robi Python")
+                GuardLog.write("acc-cored: devguard.json ma wartości innego typu niż domyślne (\(mismatched.joined(separator: ", "))): strażnika prowadzi pętla Pythona")
             }
         }
+        // a config the native tick can't read the way Python does: Python's own loop, until it can
+        if !options.shadow, !mismatched.isEmpty {
+            runPythonLoop()
+            if reschedule { schedule(after: max(0.5, cfg.number("interval_seconds"))) }
+            return
+        }
+        if pythonLoop != nil { stopPythonLoop() }
+        let probes = probesFactory?() ?? LiveProbes(home: options.home, orca: client, cache: procCache)
+        let enforce = !options.shadow && cfg["mode"] == .string("enforce")
         var next = state
         GuardLog.hold()
         let result = guardTick(cfg: cfg, state: &next, orca: orca, probes: probes, enforce: enforce, shaper: options.shadow ? nil : shaper)
@@ -181,11 +205,11 @@ public final class GuardEngine: @unchecked Sendable {
         ticks += 1
         // the first tick reads every process's arguments and asks every pattern once: not the loop's cost
         if ticks == 1, Profile.on { Profile.reset() }
-        let handover = options.shadow ? nil
-            : !mismatched.isEmpty ? HandoverPolicy.Handover(plan: nil, brake: false) : policy.next(actable: result.actable, brakeDue: result.brakeDue, now: probes.now)
+        let gap = HandoverPolicy.brakeGap(cfg, stage: result.world.pressure.stage)
+        let handover = options.shadow ? nil : policy.next(actable: result.actable, brakeDue: result.brakeDue, now: probes.now, brakeGap: gap)
         if let handover {
             GuardLog.release(write: false)  // Python's tick logs and notifies from its own reading
-            handOver(handover, result: result, cfg: cfg, configOnly: !mismatched.isEmpty)
+            handOver(handover, result: result, cfg: cfg)
         } else {
             GuardLog.release(write: true)
             state = next
@@ -201,7 +225,7 @@ public final class GuardEngine: @unchecked Sendable {
 
     /// The tick goes to Python: the state as it was before this tick, the lock let go, `devguard once`,
     /// then the state Python saved. Python's tick re-reads the Mac, decides and acts.
-    func handOver(_ handover: HandoverPolicy.Handover, result: GuardTickResult, cfg: GuardConfig, configOnly: Bool) {
+    func handOver(_ handover: HandoverPolicy.Handover, result: GuardTickResult, cfg: GuardConfig) {
         save()
         let before = actedStamp(state)
         if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_UN) }
@@ -211,15 +235,40 @@ public final class GuardEngine: @unchecked Sendable {
         if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_EX) }
         handovers += 1
         state = Files.json(statePath, fallback: .object(state)).object ?? state
-        let reason = configOnly ? "config" : handover.reason
-        if rc != 0 { GuardLog.write("acc-cored: devguard once wyszedł z kodem \(rc) (\(reason))") }
-        guard !configOnly else { return }
-        let s = LastResort.settings(cfg)
-        let gap = (result.world.pressure.stage >= 3 ? s["emergency_cooldown_seconds"] : s["brake_cooldown_seconds"])?.double ?? 0
-        policy.record(handover, acted: actedStamp(state) != before, brakeGap: gap, now: result.world.now)
+        if rc != 0 { GuardLog.write("acc-cored: devguard once wyszedł z kodem \(rc) (\(handover.reason))") }
+        policy.record(handover, acted: actedStamp(state) != before, now: result.world.now)
     }
 
-    static let onceTimeout = 120.0
+    /// Python's slowest tick: a pool Simulator's shutdown (lsappinfo 2 × 5 s, running_apps 20 s,
+    /// simctl shutdown 120 s) plus Orca's reads; killed mid-action it would lose its event
+    static let onceTimeout = 300.0
+
+    // MARK: Python's loop
+
+    /// `devguard run` as a child, with the lock let go: a crash of acc-cored takes it along (same
+    /// process group), and it is started again if it ends.
+    func runPythonLoop() {
+        if let pid = pythonLoop {
+            var status: Int32 = 0
+            if waitpid(pid, &status, WNOHANG) == 0 { return }
+            pythonLoop = nil
+        }
+        if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_UN) }
+        let argv = options.python + ["devguard", "run"]
+        pythonLoop = loopStarter?(argv) ?? Spawn.start(argv, log: GuardPaths.state(options.home) + "/devguard-launchd.log")
+    }
+
+    /// The config reads natively again: Python's loop ends (SIGTERM: it restores QoS and logs its end),
+    /// the lock comes back, and the state is Python's last one.
+    func stopPythonLoop() {
+        guard let pid = pythonLoop else { return }
+        pythonLoop = nil
+        kill(pid, SIGTERM)
+        if Spawn.reap(pid, deadline: Kernel.wall() + 10) == nil { GuardLog.write("acc-cored: pętla Pythona nie skończyła się w 10 s, zabita") }
+        if lockFd >= 0 { _ = Self.flockRetrying(lockFd, LOCK_EX) }
+        state = Files.json(statePath, fallback: .object(state)).object ?? state
+        savedStamp = Files.stamp(statePath)
+    }
 
     /// What changes when execute() acts: last_action (stop, restart, shutdown), the events, the warns.
     func actedStamp(_ s: PyObject) -> String {
@@ -271,10 +320,18 @@ public final class GuardEngine: @unchecked Sendable {
         let now = Kernel.wall()
         // a failed resolve (a 20 s timeout under load) is asked again a minute later, not only when
         // the host changes: without Orca there are no recycle plans
-        guard stamp != hostStamp || (client == nil && now >= hostRetryAt) else { return }
+        guard !resolving, stamp != hostStamp || (client == nil && now >= hostRetryAt) else { return }
         hostStamp = stamp
-        client = HostResolver.resolve(python: options.python, home: options.home)
-        if client == nil { hostRetryAt = now + 60 }
+        resolving = true
+        let python = options.python, home = options.home, resolver = resolver
+        DispatchQueue.global(qos: .utility).async {
+            let found = resolver?() ?? HostResolver.resolve(python: python, home: home)
+            self.queue.async {
+                self.resolving = false
+                self.client = found
+                if found == nil { self.hostRetryAt = Kernel.wall() + 60 }
+            }
+        }
     }
 
     // MARK: caps

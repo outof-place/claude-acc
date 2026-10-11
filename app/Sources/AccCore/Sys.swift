@@ -92,11 +92,15 @@ public enum Spawn {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP))
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETPGROUP))
         posix_spawnattr_setpgroup(&attr, 0)
         var all = sigset_t()
         sigfillset(&all)
         posix_spawnattr_setsigdefault(&attr, &all)
+        // a thread's blocked signals would pass to the child: a SIGTERM it can't receive
+        var none = sigset_t()
+        sigemptyset(&none)
+        posix_spawnattr_setsigmask(&attr, &none)
         let cargs = argv.map { strdup($0) } + [nil]
         defer { cargs.forEach { free($0) } }
         let environment = (env ?? currentEnv()).map { strdup("\($0.key)=\($0.value)") } + [nil]
@@ -178,6 +182,36 @@ public enum Spawn {
         return nil
     }
 
+    /// Starts argv without waiting (stdin /dev/null, stdout/stderr appended to `log`), in this
+    /// process's group, so whatever stops this process's group stops it too; its pid, nil if it
+    /// can't start. The caller reaps it (`reap`).
+    public static func start(_ argv: [String], log: String? = nil) -> pid_t? {
+        var actions: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, 1, log ?? "/dev/null", O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        posix_spawn_file_actions_adddup2(&actions, 1, 2)
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK))
+        var all = sigset_t()
+        sigfillset(&all)
+        posix_spawnattr_setsigdefault(&attr, &all)
+        // a thread's blocked signals would pass to the child: a SIGTERM it can't receive
+        var none = sigset_t()
+        sigemptyset(&none)
+        posix_spawnattr_setsigmask(&attr, &none)
+        let cargs = argv.map { strdup($0) } + [nil]
+        defer { cargs.forEach { free($0) } }
+        let environment = currentEnv().map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer { environment.forEach { free($0) } }
+        var pid: pid_t = 0
+        guard posix_spawnp(&pid, argv[0], &actions, &attr, cargs, environment) == 0 else { return nil }
+        return pid
+    }
+
     /// Runs argv to its end with stdout/stderr appended to `log`; the exit code, or 124 when it
     /// outlives `timeout` (its group is killed, as `timeout(1)` answers).
     public static func run(_ argv: [String], env: [String: String]? = nil, log: String? = nil, timeout: Double = .infinity) -> Int32 {
@@ -191,11 +225,15 @@ public enum Spawn {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETPGROUP))
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETPGROUP))
         posix_spawnattr_setpgroup(&attr, 0)
         var all = sigset_t()
         sigfillset(&all)
         posix_spawnattr_setsigdefault(&attr, &all)
+        // a thread's blocked signals would pass to the child: a SIGTERM it can't receive
+        var none = sigset_t()
+        sigemptyset(&none)
+        posix_spawnattr_setsigmask(&attr, &none)
         let cargs = argv.map { strdup($0) } + [nil]
         defer { cargs.forEach { free($0) } }
         let environment = (env ?? currentEnv()).map { strdup("\($0.key)=\($0.value)") } + [nil]

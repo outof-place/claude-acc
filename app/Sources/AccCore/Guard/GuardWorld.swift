@@ -253,7 +253,7 @@ public func discover(_ cfg: GuardConfig, _ table: ProcTable, probes: GuardProbes
         // a server under another server of the same kind is its child, not a server of its own
         if ancestors(table.ppid(pid), table).contains(where: foundSet.contains) { continue }
         let server = Server(pid: pid, kind: kind, command: table.command(pid), tree: descendants(pid, children), probes: probes)
-        if !scope.isEmpty, !scope.contains(where: { server.cwd == $0 || server.cwd.pyStarts($0 + "/") }) { continue }
+        if !scope.isEmpty, !scope.contains(where: { server.cwd.pyEq($0) || server.cwd.pyStarts($0 + "/") }) { continue }
         servers.append(server)
     }
     var groups: [(pid_t, [Server])] = []
