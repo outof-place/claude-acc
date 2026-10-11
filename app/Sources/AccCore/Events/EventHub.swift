@@ -18,8 +18,9 @@
 // subscribes. `pressure` is derived: devguard-state.json's snapshot.pressure.level as {"level": N},
 // sent when the level changes, so a menu bar doesn't decode 30 KB to badge a ring; its seq is
 // devguard-state.json's.
-// A client that hasn't subscribed `subscribeSeconds` after the events line, or whose frames haven't
-// drained for `stallSeconds` (it stopped reading), is dropped.
+// A client that hasn't subscribed `subscribeSeconds` after the events line, or whose socket took
+// nothing for `stallSeconds` while frames waited (it stopped reading), is dropped; the reaper looks
+// every `reapEvery`, so that's up to one more period. A slow reader that keeps taking stays.
 import Darwin
 import Dispatch
 import Synchronization
@@ -64,9 +65,11 @@ public final class EventHub: @unchecked Sendable {
         var reader: DispatchSourceRead?
         var writer: DispatchSourceWrite?
         var inbox: [UInt8] = []
-        var outbox: [UInt8] = []
-        /// how much of `outbox` the socket took
+        /// frames on their way; a snapshot's bytes are shared with every client it goes to
+        var outbox: [[UInt8]] = []
+        /// how much of `outbox[0]` the socket took, and what's left of all of them
         var sent = 0
+        var queued = 0
         var topics: Set<String> = []
         var have: [String: String] = [:]
         var maxHz: [String: Double] = [:]
@@ -74,7 +77,7 @@ public final class EventHub: @unchecked Sendable {
         /// topics whose newest version this client hasn't been sent yet
         var pending: Set<String> = []
         var subscribed = false
-        /// since when the socket hasn't taken what's unsent
+        /// since when the socket took nothing of what's unsent (any progress resets it)
         var stalledSince: Double?
         /// one timer at the earliest topic's next turn under maxHz
         var timer: DispatchSourceTimer?
@@ -89,7 +92,7 @@ public final class EventHub: @unchecked Sendable {
             adopted = at
         }
 
-        var unsent: Int { outbox.count - sent }
+        var unsent: Int { queued }
     }
 
     struct Version {
@@ -105,6 +108,8 @@ public final class EventHub: @unchecked Sendable {
     var parentSources: [String: (parent: String, source: DispatchSourceFileSystemObject)] = [:]
     var fileSources: [String: DispatchSourceFileSystemObject] = [:]
     var reaper: DispatchSourceTimer?
+    /// each topic's snapshot frame, built once per version and shared by the clients it goes to
+    var frames: [String: (seq: String, bytes: [UInt8])] = [:]
     /// one read buffer for every client: reads run on `queue` only
     var chunk = [UInt8](repeating: 0, count: 64 * 1024)
     public private(set) var framesSent = 0
@@ -185,6 +190,7 @@ public final class EventHub: @unchecked Sendable {
     }
 
     func parse(_ c: Client) {
+        guard !c.closed else { return }  // a hello that failed dropped it already
         var at = 0
         defer { if at > 0, !c.closed { c.inbox.removeFirst(at) } }
         while c.inbox.count - at >= 5 {
@@ -274,7 +280,10 @@ public final class EventHub: @unchecked Sendable {
             fileSources[file]?.cancel()
             fileSources[file] = nil
         }
-        for topic in Array(current.keys) where !topics.contains(topic) { current[topic] = nil }
+        for topic in Array(current.keys) where !topics.contains(topic) {
+            current[topic] = nil
+            frames[topic] = nil
+        }
         for dir in dirs where dirSources[dir] == nil && parentSources[dir] == nil { armDir(dir) }
         for file in paths where fileSources[file] == nil { watchFile(file) }
     }
@@ -456,7 +465,7 @@ public final class EventHub: @unchecked Sendable {
             }
             c.pending.remove(topic)
             guard let v = current[topic], c.have[topic] != v.seq else { continue }
-            c.outbox += v.data == nil ? Self.frame(4, Self.json([("topic", .string(topic))])) : Self.snapshot(topic, v)
+            append(c, v.data == nil ? Self.frame(4, Self.json([("topic", .string(topic))])) : snapshotFrame(topic, v))
             c.have[topic] = v.seq
             c.lastSent[topic] = now
             framesSent += 1
@@ -485,18 +494,38 @@ public final class EventHub: @unchecked Sendable {
         t.schedule(deadline: .now() + max(0, at - Kernel.monotonic()), leeway: .milliseconds(20))
     }
 
+    func snapshotFrame(_ topic: String, _ v: Version) -> [UInt8] {
+        if let f = frames[topic], f.seq == v.seq { return f.bytes }
+        let bytes = Self.snapshot(topic, v)
+        frames[topic] = (v.seq, bytes)
+        return bytes
+    }
+
+    func append(_ c: Client, _ frame: [UInt8]) {
+        c.outbox.append(frame)
+        c.queued += frame.count
+    }
+
     func enqueue(_ c: Client, _ frame: [UInt8]) {
-        c.outbox += frame
+        guard !c.closed else { return }
+        append(c, frame)
         write(c)
     }
 
     /// As much of the outbox as the socket takes now; the rest when it's writable again. A drained
     /// outbox sends what's pending, except when the call comes from flush itself.
     func write(_ c: Client, flushAfter: Bool = true) {
-        while c.unsent > 0 {
-            let w = c.outbox.withUnsafeBytes { Darwin.send(c.fd, $0.baseAddress! + c.sent, $0.count - c.sent, MSG_NOSIGNAL) }
+        guard !c.closed else { return }
+        while let first = c.outbox.first {
+            let w = first.withUnsafeBytes { Darwin.send(c.fd, $0.baseAddress! + c.sent, $0.count - c.sent, MSG_NOSIGNAL) }
             if w > 0 {
                 c.sent += w
+                c.queued -= w
+                c.stalledSince = nil  // it reads, however slowly
+                if c.sent == first.count {
+                    c.outbox.removeFirst()
+                    c.sent = 0
+                }
                 continue
             }
             if w < 0 && errno == EINTR { continue }
@@ -517,8 +546,6 @@ public final class EventHub: @unchecked Sendable {
             }
             return
         }
-        c.outbox.removeAll(keepingCapacity: true)
-        c.sent = 0
         c.stalledSince = nil
         if flushAfter, !c.pending.isEmpty { flush(c) }
     }

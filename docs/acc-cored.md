@@ -486,8 +486,12 @@ stream on its control socket, so a host can subscribe instead:
   replace the waiting ones instead of queueing (one flush stays well under the 16 MiB a client may
   leave unsent). `maxHz` spaces a topic's frames: it's clamped to 0.001-1000, and each client's
   one timer goes to the earliest topic's turn, so a slow topic doesn't hold back a fast one.
-- A client is dropped when it hasn't subscribed 10 s after the events line, or when its frames
-  haven't drained for 30 s (it stopped reading). 16 event clients at most; the 17th gets `busy`.
+- A client is dropped when it hasn't subscribed 10 s after the events line, or when its socket
+  took nothing for 30 s while frames waited (it stopped reading; a slow reader that keeps taking
+  stays). The reaper looks every 5 s, so that's 10-15 s and 30-35 s. 16 event clients at most;
+  the 17th gets `busy`.
+- A snapshot's frame is built once per version and shared by every client it goes to: 16 clients
+  that don't read, on 12 topics of 1 MiB, took the daemon to 31 MB, not 225 MB.
 - The files stay the contract, written atomically (a rename, as every writer does today: an
   in-place write can be sent half done). Python writes them, and acc-cored only watches them, and
   only while someone subscribes. It watches their folders for renames and each subscribed file

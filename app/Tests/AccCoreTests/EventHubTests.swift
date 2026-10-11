@@ -235,6 +235,32 @@ func eventLimits() throws {
     #expect(p.hub.count == 0)  // the silent one after 0.4 s, the stalled one after 0.4 s of a full socket
 }
 
+@Test("a slow reader that keeps taking stays past stallSeconds and gets the whole frame")
+func eventSlowReader() throws {
+    let p = try Pair("slow") { hub in
+        hub.stallSeconds = 0.5
+        hub.reapEvery = 0.1
+    }
+    let body = "{\"pad\": \"" + String(repeating: "y", count: 300_000) + "\"}"
+    p.write("status.json", body)
+    _ = p.next()
+    #expect(EventClient.subscribe(p.fd, topics: ["accounts"]))
+    // one read every 0.1 s, of what a socket pair's ~8 KB buffer holds: seconds for the frame,
+    // several stall periods
+    var got: [UInt8] = []
+    var chunk = [UInt8](repeating: 0, count: 64 * 1024)
+    let start = Kernel.monotonic()
+    while got.count < body.utf8.count + 64, Kernel.monotonic() - start < 20 {
+        usleep(100_000)
+        let n = chunk.withUnsafeMutableBytes { Darwin.read(p.fd, $0.baseAddress, $0.count) }
+        if n <= 0 { break }
+        got += chunk[..<n]
+    }
+    #expect(Kernel.monotonic() - start > 1)
+    #expect(got.count >= body.utf8.count)
+    #expect(p.hub.count == 1)
+}
+
 @Test("a client gone before its hello, and a stream the daemon closes, end without SIGPIPE or a spin")
 func eventPeerGone() throws {
     let p = try Pair("gone")
