@@ -2103,7 +2103,7 @@ FAMILIES = (
     ("metro", re.compile(r"/expo(/bin/cli)?\s+start\b|/metro\b|react-native\s+start\b")),
     ("watchers", re.compile(r"--watch(All)?\b|(^|/)nodemon(\s|$)|(^|\s)-w(\s|$)|/vitest(\.mjs)?\s+(watch|dev)\b")),
     ("lsp", re.compile(r"(^|/)gopls(\s|$)|tsserver\.js|typescript-language-server|rust-analyzer|sourcekit-lsp|clangd|pyright-langserver")),
-    ("docker", re.compile(r"com\.docker|Docker\.app|com\.apple\.Virtualization")),
+    ("docker", re.compile(r"com\.docker|Docker\.app|OrbStack\.app|com\.apple\.Virtualization")),
     ("git", re.compile(r"^(\S*/)?git(\s|$)")),
     ("agents", AGENT),
     ("browsers", BROWSER),
