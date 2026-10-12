@@ -43,6 +43,8 @@ Komendy:
   pins                  przypięcia, ich powody i terminy
   admit [--codex]       hook PreToolUse (Bash) dla Claude Code, z --codex dla Codeksa; zdarzenie
                         czyta z stdin
+  admitd                ciepły `admit` na gnieździe $STATE/admit.sock (admitd.py): pętla dla
+                        agenta Pod codes.pod.app.acc.admit, z którą claude-acc-hook nie startuje Pythona
   room [katalog]        kod 0, gdy pamięć wpuści nowy dev serwer (w tym katalogu), 1 z powodem;
                         warunek dla `claude-acc sched wait`, który odmowa podaje agentowi
   brake [--stage N] [--within PID] [--json]
@@ -52,14 +54,20 @@ Komendy:
                         "gate": [wzorzec]} dla natywnego claude-acc-hook
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # Ten plik to tylko wejście. Hook `admit` idzie przy każdym poleceniu Bash każdego agenta, a
 # skrypt podany Pythonowi wprost kompiluje się przy każdym starcie (bajtkod z __pycache__
 # dostają tylko importowane moduły): przy 1900 liniach to było 7-10 ms na każdego Basha.
 # Strażnik (pomiar, decyzje, akcje) leży więc w devguard_core.py i ładuje się z cache, a tu
 # zostaje tylko to, czego hook potrzebuje dla komendy, która dev serwera nie stawia.
 
-import os
-import sys
 
 DEV_WORDS = ("dev", "vite", "expo", "serve", "react-native")
 # słowa, bez których komenda nie ma pracy dla schedulera (Go, JS i natywne buildy z symulatorami);
@@ -419,6 +427,11 @@ def main(argv):
             return admit_codex(raw) if "--codex" in argv else admit(raw)
         except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
             return 0
+    if argv[:1] == ["admitd"]:
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import admitd
+
+        return admitd.serve()
     if argv[:1] == ["words"]:
         # jedno źródło list dla obu frontów: setup.sh zapisuje to do hook-words.json; bramka
         # jako lista, bo starszy claude-acc-hook czyta plik jako {klucz: [tekst]}

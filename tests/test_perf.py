@@ -35,6 +35,12 @@ ACC = os.path.join(ROOT, "acc.py")
 sys.path.insert(0, ROOT)
 
 import orcahost
+import owner
+
+# owner.json prawdziwego konta (Pod przejął claude-acc na tym Macu) zmieniałby tabele perf liczone
+# przy imporcie (HOST_HOOKS podpisuje ~/.orca Pod): testy biorą instalację bez właściciela, a Pod
+# sprawdzają osobno, z owned_by_pod podanym wprost
+owner.OWNER_PATH = os.path.join(tempfile.gettempdir(), f"perf-test-no-owner-{os.getpid()}", "owner.json")
 import perf
 
 
@@ -889,6 +895,27 @@ class JsonSettingTest(Isolated):
         self.assertEqual(self.read(self.files["devguard-budget"])["budget_percent"], 25)
         item.undo(record, FakeSystem({}))
         self.assertEqual(self.read(self.files["devguard-budget"]), original)
+
+    def test_docker_vm_leaves_an_uninstalled_docker_desktop_alone(self):
+        """Docker Desktop odinstalowany (2026-10-12, w zamian OrbStack): keep nie odtwarza jego
+        katalogu w Group Containers, tylko zdejmuje docker-vm, a apply odmawia."""
+        container = os.path.join(self.dir, "group.com.docker")
+        path = os.path.join(container, "settings-store.json")
+        os.makedirs(container)
+        self.write(path, {"MemoryMiB": 8192})
+        system = FakeSystem({}, docker=False)
+        with mock.patch.object(perf.tweak("docker-vm"), "path", path):
+            self.run_cmd(perf.cmd_apply, "docker-vm", system=system)
+            self.assertEqual(self.read(path)["MemoryMiB"], 6144)
+            shutil.rmtree(container)  # odinstalowanie
+            self.run_cmd(perf.cmd_keep, system=system)
+            self.assertFalse(os.path.exists(container))
+            self.assertNotIn("docker-vm", perf.load_state()["applied"])
+            code, out = self.run_cmd(perf.cmd_apply, "docker-vm", system=system)
+        self.assertFalse(os.path.exists(container))
+        self.assertNotIn("docker-vm", perf.load_state()["applied"])
+        self.assertEqual(code, 1)
+        self.assertIn("Docker Desktop nie jest zainstalowany", out)
 
     def test_docker_waits_until_docker_is_closed(self):
         path = self.files["docker-vm"]
@@ -1750,6 +1777,17 @@ class UltraTest(Isolated):
         self.assertEqual(perf.git_repos({}), [])
 
 
+def assert_out_of_background(test, now, normal):
+    """Po undo proces wyszedł z tła. `ps -o pri` zwykłego procesu to priorytet dynamiczny: pod
+    obciążeniem (load average powyżej liczby rdzeni) jądro przesuwa go o kilka punktów (31 zamiast
+    28 albo 30), więc wtedy wystarcza, że nie jest już priorytetem tła; dokładny powrót sprawdza
+    tylko spokojny Mac."""
+    test.assertNotEqual(now, perf.BACKGROUND_PRI)
+    test.assertGreater(now, perf.BACKGROUND_PRI)
+    if os.getloadavg()[0] <= (os.cpu_count() or 1):
+        test.assertEqual(now, normal)
+
+
 class UltraFakeHomeTest(unittest.TestCase):
     """Skrypt w osobnym $HOME: prawdziwe ścieżki pod HOME, prawdziwy proces-wydmuszka."""
 
@@ -1827,7 +1865,7 @@ class UltraFakeHomeTest(unittest.TestCase):
         self.assertEqual(data["applied"], perf.ULTRA)
         self.perf("ultra", "off")
         self.assertEqual(self.files(), self.originals)
-        self.assertEqual(self.priority(), normal)
+        assert_out_of_background(self, self.priority(), normal)
         data = json.loads(self.perf("ultra", "status", "--json"))
         self.assertFalse(data["on"])
 
@@ -1887,7 +1925,7 @@ class RealProcessTest(unittest.TestCase):
             procs = json.load(f)["applied"]["bg-helpers"]["procs"]
         self.assertEqual([p["pid"] for p in procs], [self.dummy.pid])
         self.perf("undo", "bg-helpers", launcher=True)
-        self.assertEqual(self.priority(), normal)
+        assert_out_of_background(self, self.priority(), normal)
 
     def test_apply_and_undo(self):
         time.sleep(0.2)
@@ -1902,7 +1940,7 @@ class RealProcessTest(unittest.TestCase):
         entry = next(t for t in status["tweaks"] if t["name"] == "bg-helpers")
         self.assertTrue(entry["applied"])
         self.perf("undo", "bg-helpers")
-        self.assertEqual(self.priority(), normal)
+        assert_out_of_background(self, self.priority(), normal)
         with open(self.state_path) as f:
             self.assertNotIn("bg-helpers", json.load(f)["applied"])
 
@@ -2261,24 +2299,26 @@ class HostFixtureTest(unittest.TestCase):
     """Orca i Pod obok siebie: hooki obu idą w tle, etykiety i krok devtools mówią o hoście."""
 
     def test_one_shared_hook_folder_named_after_the_owner(self):
-        """Pod zostaje przy ~/.orca: jeden katalog hooków statusu, w tle jak dotąd. Gdy claude-acc należy do
-        Pod (owner.json), ten katalog nosi jego hooki i panel podpisuje go Pod."""
+        """Hooki statusu Orki (~/.orca) i Poda (~/.pod od 2026-10-10) idą w tle. Pod, który jeszcze dzieli
+        ~/.orca, i należy do niego claude-acc (owner.json): ten katalog nosi jego hooki, panel podpisuje go Pod."""
         with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
             hosts = orcahost.hook_hosts([orcahost.orca(), pod_host()])
-        self.assertEqual(hosts, {".orca/agent-hooks": "Orca"})
+        self.assertEqual(hosts, {".orca/agent-hooks": "Orca", ".pod/agent-hooks": "Pod"})
         entries = perf.host_async_hooks(hosts)
-        self.assertEqual({e["match"] for e in entries}, {".orca/agent-hooks/claude-hook"})
-        self.assertEqual(len(entries), len(perf.HOST_HOOK_EVENTS))
+        self.assertEqual({e["match"] for e in entries}, {".orca/agent-hooks/claude-hook", ".pod/agent-hooks/claude-hook"})
+        self.assertEqual(len(entries), 2 * len(perf.HOST_HOOK_EVENTS))
         self.assertLessEqual({e["match"] for e in entries}, {e["match"] for e in perf.DEFAULT_CONFIG["async_hooks"]})
         owned = {"owner": "pod", "version": "1.29.2", "app": None, "at": 0}
         with mock.patch.object(orcahost, "owned_by_pod", return_value=owned):
-            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), pod_host()]), {".orca/agent-hooks": "Pod"})
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), pod_host()])[".orca/agent-hooks"], "Pod")
+            moved = pod_host()._replace(hooks=".pod/agent-hooks")
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(), moved])[".orca/agent-hooks"], "Orca")
         # Pod, który zgłosi własny katalog (ClaudeAccHost hooksDir), dokłada go obok
         canary = pod_host()._replace(name="Pod Canary", hooks=".pod-canary/agent-hooks")
         with mock.patch.object(orcahost, "owned_by_pod", return_value={}):
             hosts = orcahost.hook_hosts([orcahost.orca(), canary])
         self.assertEqual(hosts[".pod-canary/agent-hooks"], "Pod Canary")
-        self.assertEqual(len(perf.host_async_hooks(hosts)), 2 * len(perf.HOST_HOOK_EVENTS))
+        self.assertEqual(len(perf.host_async_hooks(hosts)), 3 * len(perf.HOST_HOOK_EVENTS))
 
     def test_hook_label_names_the_host(self):
         hook = '/bin/sh "${HOME-}/.orca/agent-hooks/claude-hook.sh"'

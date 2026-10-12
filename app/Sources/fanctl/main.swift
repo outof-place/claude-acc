@@ -1,4 +1,5 @@
 import Foundation
+import SMCKit
 
 // fanctl: reads and drives the Mac's fans through the SMC.
 //

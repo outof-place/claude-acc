@@ -134,7 +134,8 @@ class PodBundleTest(Fixture):
 
     def test_declared_values_win(self):
         declared = {"userData": "~/Library/Application Support/Pod Dev", "cli": "podx-canary", "keychainService": POD_SERVICE,
-                    "hooksDir": "~/.pod/agent-hooks", "dataFile": "pod-data.json", "runtimeFile": "pod-runtime.json"}
+                    "hooksDir": "~/.pod/agent-hooks", "dataFile": "pod-data.json", "runtimeFile": "pod-runtime.json",
+                    "envPrefix": "POD_"}
         for binary in (False, True):
             with self.subTest(binary=binary):
                 app = make_bundle(tempfile.mkdtemp(dir=self.home), declared=declared, binary=binary)
@@ -142,6 +143,11 @@ class PodBundleTest(Fixture):
                 self.assertEqual(host.user_data, os.path.join(self.home, "Library", "Application Support", "Pod Dev"))
                 self.assertEqual((host.cli, host.keychain_service, host.hooks), ("podx-canary", POD_SERVICE, ".pod/agent-hooks"))
                 self.assertEqual((host.data_file, host.runtime_file), ("pod-data.json", "pod-runtime.json"))
+                self.assertEqual(host.env_prefix, "POD_")
+        # hooksDir jako pełna ścieżka w HOME to ten sam katalog względem HOME
+        app = make_bundle(tempfile.mkdtemp(dir=self.home), declared={"hooksDir": os.path.join(self.home, ".pod/agent-hooks/")})
+        self.assertEqual(orcahost.from_bundle(app, self.home).hooks, ".pod/agent-hooks")
+        self.assertEqual(orcahost.from_bundle(make_bundle(tempfile.mkdtemp(dir=self.home)), self.home).env_prefix, "ORCA_")
 
     def test_unpacked_package_json_names_the_user_data_folder(self):
         app = self.install_pod()
@@ -230,6 +236,19 @@ class ResolveTest(Fixture):
         self.assertEqual(host.user_data, self.orca.user_data)
         self.assertEqual(orcahost.runtime_path(host, env), os.path.join(dev, "orca-runtime.json"))
         self.assertEqual(orcahost.runtime_path(host, {}), os.path.join(self.orca.user_data, "orca-runtime.json"))
+        # Pod ustawia POD_USER_DATA_PATH; przy obu wygrywa przedrostek hosta
+        pod = orcahost.from_bundle(self.install_pod(declared={"envPrefix": "POD_"}), self.home)
+        both = {"POD_USER_DATA_PATH": dev + "-pod", "ORCA_USER_DATA_PATH": dev}
+        self.assertEqual(orcahost.runtime_path(pod, both), os.path.join(dev + "-pod", "orca-runtime.json"))
+        self.assertEqual(orcahost.runtime_path(host, both), os.path.join(dev, "orca-runtime.json"))
+        self.assertEqual(orcahost.runtime_path(host, {"POD_USER_DATA_PATH": dev}), os.path.join(dev, "orca-runtime.json"))
+
+    def test_env_reads_either_prefix(self):
+        self.assertEqual(orcahost.env("PANE_KEY", {"POD_PANE_KEY": "p"}), "p")
+        self.assertEqual(orcahost.env("PANE_KEY", {"ORCA_PANE_KEY": "o", "POD_PANE_KEY": "p"}), "o")
+        self.assertIsNone(orcahost.env("PANE_KEY", {"ORCA_PANE_KEY": ""}))
+        self.assertIn("POD_PAIRING_CODE", orcahost.REMOTE_ENV)
+        self.assertIn("ORCA_PAIRING_CODE", orcahost.REMOTE_ENV)
 
     def test_known_lists_every_host_once(self):
         pod = orcahost.from_bundle(self.install_pod(declared={"keychainService": POD_SERVICE,
@@ -258,10 +277,18 @@ class OwnerTest(unittest.TestCase):
         self.assertEqual((host.kind, host.app), ("pod", app))
 
     def test_owner_names_the_shared_hook_folder(self):
+        both = {".orca/agent-hooks": "Pod", ".pod/agent-hooks": "Pod"}
         with mock.patch.object(self.owner, "read", return_value={"owner": "pod", "version": "1", "app": None}):
-            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home)]), {".orca/agent-hooks": "Pod"})
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home)]), both)
+            # Pod, który dzieli ~/.orca z Orką (bez własnego hooksDir), też podpisuje go sobą
+            shared = orcahost.from_bundle(make_bundle(os.path.join(self.home, "Apps")), self.home)
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home), shared]), both)
+            # Pod z własnym ~/.pod (od 2026-10-10): ~/.orca wraca do Orki
+            moved = orcahost.from_bundle(make_bundle(os.path.join(self.home, "Apps2"), declared={"hooksDir": "~/.pod/agent-hooks"}), self.home)
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home), moved]),
+                             {".orca/agent-hooks": "Orca", ".pod/agent-hooks": "Pod"})
         with mock.patch.object(self.owner, "read", return_value=None):
-            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home)]), {".orca/agent-hooks": "Orca"})
+            self.assertEqual(orcahost.hook_hosts([orcahost.orca(self.home)]), {".orca/agent-hooks": "Orca", ".pod/agent-hooks": "Pod"})
 
     def test_without_owner_json_the_usual_places(self):
         for owned in (None, {"owner": "pod", "version": "1", "app": None}):

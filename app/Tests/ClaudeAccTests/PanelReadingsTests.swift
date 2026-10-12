@@ -60,3 +60,18 @@ func renderShowsSavedRoute() throws {
     #expect(awake.hotspotVia == "iPhone USB")
     #expect(!Awake(preview: true).onHotspot)
 }
+
+@Test("accounts: a Pod profile from `status --json` reads as usage only; a row without the keys doesn't")
+func podProfileRow() throws {
+    // accswitch.py profile_items, 1.31.4: the token expired, the numbers are the last known ones
+    let row = #"{"id": "profile:p1", "email": "p@x", "real_email": null, "tier": "Max 20x", "active": false, "last_resort": false, "status": "ok", "note": "limity nieaktualne", "usable": false, "queue": null, "session": {"used": 10, "resets_at": null}, "weekly": {"used": 42, "resets_at": null}, "data_age": 1900, "full_until": null, "renews_at": null, "subscription_status": null, "subscription_since": "2026-09-20", "source": "profile", "stale": true, "host_selected": true}"#
+    let profile = try #require(Store.decode(Account.self, from: Data(row.utf8)))
+    #expect(profile.isProfile)
+    #expect(profile.isStale)
+    #expect(profile.hostSelected == true)
+    // the same row as a script before 1.31.4 writes its own accounts
+    let old = row.replacingOccurrences(of: #", "source": "profile", "stale": true, "host_selected": true"#, with: "")
+    let account = try #require(Store.decode(Account.self, from: Data(old.utf8)))
+    #expect(!account.isProfile)
+    #expect(!account.isStale)
+}

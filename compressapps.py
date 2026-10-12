@@ -16,20 +16,28 @@ zapisać. Ten skrypt robi je przez sudo, aplikacja po aplikacji:
 Aktualizacje Office (Microsoft AutoUpdate) i Creative Cloud wgrywają nowe, nieskompresowane
 pakiety, więc komenda jest do powtarzania: drugi przebieg bierze tylko to, co doszło.
 
-Wywołanie przez `claude-acc mac compress-apps [--dry-run] [--apps Word,Excel] [--threads N]`;
-janitor uruchamia ten plik jako `sudo /usr/bin/python3 -I compressapps.py run ...` z pełną
-ścieżką do afsctool, bo secure_path sudo nie zawiera /opt/homebrew/bin. Skrypt nie importuje
-nic z repo, żeby tryb -I (bez katalogu skryptu i PYTHONPATH w sys.path) działał pod rootem.
+Wywołanie przez `claude-acc mac compress-apps [--dry-run] [--apps Word,Excel] [--threads N]`. Plan
+liczy janitor bez roota; tryb `run` biegnie pod rootem tylko z kopii roota (`claude-acc root install`):
+`sudo /usr/local/libexec/claude-acc-root/root-run.sh compress-apps ...` uruchamia tam ten plik
+interpreterem z rootpy.py, z -I, i przypiętą tam kopią afsctool. Ten plik w $STATE i afsctool z
+/opt/homebrew może zmienić każdy na tym koncie, więc pod sudo nie biegną. Skrypt nie importuje nic
+z repo, żeby tryb -I (bez katalogu skryptu i PYTHONPATH w sys.path) działał pod rootem.
 """
+
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
 
 import argparse
 import json
-import os
 import re
 import shutil
 import stat
 import subprocess
-import sys
 
 APPS_ROOT = "/Applications"
 SEARCH = ("/opt/homebrew/bin", "/usr/local/bin")

@@ -56,6 +56,11 @@ export function actionArgv(action, args = {}) {
       return { argv: ['hotspot', onOff(args.on)] }
     case 'dictate':
       return { argv: ['dictate', 'toggle'] }
+    case 'panel':
+      // `claude-acc panel [section]` opens the menu helper's panel (claude-acc://panel/<section>)
+      if (args.section == null) return { argv: ['panel'] }
+      if (args.section !== 'services') throw new Error('panel: unknown section')
+      return { argv: ['panel', 'services'] }
     case 'awake':
       if (args.toggle) return { argv: ['awake', 'toggle'] }
       if (args.on && args.for != null) {

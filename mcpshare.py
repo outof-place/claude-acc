@@ -3,6 +3,7 @@
     mcpshare.py share <nazwa> [--force] [--port N]   przełącz serwer z ~/.claude.json na wspólny
     mcpshare.py unshare <nazwa> | --all               wróć do osobnej kopii stdio w każdej sesji
     mcpshare.py status [--json]
+    mcpshare.py refresh [--restart]                   plisty mostów z tej wersji (woła je setup.sh)
     mcpshare.py serve --name <nazwa>                  (to uruchamia launchd)
 
 Każda sesja Claude Code startuje własną kopię każdego serwera stdio z ~/.claude.json, więc przy
@@ -17,10 +18,17 @@ roots): wspólny proces nie wie, której sesji dotyczy takie pytanie, więc odpo
 Dlatego `share` odmawia bramce poczty, przeglądarki, chrome-devtools i MCP Magic (bez --force).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import hmac
 import itertools
 import json
-import os
 import plistlib
 import queue
 import secrets
@@ -28,7 +36,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -841,6 +848,9 @@ def write_agent(name):
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 5,
+        # most jest na ścieżce każdego wywołania narzędzia agenta: bez ProcessType (albo z Background)
+        # launchd dławi mu CPU i I/O właśnie wtedy, gdy Mac jest zajęty (man launchd.plist)
+        "ProcessType": "Interactive",
         "EnvironmentVariables": {"PATH": load_state()[name]["path"]},
         "StandardOutPath": logfile,
         "StandardErrorPath": logfile,
@@ -851,6 +861,31 @@ def write_agent(name):
     with open(plist_path(name), "wb") as f:
         plistlib.dump(data, f)
     return plist_path(name)
+
+
+def cmd_refresh(restart=False):
+    """Plisty wspólnych serwerów od nowa, z ustawieniami tej wersji (setup.sh przy każdej instalacji).
+    Działający most zostaje przy starych do następnego załadowania (logowanie, share), bo restart zrywa
+    sesje MCP otwartych rozmów; --restart ładuje od razu te, których plista się zmieniła."""
+    changed = []
+    for name in sorted(load_state()):
+        path = plist_path(name)
+        try:
+            with open(path, "rb") as f:
+                before = f.read()
+        except OSError:
+            continue  # nieudostępniony do końca albo zdjęty ręcznie: share/unshare to naprawi
+        write_agent(name)
+        with open(path, "rb") as f:
+            if f.read() == before:
+                continue
+        changed.append(name)
+        if restart:
+            agent_up(name)
+    if changed:
+        when = "załadowane od nowa" if restart else "działają do następnego logowania (--restart: od razu)"
+        print(f"plisty mostów odświeżone: {', '.join(changed)}; {when}")
+    return 0
 
 
 def domain():
@@ -1064,6 +1099,8 @@ def main(argv):
         return cmd_unshare([] if "--all" in flags else args, force="--force" in flags)
     if cmd == "status":
         return cmd_status("--json" in flags)
+    if cmd == "refresh":
+        return cmd_refresh(restart="--restart" in flags)
     print(USAGE, file=sys.stderr)
     return 2
 

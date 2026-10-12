@@ -303,6 +303,8 @@ head_delay_s         60     gdy startu głowy nie da się przewidzieć, wyprzedz
 aging_s              300    job, który się mieści, czeka za głową najwyżej tyle sekund
 stall_s              600    tyle sekund bez CPU i wyjścia: job stoi (stalled), rezerwa wraca do puli
 class_timeout_s      {}     twardy limit biegu {"prefiks klasy": sekundy}: SIGTERM, po 10 s SIGKILL
+job_qos              null   "utility" albo "background": job przez `taskpolicy -c`, limit QoS
+                            dla całego drzewa; domyślnie wyłączone, bo utility woli rdzenie E
 drop_count1          true   zdejmuj -count=1 w iteracji agenta dla pakietów bez bazy
 pause_swap_gb        0.5    przyrost swapu w 2 min, przy którym najmłodszy ciężki job dostaje SIGSTOP
 depot_eta_since      "2026-10-05"   od kiedy brać czasy z `depot-cost.py eta` (rozmiary maszyn)

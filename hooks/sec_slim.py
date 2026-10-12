@@ -19,9 +19,16 @@ the prompt warns once.
 Runs as `python -I -S`: no site packages and no script dir on sys.path, hence the explicit
 path insert below. Python 3.9 and later.
 """
-import json
+
 import os
 import sys
+
+# bytecode only in $STATE: next to a script in Pod's bundle (Pod.app/Contents/Resources/claude-acc) a
+# __pycache__ breaks the app's seal, whatever starts this file and with whatever flags (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from patterns import SECURITY_PATTERNS, _RULE_NAME_TO_ID, rule_names_to_mask  # noqa: E402

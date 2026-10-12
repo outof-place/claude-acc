@@ -13,8 +13,9 @@
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
-  <!-- nie Background: strażnik musi dostać CPU właśnie wtedy, gdy Mac się dusi -->
-  <key>ProcessType</key><string>Standard</string>
+  <!-- Interactive: strażnik musi dostać CPU właśnie wtedy, gdy Mac się dusi, a Standard (jak brak
+       ProcessType) to według man launchd.plist lekkie dławienie CPU i I/O -->
+  <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>__HOME__/.local/share/claude-acc/devguard-launchd.log</string>
   <key>StandardErrorPath</key><string>__HOME__/.local/share/claude-acc/devguard-launchd.log</string>
 </dict>

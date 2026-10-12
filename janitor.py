@@ -26,15 +26,21 @@ Komendy:
                                 ze sprawdzeniem podpisu przed i po (compressapps.py)
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import fcntl
 import glob
 import json
-import os
 import re
 import shutil
 import stat
 import subprocess
-import sys
 import time
 from bisect import bisect_left
 from datetime import datetime
@@ -222,6 +228,7 @@ def tool_path():
         "/opt/homebrew/bin",
         "/usr/local/bin",
         os.path.join(HOME, ".docker/bin"),
+        os.path.join(HOME, ".orbstack/bin"),
         os.path.join(HOME, "go/bin"),
         os.path.join(HOME, ".cargo/bin"),
         os.path.join(HOME, ".bun/bin"),
@@ -1636,7 +1643,7 @@ def cmd_report(cfg, _args):
         for plist, program in broken:
             print(f"  {short(plist)} -> {program}")
         print(
-            "  Użytkownika wyłącza `claude-acc mac optimize`, systemowe `sudo janitor-root.sh`."
+            "  Użytkownika wyłącza `claude-acc mac optimize`, systemowe `claude-acc mac root-clean`."
         )
     return 0
 
@@ -1845,14 +1852,9 @@ def optimize_undo():
 
 
 def cmd_compress_apps(cfg, args):
-    """Aplikacje roota, których zadanie `compress` nie zapisze: lista bez sudo, kompresja przez sudo.
-
-    compressapps.py leży obok tego pliku i sam nic nie importuje, więc pod sudo idzie z -I
-    (bez PYTHONPATH i katalogu skryptu w sys.path). Pełna ścieżka do afsctool idzie w
-    argumencie, bo secure_path sudo nie zna /opt/homebrew/bin.
-    """
+    """Aplikacje roota, których zadanie `compress` nie zapisze: plan bez sudo, kompresja przez sudo
+    z kopii roota (root-run.sh compress-apps), nigdy z tego katalogu."""
     here = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(here, "compressapps.py")
     sys.path.insert(0, here)
     import compressapps
 
@@ -1864,21 +1866,40 @@ def cmd_compress_apps(cfg, args):
     passthrough = ["--afsctool", tool, "--threads", str(opts.threads), "--done-ratio", str(opts.done_ratio)]
     if opts.apps:
         passthrough += ["--apps", opts.apps]
+    rc = compressapps.main(["plan"] + passthrough)
     if opts.dry_run:
-        return compressapps.main(["plan"] + passthrough)
-    out = os.path.join(user_tmpdir(), f"compress-apps-{os.getpid()}.json")
-    rc = subprocess.run(["sudo", "/usr/bin/python3", "-I", script, "run", "--json-out", out] + passthrough).returncode
-    try:
-        with open(out) as f:
-            results = json.load(f)
-        os.unlink(out)
-    except (OSError, ValueError):
-        results = []
+        return rc
+    # Pod rootem tylko kopia roota (root-install.sh): compressapps.py, rootpy i afsctool przypięte
+    # sumami w katalogu roota. Ten plik ($STATE) i afsctool z /opt/homebrew może zmienić każdy na tym
+    # koncie, więc pod sudo nie biegną nigdy
+    if not os.access(ROOT_RUN, os.X_OK):
+        print("\nKompresja aplikacji roota idzie tylko z kopii roota, a tej nie ma: claude-acc root install "
+              "(raz, sudo), potem jeszcze raz. Wyżej plan.")
+        return rc
+    argv = ["sudo", ROOT_RUN, "compress-apps", "--threads", str(opts.threads), "--done-ratio", str(opts.done_ratio)]
+    if opts.apps:
+        argv += ["--apps", opts.apps]
+    results = []
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+    for line in proc.stdout:
+        if line.startswith(ROOT_RESULTS):
+            try:
+                results = json.loads(line[len(ROOT_RESULTS):])
+            except ValueError:
+                results = []
+            continue
+        print(line, end="", flush=True)
+    rc = proc.wait()
     if results:
         freed = sum(r.get("freed", 0) for r in results)
         back = sum(1 for r in results if r.get("rolled_back"))
         log(f"compress-apps: {len(results)} aplikacji, zwolniono {human(freed)}" + (f", cofnięte: {back}" if back else ""))
     return rc
+
+
+# wejście roota z kopii roota (root-install.sh) i linia, w której root-run.sh oddaje wyniki kompresji
+ROOT_RUN = "/usr/local/libexec/claude-acc-root/root-run.sh"
+ROOT_RESULTS = "CLAUDE-ACC-RESULTS "
 
 
 COMMANDS = {

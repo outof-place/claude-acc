@@ -162,5 +162,33 @@ class GuardTest(unittest.TestCase):
         self.assertIn("brak procesu", self.w.lines())
 
 
+
+class RootInterpreterTest(unittest.TestCase):
+    """Pod rootem strażnik sprawdza przy każdym starcie, czy jego interpreter należy do roota."""
+
+    def setUp(self):
+        import importlib.util
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("acc_fsguard", GUARD)
+        self.fsguard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.fsguard)
+        self.mock = mock
+
+    def test_refuses_a_user_owned_interpreter_before_doing_anything(self):
+        m = self.mock
+        with m.patch.object(self.fsguard.os, "geteuid", return_value=0), \
+             m.patch.object(self.fsguard, "interpreter_problem", return_value="/Applications/Xcode.app"), \
+             m.patch.object(self.fsguard, "Guard") as guard, m.patch("sys.stderr"):
+            self.assertEqual(self.fsguard.main([]), 78)
+        guard.assert_not_called()
+
+    def test_the_check_follows_the_whole_chain(self):
+        self.assertIsNone(self.fsguard.interpreter_problem(["/usr/bin/true"]))
+        mine = tempfile.mkdtemp(prefix="fsguard-py-")
+        self.addCleanup(shutil.rmtree, mine, True)
+        self.assertEqual(self.fsguard.interpreter_problem([os.path.join(mine, "python3")]), os.path.join(mine, "python3"))
+
+
 if __name__ == "__main__":
     unittest.main()

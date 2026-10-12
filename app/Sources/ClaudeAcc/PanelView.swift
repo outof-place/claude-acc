@@ -134,10 +134,13 @@ private struct FooterBar: View {
                     .help("Refresh")
             }
             Divider().frame(height: 14)
-            Toggle("Open at Login", isOn: Binding(
-                get: { store.launchAtLogin },
-                set: { store.setLaunchAtLogin($0) }))
-                .toggleStyle(.pill)
+            // Pod Menu starts with Pod (its login item), so there is no switch of its own
+            if !PodMenu.active {
+                Toggle("Open at Login", isOn: Binding(
+                    get: { store.launchAtLogin },
+                    set: { store.setLaunchAtLogin($0) }))
+                    .toggleStyle(.pill)
+            }
             Menu("Logs") {
                 Button("Switch History", systemImage: "arrow.triangle.swap") { open(CLI.switchLog) }
                 Button("Cleanup Log", systemImage: "doc.text") { open(CLI.janitorLog) }

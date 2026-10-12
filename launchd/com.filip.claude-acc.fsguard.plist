@@ -3,8 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.filip.claude-acc.fsguard</string>
+  <!-- __PYTHON__ wstawia install-fsguard.sh: interpreter należący do roota (rootpy.py), nigdy
+       /usr/bin/python3, bo to zaślepka idąca do Xcode'a użytkownika -->
   <key>ProgramArguments</key>
   <array>
+    <string>__PYTHON__</string>
+    <string>-I</string>
     <string>/usr/local/libexec/claude-acc-fsguard</string>
   </array>
   <key>RunAtLoad</key><true/>

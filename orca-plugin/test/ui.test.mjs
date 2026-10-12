@@ -95,6 +95,8 @@ test('actions: closed list, checked arguments', () => {
   assert.deepEqual(actionArgv('awake', { on: true, for: 3600 }).argv, ['awake', 'on', '--for', '3600'])
   assert.deepEqual(actionArgv('ultra', { on: false }), { argv: ['perf', 'ultra', 'off'], long: true })
   assert.equal(actionArgv('clean').long, true)
+  assert.deepEqual(actionArgv('panel', { section: 'services' }).argv, ['panel', 'services'])
+  assert.deepEqual(actionArgv('panel').argv, ['panel'])
   for (const [action, args] of [
     ['guard', { verb: 'stop', target: ':3000; rm -rf ~' }],
     ['guard', { verb: 'recycle', target: '/w/app' }],
@@ -102,6 +104,7 @@ test('actions: closed list, checked arguments', () => {
     ['switch', { email: '--auto; x' }],
     ['cancel', { target: 'all' }],
     ['awake', { on: true, for: '1h' }],
+    ['panel', { section: '../../etc' }],
     ['shell', {}]
   ]) {
     assert.throws(() => actionArgv(action, args), undefined, `${action} ${JSON.stringify(args)}`)

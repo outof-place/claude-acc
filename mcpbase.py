@@ -7,12 +7,19 @@ dla nieznanej wersji). Klasa pochodna podaje nazwę, narzędzia i `call_tool`; t
 do puli wątków, więc długie wywołanie (czekanie na zgodę, ładowanie strony) nie blokuje odczytu.
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # Python 3.15 (PEP 810) ładuje go dopiero przy pierwszym serwerze, a starsze pomijają tę nazwę:
 # `--help` i status bramek nie płacą za pulę wątków
 __lazy_modules__ = ["concurrent.futures"]
 
 import json
-import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 

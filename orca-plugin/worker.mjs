@@ -89,7 +89,9 @@ export class AccPlugin {
       'claude-acc.update': () => this.act('update'),
       'claude-acc.ultra-toggle': () => this.act('ultra', { on: !this.model?.health.ultra?.on }),
       'claude-acc.dictate': () => this.act('dictate'),
-      'claude-acc.awake-toggle': () => this.act('awake', { toggle: true })
+      'claude-acc.awake-toggle': () => this.act('awake', { toggle: true }),
+      // the settings are native: Pod Menu's panel, at its claude-acc services section
+      'claude-acc.settings': () => this.act('panel', { section: 'services' }, { quiet: true })
     }
     for (const [id, handler] of Object.entries(commands)) this.orca.commands.register(id, handler)
     this.orca.events.on('agent.status.changed', (payload) => {

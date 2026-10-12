@@ -26,12 +26,18 @@ Co robi strażnik (launchd uruchamia go jako root co minutę):
 --target i --fsmonitor-match są dla testów: atrapa procesu zamiast prawdziwego demona.
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import ctypes
 import json
-import os
 import signal
 import subprocess
-import sys
 import time
 
 LIMIT_MB = 4096  # 100 razy więcej niż zwykle, 10 razy mniej niż w noc awarii
@@ -237,7 +243,38 @@ def save(path, data):
     os.replace(tmp, path)
 
 
+def interpreter_problem(paths=None):
+    """Pierwsza ścieżka interpretera tego procesu, która nie należy do roota albo jest zapisywalna dla
+    grupy lub świata (plik, prawdziwa ścieżka, biblioteka standardowa i ich katalogi nadrzędne), albo
+    None. Ta sama reguła co rootpy.unsafe_reason przy instalacji: demon sprawdza ją jeszcze raz przy
+    każdym starcie, bo interpreter mógł się zmienić od instalacji. `paths` podstawiają testy."""
+    if paths is None:
+        import sysconfig
+
+        paths = [sys.executable, os.path.realpath(sys.executable), sysconfig.get_paths()["stdlib"]]
+    for path in paths:
+        step = os.path.abspath(path)
+        while True:
+            try:
+                info = os.lstat(step)
+            except OSError:
+                return step
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return step
+            parent = os.path.dirname(step)
+            if parent == step:
+                break
+            step = parent
+    return None
+
+
 def main(args):
+    if os.geteuid() == 0:
+        bad = interpreter_problem()
+        if bad:
+            print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} odmawiam: {bad} nie należy do roota albo jest "
+                  "zapisywalny dla innych; przeinstaluj strażnika (install-fsguard.sh)", file=sys.stderr)
+            return 78
     guard = Guard(args)
     try:
         guard.run()

@@ -32,19 +32,27 @@ a upload 2 MB nie zwolnił (p50 1,01 -> 0,90 s).
   hotspot.py run --iface en8 [--seconds N] [-v]   ręczny przebieg w terminalu (sudo)
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import argparse
 import collections
 import ctypes
 import ctypes.util
 import hashlib
 import json
-import os
+import math
+import re
 import select
 import signal
 import socket
 import struct
 import subprocess
-import sys
 import time
 
 HOME = os.path.expanduser("~")
@@ -55,6 +63,18 @@ BIN = "/usr/local/libexec/claude-acc-hotspot"
 LABEL = "com.filip.claude-acc.hotspot"
 PLIST = "/Library/LaunchDaemons/%s.plist" % LABEL
 LOG = "/var/log/claude-acc-hotspot.log"
+# In Pod the controller runs as the user (`daemon --rootd`, a LaunchAgent) and Pod's root helper sets
+# the limit (docs/pod-rootd.md): `pod-rootctl shaper follow`, one session per interface, so the limit
+# goes with this process. A session's limit of 6 Mb/s or more needs no Touch ID; below it, it would.
+ROOTCTL = os.path.join(STATE_DIR, "pod-rootctl")
+ROOTD_FLOOR_KBPS = 6000
+ROOTD_RETRY_S = 30.0
+SHAPER = None  # FollowShaper while the daemon runs with --rootd
+# The agent is in JOBS, so it is on every install while the mode is opt-in: with the mode off it exits
+# 0 (KeepAlive SuccessfulExit=false keeps it down) and `hotspot on` starts it again.
+AGENT = "com.filip.claude-acc.hotspot-user"
+LAUNCHCTL = "/bin/launchctl"
+MIGRATE_WAIT_S = 60.0     # while the root daemon still runs, the agent looks this rarely
 
 IPHONE_GATEWAY = "172.20.10.1"  # Personal Hotspot zawsze daje 172.20.10.0/28, też po Wi-Fi
 IPHONE_PORT = "iPhone USB"
@@ -182,9 +202,83 @@ class Prober:
         return out
 
 
+# nazwa interfejsu z jądra (en8, bridge100): litery i cyfry, nic, co ifconfig wziąłby za opcję
+IFACE_RE = re.compile(r"^[a-z]{1,15}[0-9]{1,4}$")
+TBR_MAX_KBPS = 10_000_000
+
+
+def valid_iface(iface):
+    """Interfejs, który istnieje teraz w jądrze i ma zwykłą nazwę: tylko taki trafia do ifconfig."""
+    if not isinstance(iface, str) or not IFACE_RE.match(iface):
+        return False
+    try:
+        return iface in {name for _, name in socket.if_nameindex()}
+    except OSError:
+        return False
+
+
 def set_tbr(iface, kbps):
-    arg = "%dKbps" % int(kbps) if kbps else "0"
+    """`ifconfig <if> tbr <N>Kbps` (0 zdejmuje limit). Argumenty tylko z liczby i sprawdzonej nazwy."""
+    if not valid_iface(iface):
+        log("tbr: pomijam interfejs %r, nie ma go w jądrze albo ma dziwną nazwę" % (iface,))
+        return
+    rate = max(0, min(int(kbps or 0), TBR_MAX_KBPS))
+    if SHAPER is not None:
+        SHAPER.set(iface, rate)
+        return
+    arg = "%dKbps" % rate if rate else "0"
     subprocess.run(["/sbin/ifconfig", iface, "tbr", arg], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class FollowShaper:
+    """The limit through Pod's root helper: a `pod-rootctl shaper follow <if>` per interface, fed a
+    line per change (kb/s or "off"). The session is the process, so the helper drops the limit when
+    it ends, also when this daemon dies. Never below ROOTD_FLOOR_KBPS; a follow that died is not
+    started again for ROOTD_RETRY_S, so a helper that doesn't answer doesn't get a spawn per probe."""
+
+    def __init__(self, rootctl=ROOTCTL, now=time.monotonic):
+        self.rootctl = rootctl
+        self.now = now
+        self.procs = {}
+        self.retry_at = {}
+
+    def _proc(self, iface):
+        proc = self.procs.get(iface)
+        if proc is not None and proc.poll() is None:
+            return proc
+        if proc is not None:
+            self.procs.pop(iface)
+            self.retry_at[iface] = self.now() + ROOTD_RETRY_S
+            log("tbr: pod-rootctl shaper follow %s się skończył (%s); znowu za %d s" % (iface, proc.returncode, ROOTD_RETRY_S))
+        if self.now() < self.retry_at.get(iface, float("-inf")):
+            return None
+        proc = subprocess.Popen([self.rootctl, "shaper", "follow", iface], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, text=True, bufsize=1)
+        self.procs[iface] = proc
+        return proc
+
+    def set(self, iface, kbps):
+        line = "%d\n" % max(ROOTD_FLOOR_KBPS, kbps) if kbps else "off\n"
+        proc = self._proc(iface)
+        if proc is None:
+            return
+        try:
+            proc.stdin.write(line)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass  # it ended: the next set notices and waits before a new one
+
+    def close(self, iface=None):
+        """Ends the follow (its session, and the limit with it)."""
+        for name in [iface] if iface else list(self.procs):
+            proc = self.procs.pop(name, None)
+            if proc is None:
+                continue
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                proc.terminate()
 
 
 # --- sterownik ---------------------------------------------------------------------------------
@@ -312,6 +406,8 @@ class Session:
     def close(self):
         self.ctl.release()
         self.prober.close()
+        if SHAPER is not None:
+            SHAPER.close(self.ctl.iface)
 
     def snapshot(self):
         snap = self.ctl.snapshot()
@@ -363,23 +459,43 @@ def detect(run=_run, ports=None):
     return None
 
 
+# jedyne klucze hotspot.json; plik pisze użytkownik, a czyta root
+CONFIG_KEYS = ("enabled", "min_mbps", "max_mbps")
+
+
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def _clamp_mbps(value, low, high):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if not _number(value):
         return None
     return int(min(high, max(low, value)) * 1000)
 
 
 def read_config(path=CONFIG):
-    """Konfiguracja z katalogu użytkownika; root czyta ją bez podążania za dowiązaniem."""
+    """Konfiguracja z katalogu użytkownika; root czyta ją bez podążania za dowiązaniem. Nieznany klucz,
+    `enabled`, które nie jest true/false, albo limit, który nie jest skończoną liczbą: cały plik się nie
+    liczy, zostają bezpieczne domyślne (tryb wyłączony), a "problem" mówi dlaczego (demon to loguje)."""
     cfg = {"enabled": False, "min_kbps": MIN_KBPS, "max_kbps": MAX_KBPS}
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as f:
             raw = json.loads(f.read(4096) or b"{}")
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return cfg
+    except (OSError, ValueError) as err:
+        return dict(cfg, problem="hotspot.json nie do odczytu: %s" % (err,))
     if not isinstance(raw, dict):
-        return cfg
+        return dict(cfg, problem="hotspot.json to nie obiekt JSON")
+    unknown = sorted(str(k) for k in raw if k not in CONFIG_KEYS)
+    if unknown:
+        return dict(cfg, problem="hotspot.json: nieznane klucze %s" % ", ".join(unknown)[:200])
+    if "enabled" in raw and not isinstance(raw["enabled"], bool):
+        return dict(cfg, problem="hotspot.json: enabled to nie true/false")
+    bad = [k for k in ("min_mbps", "max_mbps") if k in raw and not _number(raw[k])]
+    if bad:
+        return dict(cfg, problem="hotspot.json: %s to nie liczba" % ", ".join(bad))
     cfg["enabled"] = raw.get("enabled") is True
     cfg["min_kbps"] = _clamp_mbps(raw.get("min_mbps"), 1, 1000) or MIN_KBPS
     cfg["max_kbps"] = _clamp_mbps(raw.get("max_mbps"), 5, 2000) or MAX_KBPS
@@ -417,7 +533,40 @@ def log(line):
     print("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), line), file=sys.stderr, flush=True)
 
 
-def daemon(config_path, state_path):
+def interpreter_problem(paths=None):
+    """Pierwsza ścieżka interpretera tego procesu, która nie należy do roota albo jest zapisywalna dla
+    grupy lub świata (plik, prawdziwa ścieżka, biblioteka standardowa i ich katalogi nadrzędne), albo
+    None. Ta sama reguła co rootpy.unsafe_reason przy instalacji: demon sprawdza ją jeszcze raz przy
+    każdym starcie, bo interpreter mógł się zmienić od instalacji. `paths` podstawiają testy."""
+    if paths is None:
+        import sysconfig
+
+        paths = [sys.executable, os.path.realpath(sys.executable), sysconfig.get_paths()["stdlib"]]
+    for path in paths:
+        step = os.path.abspath(path)
+        while True:
+            try:
+                info = os.lstat(step)
+            except OSError:
+                return step
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return step
+            parent = os.path.dirname(step)
+            if parent == step:
+                break
+            step = parent
+    return None
+
+
+def daemon(config_path, state_path, rootd=False):
+    global SHAPER
+    if rootd:
+        # the user's agent in Pod: without the helper (Homebrew, the source checkout) the root daemon
+        # does this; exit 0, so launchd doesn't start it again
+        if not os.access(ROOTCTL, os.X_OK):
+            log("brak pomocnika roota Poda (%s): to robi demon roota, jeśli jest zainstalowany" % ROOTCTL)
+            return 0
+        SHAPER = FollowShaper()
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
@@ -426,13 +575,35 @@ def daemon(config_path, state_path):
     remembered = {}  # interfejs -> (bezpieczny limit, kiedy)
     ports, ports_at = set(), float("-inf")
     last_summary = time.monotonic()
-    log("start")
+    if os.geteuid() == 0:
+        bad = interpreter_problem()
+        if bad:
+            # launchd (KeepAlive) uruchomi go znowu; pięć minut przerwy, żeby log nie puchł
+            log("odmawiam startu: %s nie należy do roota albo jest zapisywalny dla innych; "
+                "przeinstaluj demona (claude-acc hotspot install)" % bad)
+            time.sleep(300)
+            return 78
+    log("start" + (" (jako użytkownik, przez pomocnika roota Poda)" if rootd else ""))
+    problem = None
+    waiting_for_migration = False
     try:
         while not stop:
             cfg = read_config(config_path)
-            if time.monotonic() - ports_at > 60:
-                ports, ports_at = iphone_ports(), time.monotonic()
-            target = detect(ports=ports) if cfg["enabled"] else None
+            if cfg.get("problem") != problem:
+                problem = cfg.get("problem")
+                if problem:
+                    log("konfiguracja odrzucona, tryb wyłączony: %s" % problem)
+            # the root daemon still runs until `pod-rootctl legacy migrate`: one controller at a time
+            if rootd and cfg["enabled"] and installed():
+                if not waiting_for_migration:
+                    log("demon roota jeszcze działa; agent przejmie po: claude-acc rootd legacy migrate")
+                waiting_for_migration = True
+                target = None
+            else:
+                waiting_for_migration = False
+                if time.monotonic() - ports_at > 60:
+                    ports, ports_at = iphone_ports(), time.monotonic()
+                target = detect(ports=ports) if cfg["enabled"] else None
             if session and (not target or target[0] != session.ctl.iface or if_bytes(session.ctl.iface) is None):
                 snap = session.snapshot()
                 remembered[snap["iface"]] = (snap["safe_kbps"], time.time())
@@ -440,6 +611,10 @@ def daemon(config_path, state_path):
                     snap["iface"], snap["rate_kbps"] / 1000, snap["cuts"]))
                 session.close()
                 session = None
+            if rootd and not cfg["enabled"] and not session:
+                # the mode is off: the limit went with the session, nothing to watch until `hotspot on`
+                log("tryb wyłączony; agent kończy, claude-acc hotspot on uruchomi go znowu")
+                return 0
             if target and not session:
                 safe, at = remembered.get(target[0], (START_KBPS, 0))
                 start = safe if time.time() - at < REMEMBER_S else START_KBPS
@@ -453,7 +628,7 @@ def daemon(config_path, state_path):
                 session.ctl.min, session.ctl.max = float(cfg["min_kbps"]), float(cfg["max_kbps"])
                 session.step(time.monotonic() + TICK_S, stop=lambda: bool(stop))
             else:
-                deadline = time.monotonic() + TICK_S
+                deadline = time.monotonic() + (MIGRATE_WAIT_S if waiting_for_migration else TICK_S)
                 while not stop and time.monotonic() < deadline:
                     time.sleep(0.2)
             state = {"at": time.time(), "enabled": cfg["enabled"], "active": bool(session), "pid": os.getpid()}
@@ -470,6 +645,9 @@ def daemon(config_path, state_path):
     finally:
         if session:
             session.close()
+        if SHAPER is not None:
+            SHAPER.close()
+            SHAPER = None
         log("stop")
 
 
@@ -510,6 +688,8 @@ PLIST_BODY = """<?xml version="1.0" encoding="UTF-8"?>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
   <array>
+    <string>{python}</string>
+    <string>-I</string>
     <string>{bin}</string>
     <string>daemon</string>
     <string>--config</string>
@@ -531,11 +711,90 @@ def installed():
     return os.path.exists(BIN) and os.path.exists(PLIST)
 
 
+def launched_with():
+    """Program z plisty demona: [interpreter, -I, BIN, ...] albo starsze [BIN, ...]; [] bez plisty."""
+    try:
+        import plistlib
+
+        with open(PLIST, "rb") as f:
+            args = plistlib.load(f).get("ProgramArguments")
+    except (OSError, ValueError, ImportError):
+        return []
+    return [str(a) for a in args] if isinstance(args, list) else []
+
+
+def root_python():
+    """(interpreter, None) dla demona albo (None, powód): rootpy.py leży obok tego pliku."""
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    try:
+        import rootpy
+    except ImportError as err:
+        return None, f"brak rootpy.py obok hotspot.py ({err})"
+    return rootpy.find()
+
+
+def helper():
+    """Pod's root helper is there: in Pod the limit goes through it, no root daemon to install."""
+    return os.access(ROOTCTL, os.X_OK)
+
+
+def agent_label():
+    """The user agent's launchd label. Pod with its own agents (`setup.sh --pod-agents`: owner.json
+    has "menu") runs `<Pod's bundle id>.acc.hotspot-user` (scripts/pod_agents.py); Pod v1, Homebrew
+    and the source checkout run setup.sh's com.filip.claude-acc.hotspot-user. When launchd knows only
+    the other one, that one."""
+    try:
+        with open(os.path.join(STATE_DIR, "owner.json")) as f:
+            owner = json.load(f)
+    except (OSError, ValueError):
+        owner = None
+    if not isinstance(owner, dict) or owner.get("owner") != "pod":
+        return AGENT
+    app_id = "codes.pod.app"
+    if isinstance(owner.get("app"), str):
+        try:
+            import plistlib
+
+            with open(os.path.join(owner["app"], "Contents", "Info.plist"), "rb") as f:
+                found = plistlib.load(f).get("CFBundleIdentifier")
+            if isinstance(found, str) and re.fullmatch(r"[A-Za-z0-9.-]+", found):
+                app_id = found
+        except (OSError, ValueError, ImportError):
+            pass
+    pod = "%s.acc.hotspot-user" % app_id
+    primary, other = (pod, AGENT) if owner.get("menu") else (AGENT, pod)
+    if not agent_loaded(primary) and agent_loaded(other):
+        return other
+    return primary
+
+
+def agent_loaded(label):
+    return subprocess.run([LAUNCHCTL, "print", "gui/%d/%s" % (os.getuid(), label)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+
+def kickstart_agent():
+    """Start the user agent, which exited 0 while the mode was off; (label, launchctl's code)."""
+    label = agent_label()
+    done = subprocess.run([LAUNCHCTL, "kickstart", "gui/%d/%s" % (os.getuid(), label)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    return label, done.returncode
+
+
 def cmd_install(args):
+    if helper():
+        print("w Podzie limit ustawia pomocnik roota; nic do instalowania (claude-acc hotspot on)")
+        return 0
+    # demon chodzi jako root, więc nie wolno mu startować przez /usr/bin/python3: to zaślepka, która
+    # idzie do wybranego Xcode'a, a Xcode z DMG należy do użytkownika (rootpy.py)
+    python, why = root_python()
+    if not python:
+        print("nie instaluję demona: " + (why or "?"), file=sys.stderr)
+        return 1
     os.makedirs(STATE_DIR, exist_ok=True)
     plist = os.path.join(STATE_DIR, "hotspot.plist.tmp")
     with open(plist, "w") as f:
-        f.write(PLIST_BODY.format(label=LABEL, bin=BIN, config=CONFIG, state=STATE, log=LOG))
+        f.write(PLIST_BODY.format(label=LABEL, python=python, bin=BIN, config=CONFIG, state=STATE, log=LOG))
     src = os.path.realpath(__file__)
     script = (
         "set -e; install -d -o root -g wheel -m 755 /usr/local/libexec; "
@@ -577,6 +836,8 @@ def set_enabled(on, path=CONFIG):
         pass
     if not isinstance(cfg, dict):
         cfg = {}
+    # tylko znane klucze: z nieznanym demon odrzuciłby cały plik
+    cfg = {k: v for k, v in cfg.items() if k in CONFIG_KEYS}
     cfg["enabled"] = on
     os.makedirs(os.path.dirname(path), exist_ok=True)
     write_json(path, cfg)
@@ -584,6 +845,13 @@ def set_enabled(on, path=CONFIG):
 
 def cmd_on(args):
     set_enabled(True)
+    if helper():
+        label, rc = kickstart_agent()
+        if rc:
+            print("tryb hotspot włączony, ale agent %s nie wystartował (launchctl: %d)" % (label, rc), file=sys.stderr)
+            return 1
+        print("tryb hotspot włączony; zadziała, gdy domyślna trasa pójdzie przez iPhone'a")
+        return 0
     if not installed():
         if sys.stdin.isatty() and not args.no_install:
             return cmd_install(args)
@@ -604,9 +872,13 @@ def status(config_path=CONFIG, state_path=STATE, now=None):
     cfg = read_config(config_path)
     state = read_state(state_path) or {}
     running = bool(state) and now - state.get("at", 0) < 15
-    out = {"enabled": cfg["enabled"], "installed": installed(), "running": running,
+    launch = launched_with()
+    out = {"enabled": cfg["enabled"], "installed": installed() or helper(), "helper": helper(), "running": running,
            "active": running and bool(state.get("active")),
-           "current": file_hash(os.path.realpath(__file__)) == file_hash(BIN) if installed() else None}
+           "current": file_hash(os.path.realpath(__file__)) == file_hash(BIN) if installed() else None,
+           # plista sprzed 1.31.1 startowała demona przez shebang `#!/usr/bin/python3`
+           "legacy_launch": bool(launch) and os.path.basename(launch[0]) not in ("python3", "python"),
+           "config_problem": cfg.get("problem")}
     if out["active"]:
         for key in ("iface", "via", "rate_kbps", "safe_kbps", "cuts", "tx_kbps", "rx_kbps", "delay_p50_ms",
                     "delay_p90_ms", "baseline_ms", "shaping", "lost", "answered", "since"):
@@ -620,12 +892,22 @@ def cmd_status(args):
         print(json.dumps(s, sort_keys=True))
         return 0
     print("tryb hotspot: %s" % ("włączony" if s["enabled"] else "wyłączony"))
+    if s.get("config_problem"):
+        print("konfiguracja odrzucona: %s (claude-acc hotspot on|off zapisze ją od nowa)" % s["config_problem"])
     if not s["installed"]:
         print("demon: nie zainstalowany (claude-acc hotspot install)")
+    elif not s["running"] and s["helper"] and s["enabled"]:
+        # with the mode off the agent is meant to be down
+        print("agent: nie odpowiada (launchctl kickstart -k gui/%d/%s)" % (os.getuid(), agent_label()))
+    elif not s["running"] and s["helper"]:
+        pass
     elif not s["running"]:
         print("demon: nie odpowiada (sudo launchctl kickstart -k system/%s, log %s)" % (LABEL, LOG))
     elif s["current"] is False:
         print("demon: starsza wersja niż ta w claude-acc (claude-acc hotspot install)")
+    if s["installed"] and s.get("legacy_launch"):
+        print("demon: startuje przez /usr/bin/python3, czyli interpreter z Xcode'a użytkownika; "
+              "przeinstaluj (claude-acc hotspot install)")
     if s["active"]:
         print("łącze: %s przez %s, limit wysyłania %.1f Mb/s (bezpieczny %.1f), cięć %d%s" % (
             s["iface"], s["via"], s["rate_kbps"] / 1000, s["safe_kbps"] / 1000, s["cuts"],
@@ -651,14 +933,14 @@ def main(argv=None):
     p = sub.add_parser("daemon")
     p.add_argument("--config", default=CONFIG)
     p.add_argument("--state", default=STATE)
+    p.add_argument("--rootd", action="store_true", help="as the user, the limit through Pod's root helper")
     p = sub.add_parser("run")
     p.add_argument("--iface", required=True)
     p.add_argument("--seconds", type=float)
     p.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "daemon":
-        daemon(args.config, args.state)
-        return 0
+        return daemon(args.config, args.state, rootd=args.rootd) or 0
     if args.cmd == "run":
         run_foreground(args.iface, args.seconds, args.verbose)
         return 0

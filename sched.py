@@ -31,15 +31,24 @@ dopóki panel jest otwarty.
 cache wołał go w kółko zamiast blokować się dłużej, niż żyje jego cache.
 `cancel` zdejmuje job z kolejki (jego wrapper kończy się kodem 130) albo biegnącemu wysyła SIGTERM
 przez wrapper, który przekazuje go grupie procesów komendy; job wskazuje id (j-...) albo klucz
-panelu Orki (ORCA_PANE_KEY): wtedy wszystkie joby tego panelu, z --queued tylko czekające.
+panelu Orki albo Poda (ORCA_PANE_KEY, POD_PANE_KEY): wtedy wszystkie joby tego panelu, z --queued
+tylko czekające.
 """
+
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6); wczytany
+# loaderem bez __file__ (niżej) też nie pisze bajtkodu
+if not os.path.realpath(globals().get("__file__", "/")).startswith(
+        os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
 
 import functools  # bez kosztu: `re` i tak go ładuje
 import json
-import os
 import re
 import shlex
-import sys
 import time
 import types
 
@@ -50,9 +59,9 @@ try:
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import orcahost
 
-    HOST_CLIS, PANE_ENV = orcahost.CLI_NAMES, orcahost.PANE_ENV
+    HOST_CLIS, PANE_ENVS = orcahost.CLI_NAMES, tuple(p + orcahost.PANE_KEY for p in orcahost.ENV_PREFIXES)
 except (NameError, ImportError):
-    HOST_CLIS, PANE_ENV = ("orca", "podx"), "ORCA_PANE_KEY"
+    HOST_CLIS, PANE_ENVS = ("orca", "podx"), ("ORCA_PANE_KEY", "POD_PANE_KEY")
 
 # ctypes, subprocess, hashlib, random, threading, signal i fcntl ładują się w funkcjach, które
 # ich używają: hook (hook_rewrite) idzie przy każdej komendzie Go agenta i potrzebuje tylko
@@ -91,6 +100,10 @@ DEFAULTS = {
     # twardy limit czasu biegu per klasa: {"prefiks klasy": sekundy}; po nim SIGTERM grupy procesów,
     # po 10 s SIGKILL. Domyślnie pusto: nic nie ginie samo
     "class_timeout_s": {},
+    # klasa QoS jobów: null zostawia tę, z którą przyszła komenda; "utility" albo "background"
+    # uruchamia joba przez `taskpolicy -c <klasa>`, a ten limit dziedziczy całe drzewo. Domyślnie
+    # wyłączone (2026-10-10): utility woli rdzenie E, a buildy mają iść na rdzeniach P
+    "job_qos": None,
     # głowa, której startu nie da się przewidzieć, przepuszcza tylko job, którego prognoza
     # × 2 + 10 s mieści się w tylu sekundach: o tyle najwyżej ją opóźni
     "head_delay_s": 60,
@@ -3210,7 +3223,7 @@ def agent_info(session, name):
         "session": (session or "")[:8] or None,
         "name": name,
         "worktree": os.getcwd().replace(HOME, "~", 1),
-        "pane": os.environ.get(PANE_ENV),
+        "pane": next((os.environ[k] for k in PANE_ENVS if os.environ.get(k)), None),
     }
 
 
@@ -3534,6 +3547,18 @@ def start_depot(state, entry, target):
     state["running"].append(entry)
 
 
+JOB_QOS = ("utility", "background")
+TASKPOLICY = "/usr/sbin/taskpolicy"
+
+
+def job_argv(argv, cfg):
+    """argv joba z `job_qos`: `taskpolicy -c utility|background` przed komendą, inaczej bez zmian."""
+    qos = cfg.get("job_qos")
+    if qos in JOB_QOS and os.access(TASKPOLICY, os.X_OK):
+        return [TASKPOLICY, "-c", qos, *argv]
+    return list(argv)
+
+
 def run_local(entry, job, command, argv, cfg):
     import signal
     import subprocess
@@ -3553,7 +3578,7 @@ def run_local(entry, job, command, argv, cfg):
     ours_p = entry.get("p") if entry.get("p_by") == "scheduler" else None
     if ours_p or extra:
         env["GOFLAGS"] = goflags_with(ours_p, extra)
-    target = shell_argv(command) if command is not None else argv
+    target = job_argv(shell_argv(command) if command is not None else argv, cfg)
     env[NESTED_ENV] = entry["id"]
     try:
         child = subprocess.Popen(target, env=env, preexec_fn=os.setpgrp)
@@ -3986,14 +4011,97 @@ GIT_GREP = re.compile(
 GREP_BINARY_FLAG = re.compile(r"(^|\s)(-a|--text|--binary-files\S*|-I|-[A-Za-z]*I[A-Za-z]*)(?=\s|$)")
 
 
+HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
+
+
+def shell_code(command):
+    """[bool] dla każdego znaku: czy powłoka czyta go jako kod. Nie: w '...', w "..." (poza $(...)
+    w środku), w treści heredoca i w komentarzu. Wystarczy, żeby -I nie trafiło w tekst, który
+    agent pisze do pliku (2026-10-11: heredoc z `git grep` w treści dostał -I w zapisanym pliku)."""
+    code = [True] * len(command)
+    stack, depth, pending, i, n = ["n"], [0], [], 0, len(command)
+    while i < n:
+        ch, ctx = command[i], stack[-1]
+        if ctx == "s":
+            code[i] = False
+            if ch == "'":
+                stack.pop()
+            i += 1
+            continue
+        if ctx == "d":
+            code[i] = False
+            if ch == "\\" and i + 1 < n:
+                code[i + 1] = False
+                i += 2
+                continue
+            if ch == '"':
+                stack.pop()
+            elif command.startswith("$(", i):
+                stack.append("n")
+                depth.append(0)
+                i += 2
+                continue
+            i += 1
+            continue
+        # kod: na wierzchu albo w $(...) wewnątrz "..."
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'":
+            code[i] = False
+            stack.append("s")
+        elif ch == '"':
+            code[i] = False
+            stack.append("d")
+        elif ch == "(" and len(stack) > 1:
+            depth[-1] += 1
+        elif ch == ")" and len(stack) > 1:
+            if depth[-1] == 0:
+                stack.pop()
+                depth.pop()
+            else:
+                depth[-1] -= 1
+        elif ch == "#" and (i == 0 or command[i - 1] in " \t\n;&|("):
+            while i < n and command[i] != "\n":
+                code[i] = False
+                i += 1
+            continue
+        elif command.startswith("<<", i) and not command.startswith("<<<", i):
+            m = HEREDOC.match(command, i)
+            if m:
+                pending.append((m.group(3), m.group(1) == "-"))
+                i = m.end()
+                continue
+        elif ch == "\n" and pending:
+            i += 1
+            for word, tabs in pending:
+                while i < n:
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line = command[i:end]
+                    for k in range(i, min(end + 1, n)):
+                        code[k] = False
+                    i = end + 1
+                    if (line.lstrip("\t") if tabs else line) == word:
+                        break
+            pending = []
+            continue
+        i += 1
+    return code
+
+
 def git_grep_text_only(command):
     """`git grep` bez flagi o plikach binarnych dostaje -I (pomija binarki).
 
     2026-10-08 `git grep -nE ... <commit>` agenta w repo z 368 MB filmów i obrazów w historii
     urósł do 10 GB w 2 sekundy: wyrażenie -E idzie przez regex macOS, a binarka to jedna linia
-    długości megabajtów. Z -I ta sama komenda ma szczyt 270 MB, a agent i tak nie szuka w mp4."""
-    out, pos = [], 0
+    długości megabajtów. Z -I ta sama komenda ma szczyt 270 MB, a agent i tak nie szuka w mp4.
+    Tylko w kodzie (shell_code): `git grep` w cudzysłowie, heredocu czy komentarzu to tekst."""
+    out, pos, code = [], 0, None
     for m in GIT_GREP.finditer(command):
+        code = code or shell_code(command)
+        if not code[m.end() - 1]:
+            continue
         rest = command[m.end() :]
         stop = re.search(r"[;&|\n]", rest)
         segment = rest[: stop.start()] if stop else rest

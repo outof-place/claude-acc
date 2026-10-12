@@ -47,6 +47,14 @@ Linków nie otwiera, załączniki zapisuje do kwarantanny (0600). Każde wywoła
 dziennika audytu (bez treści), a stan dla panelu do mail/state.json.
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę:
 # pomoc, status i start serwera MCP nie płacą za IMAP, SMTP, TLS i parser maili. Bez json,
 # threading i concurrent.futures (mcpbase i tak ładuje je od razu) i html.parser (klasa niżej).
@@ -65,14 +73,12 @@ import hmac
 import html
 import imaplib
 import json
-import os
 import re
 import secrets
 import shlex
 import smtplib
 import ssl
 import subprocess
-import sys
 import threading
 import time
 import urllib.error

@@ -157,7 +157,9 @@ struct FansCard: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Label("Fan control isn't installed", systemImage: "fanblades")
                             .font(.callout)
-                        Text("It needs a small root helper: run ./install-fans.sh in the claude-acc folder.")
+                        Text(PodMenu.active
+                            ? "It needs Pod's root helper: turn it on in Pod, then allow it in Login Items."
+                            : "It needs a small root helper: run ./install-fans.sh in the claude-acc folder.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

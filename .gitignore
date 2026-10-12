@@ -3,3 +3,5 @@ __pycache__/
 app/.build/
 app/.swiftpm/
 dist/
+.build/
+.swiftpm/

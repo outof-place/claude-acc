@@ -3,8 +3,10 @@
 # odinstalowanych aplikacjach i stare raporty awarii. Cache dyld symulatorów iOS
 # (/Library/Developer/CoreSimulator/Caches/dyld) chroni SIP nawet przed rootem.
 # Z --high-power ustawia też tryb wysokiej wydajności na zasilaczu (MacBook Pro z M Max).
-# Uruchomienie: sudo ./janitor-root.sh [--dry-run] [--high-power]
+# Uruchomienie: claude-acc mac root-clean [--dry-run] [--high-power], czyli ten skrypt z kopii roota
+# (claude-acc root install) przez sudo; z $STATE, Homebrew albo Pod.app pod rootem nie biegnie
 set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 DRY=0
 HIGH_POWER=0
@@ -16,7 +18,12 @@ for arg in "$@"; do
   esac
 done
 if [ "$EUID" -ne 0 ] && [ "$DRY" -eq 0 ]; then
-  echo "uruchom przez sudo: sudo $0" >&2
+  echo "uruchom przez kopię roota: claude-acc mac root-clean" >&2
+  exit 1
+fi
+# ten plik poza kopią roota może zmienić każdy na tym koncie
+if [ "$EUID" -eq 0 ] && [ ! -f "$HERE/root-python" ]; then
+  echo "janitor-root.sh pod rootem biegnie tylko z kopii roota: claude-acc root install (raz), potem claude-acc mac root-clean" >&2
   exit 1
 fi
 

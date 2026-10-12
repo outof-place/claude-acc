@@ -34,7 +34,15 @@ Nigdy: claude, codex, Orca, powłoki, launchd, przeglądarka użytkownika, aplik
 `stage` i `choose` są czyste (sygnały, tabela procesów, rozmiary i wiek wchodzą z zewnątrz),
 więc testują się na atrapach: tests/test_lastresort.py.
 """
+
 import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import re
 import shlex
 
@@ -236,6 +244,12 @@ def choose(table, size_of, age_of, skip=(), owned=lambda pid: False, level=2, jo
     for job in jobs:
         shell = job.get("child_pgid")
         if not shell or shell not in table:
+            continue
+        # to wciąż powłoka tego joba tylko, gdy jej rodzicem jest wrapper z wpisu: wpis po martwym
+        # wrapperze zostaje w state.json do reapu, a pid jego powłoki bywa już obcym procesem
+        # (pidy zawijają się co ~25 minut), którego dzieci hamulec wziąłby za job od stopnia 2
+        wrapper = job.get("pid")
+        if not isinstance(wrapper, int) or isinstance(wrapper, bool) or wrapper <= 1 or table[shell][0] != wrapper:
             continue
         roots = [c for c in children.get(shell, []) if c not in skip]
         tree = []

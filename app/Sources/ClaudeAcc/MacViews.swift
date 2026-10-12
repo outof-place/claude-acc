@@ -16,7 +16,7 @@ struct DevServersCard: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Label("The guard isn't running", systemImage: "pause.circle")
                         .font(.callout)
-                    Text("launchd job com.filip.claude-acc.devguard · `claude-acc guard status`")
+                    Text("launchd job \(PodMenu.agentLabel("devguard")) · `claude-acc guard status`")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

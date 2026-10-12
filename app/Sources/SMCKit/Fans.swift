@@ -1,46 +1,48 @@
 import Foundation
 
-struct FanReading: Codable, Equatable {
-    let index: Int
-    let rpm: Double
-    let min: Double
-    let max: Double
-    let target: Double
-    let manual: Bool
+public struct FanReading: Codable, Equatable {
+    public let index: Int
+    public let rpm: Double
+    public let min: Double
+    public let max: Double
+    public let target: Double
+    public let manual: Bool
 }
 
-struct Reading: Codable {
-    var at = Date.now.timeIntervalSince1970
-    var fans: [FanReading] = []
+public struct Reading: Codable {
+    public var at = Date.now.timeIntervalSince1970
+    public var fans: [FanReading] = []
     /// Hottest CPU and GPU die sensors, °C.
-    var cpu: Double?
-    var gpu: Double?
+    public var cpu: Double?
+    public var gpu: Double?
     /// Hottest sensor per part, °C: pcores, ecores, gpu, ssd, battery.
-    var sensors: [String: Double] = [:]
+    public var sensors: [String: Double] = [:]
     /// [time, cpu, gpu, average rpm] every 5 seconds, 20 minutes back (written by the daemon;
     /// temperatures to 0.1 °C, rpm and time whole).
-    var history: [[Double]]?
+    public var history: [[Double]]?
     /// What the daemon holds the fans at: "auto" or "fixed", and the share of the range.
-    var mode: String?
-    var percent: Int?
+    public var mode: String?
+    public var percent: Int?
     /// Set while a chip runs hot and a fixed setting was overridden to full speed.
-    var boosting: Bool?
+    public var boosting: Bool?
     /// Another app (Mole, Macs Fan Control…) set the fans after we did; we don't fight it.
-    var conflict: Bool?
-    var error: String?
+    public var conflict: Bool?
+    public var error: String?
     /// The daemon turned `SleepDisabled` on for Stay Awake with the lid closed.
-    var lidHeld: Bool?
+    public var lidHeld: Bool?
+
+    public init() {}
 }
 
 /// Fans on Apple Silicon: `FNum` fans, each with `F<n>Ac` (actual rpm), `F<n>Mn`/`F<n>Mx`
 /// (range), `F<n>Tg` (target) and `F<n>Md` (`F<n>md` before M4; 0 = macOS decides, 1 = target is held).
 /// `Ftst` = 1 unlocks manual control on the M-series SMC.
-final class Fans {
-    enum Mode: Equatable, CustomStringConvertible {
+public final class Fans {
+    public enum Mode: Equatable, CustomStringConvertible {
         case auto
         case fixed(percent: Int)
 
-        var description: String {
+        public var description: String {
             switch self {
             case .auto: "auto"
             case .fixed(let percent): "\(percent)%"
@@ -48,19 +50,19 @@ final class Fans {
         }
     }
 
-    let smc: SMC
+    public let smc: SMC
     private lazy var sensors: [String: [String]] = discoverSensors()
     /// M4 calls the mode key F<n>Md, earlier M-series F<n>md.
     private lazy var upperMode: Bool = (try? smc.info("F0Md")) != nil
 
     private func modeKey(_ fan: Int) -> String { upperMode ? "F\(fan)Md" : "F\(fan)md" }
 
-    init(smc: SMC) { self.smc = smc }
+    public init(smc: SMC) { self.smc = smc }
 
     /// FNum doesn't change while the Mac runs: read until it answers, then kept.
     private var fanCount: Int?
 
-    var count: Int {
+    public var count: Int {
         if let fanCount { return fanCount }
         guard let value = try? smc.number("FNum") else { return 0 }
         fanCount = Int(value)
@@ -68,7 +70,7 @@ final class Fans {
     }
 
     /// `sensors: false` reads only the fans: a dozen SMC calls instead of ~170 on an M4 Max.
-    func reading(sensors withSensors: Bool = true) -> Reading {
+    public func reading(sensors withSensors: Bool = true) -> Reading {
         var reading = Reading()
         for i in 0..<count {
             reading.fans.append(FanReading(
@@ -88,7 +90,7 @@ final class Fans {
         return reading
     }
 
-    func apply(_ mode: Mode) throws {
+    public func apply(_ mode: Mode) throws {
         switch mode {
         case .auto:
             for i in 0..<count { try smc.setNumber(modeKey(i), 0) }
@@ -105,7 +107,7 @@ final class Fans {
     }
 
     /// Is the hardware still where we put it? The SMC drops manual mode after sleep.
-    func holds(_ mode: Mode, _ reading: Reading) -> Bool {
+    public func holds(_ mode: Mode, _ reading: Reading) -> Bool {
         switch mode {
         case .auto:
             return reading.fans.allSatisfy { !$0.manual }

@@ -42,10 +42,18 @@ try:
 except (OSError, ValueError):
     state = {"on": False, "manual": False}
 verb = url.path.strip("/")
+if url.netloc == "awake-lid":
+    if os.environ.get("FAKE_APP_OLD"):
+        sys.exit(0)
+    state.update(lid_closed=verb == "on", updated_at=time.time())
+    json.dump(state, open(path, "w"))
+    sys.exit(0)
 on = {"on": True, "off": False}.get(verb, not state.get("on"))
 seconds = dict(urllib.parse.parse_qsl(url.query)).get("for")
 state = {"on": on, "manual": on, "forever": on and not seconds, "hotspot": False, "auto_on_hotspot": True,
-         "lid_closed": True, "pid": int(os.environ["FAKE_APP_PID"]), "updated_at": time.time()}
+         "lid_closed": state.get("lid_closed", True), "pid": int(os.environ["FAKE_APP_PID"]), "updated_at": time.time()}
+if not os.environ.get("FAKE_APP_OLD"):
+    state["lid_settable"] = True
 if on and seconds:
     state["until"] = time.time() + float(seconds)
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -124,6 +132,25 @@ class CommandTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("nie potwierdziła", err)
         self.assertGreaterEqual(time.time() - start, A_confirm - 0.5)
+
+    def test_lid_setting_goes_to_its_own_host_and_is_confirmed(self):
+        self.assertEqual(self.run_awake("off")[0], 0)
+        rc, out, _ = self.run_awake("lid", "off")
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(json.load(open(self.state_path))["lid_closed"])
+        rc, out, _ = self.run_awake("lid", "on")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(json.load(open(self.state_path))["lid_closed"])
+        self.assertEqual(self.urls()[-2:], ["claude-acc://awake-lid/off", "claude-acc://awake-lid/on"])
+        self.assertEqual(self.run_awake("lid", "maybe")[0], 2)
+
+    def test_an_app_without_the_lid_route_is_not_asked(self):
+        # an app from before the route writes no lid_settable and never answers claude-acc://awake-lid
+        self.assertEqual(self.run_awake("off", FAKE_APP_OLD="1")[0], 0)
+        rc, _, err = self.run_awake("lid", "off", FAKE_APP_OLD="1")
+        self.assertEqual(rc, 1)
+        self.assertIn("tylko w swoim panelu", err)
+        self.assertEqual(self.urls(), ["claude-acc://awake/off"])
 
     def test_bad_duration(self):
         rc, _, err = self.run_awake("on", "--for", "soon")

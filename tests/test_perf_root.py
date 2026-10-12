@@ -156,33 +156,98 @@ class SudoUserTest(unittest.TestCase):
         done = self.user(uid=501, user="tester", console="other")
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "tester"))
 
-    def wrapper(self):
-        """Komenda claude-acc z setup.sh, z katalogiem źródeł, w którym perf-root.sh tylko się przedstawia."""
+    def wrapper(self, root_copy=True):
+        """Komenda claude-acc z setup.sh; kopia roota (root-run.sh) leży w katalogu testu i tylko się
+        przedstawia, a perf-root.sh w `source` (libexec) też, żeby było widać, że go nie woła."""
         src = open(os.path.join(ROOT, "setup.sh"), encoding="utf-8").read()
         start = src.index("<<'EOF'\n", src.index('cat > "$HOME/.local/bin/claude-acc"')) + len("<<'EOF'\n")
+        rootdir = os.path.join(self.tmp, "claude-acc-root")
         path = os.path.join(self.tmp, "claude-acc")
         with open(path, "w") as f:
-            f.write(src[start:src.index("\nEOF\n", start) + 1])
+            f.write(src[start:src.index("\nEOF\n", start) + 1].replace("/usr/local/libexec/claude-acc-root", rootdir))
         libexec = os.path.join(self.tmp, "libexec")
         state = os.path.join(self.tmp, ".local", "share", "claude-acc")
         os.makedirs(libexec)
         os.makedirs(state)
         with open(os.path.join(state, "source"), "w") as f:
             f.write(libexec + "\n")
-        fake = os.path.join(libexec, "perf-root.sh")
-        with open(fake, "w") as f:
-            f.write('#!/bin/sh\necho "perf-root SUDO_USER=${SUDO_USER:-} $*"\n')
-        os.chmod(fake, 0o755)
-        return path, fake
+        for folder, name in ((libexec, "perf-root.sh"), (rootdir, "root-run.sh")):
+            if folder == rootdir and not root_copy:
+                continue
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, name), "w") as f:
+                f.write('#!/bin/sh\necho "%s SUDO_USER=${SUDO_USER:-} $*"\n' % name)
+            os.chmod(os.path.join(folder, name), 0o755)
+        return path, os.path.join(rootdir, "root-run.sh")
 
     def test_wrapper_under_sudo_keeps_sudo_user(self):
-        path, fake = self.wrapper()
+        path, run = self.wrapper()
         under_sudo = subprocess.run(["/bin/sh", path, "perf-root", "spotlight", "apps-only"],
                                     env=self.env(uid=0, sudo_user="tester"), capture_output=True, text=True)
-        self.assertEqual(under_sudo.stdout.strip(), "perf-root SUDO_USER=tester spotlight apps-only", under_sudo.stderr)
+        self.assertEqual(under_sudo.stdout.strip(), "root-run.sh SUDO_USER=tester perf-root spotlight apps-only",
+                         under_sudo.stderr)
         plain = subprocess.run(["/bin/sh", path, "perf-root", "spotlight", "apps-only"],
                                env=self.env(uid=501), capture_output=True, text=True)
-        self.assertEqual(plain.stdout.strip(), f"sudo {fake} spotlight apps-only", plain.stderr)
+        self.assertEqual(plain.stdout.strip(), f"sudo {run} perf-root spotlight apps-only", plain.stderr)
+
+    def test_wrapper_never_runs_the_source_copy_under_sudo(self):
+        """Bez kopii roota odmowa z poleceniem instalacji, a nie sudo na pliku z `source`."""
+        path, _ = self.wrapper(root_copy=False)
+        for cmd in (["perf-root", "spotlight", "apps-only"], ["mac", "root-clean", "--dry-run"]):
+            with self.subTest(cmd=cmd):
+                done = subprocess.run(["/bin/sh", path, *cmd], env=self.env(uid=501), capture_output=True, text=True)
+                self.assertEqual(done.returncode, 1)
+                self.assertEqual(done.stdout, "")
+                self.assertIn("claude-acc root install", done.stderr)
+
+    def test_fsguard_status_reads_the_daemon_without_root(self):
+        """`claude-acc fsguard` (status) tylko czyta plistę demona: nic nie woła sudo ani instalatora."""
+        path, _ = self.wrapper()
+        done = subprocess.run(["/bin/sh", path, "fsguard"], env=self.env(uid=501), capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.count("\n"), 1, done.stdout)  # jedna linia, bez przejścia do accswitch
+        self.assertTrue(done.stdout.startswith("strażnik fseventsd:"), done.stdout)
+
+    def test_fsguard_status_wants_a_root_interpreter_with_isolation(self):
+        """Tylko interpreter roota z -I jest dobrym startem; /usr/bin/python3 (zaślepka do Xcode'a
+        użytkownika), brak -I albo interpreter użytkownika to przeinstalowanie."""
+        path, _ = self.wrapper()
+        plist = os.path.join(self.tmp, "fsguard.plist")
+        with open(path) as f:
+            text = f.read().replace("/Library/LaunchDaemons/com.filip.claude-acc.fsguard.plist", plist)
+        with open(path, "w") as f:
+            f.write(text)
+        mine = os.path.join(self.tmp, "python3")
+        shutil.copy("/bin/sh", mine)  # plik użytkownika, nie roota
+        cases = [
+            (["/bin/sh", "-I", "/usr/local/libexec/claude-acc-fsguard"], True),  # root:wheel
+            (["/usr/bin/python3", "-I", "/usr/local/libexec/claude-acc-fsguard"], False),
+            (["/bin/sh", "/usr/local/libexec/claude-acc-fsguard"], False),
+            ([mine, "-I", "/usr/local/libexec/claude-acc-fsguard"], False),
+            (["/usr/local/libexec/claude-acc-fsguard"], False),  # sprzed 1.31.1: #!/usr/bin/python3
+        ]
+        for argv, good in cases:
+            with self.subTest(argv=argv):
+                with open(plist, "wb") as f:
+                    plistlib.dump({"Label": "com.filip.claude-acc.fsguard", "ProgramArguments": argv}, f)
+                done = subprocess.run(["/bin/sh", path, "fsguard", "status"], env=self.env(uid=501),
+                                      capture_output=True, text=True)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual("przeinstaluj" not in done.stdout, good, done.stdout)
+
+    def test_root_outside_the_root_copy_is_refused(self):
+        """perf-root.sh i janitor-root.sh z katalogu źródeł pod rootem: odmowa, zanim cokolwiek zmienią."""
+        for script, args in (("perf-root.sh", ["spotlight", "apps-only"]), ("janitor-root.sh", [])):
+            with self.subTest(script=script):
+                env = self.env(uid=0, sudo_user="tester")
+                done = subprocess.run(["/bin/bash", os.path.join(ROOT, script), *args], env=env,
+                                      capture_output=True, text=True)
+                if script == "janitor-root.sh" and os.geteuid() != 0:
+                    # janitor-root.sh czyta $EUID powłoki, którego atrapa id nie zmienia
+                    self.assertIn("kopię roota", done.stderr)
+                    continue
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("tylko z kopii roota", done.stderr)
 
 
 if __name__ == "__main__":

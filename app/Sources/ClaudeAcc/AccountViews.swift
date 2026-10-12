@@ -212,8 +212,13 @@ struct AccountDetails: View {
         VStack(alignment: .leading, spacing: 10) {
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 7) {
                 row("Plan", account.tier.isEmpty ? "Unknown" : account.tier)
-                row("Subscription", subscription.status, detail: subscription.since,
-                    tint: account.subscriptionStatus.map { $0 == "active" ? nil : .orange } ?? nil)
+                if account.isProfile {
+                    // its status comes from the profile API, and a profile's token reads only usage
+                    if let since = account.subscriptionSince { row("Subscription", "since \(Format.isoDay(since))") }
+                } else {
+                    row("Subscription", subscription.status, detail: subscription.since,
+                        tint: account.subscriptionStatus.map { $0 == "active" ? nil : .orange } ?? nil)
+                }
                 if let renews = account.renewsAt {
                     row("Renews", Format.fullDate(renews), detail: "in \(Format.countdown(renews, now: now))",
                         help: "Estimated: the monthly anniversary of the subscription start. The API has no billing date.")
@@ -227,19 +232,19 @@ struct AccountDetails: View {
                 if let age = account.dataAge {
                     row("Data", "read \(Format.age(age)) ago",
                         detail: account.fullUntil.map { "exact until \(Format.moment($0, now: now))" },
-                        tint: account.dataStale ? .orange : nil,
+                        tint: account.dataStale || account.isStale ? .orange : nil,
                         help: account.fullUntil == nil ? nil
                             : "A full window stays full until it resets, so the API isn't asked again before then")
                 }
                 if account.mislabeled, let real = account.realEmail {
                     row("Holds", real, tint: .orange)
                 }
-                if account.status != .ok, !account.note.isEmpty {
+                if account.status != .ok || account.isStale, !account.note.isEmpty {
                     row("Note", account.note, tint: .orange)
                 }
             }
             .font(.caption)
-            if !account.active {
+            if !account.active, !account.isProfile {
                 HStack(spacing: 8) {
                     Button("Switch Here", systemImage: "arrow.triangle.swap") { Task { await store.switchTo(account) } }
                         .panelButton()
@@ -263,6 +268,7 @@ struct AccountDetails: View {
 
     private var queue: String {
         if account.active { return "Active now" }
+        if account.isProfile { return "Never: \(HostApp.current.name) keeps this login" }
         if account.status == .needsLogin { return "Skipped until it signs in again" }
         if let status = account.subscriptionStatus, status != "active" { return "Skipped, subscription \(status)" }
         if account.lastResort { return account.queue.map { "#\($0) in line · backup, used last" } ?? "Backup, used last" }
@@ -421,7 +427,7 @@ struct AccountsCard: View {
                             AccountRow(
                                 store: store, account: account,
                                 isNext: account.id == snapshot.next?.id,
-                                switchBlocked: snapshot.orcaSelected != nil,
+                                switchBlocked: snapshot.orcaSelected != nil || account.isProfile,
                                 isOpen: expanded == account.id
                             ) {
                                 expanded = expanded == account.id ? nil : account.id
@@ -473,6 +479,7 @@ private struct AccountRow: View {
                 .overlay(alignment: .trailing) { switchButton }
             if isNext { Chip("Next", tint: Format.violet) }
             if account.lastResort { Chip("Backup") }
+            if account.isProfile { Chip(account.hostSelected == true ? "In \(HostApp.current.name)" : HostApp.current.name) }
             trailing
                 .frame(width: 150, alignment: .trailing)
         }
@@ -485,12 +492,15 @@ private struct AccountRow: View {
         .onHover { hovering = $0 }
         .animation(.snappy(duration: 0.18), value: hovering)
         .contextMenu {
-            Button("Switch to This Account", systemImage: "arrow.triangle.swap") {
-                Task { await store.switchTo(account) }
+            // a host profile's login is the host's: no switch, no sign-in from here
+            if !account.isProfile {
+                Button("Switch to This Account", systemImage: "arrow.triangle.swap") {
+                    Task { await store.switchTo(account) }
+                }
+                .disabled(store.busy != nil || account.status == .needsLogin || switchBlocked)
+                Button("Sign In Again", systemImage: "person.badge.key") { Task { await store.login(account) } }
+                    .disabled(store.busy != nil)
             }
-            .disabled(store.busy != nil || account.status == .needsLogin || switchBlocked)
-            Button("Sign In Again", systemImage: "person.badge.key") { Task { await store.login(account) } }
-                .disabled(store.busy != nil)
         }
     }
 
@@ -536,6 +546,10 @@ private struct AccountRow: View {
     /// Everything that doesn't fit in one line goes to the tooltip.
     private var caption: String {
         if account.status == .needsLogin { return "Session expired, sign in again" }
+        if account.isProfile, account.isStale || account.session == nil {
+            let age = account.dataAge.map { " · data \(Format.age($0)) old" } ?? ""
+            return "\(HostApp.current.name) profile, usage only · \(account.note)\(age)"
+        }
         if account.status == .error || account.session == nil {
             let age = account.dataAge.map { " · data \(Format.age($0)) old" } ?? ""
             return account.note + age
@@ -544,6 +558,9 @@ private struct AccountRow: View {
         let session = account.session?.resetsAt.map { "5h \(Format.until($0, now: now))" } ?? "5h unused"
         let weekly = account.weekly?.resetsAt.map { "week \(Format.until($0, now: now)) (\(Format.moment($0, now: now)))" }
         var lines = ["Resets " + [session, weekly].compactMap(\.self).joined(separator: " · ")]
+        if account.isProfile {
+            lines.append("\(HostApp.current.name) profile, usage only: auto-switch never uses it")
+        }
         if let renews = account.renewsAt {
             lines.append("Renews \(Format.day(renews)) · \(Format.inDays(renews))")
         }
@@ -577,8 +594,8 @@ private struct AccountRow: View {
                 Text("No data").font(.caption).foregroundStyle(.secondary)
             } else {
                 HStack(spacing: 10) {
-                    MiniUsage(label: "5h", window: account.session, stale: account.status != .ok)
-                    MiniUsage(label: "wk", window: account.weekly, stale: account.status != .ok)
+                    MiniUsage(label: "5h", window: account.session, stale: account.status != .ok || account.isStale)
+                    MiniUsage(label: "wk", window: account.weekly, stale: account.status != .ok || account.isStale)
                 }
                 .transition(.opacity)
             }

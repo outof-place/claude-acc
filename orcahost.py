@@ -1,10 +1,11 @@
 """The IDE that hosts claude-acc: Orca, or Pod (outofplace's downstream of Orca), in one place.
 
 Everything claude-acc knows about the host app lives here, so the rest asks this module instead of
-spelling Orca's paths: the userData folder (claude-accounts, orca-data.json, orca-runtime.json), the app
+spelling Orca's paths: the userData folder (claude-accounts, claude-profiles, orca-data.json, orca-runtime.json), the app
 bundle and its main process, its CLI, the Keychain service of its Claude accounts and the folder of its
-agent hooks. The env keys the host sets in its terminals (ORCA_PANE_KEY, ORCA_TERMINAL_HANDLE, ...) are
-constants: Pod keeps Orca's names, its CLI and hooks speak them.
+agent hooks. The env keys the host sets in its terminals come with the host's prefix: Orca's ORCA_PANE_KEY,
+ORCA_TERMINAL_HANDLE, ..., Pod's POD_* since it cut its runtime ties to Orca (2026-10-10); env() reads
+whichever is set.
 
 Which host, first match wins:
 1. explicit: CLAUDE_ACC_HOST=orca|pod pins one; CLAUDE_ACC_HOST_APP (or POD_APP_PATH) names the app
@@ -15,7 +16,7 @@ Which host, first match wins:
 "Runs" is Electron's SingletonLock in the userData folder (a link to "<host>-<pid>") with a live pid,
 so the check spawns nothing.
 
-ORCA_USER_DATA_PATH, which Orca and Pod set in their agent sessions, names the instance a session
+ORCA_USER_DATA_PATH (POD_USER_DATA_PATH in Pod), set in agent sessions, names the instance a session
 belongs to (a dev build has its own). Only the runtime socket follows it, as devguard did before:
 accounts and settings stay with the host the launchd jobs see, so an agent in a dev instance and the
 tick never disagree about them.
@@ -25,26 +26,35 @@ CFBundleIdentifier) and, when the app isn't packed into app.asar, Resources/app/
 (Electron's userData folder is Application Support/<productName or name>; packed, the lower-case
 bundle name, which is how Orca's "orca" comes about). What a bundle can't tell, Pod may declare in
 Info.plist under `ClaudeAccHost` (electron-builder `extendInfo`): userData, cli, keychainService,
-hooksDir, dataFile, runtimeFile. Without it Pod gets Orca's values, which a fork keeps unless it
-renames them.
+hooksDir, dataFile, runtimeFile, envPrefix. Without it Pod gets Orca's values, which a fork keeps unless
+it renames them.
 
     orcahost.py [field]     the resolved host as JSON, or one field (perf-root.sh asks for `app`)
 """
 
-import json
 import os
-import re
 import sys
+
+# bytecode only in $STATE: next to a script in Pod's bundle (Pod.app/Contents/Resources/claude-acc) a
+# __pycache__ breaks the app's seal, whatever starts this file and with whatever flags (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
+import json
+import re
 import time
 from collections import namedtuple
 
-# what the host sets in its terminals and agent sessions; Pod keeps Orca's names
-PANE_ENV = "ORCA_PANE_KEY"
-TERMINAL_ENV = "ORCA_TERMINAL_HANDLE"
-USER_DATA_ENV = "ORCA_USER_DATA_PATH"
+# what the hosts set in their terminals and agent sessions, behind their prefix: Orca's ORCA_*, Pod's
+# POD_* (env() reads whichever is set, Orca's first). The *_ENV names are Orca's, for docs and messages
+ENV_PREFIXES = ("ORCA_", "POD_")
+ENV_PREFIX = ENV_PREFIXES[0]
+PANE_KEY, TERMINAL_KEY, USER_DATA_KEY = "PANE_KEY", "TERMINAL_HANDLE", "USER_DATA_PATH"
+PANE_ENV = ENV_PREFIX + PANE_KEY
+TERMINAL_ENV = ENV_PREFIX + TERMINAL_KEY
+USER_DATA_ENV = ENV_PREFIX + USER_DATA_KEY
 # a remote host (pairing, environment): its CLI knows the way, the local socket doesn't
-REMOTE_ENV = ("ORCA_PAIRING_CODE", "ORCA_REMOTE_PAIRING", "ORCA_ENVIRONMENT")
-ENV_PREFIX = "ORCA_"
+REMOTE_ENV = tuple(p + k for p in ENV_PREFIXES for k in ("PAIRING_CODE", "REMOTE_PAIRING", "ENVIRONMENT"))
 
 PIN_ENV = "CLAUDE_ACC_HOST"
 APP_ENV = ("CLAUDE_ACC_HOST_APP", "POD_APP_PATH")
@@ -57,16 +67,24 @@ POD_NAME = "Pod"
 # `pod` is CocoaPods, which the scheduler runs as a native build)
 CLI_NAMES = ("orca", "podx")
 # agent-hooks folders the hosts write into ~/.claude/settings.json, relative to HOME, and whose they are.
-# Pod keeps Orca's ~/.orca (Orca hard-codes it all over), so the folder is shared; hook_hosts names it
-# after Pod once Pod owns claude-acc (owner.json)
-HOOK_DIRS = {".orca/agent-hooks": "Orca"}
+# Pod moves to ~/.pod (2026-10-10); a Pod that still shares Orca's ~/.orca has it named after Pod by
+# hook_hosts once Pod owns claude-acc (owner.json)
+HOOK_DIRS = {".orca/agent-hooks": "Orca", ".pod/agent-hooks": POD_NAME}
 
 Host = namedtuple(
     "Host",
-    "kind name app executable bundle_id user_data cli keychain_service hooks data_file runtime_file",
+    "kind name app executable bundle_id user_data cli keychain_service hooks data_file runtime_file env_prefix",
+    defaults=(ENV_PREFIX,),
 )
 Host.__doc__ = """One host app. `hooks` is its agent-hooks folder relative to HOME (".orca/agent-hooks"),
-which is how its hook commands show up in ~/.claude/settings.json."""
+which is how its hook commands show up in ~/.claude/settings.json; `env_prefix` starts the env keys it
+sets in its terminals ("ORCA_")."""
+
+
+def env(key, environ=None, prefixes=ENV_PREFIXES):
+    """A host env value by its key without the prefix ("PANE_KEY"): the first prefix that has it."""
+    environ = os.environ if environ is None else environ
+    return next((environ[p + key] for p in prefixes if environ.get(p + key)), None)
 
 
 def _home(home=None):
@@ -202,6 +220,8 @@ def from_bundle(app, home=None):
     hooks = declared.get("hooksDir") or base.hooks
     if hooks.startswith("~/"):
         hooks = hooks[2:]
+    elif hooks.startswith(_home(home).rstrip("/") + "/"):
+        hooks = hooks[len(_home(home).rstrip("/")) + 1 :]
     return Host(
         kind="orca" if bundle_id == ORCA_BUNDLE_ID else "pod",
         name=name,
@@ -214,6 +234,7 @@ def from_bundle(app, home=None):
         hooks=hooks.rstrip("/"),
         data_file=declared.get("dataFile") or base.data_file,
         runtime_file=declared.get("runtimeFile") or base.runtime_file,
+        env_prefix=declared.get("envPrefix") or base.env_prefix,
     )
 
 
@@ -335,11 +356,12 @@ def main_marker(h=None):
     return "%s/Contents/MacOS/%s" % (os.path.basename(h.app), h.executable)
 
 
-def runtime_path(h=None, env=None):
-    """orca-runtime.json of the instance this process belongs to (ORCA_USER_DATA_PATH), else the host's."""
+def runtime_path(h=None, environ=None):
+    """orca-runtime.json of the instance this process belongs to (ORCA_USER_DATA_PATH, Pod's
+    POD_USER_DATA_PATH; the host's own prefix first), else the host's."""
     h = h or host()
-    env = os.environ if env is None else env
-    return os.path.join(env.get(USER_DATA_ENV) or h.user_data, h.runtime_file)
+    prefixes = tuple(dict.fromkeys((h.env_prefix,) + ENV_PREFIXES))
+    return os.path.join(env(USER_DATA_KEY, environ, prefixes) or h.user_data, h.runtime_file)
 
 
 def cli_path(h=None, which=None):
@@ -359,13 +381,59 @@ def keychain_services(env=None, home=None):
     return list(dict.fromkeys(h.keychain_service for h in known(env, home)))
 
 
+# A host's Claude profiles (upstream #26801, in Pod since 5.1): <userData>/claude-profiles/<id>/home is
+# the CLAUDE_CONFIG_DIR of one signed-in account, profile.json beside it the marker the host writes
+# when its setup finished, and selected-host the home launches run in ("" for System default)
+PROFILES_DIR = "claude-profiles"
+PROFILE_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def claude_profiles(h=None):
+    """[(id, home)] of the host's profiles on this Mac's disk, by id: a finished setup (the marker
+    names the same id, runtime "host") and a home that is a folder, not a link. A WSL profile's home
+    lives on the guest's disk, so it isn't one."""
+    h = h or resolve()
+    root = os.path.join(h.user_data, PROFILES_DIR)
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not PROFILE_ID.fullmatch(name):
+            continue
+        try:
+            with open(os.path.join(root, name, "profile.json")) as f:
+                marker = json.load(f)
+        except (OSError, ValueError):
+            continue
+        home = os.path.join(root, name, "home")
+        if (isinstance(marker, dict) and marker.get("accountId") == name and marker.get("runtime") == "host"
+                and os.path.isdir(home) and not os.path.islink(home)):
+            found.append((name, home))
+    return found
+
+
+def selected_profile_home(h=None):
+    """The home of the profile the host routes its launches to, or None for System default."""
+    h = h or resolve()
+    try:
+        with open(os.path.join(h.user_data, PROFILES_DIR, "selected-host")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 def hook_hosts(hosts=None):
     """{agent-hooks folder: host name}: HOOK_DIRS, then a folder a host on this Mac declares (hooksDir).
-    With Pod owning claude-acc the shared ~/.orca folder carries Pod's hooks, so it is named Pod."""
+    A Pod that still shares Orca's ~/.orca (declares no hooksDir of its own) and owns claude-acc puts
+    its hooks there, so that folder is named Pod."""
+    hosts = known() if hosts is None else hosts
     found = dict(HOOK_DIRS)
-    if owned_by_pod():
+    pod_dirs = [h.hooks for h in hosts if h.kind == "pod"]
+    if owned_by_pod() and (not pod_dirs or ".orca/agent-hooks" in pod_dirs):
         found[".orca/agent-hooks"] = POD_NAME
-    for h in known() if hosts is None else hosts:
+    for h in hosts:
         found.setdefault(h.hooks, h.name)
     return found
 

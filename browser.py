@@ -41,6 +41,14 @@ Tryb full: agent może wszystko, zostają tylko Twoje własne wpisy deny i read.
 w kopercie <untrusted-page>; każde wywołanie trafia do dziennika audytu (bez wpisywanego tekstu).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 # Python 3.15 (PEP 810) ładuje je dopiero przy pierwszym użyciu, a starsze pomijają tę nazwę.
 # Bez json, threading i concurrent.futures: mcpbase i tak ładuje je od razu.
 __lazy_modules__ = ["base64", "hashlib", "secrets", "socket", "struct", "subprocess", "urllib.parse"]
@@ -49,13 +57,11 @@ import base64
 import fcntl
 import hashlib
 import json
-import os
 import re
 import secrets
 import socket
 import struct
 import subprocess
-import sys
 import threading
 import time
 import urllib.parse
@@ -3021,7 +3027,11 @@ def cmd_config(cmd, args):
 
 
 # sesja agenta, z której przyszło wywołanie z wiersza: zmienna i przedrostek właściciela, od najdokładniejszej
-CLI_SESSION_VARS = (("CLAUDE_CODE_SESSION_ID", "claude"), (orcahost.TERMINAL_ENV, "orca"), ("TERM_SESSION_ID", "term"))
+CLI_SESSION_VARS = (
+    ("CLAUDE_CODE_SESSION_ID", "claude"),
+    *((p + orcahost.TERMINAL_KEY, p.rstrip("_").lower()) for p in orcahost.ENV_PREFIXES),
+    ("TERM_SESSION_ID", "term"),
+)
 
 
 def cli_owner(env=None):

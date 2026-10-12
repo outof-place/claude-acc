@@ -250,6 +250,14 @@ class CheckpointTest(Guarded):
         self.assertIsNotNone(w.context(w.fire("PostToolUse")))
 
 
+def wake_timeout(base=10.0):
+    """Czas na budzik: budzik to proces w tle, który pod obciążeniem (load average ponad liczbę rdzeni,
+    np. 60-240 przy kilkunastu agentach) dostaje CPU z opóźnieniem. Na spokojnym Macu 10 s jak dotąd,
+    pod obciążeniem proporcjonalnie dłużej, najwyżej 90 s; sprawdzamy, czy się obudzi, nie jak szybko."""
+    cores = os.cpu_count() or 1
+    return min(90.0, base * max(1.0, os.getloadavg()[0] / cores))
+
+
 class WakeTest(Guarded):
     def stopped_session(self, w, session="s1"):
         w.pause()
@@ -263,7 +271,7 @@ class WakeTest(Guarded):
         self.assertIsNone(p.poll())  # czeka, nie budzi w trakcie pauzy
 
         w.unpause()
-        code = p.wait(timeout=10)
+        code = p.wait(timeout=wake_timeout())
 
         self.assertEqual(code, 2)
         self.assertIn("Limity wróciły", p.stderr.read())
@@ -275,7 +283,7 @@ class WakeTest(Guarded):
         with open(w.transcript, "a") as f:
             f.write('{"type":"user","message":"lecimy dalej"}\n')
 
-        code = p.wait(timeout=10)
+        code = p.wait(timeout=wake_timeout())
 
         self.assertEqual((code, p.stderr.read()), (0, ""))
 
@@ -285,9 +293,9 @@ class WakeTest(Guarded):
         time.sleep(0.3)
 
         second = w.spawn("Stop")
-        self.assertEqual(second.wait(timeout=10), 0)
+        self.assertEqual(second.wait(timeout=wake_timeout()), 0)
         w.unpause()
-        self.assertEqual(first.wait(timeout=10), 2)
+        self.assertEqual(first.wait(timeout=wake_timeout()), 2)
 
     def test_parent_waiting_on_a_stopped_subagent_gets_an_alarm(self):
         # rodzic tylko czekał na subagenta, więc polecenie dostał sam subagent;
@@ -301,7 +309,7 @@ class WakeTest(Guarded):
 
         w.unpause()
 
-        self.assertEqual(p.wait(timeout=10), 2)
+        self.assertEqual(p.wait(timeout=wake_timeout()), 2)
 
     def test_session_that_was_idle_before_pause_gets_no_alarm(self):
         w = World()
@@ -318,14 +326,14 @@ class WakeTest(Guarded):
         # przełączenie dopiero po starcie budzika: wolny start (load 40) czytał już nowy
         # switched_at jako punkt wyjścia i czekał w nieskończoność
         lock = os.path.join(w.dir, "pause-watchers", "s1.lock")
-        deadline = time.time() + 10
+        deadline = time.time() + wake_timeout()
         while not os.path.exists(lock) and time.time() < deadline and p.poll() is None:
             time.sleep(0.05)
         time.sleep(0.4)
         self.assertIsNone(p.poll())
 
         json.dump({"switched_at": int(time.time())}, open(os.path.join(w.dir, "state.json"), "w"))
-        code = p.wait(timeout=10)
+        code = p.wait(timeout=wake_timeout())
 
         self.assertEqual(code, 2)
         self.assertIn("innym koncie", p.stderr.read())

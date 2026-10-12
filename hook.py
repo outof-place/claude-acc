@@ -23,11 +23,17 @@ w powłoce. Ścieżkę pliku pauzy można nadpisać zmienną
 CLAUDE_ACC_PAUSE_FILE (sesja testowa nie wstrzymuje wtedy pozostałych).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import fcntl
 import json
-import os
 import shutil
-import sys
 import time
 from datetime import datetime
 

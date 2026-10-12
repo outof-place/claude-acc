@@ -2539,20 +2539,37 @@ class HostTest(Paths):
         """sched.py wczytany bez __file__ i bez sąsiadów ma te same nazwy, co orcahost."""
         import orcahost
 
-        self.assertEqual((S.HOST_CLIS, S.PANE_ENV), (orcahost.CLI_NAMES, orcahost.PANE_ENV))
+        panes = tuple(p + orcahost.PANE_KEY for p in orcahost.ENV_PREFIXES)
+        self.assertEqual((S.HOST_CLIS, S.PANE_ENVS), (orcahost.CLI_NAMES, panes))
         code = (
             "import sys\n"
             "from importlib.machinery import SourceFileLoader\n"
             "m = type(sys)('acc_sched')\n"
             f"SourceFileLoader('acc_sched', {SCRIPT!r}).exec_module(m)\n"
-            "print('orcahost' in sys.modules, m.HOST_CLIS, m.PANE_ENV)\n"
+            "print('orcahost' in sys.modules, m.HOST_CLIS, m.PANE_ENVS)\n"
         )
         out = subprocess.run([sys.executable, "-I", "-S", "-c", code], capture_output=True, text=True, check=True)
-        self.assertEqual(out.stdout.strip(), f"False {orcahost.CLI_NAMES} {orcahost.PANE_ENV}")
+        self.assertEqual(out.stdout.strip(), f"False {orcahost.CLI_NAMES} {panes}")
+
+    def test_job_qos_clamps_only_when_configured(self):
+        argv = ["pnpm", "test"]
+        self.assertEqual(S.job_argv(argv, dict(S.DEFAULTS)), argv)  # domyślnie bez zmian
+        self.assertIsNone(S.DEFAULTS["job_qos"])
+        with mock.patch.object(S.os, "access", return_value=True):
+            self.assertEqual(S.job_argv(argv, {"job_qos": "utility"}), [S.TASKPOLICY, "-c", "utility", *argv])
+            self.assertEqual(S.job_argv(argv, {"job_qos": "background"})[:3], [S.TASKPOLICY, "-c", "background"])
+            # nic spoza listy: wartość z configu nie trafia do argv
+            self.assertEqual(S.job_argv(argv, {"job_qos": "-p 1"}), argv)
+        with mock.patch.object(S.os, "access", return_value=False):
+            self.assertEqual(S.job_argv(argv, {"job_qos": "utility"}), argv)  # bez taskpolicy jak dotąd
 
     def test_agent_pane_comes_from_the_host_env(self):
         with mock.patch.dict(os.environ, {"ORCA_PANE_KEY": "tab-1:pane-2"}):
             self.assertEqual(S.agent_info("abcdef123456", "worker")["pane"], "tab-1:pane-2")
+        # Pod's terminals set POD_* since it dropped Orca's names
+        with mock.patch.dict(os.environ, {"POD_PANE_KEY": "tab-3:pane-1"}):
+            os.environ.pop("ORCA_PANE_KEY", None)
+            self.assertEqual(S.agent_info("abcdef123456", "worker")["pane"], "tab-3:pane-1")
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(S.agent_info(None, None)["pane"])
 
@@ -2968,6 +2985,28 @@ class GitGrepTest(unittest.TestCase):
         for command in ("git grep -nI foo", "git grep -a foo", "git grep --text foo",
                         "git grep --binary-files=text foo", "echo git grep", "rg -n 'git grep' docs"):
             self.assertEqual(S.git_grep_text_only(command), command, command)
+
+
+    def test_text_the_shell_does_not_run_stays(self):
+        """2026-10-11: the hook put -I into a heredoc an agent wrote to a file."""
+        G = "git" + " " + "grep"
+        for command in (
+            f"echo '{G} foo'",
+            f"cat > notes.md <<EOF\nuse `{G} x` here\nEOF",
+            f"python3 - <<'PY'\ns = \"`{G} <p> <tree>`\"\nPY",
+            f"cat <<-EOF\n\t{G} q\n\tEOF",
+            f"# {G} x",
+        ):
+            self.assertEqual(S.git_grep_text_only(command), command, command)
+        # code next to text still gets it
+        cases = {
+            f"cat > f <<EOF\n{G} x\nEOF\n{G} y": f"cat > f <<EOF\n{G} x\nEOF\n{G} -I y",
+            f'echo "$({G} foo)"': f'echo "$({G} -I foo)"',
+            f"# {G} x\n{G} z": f"# {G} x\n{G} -I z",
+            f"cat <<<'{G} a' && {G} b": f"cat <<<'{G} a' && {G} -I b",
+        }
+        for command, want in cases.items():
+            self.assertEqual(S.git_grep_text_only(command), want, command)
 
 
 class RtkExcludesTest(unittest.TestCase):

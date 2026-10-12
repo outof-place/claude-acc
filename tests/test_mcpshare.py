@@ -12,6 +12,7 @@ Uruchomienie: /usr/bin/python3 -m unittest tests.test_mcpshare
 import importlib.util
 import json
 import os
+import plistlib
 import shutil
 import stat
 import sys
@@ -21,6 +22,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 
 # prawdziwy osascript pokazałby w testach prawdziwy baner: atrapa jest pierwsza na PATH
 os.environ["PATH"] = os.pathsep.join(
@@ -327,6 +329,22 @@ class ShareTest(unittest.TestCase):
         self.assertEqual(json.load(open(state["backup"]))["mcpServers"]["fake"], self.original)
         plist = os.path.join(self.env["CLAUDE_ACC_LAUNCH_AGENTS"], "com.filip.claude-acc.mcpshare.fake.plist")
         self.assertTrue(os.path.exists(plist))
+        with open(plist, "rb") as f:
+            agent = plistlib.load(f)
+        # most na ścieżce wywołań narzędzi agentów: launchd nie może go dławić jak zadania w tle
+        self.assertEqual(agent["ProcessType"], "Interactive")
+        # plista sprzed tej wersji (bez ProcessType): refresh ją przepisuje, bez restartu mostu
+        del agent["ProcessType"]
+        with open(plist, "wb") as f:
+            plistlib.dump(agent, f)
+        with open(self.env["FAKE_LAUNCHCTL_DB"]) as f:
+            loaded = json.load(f)
+        with mock.patch("sys.stdout"):
+            self.assertEqual(mcpshare.cmd_refresh(), 0)
+        with open(plist, "rb") as f:
+            self.assertEqual(plistlib.load(f)["ProcessType"], "Interactive")
+        with open(self.env["FAKE_LAUNCHCTL_DB"]) as f:
+            self.assertEqual(json.load(f), loaded)  # ten sam pid: most nie załadowany od nowa
 
         # sesja Claude Code łączy się z wpisem, który dostała w konfiguracji, i woła narzędzie dziecka
         port = int(entry["url"].rsplit(":", 1)[1].split("/")[0])

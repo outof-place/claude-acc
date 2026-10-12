@@ -27,12 +27,18 @@ GUI. Fokus nie jest nigdy zabierany poza tym, co wynika z samego kliknięcia. Ka
 dziennika audytu (aplikacja na wierzchu, członek, bez wpisywanego tekstu, tylko jego długość).
 """
 
+import os
+import sys
+
+# bajtkod tylko w $STATE: obok skryptu w paczce Poda (Pod.app/Contents/Resources/claude-acc) __pycache__
+# łamie pieczęć aplikacji, czymkolwiek i z jakimikolwiek flagami ten plik uruchomić (1.31.6)
+if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
+    sys.dont_write_bytecode = True
+
 import base64
 import json
-import os
 import re
 import subprocess
-import sys
 import threading
 import time
 
@@ -859,7 +865,8 @@ def cmd_mode(args):
 
 def cli_owner(env=None):
     env = os.environ if env is None else env
-    for var, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), (orcahost.TERMINAL_ENV, "orca"), ("TERM_SESSION_ID", "term")):
+    hosts = tuple((p + orcahost.TERMINAL_KEY, p.rstrip("_").lower()) for p in orcahost.ENV_PREFIXES)
+    for var, prefix in (("CLAUDE_CODE_SESSION_ID", "claude"), *hosts, ("TERM_SESSION_ID", "term")):
         if env.get(var):
             return f"cli:{prefix}:{env[var]}"
     return "cli"

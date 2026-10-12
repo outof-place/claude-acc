@@ -1,4 +1,5 @@
 import Foundation
+import SMCKit
 
 /// Root LaunchDaemon loop. The menu bar app writes the wanted mode to a JSON file in the user's
 /// folder; this follows it every 2 seconds and writes readings back for the panel.

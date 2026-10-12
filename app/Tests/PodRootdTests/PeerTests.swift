@@ -1,0 +1,191 @@
+import Foundation
+import LightweightCodeRequirements
+import Security
+import Testing
+import XPC
+@testable import PodRootdCore
+import PodRootdClient
+
+// The XPC side for real, in one process: an anonymous listener with the engine on the fake machine,
+// and PodRootdClient on an endpoint. The test runner is not signed by Pod's team, which is exactly
+// the peer the helper has to turn away.
+
+/// The signing identifier of this test process (ad hoc: swiftpm-testing-helper-<hash>).
+private func ownIdentifier() throws -> String {
+    var code: SecCode?
+    var staticCode: SecStaticCode?
+    var info: CFDictionary?
+    try #require(SecCodeCopySelf([], &code) == errSecSuccess)
+    try #require(SecCodeCopyStaticCode(try #require(code), [], &staticCode) == errSecSuccess)
+    try #require(SecCodeCopySigningInformation(
+        try #require(staticCode), SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess)
+    return try #require((info as? [String: Any])?[kSecCodeInfoIdentifier as String] as? String)
+}
+
+/// This process's code signing flags as the kernel has them (`csops`, `CS_OPS_STATUS`).
+@_silgen_name("csops")
+private func csops(_ pid: pid_t, _ ops: UInt32, _ useraddr: UnsafeMutableRawPointer?, _ usersize: Int) -> Int32
+
+private func ownFlags() -> UInt32 {
+    var flags: UInt32 = 0
+    _ = csops(getpid(), 0, &flags, MemoryLayout<UInt32>.size)
+    return flags
+}
+
+/// A policy this process passes, as the given caller.
+private func admitting(as caller: Caller) throws -> PeerPolicy {
+    let me = try ownIdentifier()
+    let requirement = XPCPeerRequirement.codeRequirement(try ProcessCodeRequirement.allOf { SigningIdentifier(me) })
+    return PeerPolicy(listener: requirement, callers: [(caller, requirement)])
+}
+
+private final class Wire {
+    let rig: Rig
+    let server: Server
+    let client: PodRootdClient
+
+    init(peers: PeerPolicy, rig: Rig = Rig()) throws {
+        self.rig = rig
+        server = Server(engine: rig.engine, peers: peers)
+        client = try PodRootdClient(endpoint: server.listenAnonymously())
+    }
+
+    func close() {
+        client.close()
+        server.cancel()
+    }
+}
+
+/// Until `condition` holds or a second goes by, letting the main queue run the session's end.
+private func eventually(_ condition: () -> Bool) async {
+    for _ in 0..<100 where !condition() { try? await Task.sleep(for: .milliseconds(10)) }
+}
+
+@Test("a peer outside Pod's team is turned away before any verb, and learns nothing")
+func foreignPeerRejected() async throws {
+    let wire = try Wire(peers: try PeerPolicy.production())
+    defer { wire.close() }
+    let reply = try await wire.client.send(.fansSet(mode: fan50))
+    #expect(reply.refusal == .peerNotAllowed)
+    #expect(reply.status == nil)
+    #expect(wire.rig.backend.calls.isEmpty)
+    let status = try await wire.client.send(.status)
+    #expect(status.refusal == .peerNotAllowed)
+    #expect(status.status == nil)
+}
+
+@Test("the right signing identity without the hardened runtime is turned away before any verb")
+func nonHardenedPeerRejected() async throws {
+    // This runner is ad hoc and not hardened, like a team-signed copy built without `--options
+    // runtime,library`. The team and the Developer ID category are left out because an ad hoc
+    // runner has neither, so only the flags can refuse it.
+    let me = try ownIdentifier()
+    let hardened = try PeerPolicy.requirement(team: nil, identifiers: [me], flags: PeerPolicy.hardening(.menu))
+    let wire = try Wire(peers: PeerPolicy(listener: hardened, callers: [(.menu, hardened)]))
+    defer { wire.close() }
+    let reply = try await wire.client.send(.restoreDefaults)
+    #expect(reply.refusal == .peerNotAllowed)
+    #expect(reply.status == nil)
+    #expect(wire.rig.backend.calls.isEmpty)
+    // the same identity without the flags gets in: the flags are what turned it away
+    let plain = try PeerPolicy.requirement(team: nil, identifiers: [me], flags: [])
+    let open = try Wire(peers: PeerPolicy(listener: plain, callers: [(.menu, plain)]))
+    defer { open.close() }
+    #expect(try await open.client.send(.status).refusal == nil)
+}
+
+@Test("a debuggable sender (get-task-allow, or under a debugger) is turned away even with the right identity")
+func debuggablePeerRejected() async throws {
+    // the runner stands in for a debuggable build: the refused requirement is one it satisfies
+    let me = try ownIdentifier()
+    let admit = try PeerPolicy.requirement(team: nil, identifiers: [me], flags: [])
+    let wire = try Wire(peers: PeerPolicy(listener: admit, callers: [(.menu, admit)], refused: [admit]))
+    defer { wire.close() }
+    let reply = try await wire.client.send(.status)
+    #expect(reply.refusal == .peerNotAllowed)
+    #expect(reply.status == nil)
+    // the production check against the real flags: swiftpm's test runner is itself debuggable
+    // (CS_GET_TASK_ALLOW 0x4 or CS_DEBUGGED 0x10000000), so it is turned away exactly when they're set
+    #expect(try PeerPolicy.production().refused.count == 2)
+    let flags = ownFlags()
+    let debuggable = flags & 0x4 != 0 || flags & 0x1000_0000 != 0
+    let real = try Wire(peers: PeerPolicy(listener: admit, callers: [(.menu, admit)], refused: try PeerPolicy.debuggable()))
+    defer { real.close() }
+    #expect(try await real.client.send(.status).refusal == (debuggable ? .peerNotAllowed : nil), "flags 0x\(String(flags, radix: 16))")
+    #expect(PeerPolicy(listener: admit, callers: [(.menu, admit)], refused: [admit]).classify { _ in true } == nil)
+}
+
+@Test("Pod Menu and the CLI need library validation too; Electron Pod the hardened runtime only")
+func hardeningPerCaller() {
+    #expect(PeerPolicy.hardening(.menu) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
+    #expect(PeerPolicy.hardening(.cli) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
+    #expect(PeerPolicy.hardening(.app) == [.isHardenedRuntimeEnforced])
+}
+
+@Test("the production policy names the three signing identities of team 75Y2KR6P5W")
+func productionCallers() throws {
+    let policy = try PeerPolicy.production()
+    #expect(policy.callers.map(\.0) == [.app, .menu, .cli])
+    // nothing here is signed by that team, so no identity matches
+    #expect(policy.classify { _ in false } == nil)
+    // a sender that matches everything is debuggable too, and that wins
+    #expect(policy.classify { _ in true } == nil)
+    #expect(PeerPolicy(listener: policy.listener, callers: policy.callers).classify { _ in true } == .app)
+}
+
+@Test("an admitted peer gets the verb done and the status back over XPC")
+func admittedPeer() async throws {
+    let wire = try Wire(peers: try admitting(as: .menu))
+    defer { wire.close() }
+    let reply = try await wire.client.run(.fansSet(mode: fan50))
+    #expect(reply.status?.fans.mode == fan50)
+    #expect(wire.rig.backend.calls == ["applyFans 50%"])
+    #expect(try await wire.client.status().fans.applied == fan50)
+}
+
+@Test("over XPC: Electron Pod gets tier A only, Pod Menu tier B on a click, the CLI tier B only approved")
+func tiersByCaller() async throws {
+    let app = try Wire(peers: try admitting(as: .app))
+    defer { app.close() }
+    #expect(try await app.client.send(.spotlightAppsOnly).refusal == .verbNotAllowed(verb: "spotlight.appsOnly", caller: .app))
+    #expect(try await app.client.send(.fansSet(mode: .auto)).refusal == nil)
+    let menu = try Wire(peers: try admitting(as: .menu))
+    defer { menu.close() }
+    #expect(try await menu.client.send(.spotlightAppsOnly).refusal == nil)
+    let cli = try Wire(peers: try admitting(as: .cli))
+    defer { cli.close() }
+    #expect(try await cli.client.send(.spotlightRestore).refusal == .needsApproval(verb: "spotlight.restore"))
+    let approved = Approval(authenticated: true, parent: "sid=1 ppid=2@3 tty=ttys001")
+    #expect(try await cli.client.send(.spotlightRestore, approval: approved).refusal == nil)
+}
+
+@Test("letting go of a client without close ends its session too, and doesn't crash the process")
+func releasedClientEndsSession() async throws {
+    let rig = Rig()
+    let server = Server(engine: rig.engine, peers: try admitting(as: .menu))
+    defer { server.cancel() }
+    var client: PodRootdClient? = try PodRootdClient(endpoint: server.listenAnonymously())
+    try await client?.run(.lidHold(seconds: LidSeconds(3600)!))
+    #expect(server.sessions == 1)
+    client = nil
+    await eventually { server.sessions == 0 }
+    #expect(server.sessions == 0)
+    #expect(rig.engine.status().lid.leaseUntil == nil)
+}
+
+@Test("closing the client ends its lid hold after the re-hold minute: a quit Pod Menu can't keep the Mac up")
+func leaseEndsWithSession() async throws {
+    let wire = try Wire(peers: try admitting(as: .menu))
+    defer { wire.server.cancel() }
+    try await wire.client.run(.lidHold(seconds: LidSeconds(3600)!))
+    #expect(wire.rig.backend.sleepIsDisabled)
+    #expect(wire.server.sessions == 1)
+    wire.client.close()
+    await eventually { wire.server.sessions == 0 }
+    #expect(wire.server.sessions == 0)
+    #expect(wire.rig.engine.status().lid.reholdUntil != nil)
+    wire.rig.clock.advance(Engine.lidRehold + 1)
+    wire.rig.engine.tick()
+    #expect(!wire.rig.backend.sleepIsDisabled)
+    #expect(wire.rig.engine.status().lid.lastRelease == "session ended")
+}
