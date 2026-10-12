@@ -228,6 +228,7 @@ def tool_path():
         "/opt/homebrew/bin",
         "/usr/local/bin",
         os.path.join(HOME, ".docker/bin"),
+        os.path.join(HOME, ".orbstack/bin"),
         os.path.join(HOME, "go/bin"),
         os.path.join(HOME, ".cargo/bin"),
         os.path.join(HOME, ".bun/bin"),

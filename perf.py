@@ -1477,16 +1477,20 @@ class JsonSetting:
 
     root = False
 
-    def __init__(self, name, group, path, key, config_key, title, effect, defer=False):
+    def __init__(self, name, group, path, key, config_key, title, effect, defer=False, owner=None):
         self.name, self.group, self.path, self.key = name, group, path, key
         self.config_key, self.defer = config_key, defer
         self.title, self.effect = title, effect
+        # aplikacja, której katalog trzyma plik: bez katalogu jej nie ma i nie ma czego ustawiać
+        self.owner = owner
 
     def blocked(self, system):
         """Docker nadpisuje swój plik ustawień; dopóki działa, zapis czeka."""
         return self.defer and system.docker_running()
 
     def apply(self, cfg, system, record=None):
+        if self.owner and not os.path.isdir(os.path.dirname(self.path)):
+            raise AppMissing(f"{self.owner} nie jest zainstalowany")
         value = cfg[self.config_key]
         if self.blocked(system):
             if record and record.get("written"):
@@ -1621,6 +1625,18 @@ class DockerIdle:
 
 class Deferred(Exception):
     """Cofnięcie musi poczekać (Docker działa); `keep` dokończy je później."""
+
+
+class AppMissing(Exception):
+    """Plik ustawień należy do aplikacji, której już nie ma: jej katalogu nie odtwarzamy."""
+
+
+def forget(state, name):
+    """Zdejmuje poprawkę ze stanu i z listy Ultry, niczego nie cofając na dysku."""
+    state["applied"].pop(name, None)
+    applied = ultra_state(state)["applied"]
+    if name in applied:
+        applied.remove(name)
 
 
 ORCA_DATA = os.path.join(HOST.user_data, HOST.data_file)
@@ -2651,6 +2667,7 @@ TWEAKS = [
         "mniejsza maszyna Dockera (settings-store.json MemoryMiB), od następnego startu Dockera",
         "VM trzymała 8,0 GB, 21 kontenerów używało 3,7 GB; Virtualization.framework nie oddaje pamięci",
         defer=True,
+        owner="Docker Desktop",
     ),
     GitSpeed(),
     HookWrap(),
@@ -3628,6 +3645,8 @@ def ultra_apply(name, cfg, system, state):
         before = git_status_ms(system, git_repos(cfg))
     try:
         record, changed = item.apply(cfg, system, old)
+    except AppMissing as err:
+        return [f"{name}: {err}"]
     except (OSError, ValueError, RuntimeError) as err:
         return [f"{name}: błąd {err}"]
     record["at"] = old["at"] if old else time.time()
@@ -4251,7 +4270,13 @@ def cmd_apply(cfg, args, system=None):
                 print(f"  w tle: {names or 'nic (brak procesów z listy)'}")
             continue
         old = state["applied"].get(item.name)
-        record, changed = item.apply(cfg, system, old)
+        try:
+            record, changed = item.apply(cfg, system, old)
+        except AppMissing as err:
+            print(f"{item.name}: {err}, nie ma czego ustawiać")
+            forget(state, item.name)
+            code = 1
+            continue
         record["at"] = old["at"] if old else time.time()
         if old and old.get("ultra"):
             record["ultra"] = True
@@ -4327,6 +4352,11 @@ def cmd_keep(cfg, args, system=None):
             continue
         try:
             record, changed = item.apply(cfg, system, old)
+        except AppMissing as err:
+            # odinstalowana aplikacja (Docker Desktop -> OrbStack): poprawka znika, katalog nie wraca
+            forget(state, item.name)
+            log(f"keep {item.name}: zdjęte, {err}")
+            continue
         except (OSError, ValueError, RuntimeError) as err:
             # ten sam błąd co 5 min (docker-vm: macOS nie wpuszcza do kontenera Dockera)
             # trafia do logu raz, nowy znowu

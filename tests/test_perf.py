@@ -896,6 +896,27 @@ class JsonSettingTest(Isolated):
         item.undo(record, FakeSystem({}))
         self.assertEqual(self.read(self.files["devguard-budget"]), original)
 
+    def test_docker_vm_leaves_an_uninstalled_docker_desktop_alone(self):
+        """Docker Desktop odinstalowany (2026-10-12, w zamian OrbStack): keep nie odtwarza jego
+        katalogu w Group Containers, tylko zdejmuje docker-vm, a apply odmawia."""
+        container = os.path.join(self.dir, "group.com.docker")
+        path = os.path.join(container, "settings-store.json")
+        os.makedirs(container)
+        self.write(path, {"MemoryMiB": 8192})
+        system = FakeSystem({}, docker=False)
+        with mock.patch.object(perf.tweak("docker-vm"), "path", path):
+            self.run_cmd(perf.cmd_apply, "docker-vm", system=system)
+            self.assertEqual(self.read(path)["MemoryMiB"], 6144)
+            shutil.rmtree(container)  # odinstalowanie
+            self.run_cmd(perf.cmd_keep, system=system)
+            self.assertFalse(os.path.exists(container))
+            self.assertNotIn("docker-vm", perf.load_state()["applied"])
+            code, out = self.run_cmd(perf.cmd_apply, "docker-vm", system=system)
+        self.assertFalse(os.path.exists(container))
+        self.assertNotIn("docker-vm", perf.load_state()["applied"])
+        self.assertEqual(code, 1)
+        self.assertIn("Docker Desktop nie jest zainstalowany", out)
+
     def test_docker_waits_until_docker_is_closed(self):
         path = self.files["docker-vm"]
         original = {"AutoStart": True, "UseContainerdSnapshotter": True}

@@ -1901,6 +1901,17 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(inv["biggest"][0], 16)
         self.assertIn("symulatory 3,0 GB", dg.inventory_line(inv).replace(".", ","))
 
+    def test_orbstack_vm_is_docker(self):
+        """OrbStack zamiast Docker Desktop (2026-10-12): jego VM to Docker, długo żyjący, nie reszta."""
+        helper = "/Applications/OrbStack.app/Contents/Frameworks/OrbStack Helper.app/Contents/MacOS/OrbStack Helper"
+        table = {20: (1, helper), 21: (1, "/Applications/OrbStack.app/Contents/MacOS/OrbStack")}
+        sizes = {20: 2, 21: 1}
+        with mock.patch.object(dg, "usage", lambda pid: {"footprint": sizes[pid] * GB, "start": 1}), \
+                mock.patch.object(dg.janitor, "load_json", lambda path, default: {}):
+            inv = dg.inventory(table, [], NOW_T)
+        self.assertEqual({n: f["footprint"] // GB for n, f in inv["families"].items()}, {"docker": 3})
+        self.assertEqual(inv["long_lived"], 3 * GB)
+
 
 class HostFixtureTest(unittest.TestCase):
     """Orca i Pod (orcahost): CLI, gniazdo, proces główny i ochrona procesów idą za hostem."""
