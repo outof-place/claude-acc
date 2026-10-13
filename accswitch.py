@@ -1312,9 +1312,10 @@ def cmd_heal(cfg, args):
     return 0 if fixed else 1
 
 
-def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
+def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True, in_use_id=None):
     """Limity wszystkich kont z oceną przydatności. Błąd odczytu to nie to samo,
-    co wypalone konto, więc niesie osobną etykietę."""
+    co wypalone konto, więc niesie osobną etykietę. in_use_id to konto, na którym
+    pracują teraz sesje: jego pominięty status sprawdzamy częściej (niżej)."""
     rows = []
     for a in accounts:
         if a.id == exclude_id or a.email in cfg["never"]:
@@ -1327,10 +1328,14 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
         # Anulowane konto automat pomija. Limitów o nie nie pytamy: API odpowiada
         # 403, a panel pytał co minutę i przybliżał 429 dla reszty kont. Status
         # sprawdzamy w profilu co LAPSED_RECHECK, więc po odnowieniu konto szybko
-        # samo wraca do rotacji.
+        # samo wraca do rotacji. Konto w użyciu (in_use_id) sprawdzamy w rytmie
+        # odczytu aktywnego konta: sesje na nim pracują, więc "canceled" z pamięci
+        # najpewniej przeżyło odnowienie zrobione w przeglądarce, a panel nie może
+        # przez 10 minut pokazywać używanego konta jako pominiętego.
         status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
         if status and status != "active":
-            status = (identity(a, cfg, max_age=LAPSED_RECHECK, refresh=may_refresh) or {}).get("status")
+            recheck = ACTIVE_MAX_AGE[0] if a.id == in_use_id else LAPSED_RECHECK
+            status = (identity(a, cfg, max_age=recheck, refresh=may_refresh) or {}).get("status")
         if status and status != "active":
             rows.append({"account": a, "data": None, "why": f"subskrypcja: {status}, automat pomija",
                          "usable": False, "error": True, "skipped": True})
@@ -1566,11 +1571,12 @@ def snapshot(cfg, accounts=None):
     # tego panel pokazywał dane sprzed kilkunastu godzin.
     held = {oauth_of(kc_read(s, KEYCHAIN_USER)).get("refreshToken") for s in runtime_services(cfg)}
     idle = lambda a: not orca and a.seen_oauth.get("refreshToken") not in held
-    rows = survey(accounts, cfg, max_age=IDLE_MAX_AGE, refresh=idle)
+    rows = survey(accounts, cfg, max_age=IDLE_MAX_AGE, refresh=idle, in_use_id=active.id if active else None)
     if active and all(r["account"].id != active.id for r in rows):
         # konto z listy "never" też bywa aktywne (np. wybrane ręcznie): pokazujemy je,
         # tylko automat nigdy na nie nie przełącza
-        rows += survey([active], dict(cfg, never=[]), max_age=active_max_age(active, cfg), refresh=False)
+        rows += survey([active], dict(cfg, never=[]), max_age=active_max_age(active, cfg), refresh=False,
+                       in_use_id=active.id)
         rows[-1]["usable"] = False
     cache = load_json(USAGE_CACHE_PATH, {})
     order = {r["account"].id: i for i, r in enumerate(queue(rows), 1)}
