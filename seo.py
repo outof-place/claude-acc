@@ -121,7 +121,8 @@ SESSION_TIMEOUT = 20 * 60
 MAX_WORDS = 8  # dłuższa fraza nie trafia do puli
 
 # ile sesja może wydać najwyżej; razem mieszczą się w budżecie bloga (domyślnie 1 USD)
-CAPS = {"discovery": 0.45, "cluster": 0.35, "ai": 0.35}
+# discovery biegnie raz na blog (potem konkurencja jest przypięta); WebSearch to ok. 0,04 USD za szukanie
+CAPS = {"discovery": 0.60, "cluster": 0.35, "ai": 0.35}
 TURNS = {"discovery": 30, "cluster": 6, "ai": 30}
 EFFORT = {"discovery": "low", "cluster": "medium", "ai": "low"}
 WEB_TOOLS = ("WebSearch", "WebFetch")
@@ -1178,12 +1179,12 @@ Topics (language in brackets):
 {lines}
 
 For each topic run one WebSearch in the topic's language and note the domains of the organic results.
-Run the searches in parallel, several WebSearch calls per turn, and do not repeat a search.
+Work in batches of at most 4 searches per turn, and do not repeat a search.
 Skip ads, maps, video and social sites. Do not open the pages: the result list is enough.
 {UNTRUSTED}
 
-After every batch of searches, write the file {{OUT}} again with everything found so far, so the
-file is complete even if you are stopped. It holds JSON and nothing else:
+After every batch, before the next one, write the file {{OUT}} again with everything found so far,
+so the file is complete even if you are stopped. It holds JSON and nothing else:
 {{"topics": [{{"topic": "<topic text>", "domains": ["example.com", "..."]}}]}}
 Use registrable domains without www. Write no other file."""
 
@@ -1600,10 +1601,31 @@ def finalize(clusters, pool, blog, posts, limit):
             "ranks_today": bool(ranking), "ranking": ranking, "sources": sorted({e["source"] for e in ev}),
             "evidence": ev, "ai_answer": None, "note": c["note"],
         })  # fmt: skip
-    out.sort(key=lambda c: -c["score"])
-    for i, c in enumerate(out[:limit]):
+    out = rank(out)[:limit]
+    for i, c in enumerate(out):
         c["id"] = f"c{i + 1:02d}"
-    return out[:limit]
+    return out
+
+
+def rank(clusters, block=10, fresh=4):
+    """Kolejność listy: wynik, ale w każdej dziesiątce co najmniej `fresh` miejsc dla najlepszych
+    klastrów, na które blog nie ma dziś wyświetleń w GSC, póki takie są. Wyświetlenia bloga z GSC
+    dają odświeżeniom wyższy popyt niż podpowiedzi nowym frazom, a research ma też poszerzać."""
+    left = sorted(clusters, key=lambda c: -c["score"])
+    out = []
+    while left:
+        pick = left[:block]
+        need = min(fresh, sum(1 for c in left if not c["ranks_today"]))
+        have = sum(1 for c in pick if not c["ranks_today"])
+        if have < need:
+            extra = [c for c in left[block:] if not c["ranks_today"]][: need - have]
+            drop = {id(c) for c in [c for c in reversed(pick) if c["ranks_today"]][: len(extra)]}
+            pick = [c for c in pick if id(c) not in drop] + extra
+        pick.sort(key=lambda c: -c["score"])
+        out += pick
+        taken = {id(c) for c in pick}
+        left = [c for c in left if id(c) not in taken]
+    return out
 
 
 def cluster(ctx, blog, pool, posts):

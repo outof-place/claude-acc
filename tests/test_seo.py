@@ -343,6 +343,23 @@ class ClusterTest(Base):
         self.assertEqual(price["ranking"]["page"], SITE + "/")
 
 
+class RankTest(unittest.TestCase):
+    def test_every_ten_keeps_room_for_phrases_the_blog_does_not_rank_for(self):
+        """Czerwony, gdy odświeżenia z wyświetleniami GSC zajmują całą dziesiątkę, choć są nowe
+        tematy (Agro-Malz 13.10: 20 z 20 to odświeżenia), albo gdy kolejność w dziesiątce łamie wynik."""
+        ranking = [{"target": f"r{i}", "score": 90.0 - i, "ranks_today": True} for i in range(14)]
+        fresh = [{"target": f"n{i}", "score": 20.0 - i, "ranks_today": False} for i in range(5)]
+        ordered = seo.rank(ranking + fresh)
+        first = ordered[:10]
+        self.assertEqual(sum(1 for c in first if not c["ranks_today"]), 4)
+        self.assertEqual([c["target"] for c in first[:6]], ["r0", "r1", "r2", "r3", "r4", "r5"])
+        self.assertEqual([c["score"] for c in first], sorted((c["score"] for c in first), reverse=True))
+        self.assertEqual(sum(1 for c in ordered[10:] if not c["ranks_today"]), 1)
+        self.assertEqual(len(ordered), 19)
+        # bez nowych tematów nic się nie zmienia
+        self.assertEqual(seo.rank(ranking), ranking)
+
+
 class SessionTest(Base):
     def test_research_sessions_get_only_web_tools_and_one_output_path(self):
         """Czerwony, gdy sesja czytająca sieć dostaje Bash, MCP, Read albo zapis poza jednym plikiem,
