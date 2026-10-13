@@ -1216,7 +1216,7 @@ def discover(ctx, blog, seeds):
     key = "domains"
     found = cache.get(key, DISCOVERY_TTL)
     if found is None:
-        ctx.log(f"konkurencja: sesja Sonnet z WebSearch na {len(topics)} tematach")
+        ctx.log(f"konkurencja: sesja Sonnet z WebSearch, {plural(len(topics), 'temat', 'tematy', 'tematów')}")
         data, problem = session(ctx, blog, "discovery", discovery_prompt(blog, topics))
         if problem:
             return [], source("competitors", False, problem)
@@ -1672,7 +1672,7 @@ def ai_visibility(ctx, blog, clusters):
     if not top:
         return None, source("ai_visibility", False, "brak klastrów do sprawdzenia", skipped=True)
     queries = [(c["lang"], c["target"]) for c in top]
-    ctx.log(f"widoczność AI: sesja Sonnet z WebSearch, {len(queries)} zapytań")
+    ctx.log(f"widoczność AI: sesja Sonnet z WebSearch, {plural(len(queries), 'zapytanie', 'zapytania', 'zapytań')}")
     data, problem = session(ctx, blog, "ai", ai_prompt(blog, queries))
     if problem:
         return None, source("ai_visibility", False, problem)
