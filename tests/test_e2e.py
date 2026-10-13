@@ -539,6 +539,41 @@ class PanelFreshnessTest(unittest.TestCase):
         self.assertIsNotNone(row["queue"])
         self.assertEqual(row["weekly"]["used"], 20)
 
+    def test_renewed_subscription_of_the_account_in_use_shows_within_the_active_cadence(self):
+        # konto odnowione w przeglądarce, bez claude-acc login, a sesje dalej na nim pracowały:
+        # panel pokazywał używane konto jako "Subscription canceled · skipped" do rechecku
+        # po LAPSED_RECHECK; konto w użyciu sprawdzamy w rytmie odczytu aktywnego konta
+        w = Env()
+        w.account("a@x", weekly_used=10)
+        b = w.account("b@x", weekly_used=20)
+        w.runtime(b)
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 3 * 60, "email": "b@x",
+                                         "status": "canceled"}})
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["subscription_status"], "active")
+        self.assertNotIn("subskrypcja", row.get("why") or "")
+
+    def test_lapsed_account_not_in_use_keeps_the_lapsed_cadence(self):
+        # kontrola: konto pominięte, na którym nikt nie pracuje, nie pyta profilu częściej
+        # niż co LAPSED_RECHECK (3 minuty temu sprawdzone -> zostaje pominięte)
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 3 * 60, "email": "b@x",
+                                         "status": "canceled"}})
+
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["subscription_status"], "canceled")
+        self.assertFalse(row["usable"])
+
 
 class UsageTrafficTest(unittest.TestCase):
     """Ile zapytań idzie do API limitów. Liczby, które da się policzyć lokalnie (pełne okno
