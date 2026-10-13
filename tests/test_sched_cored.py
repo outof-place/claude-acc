@@ -125,6 +125,85 @@ class CoredSchedTest(unittest.TestCase):
         # sooner than the wrapper's own wake (CORED_WAKE_S, 5 s): one pass, the signal, the job's 0.2 s
         self.assertLess(time.time() - freed, 4.5)
 
+    def test_events_into_head_ends_with_its_reader(self):
+        # only `run` ignores SIGPIPE: the printing CLI dies at its next line after the reader went,
+        # as a pipe expects (with no frame coming it can't know; frames keep coming here)
+        import threading
+
+        owner = os.path.join(self.state, "owner.json")
+
+        def write(n):
+            with open(owner + ".t", "w") as f:
+                f.write(json.dumps({"n": n}))
+            os.replace(owner + ".t", owner)
+
+        write(0)
+        self.start_cored()
+        stop = threading.Event()
+
+        def writer():
+            n = 0
+            while not stop.wait(0.2):
+                n += 1
+                write(n)
+
+        threading.Thread(target=writer, daemon=True).start()
+        self.addCleanup(stop.set)
+        start = time.time()
+        done = subprocess.run(["/bin/sh", "-c", f"'{BUILT}' events owner | head -1"], env=self.env, capture_output=True,
+                              text=True, timeout=20)  # fmt: skip
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("hello", done.stdout)
+        self.assertLess(time.time() - start, 5)
+
+    def test_events_dies_of_sigpipe_under_an_inherited_ignore_while_frames_keep_coming(self):
+        # frames every 0.2 s, so the once-a-second look at stdout never comes into play: only the
+        # SIG_DFL `events` sets ends it at its next line (with SIG_IGN kept, it would write into EPIPE)
+        import threading
+
+        owner = os.path.join(self.state, "owner.json")
+
+        def write(n):
+            with open(owner + ".t", "w") as f:
+                f.write(json.dumps({"n": n}))
+            os.replace(owner + ".t", owner)
+
+        write(0)
+        self.start_cored()
+        stop = threading.Event()
+
+        def writer():
+            n = 0
+            while not stop.wait(0.2):
+                n += 1
+                write(n)
+
+        threading.Thread(target=writer, daemon=True).start()
+        self.addCleanup(stop.set)
+        cli = subprocess.Popen([BUILT, "events", "owner"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               restore_signals=False)  # fmt: skip
+        self.addCleanup(lambda: cli.poll() is None and cli.kill())
+        self.assertIn(b"hello", cli.stdout.readline())
+        cli.stdout.close()
+        cli.wait(timeout=10)
+        self.assertEqual(cli.returncode, -13)
+
+    def test_events_ends_with_its_reader_under_an_ignored_sigpipe_and_no_frames(self):
+        # a parent that ignores SIGPIPE passes it on (restore_signals=False keeps Python's SIG_IGN);
+        # no file changes, so no frame comes after the first ones: the once-a-second look at stdout
+        # (POLLHUP) ends it
+        self.start_cored()
+        cli = subprocess.Popen([BUILT, "events", "owner"], env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               restore_signals=False)  # fmt: skip
+        self.addCleanup(lambda: cli.poll() is None and cli.kill())
+        self.assertIn(b"hello", cli.stdout.readline())
+        time.sleep(0.5)
+        cli.stdout.close()
+        start = time.time()
+        cli.wait(timeout=10)
+        self.assertLess(time.time() - start, 3)
+        self.assertIn(cli.returncode, (0, -13))  # the look, or the next line's SIGPIPE
+
     def test_short_jobs_get_their_peak(self):
         self.start_cored()
         jobs = [self.job(300, 0.3, 0) for _ in range(4)]

@@ -457,6 +457,74 @@ from `janitor.json` holds it as well. Idle is keyboard and mouse only: a video o
 input counts as idle. A user who comes back during a sweep doesn't stop it. `acc-cored janitor-check`
 prints the live reading and what the engine would do.
 
+## Events for hosts
+
+Hosts that show claude-acc's state (AccKit's `AccStore` in PodNative, Pod Menu) watch the state
+directory and read files again on every rename in it. `acc-cored run` serves the same files as a
+stream on its control socket, so a host can subscribe instead:
+- The line `{"op":"events","v":1}` turns the connection into frames: a u32 little-endian length
+  of what follows, a u8 kind, then the payload.
+  - 1 hello (server): `{"v": 1, "topics": [...]}`.
+  - 2 subscribe (client): `{"topics": [...], "have": {topic: seq}, "maxHz": {topic: hz}}`. It is
+    the whole set and replaces the last one, and `have` says what the client holds now.
+  - 3 snapshot (server): a u16 little-endian header length, the header `{"topic", "seq"}`, then
+    the file's exact bytes. A host decodes them with the same `Decodable` it uses on the file.
+  - 4 gone (server): `{"topic"}`, the file isn't there, or isn't a state file: a link, a FIFO
+    (opened without blocking), a device, or a file over 1 MiB.
+  - 5 error (server): `{"code", "msg"}`. An unknown topic is reported and the rest still flows.
+    A frame that isn't a subscribe ends the stream.
+- `seq` is the file's `ino:mtime_ns:size`, the stamp a host computes when it reads the file itself
+  (from `st_mtimespec` in ns, not a `Date`), so `have` holds across a fallback to the files.
+  `pressure`'s seq is devguard-state.json's.
+- Topics:
+  - `accounts` (status.json), `accountsSlot` (accswitch-slot.json), `devguard`, `sched`
+    (sched/state.json), `depot` (sched/depot.json), `awake`, `services` (pod-services.json),
+    `owner`, `menuBar` (menubar.json), `janitor`, `fans` and `hotspot` (their state files);
+  - `pressure`, derived: devguard-state.json's `snapshot.pressure.level` as `{"level": N}`, sent
+    only when the level changes.
+- Latest-wins per topic and client: while a client hasn't taken what was sent, newer versions
+  replace the waiting ones instead of queueing (one flush stays well under the 16 MiB a client may
+  leave unsent). `maxHz` spaces a topic's frames: it's clamped to 0.001-1000, and each client's
+  one timer goes to the earliest topic's turn, so a slow topic doesn't hold back a fast one.
+- A client is dropped when it hasn't subscribed 10 s after the events line, or when its socket
+  took nothing for 30 s while frames waited (it stopped reading; a slow reader that keeps taking
+  stays). The reaper looks every 5 s, so that's 10-15 s and 30-35 s. 16 event clients at most;
+  the 17th gets `busy`.
+- A snapshot's frame is built once per version and shared by every client it goes to: 16 clients
+  that don't read, on 12 topics of 1 MiB and the same version, took the daemon to 31 MB, not
+  225 MB. A slow reader holds the version it's on, though: with each of 16 clients joining after
+  another change of all 12 files, it's 220-252 MB again, the worst case `maxOutbox` bounds (16 ×
+  16 MiB). The hub also holds each watched file twice (its frame and its last data), ~50 KB in
+  practice.
+- A client with a small `SO_RCVBUF` (1024) still gets everything: the hub sets `SO_SNDLOWAT` to 1,
+  since after a drain such a client never leaves the default 2048 bytes of room.
+- `acc-cored events` restores SIGPIPE's default (a parent may pass on SIG_IGN), and checks once a
+  second whether stdout's reader went (POLLHUP), so `| head -1` ends it even while no frame comes.
+- The files stay the contract, written atomically (a rename, as every writer does today: an
+  in-place write can be sent half done). Python writes them, and acc-cored only watches them, and
+  only while someone subscribes. It watches their folders for renames and each subscribed file
+  for writes in place, and stats a file before reading it, so writes to other files in a folder
+  cost a stat each. A folder that's missing is waited for from its nearest parent; a folder made,
+  removed or moved re-arms its watches and re-stamps its topics.
+- The daemon ignores SIGPIPE and sends with `MSG_NOSIGNAL`, so a client gone mid-frame costs
+  nothing. A connection is handed from the control socket to the hub only once its read source's
+  cancel has run, so no source watches a descriptor the hub may close.
+- `acc-cored events [--for SECONDS] TOPIC...` prints one line per frame of a running daemon (line
+  buffered, and it ends when the daemon closes the stream), and `ping` counts the event clients
+  without waiting for the hub.
+- A host should give the hello 1 s at most (a hung daemon accepts connections it never answers)
+  and read the files when the socket is missing or drops.
+
+Cost, measured 2026-10-11 with a release build: a scratch HOME, `run` with no engine, one client
+on every topic for 60 s. The files were written at the live rates counted that day (sched 32/min,
+hotspot 30, devguard 11 at 30 KB, fans 10). The client got exactly one frame per write (83), plus
+10 pressure frames. The daemon used about 0.8 ms/s (the whole process, start included), the client
+under 0.17 ms/s (below `time`'s 10 ms resolution).
+
+After the review fixes (stat before read, a file's own event re-stamps only its topic), 30 s runs
+on the same Mac, the hub before and after: 1.24 and 0.61 ms/s at those rates; with 5 writes/s of
+files no topic names added to the state directory, 2.03 and 1.14 ms/s.
+
 ## Switching
 
 `scripts/acc-cored-switch.sh` swaps three launchd jobs for one acc-cored job, and back: devguard,

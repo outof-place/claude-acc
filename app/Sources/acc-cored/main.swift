@@ -19,8 +19,9 @@ let usage = """
            acc-cored janitor-check        the janitor's due time, idle time, builds and battery, and what run --janitor would do
            acc-cored caps-watch [SECONDS] [--report FILE|-]  how often the capped folders change (FSEvents), nothing run;
                the report (`acc.py devguard caps --dry-run`) adds the folders a run matched, as the guard watches them
-           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--accswitch | --accswitch-shadow FILE] [--janitor] [--for SECONDS] [--wait-lock]
-                                   the daemon
+           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--accswitch | --accswitch-shadow FILE] [--janitor] [--for SECONDS]
+                         [--wait-lock]   the daemon; --wait-lock waits for a running one instead of exiting
+           acc-cored events [--for SECONDS] TOPIC...   the event stream of a running daemon, one line per frame
     """
 
 func json(_ value: Any) -> String {
@@ -300,6 +301,8 @@ case "run":
     let schedRunning = schedEngine
     let switchRunning = switchEngine
     let janitorRunning = janitorEngine
+    // state files as a stream for hosts that subscribe ({"op": "events"}); nothing watched without them
+    let events = EventHub(stateDir: state)
     let control = ControlSocket(path: state + "/acc-cored.sock") { request in
         switch request["op"]?.string {
         case "sched.final":
@@ -309,11 +312,13 @@ case "run":
                 ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
                 ("wakes", .int(schedRunning?.wakeCount.load(ordering: .relaxed) ?? 0)),
                 ("accswitch", switchRunning.map { .object($0.status()) } ?? .bool(false)), ("janitor", .bool(janitorRunning != nil)),
+                ("events", .int(events.count)),
             ]))
         default:
             return .object(PyObject([("ok", false), ("error", "unknown op")]))
         }
     }
+    control.upgrade = { fd, rest in events.adopt(fd, leftover: rest) }
     if !control.start() {
         // without it no wrapper attaches (they ping it first): a path over 104 bytes, or no room
         FileHandle.standardError.write(Data("acc-cored: gniazdo \(state)/acc-cored.sock nie wstało\n".utf8))
@@ -322,6 +327,7 @@ case "run":
     signal(SIGINT, SIG_IGN)
     let stopAll = { (code: Int32) in
         control.stop()
+        events.stop()
         janitorRunning?.stop()
         switchRunning?.stop()
         schedRunning?.stop()
@@ -336,6 +342,14 @@ case "run":
     int.resume()
     if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stopAll(0) } }
     dispatchMain()
+case "events":
+    // a parent that ignores SIGPIPE (perl's $SIG{PIPE}="IGNORE", then exec) passes that on: then
+    // `| head -1` would leave this writing into EPIPE forever
+    signal(SIGPIPE, SIG_DFL)
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let seconds = value("--for", in: args).flatMap { Double($0) }
+    let topics = args.enumerated().filter { $0.element != "--for" && ($0.offset == 0 || args[$0.offset - 1] != "--for") }.map(\.element)
+    EventClient.watch(socket: GuardPaths.state(home) + "/acc-cored.sock", topics: topics, seconds: seconds)
 case "-h", "--help", "help":
     print(usage)
 default:

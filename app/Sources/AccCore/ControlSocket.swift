@@ -3,6 +3,7 @@
 // Requests are answered on the socket's own queue; a handler that needs an engine's queue syncs.
 // A client gets `maxClients` at most, `idleSeconds` without a line before it is closed, and
 // `writeSeconds` to take an answer; with no descriptor left (EMFILE) the listener rests a second.
+// The line {"op": "events"} hands the connection to `upgrade` (EventHub), with what followed it.
 import Darwin
 import Dispatch
 
@@ -13,13 +14,22 @@ public final class ControlSocket: @unchecked Sendable {
     let handler: Handler
     let queue = DispatchQueue(label: "acc-cored.control", qos: .userInitiated)
     var listener: DispatchSourceRead?
-    var clients: [Int32: (DispatchSourceRead, [UInt8])] = [:]
+    var clients: [Int32: (source: DispatchSourceRead, buffer: [UInt8], handOff: HandOff)] = [:]
     var lastSeen: [Int32: Double] = [:]
     var reaper: DispatchSourceTimer?
     var resting = false
     public var maxClients = 32
     public var idleSeconds = 30.0
     public var writeSeconds = 1.0
+    /// takes a connection that asked for events, and the bytes after its line
+    public var upgrade: (@Sendable (Int32, [UInt8]) -> Void)?
+
+    /// What a connection's read source does when it's cancelled: close the descriptor, or hand it
+    /// to `upgrade`. The handover waits for the cancel, so no source here watches a descriptor the
+    /// event hub may close (and a new connection get the same number) meanwhile.
+    final class HandOff: @unchecked Sendable {
+        var to: (@Sendable () -> Void)?
+    }
 
     public init(path: String, handler: @escaping Handler) {
         self.path = path
@@ -73,7 +83,7 @@ public final class ControlSocket: @unchecked Sendable {
     }
 
     func drop(_ fd: Int32) {
-        clients[fd]?.0.cancel()
+        clients[fd]?.source.cancel()
         clients[fd] = nil
         lastSeen[fd] = nil
     }
@@ -82,7 +92,7 @@ public final class ControlSocket: @unchecked Sendable {
         queue.sync {
             reaper?.cancel()
             listener?.cancel()
-            for (_, (source, _)) in clients { source.cancel() }
+            for entry in clients.values { entry.source.cancel() }
             clients.removeAll()
             lastSeen.removeAll()
         }
@@ -124,9 +134,12 @@ public final class ControlSocket: @unchecked Sendable {
             }
             _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL) | O_NONBLOCK)
             let source = DispatchSource.makeReadSource(fileDescriptor: client, queue: queue)
+            let handOff = HandOff()
             source.setEventHandler { [weak self] in self?.read(client) }
-            source.setCancelHandler { close(client) }
-            clients[client] = (source, [])
+            source.setCancelHandler {
+                if let to = handOff.to { to() } else { close(client) }
+            }
+            clients[client] = (source, [], handOff)
             lastSeen[client] = Kernel.monotonic()
             source.resume()
         }
@@ -162,17 +175,27 @@ public final class ControlSocket: @unchecked Sendable {
             drop(fd)
             return
         }
-        entry.1 += chunk[..<n]
+        entry.buffer += chunk[..<n]
         // one request may come in pieces; a line over 1 MiB is not ours
-        if entry.1.count > 1 << 20 {
+        if entry.buffer.count > 1 << 20 {
             drop(fd)
             return
         }
-        while let nl = entry.1.firstIndex(of: 0x0A) {
-            let line = Array(entry.1[..<nl])
-            entry.1.removeSubrange(...nl)
+        while let nl = entry.buffer.firstIndex(of: 0x0A) {
+            let line = Array(entry.buffer[..<nl])
+            entry.buffer.removeSubrange(...nl)
             let answer: PyJSON
-            if let request = (try? PyJSON.loads(bytes: line))?.object {
+            let request = (try? PyJSON.loads(bytes: line))?.object
+            if let request, request["op"] == .string("events"), let upgrade {
+                // from here on the connection speaks frames, on the event hub's queue, once this
+                // source's cancel has run
+                let rest = entry.buffer
+                entry.handOff.to = { upgrade(fd, rest) }
+                entry.source.cancel()
+                clients[fd] = nil
+                lastSeen[fd] = nil
+                return
+            } else if let request {
                 answer = handler(request)
             } else {
                 answer = .object(PyObject([("ok", false), ("error", "not a JSON object")]))
