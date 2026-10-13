@@ -28,7 +28,7 @@ if sys.pycache_prefix is None and not sys.dont_write_bytecode:
     sys.pycache_prefix = os.path.join(os.path.expanduser("~"), ".local", "share", "claude-acc", "pycache")
 
 SCRIPTS = ("accswitch", "admitchain", "awake", "browser", "credits", "desktop", "devguard", "hint", "hook", "hotspot", "janitor",
-           "jobs", "mail", "mailhint", "mcpshare", "orcaplugin", "perf", "sched", "updates")
+           "jobs", "mail", "mailhint", "mcpshare", "orcaplugin", "perf", "sched", "seo", "updates")
 # dawna nazwa skryptu, która może jeszcze stać we wpisie hooka w settings.json
 ALIASES = {"mailhint": "hint"}
 

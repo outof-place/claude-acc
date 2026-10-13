@@ -118,9 +118,10 @@ CACHE_PRUNE = 120 * DAY
 MAX_BODY = 30 * 1024 * 1024
 TITLE_BYTES = 256 * 1024
 SESSION_TIMEOUT = 20 * 60
+MAX_WORDS = 8  # dłuższa fraza nie trafia do puli
 
 # ile sesja może wydać najwyżej; razem mieszczą się w budżecie bloga (domyślnie 1 USD)
-CAPS = {"discovery": 0.40, "cluster": 0.35, "ai": 0.35}
+CAPS = {"discovery": 0.45, "cluster": 0.35, "ai": 0.35}
 TURNS = {"discovery": 30, "cluster": 6, "ai": 30}
 EFFORT = {"discovery": "low", "cluster": "medium", "ai": "low"}
 WEB_TOOLS = ("WebSearch", "WebFetch")
@@ -130,7 +131,7 @@ DEFAULT_LIMITS = {
     "requests": 160,  # zapytań autocomplete z sieci na język i bieg (cache nie liczy się)
     "modifier_seeds": 8,  # tyle pierwszych nasion dostaje modyfikatory pytające
     "letter_seeds": 3,  # tyle pierwszych nasion dostaje litery a-z
-    "discovery_topics": 20,  # nasion dla sesji, która szuka konkurencji
+    "discovery_topics": 12,  # nasion dla sesji, która szuka konkurencji
     "competitors": 5,
     "competitor_urls": 3000,  # adresów z map stron jednej domeny
     "titles": 15,  # tytułów stron luki pobieranych na domenę
@@ -233,6 +234,14 @@ def say(text):
     print(f"[seo] {text}", file=sys.stderr, flush=True)
 
 
+def plural(n, one, few, many):
+    """Liczba z polską formą: 1 klaster, 2 klastry, 5 klastrów (12 do 14 też "many")."""
+    n = int(n)
+    if n == 1:
+        return f"{n} {one}"
+    return f"{n} {few if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else many}"
+
+
 def iso(ts):
     return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
 
@@ -255,7 +264,7 @@ def read_json(path, default=None):
 
 
 def no_dashes(text):
-    return text.replace("—", "-").replace("–", "-")
+    return text.replace("\u2014", "-").replace("\u2013", "-")
 
 
 def clean(text, limit=160):
@@ -301,8 +310,9 @@ def containment(part, whole):
     return len(part & whole) / len(part) if part else 0.0
 
 
-def guess_lang(text, langs):
-    """Język frazy spośród języków bloga: znaki diakrytyczne i słowa funkcyjne."""
+def guess_lang(text, langs, fallback=None):
+    """Język frazy spośród języków bloga: znaki diakrytyczne i słowa funkcyjne; bez żadnego znaku
+    fallback (np. język strony, która ma wyświetlenia), a bez niego pierwszy język bloga."""
     if len(langs) == 1:
         return langs[0]
     low = norm(text)
@@ -313,7 +323,7 @@ def guess_lang(text, langs):
         "cs": {"jak", "co", "pro", "na", "je", "se"}, "uk": {"як", "що", "для"}, "lt": {"kaip", "kas", "ir"},
     }  # fmt: skip
     tokens = set(re.findall(r"\w+", low))
-    best, score = langs[0], 0
+    best, score = fallback if fallback in langs else langs[0], 0
     for lang in langs:
         points = 3 * sum(1 for c in marks.get(lang, "") if c in low) + len(tokens & common.get(lang, set()))
         if points > score:
@@ -379,7 +389,7 @@ def slug_words(url):
     """Temat z adresu: ostatni człon ścieżki bez rozszerzenia, liczb na końcu i myślników."""
     segment = url_path(url).rsplit("/", 1)[-1]
     segment = urllib.parse.unquote(re.sub(r"\.(html?|php|aspx?)$", "", segment, flags=re.IGNORECASE))
-    segment = re.sub(r"([-_]\d+)+$", "", segment)
+    segment = re.sub(r"([-_]\d{6,})+$", "", segment)  # identyfikator wpisu, nie numer normy (en-13150)
     return re.sub(r"[-_+]+", " ", segment).strip()
 
 
@@ -702,10 +712,10 @@ def gsc_rows(ctx, blog):
         item["position"] = round(item.pop("weighted") / item["impressions"], 1)
         # język z adresu strony, która dostaje wyświetlenia (/pl/..., /de/...), inaczej z samej frazy
         top = max(item["pages"], key=item["pages"].get) if item["pages"] else None
-        item["lang"] = lang_of_path(blog, url_path(top)) if top and len(blog["langs"]) > 1 else guess_lang(item["query"], blog["langs"])
+        item["lang"] = guess_lang(item["query"], blog["langs"], lang_of_path(blog, url_path(top)) if top else None)
     stale = age_days > float(spec.get("max_age_days", 8))
     when = datetime.fromtimestamp(os.path.getmtime(path)).strftime("%d.%m")
-    detail = f"{len(agg)} zapytań, cache z {when}" + (f", nieświeży ({age_days:.0f} dni)" if stale else "") + (f"; {ran}" if ran else "")
+    detail = f"{plural(len(agg), 'zapytanie', 'zapytania', 'zapytań')}, cache z {when}" + (f", nieświeży ({age_days:.0f} dni)" if stale else "") + (f"; {ran}" if ran else "")
     return agg, source("gsc", bool(agg), detail, len(agg), degraded=stale)
 
 
@@ -901,7 +911,8 @@ def load_posts(ctx, blog):
             path = url_path(url)
             posts.append({"url": url, "path": path, "lang": lang_of_path(blog, path),
                           "title": str(item.get(spec.get("title", "title")) or slug_words(url))})  # fmt: skip
-        return posts, source("posts", bool(posts), f"{len(posts)} wpisów z {os.path.basename(spec.get('path', ''))}", len(posts))
+        detail = f"{plural(len(posts), 'wpis', 'wpisy', 'wpisów')} z {os.path.basename(spec.get('path', ''))}"
+        return posts, source("posts", bool(posts), detail, len(posts))
     site = Site(ctx, blog["site"], own=True)
     include = re.compile(spec.get("include") or r"/blog/[^/]+$")
     urls, titles, problems = site.urls([spec.get("url") or blog["site"] + "/sitemap.xml"], 20000, ttl=OWN_SITEMAP_TTL, child_cap=20)
@@ -909,7 +920,7 @@ def load_posts(ctx, blog):
         path = url_path(url)
         if on_domain(url, blog["domain"]) and include.search(path):
             posts.append({"url": url, "path": path, "lang": lang_of_path(blog, path), "title": clean(titles.get(url) or slug_words(url), 140)})
-    detail = f"{len(posts)} wpisów z mapy strony" + (f"; {'; '.join(problems[:2])}" if problems else "")
+    detail = f"{plural(len(posts), 'wpis', 'wpisy', 'wpisów')} z mapy strony" + (f"; {'; '.join(problems[:2])}" if problems else "")
     return posts, source("posts", bool(posts), detail, len(posts), degraded=bool(problems))
 
 
@@ -931,8 +942,9 @@ def build_seeds(blog, gsc, posts):
         queries = sorted((q for q in gsc.values() if q["lang"] == lang and 2 <= len(q["query"].split()) <= 6),
                          key=lambda q: -q["impressions"])  # fmt: skip
         candidates += [q["query"] for q in queries[:8]]
+        # początek tytułu wpisu, gdy tytuł jest w tym języku (slug bywa polski we wszystkich wersjach)
         candidates += [" ".join([w for w in norm(post["title"]).split() if fold(w) not in STOPWORDS][:3])
-                       for post in posts if post["lang"] == lang]  # fmt: skip
+                       for post in posts if post["lang"] == lang and guess_lang(post["title"], blog["langs"], lang) == lang]  # fmt: skip
         seeds, seen = [], set()
         for text in candidates:
             text = norm(text)
@@ -1032,7 +1044,7 @@ def autocomplete(ctx, blog, seeds):
                                        "query": query, "rank": rank})  # fmt: skip
                 found_here += 1
         ctx.save_caches()
-        detail = f"{len(queries)} zapytań: {state['fetched']} z sieci, {state['cached']} z cache"
+        detail = f"{plural(len(queries), 'zapytanie', 'zapytania', 'zapytań')}: {state['fetched']} z sieci, {state['cached']} z cache"
         if state["over"]:
             detail += f", {state['over']} poza limitem tego biegu"
         if stopped:
@@ -1159,12 +1171,14 @@ Topics (language in brackets):
 {lines}
 
 For each topic run one WebSearch in the topic's language and note the domains of the organic results.
+Run the searches in parallel, several WebSearch calls per turn, and do not repeat a search.
 Skip ads, maps, video and social sites. Do not open the pages: the result list is enough.
 {UNTRUSTED}
 
-When done, write exactly one file, {{OUT}}, with JSON and nothing else:
+After every batch of searches, write the file {{OUT}} again with everything found so far, so the
+file is complete even if you are stopped. It holds JSON and nothing else:
 {{"topics": [{{"topic": "<topic text>", "domains": ["example.com", "..."]}}]}}
-Use registrable domains without www."""
+Use registrable domains without www. Write no other file."""
 
 
 def pick_competitors(blog, data, limit):
@@ -1229,7 +1243,7 @@ def site_topics(ctx, origin, cap):
         if len(tokens) < 2 or (navigation and not content) or (not content and len(tokens) < 3):
             continue
         topics.append({"url": url, "text": text, "titled": url in titles})
-    detail = f"{len(urls)} adresów, {len(topics)} tematów" + (f"; {'; '.join(problems[:2])}" if problems else "")
+    detail = f"{plural(len(urls), 'adres', 'adresy', 'adresów')}, {plural(len(topics), 'temat', 'tematy', 'tematów')}" + (f"; {'; '.join(problems[:2])}" if problems else "")
     return site, topics, source(name, bool(topics), detail, len(topics), degraded=bool(problems) and not topics)
 
 
@@ -1306,14 +1320,19 @@ def build_pool(blog, gsc, hits, gaps):
     def entry(text, lang):
         return pool.setdefault(text, {"text": text, "lang": lang, "gsc": None, "ac": [], "comp": [], "bing": None, "demand": 0.0})
 
+    def usable(text):
+        # zapytanie dłuższe niż MAX_WORDS słów to zwykle rozmowa z wyszukiwarką AI, nie temat wpisu
+        return text and len(text.split()) <= MAX_WORDS and not branded(text, blog)
+
     for query, row in gsc.items():
-        if not branded(query, blog):
+        if usable(query):
             entry(query, row["lang"])["gsc"] = row
     for key, hit in hits.items():
-        entry(key, hit["lang"])["ac"] = hit["ev"]
+        if usable(key):
+            entry(key, hit["lang"])["ac"] = hit["ev"]
     for gap in gaps:
         text = norm(gap["text"])
-        if text and not branded(text, blog):
+        if usable(text):
             entry(text, guess_lang(text, blog["langs"]))["comp"] = gap["ev"]
     score_demand(pool)
     return pool
@@ -1373,7 +1392,7 @@ def signals(p):
 # ---------- klastry ----------
 
 
-def context_text(blog, cap=6000):
+def context_text(blog, cap=4000):
     parts = []
     for path in blog["context"]:
         try:
@@ -1607,6 +1626,7 @@ def ai_prompt(blog, queries):
     return f"""You act as an AI answer engine (like ChatGPT search, Perplexity or Google AI Overviews).
 For each query below, run WebSearch in the query's language, answer it in one sentence, and list the
 3 to 6 pages you would cite as sources of that answer. Do not favour or avoid any particular site.
+Run the searches in parallel, several WebSearch calls per turn, one search per query.
 {UNTRUSTED}
 
 Queries (language in brackets):
@@ -1797,8 +1817,9 @@ def table(clusters, n=20):
 def wynik_lines(blog, clusters, sources, ai, pool_size, path, outcome):
     fresh = sum(1 for c in clusters if c["action"] == "new")
     lines = [f"WYNIK: {outcome}"]
-    lines.append(f"Research słów kluczowych {blog['name']}: {len(clusters)} klastrów ({fresh} nowych, "
-                 f"{len(clusters) - fresh} do odświeżenia) z {pool_size} fraz.")  # fmt: skip
+    lines.append(f"Research słów kluczowych {blog['name']}: {plural(len(clusters), 'klaster', 'klastry', 'klastrów')} "
+                 f"({plural(fresh, 'nowy', 'nowe', 'nowych')}, {len(clusters) - fresh} do odświeżenia) "
+                 f"z {plural(pool_size, 'frazy', 'fraz', 'fraz')}.")  # fmt: skip
     if clusters:
         lines.append("Najlepsze: " + "; ".join(f"\"{c['target']}\" ({c['score']:.0f}, {'nowy' if c['action'] == 'new' else 'odśwież'})" for c in clusters[:3]))
     lines.append("Źródła: " + "; ".join(f"{s['name']} {'ok' if s['ok'] else 'pominięte' if s['skipped'] else 'brak'}: {s['detail']}" for s in sources))
@@ -1861,7 +1882,7 @@ def research(ctx, blog, dry=False, ai=None, config_path=None, out_dir=None):
     print(table(clusters))
     if dry:
         unranked = sum(1 for c in clusters[:20] if not c["ranks_today"])
-        print(no_dashes(f"\nNa sucho: nic nie zapisano. W pierwszej 20: {unranked} klastrów bez pozycji w GSC. "
+        print(no_dashes(f"\nNa sucho: nic nie zapisano. W pierwszej 20: {plural(unranked, 'klaster', 'klastry', 'klastrów')} bez pozycji w GSC. "
                         f"Koszt sesji: {ctx.spent:.2f} USD."))  # fmt: skip
         for s in sources:
             print(no_dashes(f"  {s['name']}: {'ok' if s['ok'] else 'pominięte' if s['skipped'] else 'brak'}, {s['detail']}"))
@@ -1880,8 +1901,9 @@ def research(ctx, blog, dry=False, ai=None, config_path=None, out_dir=None):
     degraded = [f"{s['name']}: {s['detail']}" for s in sources if (not s["ok"] and not s["skipped"]) or s["degraded"]]
     fresh = sum(1 for c in clusters if c["action"] == "new")
     write_result({
-        "outcome": "OPUBLIKOWANO", "title": f"Research słów kluczowych {blog['name']}: {len(clusters)} klastrów",
-        "reason": no_dashes(f"keywords.json: {len(clusters)} klastrów ({fresh} nowych, {len(clusters) - fresh} do odświeżenia)"
+        "outcome": "OPUBLIKOWANO", "title": f"Research słów kluczowych {blog['name']}: {plural(len(clusters), 'klaster', 'klastry', 'klastrów')}",
+        "reason": no_dashes(f"keywords.json: {plural(len(clusters), 'klaster', 'klastry', 'klastrów')} "
+                            f"({plural(fresh, 'nowy', 'nowe', 'nowych')}, {len(clusters) - fresh} do odświeżenia)"
                             + (f"; AI share of voice {summary['cited']}/{summary['checked']} (przybliżone)" if summary else "")),
         "urls": [], "pr": None, "retryable": False, "notes": no_dashes("; ".join(degraded))[:600],
     })  # fmt: skip
