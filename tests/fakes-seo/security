@@ -1,0 +1,4 @@
+#!/bin/sh
+# atrapa Pęku kluczy dla testów seo.py: wpisu nie ma (jak klucz Bing, którego Filip jeszcze nie dodał)
+echo "security: The specified item could not be found in the keychain." >&2
+exit 44

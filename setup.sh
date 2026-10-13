@@ -322,6 +322,8 @@ case "$1" in
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
   # biegi blogów bez człowieka: płatnik z puli, licznik, limity czuwania, zapis biegu (jobs.py)
   jobs) shift; exec "$PY" "$RUN" jobs "$@" ;;
+  # research słów kluczowych blogów: keywords.json w ~/.local/share/claude-acc/seo/<blog> (seo.py)
+  seo) shift; exec "$PY" "$RUN" seo "$@" ;;
   # wspólne serwery MCP: jeden proces stdio dla wszystkich sesji Claude Code
   mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)
