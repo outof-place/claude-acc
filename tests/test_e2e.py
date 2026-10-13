@@ -269,6 +269,24 @@ class LoginTest(unittest.TestCase):
             self.assertEqual(live.get("mcpOAuth"), {"srv": "runtime-own"}, service)
         self.assertIsNone(w.login_entry())
 
+    def test_login_shows_renewed_subscription_at_once(self):
+        # konto odnowiło subskrypcję i zalogowano je ponownie, a panel jeszcze godzinę
+        # pokazywał "Subscription canceled · skipped" z pamięci sprzed odnowienia
+        w = Env()
+        a = w.account("a@x")
+        w.account("b@x", weekly_used=20)
+        w.runtime(a)
+        w.write()
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()), "email": "b@x", "status": "canceled"}})
+
+        r = w.run("login", "b@x")
+        snap = json.loads(w.run("status", "--json").stdout)
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        row = next(x for x in snap["accounts"] if x["email"] == "b@x")
+        self.assertEqual(row["subscription_status"], "active")
+        self.assertTrue(row["usable"])
+
     def test_login_as_other_account_changes_nothing(self):
         w = Env()
         before = w.account("a@x", alive=False)
@@ -502,14 +520,15 @@ class PanelFreshnessTest(unittest.TestCase):
         self.assertIsNone(row["queue"])
 
     def test_renewed_subscription_returns_to_rotation_by_itself(self):
-        # status anulowanego konta sprawdzany w profilu co godzinę: po odnowieniu konto
-        # wraca do kolejki bez ręcznego grzebania w stanie (przy 12 h czekało pół dnia)
+        # status anulowanego konta sprawdzany w profilu co 10 minut: po odnowieniu konto
+        # wraca do kolejki bez ręcznego grzebania w stanie (przy godzinie panel długo
+        # pokazywał odnowione konto jako pominięte, przy 12 h czekało pół dnia)
         w = Env()
         a = w.account("a@x")
         w.account("b@x", weekly_used=20)
         w.runtime(a)
         w.write()
-        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 2 * 3600, "email": "b@x",
+        w.state(identity={w.ids["b@x"]: {"ts": int(time.time()) - 15 * 60, "email": "b@x",
                                          "status": "canceled"}})
 
         snap = json.loads(w.run("status", "--json").stdout)

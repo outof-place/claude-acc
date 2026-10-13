@@ -155,6 +155,9 @@ FULL_RECHECK = 3 * 3600
 PEAK_BURN = {"five_hour": 5.0, "seven_day": 1.0}
 # odczyt aktywnego konta: najczęściej co przebieg automatu (launchd co 120 s), najrzadziej co kwadrans
 ACTIVE_MAX_AGE = (100, 900)
+# Status subskrypcji konta pominiętego (canceled itp.) sprawdzamy w profilu, który nie dławi.
+# Co godzinę to było za rzadko: odnowione konto wisiało w panelu jako pominięte
+LAPSED_RECHECK = 600
 
 DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
 DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
@@ -819,6 +822,11 @@ def identity(account, cfg, max_age=12 * 3600, refresh=True):
     profile = fetch_profile(oauth_of(creds)["accessToken"])
     if not profile:
         return hit
+    return remember_identity(account, profile)
+
+
+def remember_identity(account, profile):
+    """Zapisuje, kim jest konto według odpowiedzi API profilu."""
     org = profile.get("organization") or {}
     info = {
         "ts": int(time.time()),
@@ -1318,11 +1326,11 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
         may_refresh = refresh(a) if callable(refresh) else refresh
         # Anulowane konto automat pomija. Limitów o nie nie pytamy: API odpowiada
         # 403, a panel pytał co minutę i przybliżał 429 dla reszty kont. Status
-        # sprawdzamy w profilu co godzinę (ten endpoint nie dławi), więc po
-        # odnowieniu konto szybko samo wraca do rotacji.
+        # sprawdzamy w profilu co LAPSED_RECHECK, więc po odnowieniu konto szybko
+        # samo wraca do rotacji.
         status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
         if status and status != "active":
-            status = (identity(a, cfg, max_age=3600, refresh=may_refresh) or {}).get("status")
+            status = (identity(a, cfg, max_age=LAPSED_RECHECK, refresh=may_refresh) or {}).get("status")
         if status and status != "active":
             rows.append({"account": a, "data": None, "why": f"subskrypcja: {status}, automat pomija",
                          "usable": False, "error": True, "skipped": True})
@@ -1945,6 +1953,8 @@ def cmd_login(cfg, args):
             kc_write(runtime, KEYCHAIN_USER, with_oauth(current, fresh))
             log(f"login: nowy token {email} wpisany do {runtime}")
     clear_needs_login(target)
+    # profil z tego logowania jest świeży: odnowioną subskrypcję widać od razu, nie po LAPSED_RECHECK
+    remember_identity(target, profile)
     cache = load_json(USAGE_CACHE_PATH, {})
     if cache.pop(email, None) is not None:
         write_json(USAGE_CACHE_PATH, cache)
