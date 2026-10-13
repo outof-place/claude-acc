@@ -75,6 +75,26 @@ JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.dev
 # ~/Library/LaunchAgents, bo taki agent to osobna tożsamość TCC, a admitd wchodzi do katalogów agentów
 POD_JOBS="com.filip.claude-acc.admit"
 
+# tick kont schodzi pod blokadą automatu: żaden tick nie jest wtedy między odświeżeniem tokenu a zapisem
+# do Pęku kluczy (blokada trzymana ponad 150 s: bootout idzie i tak, jak dotąd). Niezaładowany job
+# nie czeka na blokadę: zawieszony `status` kosztowałby 150 s za nic
+bootout_job() {
+  local job=$1
+  shift
+  launchctl print "gui/$(id -u)/$job" >/dev/null 2>&1 || return 0
+  if [ "$job" = com.filip.claude-acc ] && /usr/bin/lockf -k -t 150 "$STATE/lock" launchctl bootout "$@" 2>/dev/null; then
+    return 0
+  fi
+  launchctl bootout "$@" 2>/dev/null || true
+}
+
+# acc-cored z przełączenia (scripts/acc-cored-switch.sh): pod KeepAlive tikałby dalej automat kont
+# i odświeżał tokeny ze $STATE obok agentów Pod albo po deinstalacji, więc schodzi razem z resztą
+drop_cored() {
+  launchctl bootout "gui/$(id -u)/com.filip.claude-acc.cored" 2>/dev/null || true
+  rm -f "$AGENTS/com.filip.claude-acc.cored.plist" "$STATE/acc-cored-switch.json"
+}
+
 APP_SRC=""
 FANCTL=""
 HOOK=""
@@ -93,8 +113,9 @@ while [ $# -gt 0 ]; do
     --orca-plugin) ORCA_PLUGIN=1; shift ;;
     --owner|--owner-app) shift 2 ;;
     --uninstall)
+      drop_cored
       for job in $JOBS; do
-        launchctl bootout "gui/$(id -u)" "$AGENTS/$job.plist" 2>/dev/null || true
+        bootout_job "$job" "gui/$(id -u)" "$AGENTS/$job.plist"
         rm -f "$AGENTS/$job.plist"
       done
       pkill -x ClaudeAcc 2>/dev/null || true
@@ -391,15 +412,18 @@ chmod +x "$HOME/.local/bin/claude-acc"
 # perf keep co 5 minut (poprawki Ultra wracają na nowe pid i po restarcie), aktualizacje o 4:30 co 3 dni,
 # harmonogram blogów (jobs tick) co 2 minuty
 # Z --pod-agents te same automaty to agenty Pod (codes.pod.app.acc.*, SMAppService): stare zdejmujemy
+if [ -n "$POD_AGENTS" ]; then
+  drop_cored
+fi
 for job in $JOBS; do
   plist="$AGENTS/$job.plist"
   if [ -n "$POD_AGENTS" ]; then
-    launchctl bootout "gui/$(id -u)/$job" 2>/dev/null || true
+    bootout_job "$job" "gui/$(id -u)/$job"
     rm -f "$plist"
     continue
   fi
   sed "s|__HOME__|$HOME|g" "$SRC/launchd/$job.plist.template" > "$plist"
-  launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+  bootout_job "$job" "gui/$(id -u)" "$plist"
   launchctl bootstrap "gui/$(id -u)" "$plist"
 done
 

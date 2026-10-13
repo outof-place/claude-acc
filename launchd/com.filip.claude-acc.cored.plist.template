@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.filip.claude-acc.cored</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/share/claude-acc/acc-cored</string>
+    <string>run</string>
+    <string>--guard</string>
+    <string>--sched</string>
+    <string>--accswitch</string>
+    <string>--janitor</string>
+    <string>--wait-lock</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <!-- Interactive, as the devguard job it replaces: the guard must get CPU exactly when the Mac
+       is choking. The janitor's sweep goes to the background band on its own (taskpolicy -b). -->
+  <key>ProcessType</key><string>Interactive</string>
+  <!-- stopping ends Python's guard loop (up to 10 s) before the lock goes; the tick isn't in this job's group -->
+  <key>ExitTimeOut</key><integer>30</integer>
+  <key>StandardOutPath</key><string>__HOME__/.local/share/claude-acc/acc-cored-launchd.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.local/share/claude-acc/acc-cored-launchd.log</string>
+</dict>
+</plist>

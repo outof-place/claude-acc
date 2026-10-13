@@ -459,13 +459,52 @@ prints the live reading and what the engine would do.
 
 ## Switching
 
-Not done by this branch. The plan:
-- Pod registers `codes.pod.app.acc.cored` in place of the devguard agent.
-- Standalone installs swap `com.filip.claude-acc.devguard` for a `cored` plist.
-- Undo: bootout the cored job and bootstrap the devguard plist again.
+`scripts/acc-cored-switch.sh` swaps three launchd jobs for one acc-cored job, and back: devguard,
+the accswitch tick (`com.filip.claude-acc`) and the janitor. Standalone installs only: Pod
+registers its own agents, so where `owner.json` says Pod owns claude-acc, `on` refuses with exit 3
+(`owner.py check`, as setup.sh does), and it exits 1 when none of the three jobs is loaded. A
+tombstone (handed back to Homebrew, uninstalled) is a standalone install again.
 
-The scheduler needs no switch of its own. Wrappers use acc-cored only while it runs with `--sched`
-and marks the state, and they fall back on their own when it stops.
+    scripts/acc-cored-switch.sh status
+    scripts/acc-cored-switch.sh on  [--apply] [--binary PATH]
+    scripts/acc-cored-switch.sh off [--apply]
 
-Both guard loops hold `devguard.lock`, so they never run together. `acc-cored guard --shadow FILE` runs
-the native loop beside the Python one, observe-only, and writes its state to FILE.
+- **Check-only by default:** without `--apply` it prints what it would do.
+- **`on`:**
+  - It installs the binary as `$STATE/acc-cored` (a temp file, then a rename: overwriting a
+    running binary gets its next launch killed) and writes `com.filip.claude-acc.cored.plist`. The
+    job runs `acc-cored run --guard --sched --accswitch --janitor` as `ProcessType Interactive`,
+    with `KeepAlive`.
+  - It writes the plist and records the jobs it stops in `$STATE/acc-cored-switch.json` first, so
+    a Ctrl-C later still leaves `off` what to bring back.
+  - The tick's job goes first, under the switcher's own lock (`lockf -k -t 150 $STATE/lock`), so
+    no tick is between a token refresh and its Keychain write when launchd stops it. Whether it
+    went is what launchd says afterwards, not bootout's exit code. If it's still loaded (the lock
+    held past 150 s by a hung `claude-acc status`, say), the script removes the record and the
+    plist again and exits 1: no other job goes and no acc-cored starts (the new binary is in
+    place).
+  - Then it boots out the other two and bootstraps acc-cored (one launchd doesn't have loaded
+    afterwards exits 1 and points at `off`). The job runs with `--wait-lock` and `ExitTimeOut` 30 s (stopping ends
+    Python's guard loop first, up to 10 s).
+  - setup.sh boots the tick's job out under the same lock too (past 150 s, without it, as before),
+    and only when launchd has it loaded. `setup.sh --uninstall` and `--pod-agents` take acc-cored
+    down as well, with its plist and the record: under KeepAlive it would go on ticking accswitch
+    beside Pod's agents or after an uninstall.
+  - The three plists stay where setup.sh wrote them.
+- **`off`** is the undo. It boots acc-cored out, bootstraps the recorded jobs from their plists
+  again, and removes the plist and the record. Each step is judged by what launchd says afterwards,
+  as in `on`. If any of them didn't take (or a job's plist is missing), the record and the plist
+  stay and it exits 1, so it can run again.
+- **After a setup.sh run**, the three jobs come back beside acc-cored. The two guards then share
+  `devguard.lock`, the ticks the switcher's lock, and the sweeps `janitor.lock`, so they take turns
+  instead of acting twice. Run `off` and `on` again after it.
+- **With main's Python** (no `tick_due`, no sched cooperation) acc-cored still works:
+  - the tick runs in every slot, as launchd ran it;
+  - wrappers keep their own loops, and the sched pass stays idle;
+  - the guard and the janitor gain fully.
+
+Before the first live switch: measure the stage-3 handover latency (a cold `devguard once` under
+memory pressure).
+
+`acc-cored guard --shadow FILE` runs the native guard beside the Python one, observe-only, and
+writes its state to FILE. `run --accswitch-shadow FILE` does the same for the tick.
