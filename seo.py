@@ -122,7 +122,7 @@ MAX_WORDS = 8  # dłuższa fraza nie trafia do puli
 
 # ile sesja może wydać najwyżej; razem mieszczą się w budżecie bloga (domyślnie 1 USD)
 # discovery biegnie raz na blog (potem konkurencja jest przypięta); WebSearch to ok. 0,04 USD za szukanie
-CAPS = {"discovery": 0.60, "cluster": 0.35, "ai": 0.35}
+CAPS = {"discovery": 0.60, "cluster": 0.35, "ai": 0.45}
 TURNS = {"discovery": 30, "cluster": 6, "ai": 30}
 EFFORT = {"discovery": "low", "cluster": "medium", "ai": "low"}
 WEB_TOOLS = ("WebSearch", "WebFetch")
@@ -138,7 +138,7 @@ DEFAULT_LIMITS = {
     "titles": 15,  # tytułów stron luki pobieranych na domenę
     "phrases": 350,  # fraz dla sesji klastrowania
     "clusters": 60,  # klastrów w keywords.json
-    "ai_queries": 10,
+    "ai_queries": 8,
 }
 MODIFIERS = {
     "pl": ("jak", "ile", "czy", "co to", "dlaczego", "jaki"),
@@ -1655,14 +1655,16 @@ def ai_prompt(blog, queries):
     return f"""You act as an AI answer engine (like ChatGPT search, Perplexity or Google AI Overviews).
 For each query below, run WebSearch in the query's language, answer it in one sentence, and list the
 3 to 6 pages you would cite as sources of that answer. Do not favour or avoid any particular site.
-Run the searches in parallel, several WebSearch calls per turn, one search per query.
+Work in batches of at most 4 searches per turn, one search per query.
 {UNTRUSTED}
 
 Queries (language in brackets):
 {lines}
 
-Write exactly one file, {{OUT}}, with JSON and nothing else:
-{{"answers": [{{"id": 1, "answer": "...", "sources": ["https://...", "..."]}}]}}"""
+After every batch, before the next one, write the file {{OUT}} again with all answers so far, so the
+file is complete even if you are stopped. It holds JSON and nothing else:
+{{"answers": [{{"id": 1, "answer": "...", "sources": ["https://...", "..."]}}]}}
+Write no other file."""
 
 
 def ai_visibility(ctx, blog, clusters):
