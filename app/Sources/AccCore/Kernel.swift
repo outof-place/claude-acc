@@ -29,6 +29,11 @@ public enum Kernel {
         return (usage.xsu_total, usage.xsu_used)
     }
 
+    /// Seconds on a clock that a wall-clock change doesn't move (deadlines, idle times)
+    public static func monotonic() -> Double {
+        Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1e9
+    }
+
     /// Wall clock in seconds, as Python's time.time().
     public static func wall() -> Double {
         var spec = timespec()

@@ -14,6 +14,9 @@ let usage = """
            acc-cored guard-replay F.jsonl [--show N]   the native guard tick on parity fixtures
            acc-cored guard-bench [N]      N ticks back to back, CPU per phase
            acc-cored orca-read            the host's four reads over its socket, timed
+           acc-cored sched-replay F.jsonl [--show N]   the scheduler's housekeeping on parity fixtures
+           acc-cored sched-scan [--sims-since T] [--sims-only]   native_scan() as JSON (parity)
+           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS] [--wait-lock]   the daemon
     """
 
 func json(_ value: Any) -> String {
@@ -185,6 +188,112 @@ case "guard":
     int.setEventHandler { stop(0) }
     int.resume()
     if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stop(0) } }
+    dispatchMain()
+case "sched-replay":
+    guard let path = args.first, let data = Files.read(path) else { fail(usage) }
+    let show = value("--show", in: args).flatMap { Int($0) } ?? 3
+    var same = 0, different = 0, shown = 0
+    for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where !line.isEmpty {
+        guard let fixture = (try? PyJSON.loads(String(line)))?.object else { fail("unreadable fixture") }
+        let diffs = Sched.replay(fixture)
+        if diffs.isEmpty {
+            same += 1
+        } else {
+            different += 1
+            if shown < show {
+                shown += 1
+                print("fixture \(same + different): \(diffs.count) differences")
+                for d in diffs.prefix(12) { print("  " + d) }
+            }
+        }
+    }
+    print("same \(same), different \(different)")
+    if same + different == 0 { fail("no fixtures in \(path)", 1) }  // an empty file proves nothing
+    exit(different == 0 ? 0 : 1)
+case "sched-scan":
+    // native_scan() as JSON: what builds and simulators the scheduler counts (parity)
+    let since = value("--sims-since", in: args).flatMap { Double($0) }
+    let r = SchedNative.scan(simsSince: since, builds: !args.contains("--sims-only"))
+    print(PyJSON.object(PyObject([
+        ("gb", .double(r.gb)), ("active", .bool(r.active)), ("pids", .array(r.pids.sorted().map { .int(Int($0)) })),
+    ])).dumps())
+case "run":
+    // the daemon: the parts asked for, and the control socket ($STATE/acc-cored.sock)
+    // A peer gone mid-write (a wrapper whose call timed out, a host that quit) is EPIPE here, never
+    // the death of every engine in this process. Children get every signal back at its default
+    // (Spawn's posix_spawnattr_setsigdefault), and the commands that print keep the default too,
+    // so `acc-cored events | head` ends with its reader.
+    signal(SIGPIPE, SIG_IGN)
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let state = GuardPaths.state(home)
+    let shadow = value("--shadow-guard", in: args)
+    let seconds = value("--for", in: args).flatMap { Double($0) }
+    // one daemon per user: a second one would take the control socket and flip the sched mark
+    Files.mkdirs(state)
+    let instance = open(state + "/acc-cored.lock", O_WRONLY | O_CREAT | O_CLOEXEC, 0o600)
+    guard instance >= 0 else { fail("acc-cored: brak \(state)/acc-cored.lock") }
+    if flock(instance, LOCK_EX | LOCK_NB) != 0 {
+        // launchd (KeepAlive) would start an exiting second one every 10 s: it waits for the lock
+        guard args.contains("--wait-lock") else {
+            print("acc-cored już działa")
+            exit(0)
+        }
+        print("acc-cored już działa, czekam na jego koniec")
+        while flock(instance, LOCK_EX) != 0 {
+            guard errno == EINTR else { fail("acc-cored: blokada \(state)/acc-cored.lock: errno \(errno)") }
+        }
+    }
+    var guardEngine: GuardEngine?
+    if args.contains("--guard") || shadow != nil {
+        let engine = GuardEngine(.init(home: home, shadow: shadow != nil, shadowPath: shadow))
+        guard engine.start() else {
+            print("strażnik już działa")
+            exit(0)
+        }
+        guardEngine = engine
+    }
+    var schedEngine: SchedEngine?
+    if args.contains("--sched") {
+        let engine = SchedEngine(stateDir: state)
+        // the snapshot the wrappers read is devguard-state.json's: a shadow guard's is its own
+        if let guardEngine, shadow == nil { engine.snapshot = { guardEngine.latestSnapshot() } }
+        engine.start()
+        schedEngine = engine
+    }
+    let guardRunning = guardEngine
+    let schedRunning = schedEngine
+    let control = ControlSocket(path: state + "/acc-cored.sock") { request in
+        switch request["op"]?.string {
+        case "sched.final":
+            return schedRunning?.final(request["id"]?.string ?? "") ?? .object(PyObject([("ok", false)]))
+        case "ping":
+            return .object(PyObject([
+                ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
+                ("wakes", .int(schedRunning?.wakeCount.load(ordering: .relaxed) ?? 0)),
+            ]))
+        default:
+            return .object(PyObject([("ok", false), ("error", "unknown op")]))
+        }
+    }
+    if !control.start() {
+        // without it no wrapper attaches (they ping it first): a path over 104 bytes, or no room
+        FileHandle.standardError.write(Data("acc-cored: gniazdo \(state)/acc-cored.sock nie wstało\n".utf8))
+    }
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let stopAll = { (code: Int32) in
+        control.stop()
+        schedRunning?.stop()
+        guardRunning?.stop()
+        exit(code)
+    }
+    let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    term.setEventHandler { stopAll(0) }
+    term.resume()
+    let int = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    int.setEventHandler { stopAll(0) }
+    int.resume()
+    if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stopAll(0) } }
     dispatchMain()
 case "-h", "--help", "help":
     print(usage)

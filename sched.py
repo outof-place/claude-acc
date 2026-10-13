@@ -484,6 +484,82 @@ def alive(pid):
     return True
 
 
+# acc-cored (natywny demon claude-acc, docs/acc-cored.md) robi pracę „co sekundę” za wszystkie wrappery
+# naraz: heartbeaty, reap, refresh_memory, safety, plan i widok kolejki. Wrapper, który go widzi, czeka
+# w kolejce na SIGUSR1 (plan go wpuścił) zamiast co 0,5 s, a job pilnuje wait4 zamiast pętli 4 Hz; budzi
+# się co CORED_WAKE_S po swoje (log postoju, limit klasy) i żeby sprawdzić, czy acc-cored dalej działa
+CORED_SOCK = os.path.join(STATE_DIR, "acc-cored.sock")
+CORED_WAKE_S = 5.0
+# znaczenie znaku i gniazda; acc-cored innej wersji to dla wrappera brak acc-cored
+CORED_PROTO = 1
+# znak starszy niż tyle przy podłączonym wrapperze: acc-cored stoi (zatrzymany, zawieszony na blokadzie),
+# więc wrapper wraca do własnych pętli; przebieg acc-cored odświeża znak co sekundę
+CORED_STALE_S = 3.0
+
+
+def cored_mark(state):
+    """pid acc-cored ze znaku w stanie, gdy to żywy acc-cored tej samej wersji; inaczej None.
+    SCHED_NO_CORED=1 zostawia wrapper przy własnych pętlach."""
+    if os.environ.get("SCHED_NO_CORED"):
+        return None
+    mark = state.get("cored") or {}
+    pid = mark.get("pid")
+    if mark.get("proto") != CORED_PROTO or not isinstance(pid, int) or pid <= 1 or not alive(pid):
+        return None
+    return pid if proc_name(pid) == "acc-cored" else None
+
+
+def cored_ping():
+    """Czy gniazdo acc-cored odpowiada: bez jobów znak w stanie bywa stary (acc-cored pisze go wtedy
+    raz), więc przed podłączeniem o życie pytamy gniazdo, poza blokadą schedulera."""
+    if os.environ.get("SCHED_NO_CORED") or not os.path.exists(CORED_SOCK):
+        return False
+    return cored_call({"op": "ping"}, timeout=0.2) is not None
+
+
+def cored_live(state):
+    """Czy podłączony wrapper może dalej polegać na acc-cored: żywy znak, odświeżony w CORED_STALE_S."""
+    if not cored_mark(state):
+        return False
+    at = (state.get("cored") or {}).get("at")
+    return isinstance(at, (int, float)) and time.time() - at <= CORED_STALE_S
+
+
+def cored_waker():
+    """kqueue z każdą próbą doręczenia SIGUSR1, którym acc-cored budzi czekający wrapper. Sygnał ma pusty
+    handler, więc wrappera nie zabije (także spóźniony, po wpuszczeniu); kqueue liczy próby i tak
+    (EVFILT_SIGNAL). Nie SIG_IGN: ignorowany sygnał przeszedłby przez exec do joba, handler wraca do
+    domyślnego."""
+    import select
+    import signal
+
+    signal.signal(signal.SIGUSR1, lambda _sig, _frame: None)
+    kq = select.kqueue()
+    kq.control([select.kevent(signal.SIGUSR1, filter=select.KQ_FILTER_SIGNAL, flags=select.KQ_EV_ADD)], 0, 0)
+    return kq
+
+
+def cored_call(request, timeout=1.0):
+    """Jedno pytanie do gniazda acc-cored; jego odpowiedź z "ok" albo None."""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_UNIX) as conn:
+            conn.settimeout(timeout)
+            conn.connect(CORED_SOCK)
+            conn.sendall(json.dumps(request).encode() + b"\n")
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        answer = json.loads(buf)
+    except (OSError, ValueError):
+        return None
+    return answer if isinstance(answer, dict) and answer.get("ok") else None
+
+
 def fake_memory():
     """Pamięć z pliku SCHED_FAKE_MEMORY (testy) albo None."""
     path = os.environ.get("SCHED_FAKE_MEMORY")
@@ -2498,15 +2574,110 @@ def save_cache(cache):
     os.replace(tmp, CACHE_PATH)
 
 
+def boot_session():
+    """Ten start systemu (kern.bootsessionuuid): nowy po każdym restarcie, a zmiana zegara go nie
+    rusza (kern.boottime przesuwa każdy settimeofday). None, gdy jądro nie odpowie."""
+    if not _BOOT:
+        k = kernel()
+        buf = k.ctypes.create_string_buffer(64)
+        size = k.ctypes.c_size_t(64)
+        ok = k.libc.sysctlbyname(b"kern.bootsessionuuid", buf, k.ctypes.byref(size), None, 0) == 0
+        _BOOT.append((buf.value.decode("ascii", "replace") or None) if ok else None)
+    return _BOOT[0]
+
+
+_BOOT = []
+
+
+def stale(job, session):
+    """Wpis z innego startu systemu: jego boot_session to nie dzisiejsza sesja. Jego pid i grupa
+    należą dziś do obcych procesów, a p_uniqueid liczy się po restarcie od nowa (na początku równy
+    pidowi), więc ta sama para (pid, p_uniqueid) bywa już czyjaś. Wpis bez boot_session (sprzed tej
+    reguły) nie jest stary: sygnału i tak nie dostanie (group_of)."""
+    mine = job.get("boot_session")
+    return isinstance(mine, str) and session is not None and mine != session
+
+
+def same_boot(job, session):
+    """Wpis z tego startu systemu: zapisał w boot_session dzisiejszą sesję."""
+    return session is not None and job.get("boot_session") == session
+
+
+PROC_PIDUNIQIDENTIFIERINFO = 17
+UNIQIDENTIFIERINFO_SIZE = 56  # struct proc_uniqidentifierinfo: p_uuid[16], potem p_uniqueid (u64)
+
+
+def proc_uid(pid):
+    """p_uniqueid procesu albo None, gdy go nie ma. Jądro nadaje go przy fork i nie powtarza do
+    restartu, więc pid użyty ponownie ma inny, a zmiana zegara go nie rusza. W odróżnieniu od
+    proc_bsdinfo (EPERM) działa też dla procesów innych użytkowników, np. wrappera spod sudo."""
+    k = kernel()
+    buf = k.ctypes.create_string_buffer(UNIQIDENTIFIERINFO_SIZE)
+    got = k.libc.proc_pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, k.ctypes.c_uint64(0), buf, UNIQIDENTIFIERINFO_SIZE)
+    if got != UNIQIDENTIFIERINFO_SIZE:
+        return None
+    return int.from_bytes(buf.raw[16:24], "little")
+
+
+def uid_of(value):
+    """p_uniqueid z wpisu: int w zakresie Int64 i nieujemny (tyle zna też acc-cored), inaczej None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**63 else None
+
+
+def pid_of(value):
+    """Pid z wpisu: int w zakresie pid_t powyżej 0, inaczej None (os.kill rzuca na innych typach)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2**31 else None
+
+
+def number(value):
+    """Liczba z wpisu; int tylko w zakresie Int64, jak w acc-cored (większy to zepsuty stan)."""
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, float) or (isinstance(value, int) and -(2**63) <= value < 2**63)
+
+
+def owned(job):
+    """Wrapper joba żyje i to wciąż on: jego pid ma ten p_uniqueid (proc_uid), który wrapper zapisał
+    we wpisie (pid_uid). Pidy zawijają się tu co ~25 minut, więc pid martwego wrappera bywa już
+    obcym procesem, a wpis żyłby razem z nim (rezerwa, SIGSTOP grupy, SIGTERM przy jego końcu).
+    Porównanie z zegarem ściennym (enqueued_at) myliło się o 1-2 s i po cofnięciu zegara, a wtedy reap
+    zabijał żywy job. Wpis bez pid_uid (sprzed tej reguły) liczy się jak dotąd: wystarczy, że pid żyje."""
+    pid = pid_of(job.get("pid"))
+    if not pid or not alive(pid):
+        return False
+    mine = uid_of(job.get("pid_uid"))
+    if mine is None:
+        return True
+    return proc_uid(pid) == mine
+
+
+def group_of(job, session):
+    """child_pgid joba, jeśli to wciąż jego grupa: wpis jest z tego startu systemu (same_boot), a lider
+    ma ten p_uniqueid, który wrapper zapisał przy uruchomieniu (child_uid). Tożsamość to więc (sesja,
+    grupa, p_uniqueid), bez zegara. Bez nich nie ma czym tego sprawdzić, więc i sygnału nie ma."""
+    pgid = group_id(job.get("child_pgid"))
+    mine = uid_of(job.get("child_uid"))
+    if not pgid or mine is None or not same_boot(job, session):
+        return None
+    return pgid if proc_uid(pgid) == mine else None
+
+
 def reap(state):
-    """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM."""
+    """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM. Wpis sprzed
+    restartu Maca (stale: inna sesja) znika bez sygnałów: nikt z niego nie żyje, a jego pid i grupa
+    są dziś czyjeś. Pid wrappera albo grupa użyte ponownie w tym samym starcie (owned, group_of) też
+    nie dostają sygnału, wpis bez liczbowego started_at również. Własnej grupy procesów sprzątający
+    nie dotyka."""
+    session = boot_session()
     keep = []
     for job in state["running"]:
-        if alive(job.get("pid")):
+        if stale(job, session):
+            continue
+        if owned(job):
             keep.append(job)
             continue
-        pgid = job.get("child_pgid")
-        if pgid and alive(pgid):
+        pgid = group_of(job, session)
+        if pgid and pgid != os.getpgrp() and number(job.get("started_at")):
             import signal
 
             for sig in (signal.SIGCONT, signal.SIGTERM):
@@ -2515,7 +2686,7 @@ def reap(state):
                 except OSError:
                     pass
     state["running"] = keep
-    state["queue"] = [j for j in state["queue"] if alive(j.get("pid"))]
+    state["queue"] = [j for j in state["queue"] if not stale(j, session) and owned(j)]
 
 
 # rezerwa po rozgrzewce: job, który przebiegł max(60 s, połowę prognozy czasu), najwyżej 300 s,
@@ -3141,9 +3312,9 @@ def safety(state, cfg):
 
     mem = state["memory"]
     growth = mem.get("swap_growth_2m_gb", 0)
-    local = [
-        j for j in state["running"] if j["where"] == "local" and j.get("child_pgid")
-    ]
+    # tylko grupa, która wciąż jest joba (group_of): SIGSTOP obcej byłby gorszy niż swap
+    session = boot_session()
+    local = [j for j in state["running"] if j["where"] == "local" and group_of(j, session)]
     paused = [j for j in local if j.get("paused")]
     swapping = (growth > cfg["pause_swap_gb"] and mem["level_pct"] < 25) or mem.get(
         "pressure"
@@ -3309,6 +3480,10 @@ def new_entry(job, command, argv, opts):
         # pamięć poza drzewem procesów (natywny, Docker): rezerwa zostaje przy prognozie
         "outside": bool(job.get("outside") or job.get("floor_gb")),
         "pid": os.getpid(),
+        # tożsamość wrappera dla owned(): pid po ponownym użyciu ma inny p_uniqueid
+        "pid_uid": proc_uid(os.getpid()),
+        # i start systemu, z którego są pid i p_uniqueid (po restarcie liczą się od nowa)
+        "boot_session": boot_session(),
         "via": opts.get("via", "cli"),
         "enqueued_at": time.time(),
     }
@@ -3368,6 +3543,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
     timeout = float(opts.get("timeout") or 0)
     start = time.time()
     target = None
+    pinged = cored_ping()
     with Locked():
         state = load_state(cfg)
         reap(state)
@@ -3385,6 +3561,11 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
         entry["small"] = gb <= cfg["small_gb"] and wall <= cfg["small_wall_s"]
         entry["route"], target = decide_route(state, job, gb, wall, cfg, cache)
         entry["routed_at"] = time.time()
+        waker = None
+        if pinged and cored_mark(state):
+            # gotowy na SIGUSR1, zanim acc-cored zobaczy wpis: domyślna akcja zabiłaby wrapper
+            waker = cored_waker()
+            entry["wake"] = "usr1"
         state["queue"].append(entry)
         if target and entry["route"]["choice"] == "depot":
             start_depot(state, entry, target)
@@ -3405,7 +3586,11 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
             )
         cancelled = False
         while entry.get("where") is None:
-            time.sleep(0.5)
+            if entry.get("wake") and waker is not None:
+                left = start + timeout - time.time() if timeout else CORED_WAKE_S
+                waker.control(None, 1, max(0.01, min(CORED_WAKE_S, left)))
+            else:
+                time.sleep(0.5)
             if timeout and time.time() - start > timeout:
                 with Locked():
                     state = load_state(cfg)
@@ -3427,6 +3612,8 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                 if me is None:
                     me = entry
                     state["queue"].append(me)
+                if me.get("wake") and not cored_live(state):
+                    me["wake"] = None  # acc-cored zniknął: znowu co 0,5 s
                 if time.time() - me.get("routed_at", 0) > 15:
                     me["route"], target = decide_route(
                         state,
@@ -3580,6 +3767,7 @@ def run_local(entry, job, command, argv, cfg):
         env["GOFLAGS"] = goflags_with(ours_p, extra)
     target = job_argv(shell_argv(command) if command is not None else argv, cfg)
     env[NESTED_ENV] = entry["id"]
+    pinged = cored_ping()  # przed startem: wolne gniazdo nie odbiera jobowi próbek
     try:
         child = subprocess.Popen(target, env=env, preexec_fn=os.setpgrp)
     except OSError as err:
@@ -3587,11 +3775,19 @@ def run_local(entry, job, command, argv, cfg):
         finish(entry["id"], cfg, 127, 0.0, 0.0, None)
         return 127
     jid = entry["id"]
+    spawned_at = time.time()
+    cored = False
     with Locked():
         state = load_state(cfg)
         me = next((j for j in state["running"] if j["id"] == jid), None)
         if me is not None:
             me["child_pgid"] = child.pid
+            # zawsze: reap i safety sygnalizują grupę tylko, gdy jej lider to wciąż to dziecko
+            me["child_uid"] = proc_uid(child.pid)
+            me["child_started_at"] = spawned_at
+            if pinged and cored_mark(state):
+                me["monitor"] = "cored"
+                cored = True
             save_state(state)
 
     def forward(sig, _frame):
@@ -3606,6 +3802,22 @@ def run_local(entry, job, command, argv, cfg):
     started = time.time()
     peak, cpu_live, last_beat = 0.0, 0.0, 0.0
     watch = StallWatch(cfg, job, jid)
+    if cored:
+        done = wait_cored(child, jid, cfg, watch, started)
+        if done is not None:
+            status, rusage, peak, cpu_live = done
+            rc = os.waitstatus_to_exitcode(status)
+            cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
+            finish(jid, cfg, rc, time.time() - started, peak, cpu)
+            return rc if rc >= 0 else 128 - rc
+        # acc-cored zniknął w trakcie: dalej własna pętla, od szczytu, który zdążył zapisać
+        with Locked():
+            state = load_state(cfg)
+            me = next((j for j in state["running"] if j["id"] == jid), None)
+            if me is not None:
+                peak = float(me.get("mem_peak_gb") or 0.0)
+                me["monitor"] = None
+                save_state(state)
     # natywny build: do pamięci joba dochodzą drzewa xcodebuild na Macu (jeden build naraz, więc
     # to jego) i symulator, który `portivo-mobile up` włączył; oba poza drzewem procesów joba
     native = job.get("lang") == "native" and job.get("exclusive")
@@ -3636,6 +3848,43 @@ def run_local(entry, job, command, argv, cfg):
     cpu = rusage.ru_utime + rusage.ru_stime if rusage else cpu_live
     finish(jid, cfg, rc, time.time() - started, peak, cpu)
     return rc if rc >= 0 else 128 - rc
+
+
+def wait_cored(child, jid, cfg, watch, started):
+    """Job pod okiem acc-cored: wrapper śpi w kqueue (NOTE_EXIT dziecka) i budzi się co CORED_WAKE_S po log
+    postoju (stalled_s liczy acc-cored), po limit klasy i żeby sprawdzić, czy acc-cored działa. Po końcu
+    joba: (status, rusage, szczyt w GB, CPU żywych procesów) z ostatnich próbek acc-cored; None, gdy
+    acc-cored zniknął przed końcem joba (wtedy wraca pętla wrappera)."""
+    import select
+
+    kq = select.kqueue()
+    try:
+        kq.control([select.kevent(child.pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD, fflags=select.KQ_NOTE_EXIT)], 0, 0)
+    except OSError:
+        pass  # już po końcu: wait4 niżej go odbierze
+    while True:
+        pid, status, rusage = os.wait4(child.pid, os.WNOHANG)
+        if pid == child.pid:
+            final = cored_call({"op": "sched.final", "id": jid})
+            if final is None:
+                state = load_state(cfg)
+                me = next((j for j in state["running"] if j["id"] == jid), None) or {}
+                final = {"peak_gb": me.get("mem_peak_gb") or 0.0, "cpu_s": 0.0}
+            return status, rusage, float(final.get("peak_gb") or 0.0), float(final.get("cpu_s") or 0.0)
+        kq.control(None, 1, CORED_WAKE_S)
+        state = load_state(cfg)
+        if not cored_live(state):
+            return None
+        me = next((j for j in state["running"] if j["id"] == jid), None) or {}
+        stalled = me.get("stalled_s")
+        if stalled and not watch.notified:
+            watch.notified = True
+            log(f"{watch.label} stoi od {human_s(stalled)}: bez CPU i bez wyjścia; rezerwa pamięci wraca do puli")
+            notify("claude-acc: job stoi", f"{watch.label}: {human_s(stalled)} bez CPU i wyjścia (claude-acc sched status)")
+        elif not stalled and watch.notified:
+            watch.notified = False
+            log(f"{watch.label} znowu pracuje")
+        watch.enforce(time.time() - started, child.pid)
 
 
 class StallWatch:
@@ -4594,11 +4843,19 @@ def signal_job(job, sig):
     return True
 
 
+def group_id(value):
+    """child_pgid ze stanu jako grupa procesów albo None. killpg(-N) to kill(N), killpg(0) to własna
+    grupa, a 1 to launchd: stan, który pisze też inny proces, nie może wskazać obcego. Ponad pid_t
+    (2**31 - 1) os.killpg rzuca OverflowError, a nie OSError: przebieg by padł."""
+    ok = isinstance(value, int) and not isinstance(value, bool) and 1 < value < 2**31
+    return value if ok else None
+
+
 def kill_child(job):
     """SIGKILL grupie procesów komendy, jeśli jej lider to wciąż dziecko wrappera."""
     import signal
 
-    pgid = job.get("child_pgid")
+    pgid = group_id(job.get("child_pgid"))
     if not pgid or not alive(pgid) or proc_bsd(pgid, BSD_PPID) != job.get("pid"):
         return False
     for sig in (signal.SIGCONT, signal.SIGKILL):

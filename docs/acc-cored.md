@@ -5,8 +5,8 @@ reads the kernel directly (sysctl, `proc_pid_rusage`, `proc_pidinfo`, kqueue, Di
 instead of starting Python every few seconds. Every action stays in Python. When a tick would act,
 acc-cored hands that tick to the script, which reads the Mac again and acts exactly as before.
 
-Status: the measuring tool, the readers and the dev-server guard's tick (these stacked branches).
-Nothing is registered on a Mac by the build or the tests. The switch from `devguard run` to
+Status: the measuring tool, the readers, the dev-server guard's tick and the scheduler's per-second
+pass (these stacked branches). Nothing is registered on a Mac by the build or the tests. The switch from `devguard run` to
 `acc-cored guard` is a separate step with its own undo (see [Switching](#switching)).
 
 ## What the loops cost
@@ -155,6 +155,143 @@ The Python guard spends 6 to 7.5 ms/s.
 Pod's runtime answers `browser.tabList` in about 8 s. While dev servers run, the guard's Orca
 refresh (every `orca_seconds`) blocks the tick for that long, in Python as well as here.
 
+## The scheduler
+
+Today every `sched run` wrapper runs its own loops. A queued wrapper reloads `state.json` every
+0.5 s. A running one samples its job's process tree at 4 Hz and writes a heartbeat once a second.
+Each of them runs `reap`, `refresh_memory`, `safety`, `plan` and `update_queue_view` on every pass,
+so ten wrappers do the same housekeeping ten times.
+
+`acc-cored run --sched` does that work once for all jobs:
+- **One pass a second, under `sched/lock`:** the heartbeats of the jobs it watches, then `reap`,
+  `refresh_memory`, `safety`, `plan` and `update_queue_view`, ported line by line (`Sched.tick`).
+  The pass reads memory as `probe_memory` does, the guard's snapshot from the guard in the same
+  process when there is one, and native builds as `native_scan` does.
+- **Job trees:** sampled on the wrapper's own cadence (10 ms, then 50 ms, then 250 ms), for the peak,
+  the CPU, the class limit and the stall clock.
+- **Wake-ups:** when `plan` admits a queued job, acc-cored sends that wrapper SIGUSR1. The wrapper
+  then admits itself, as before.
+- **Idle:** with no job left the timers stop, and acc-cored only watches the `sched` directory.
+
+The wrapper (`sched.py`) cooperates only when acc-cored marks the state (`"cored": {"pid", "at",
+"proto"}`), that pid is a live `acc-cored` of the same `proto`, and its socket answers a ping
+(asked outside `sched/lock`). `SCHED_NO_CORED=1` keeps the old loops. While attached, a wrapper
+treats a mark older than 3 s as acc-cored gone. That covers a stopped or wedged daemon, whose socket
+may still answer: acc-cored refreshes the mark on every pass.
+- **Queued:** the wrapper marks its entry `"wake": "usr1"` and waits in a kqueue for the signal
+  (`EVFILT_SIGNAL`, with a no-op handler so a late signal can't kill it and the job's disposition
+  stays default). It still wakes every 5 s for its own checks (timeout, reroute).
+- **Running:** the wrapper marks its entry `"monitor": "cored"` and blocks on the child's exit
+  (kqueue `NOTE_EXIT`, `wait4`). Every 5 s it writes the stall log from acc-cored's `stalled_s` and
+  enforces the class limit. At exit it asks for the job's final peak and CPU over the control socket
+  (`sched.final`).
+- **Fallback:** if acc-cored disappears, a queued wrapper drops its mark and polls again. A running
+  one goes back to its own loop, starting from the last peak acc-cored saved. When acc-cored stops,
+  it removes its mark. A restarted acc-cored takes over with the peak the entry holds.
+- **When acc-cored stands back:** it doesn't run a pass, and writes nothing, in three cases. A state
+  of another version or an unreadable one (sched.py may be newer than the daemon; a fresh state
+  would wipe the queue) is one. A `config.json` value of another type than its default is another
+  (`"stall_s": "600"` is 600 to Python's `float()`); then the mark is taken away. In both cases
+  the wrappers watch their own jobs again, so acc-cored drops its watches and stops sampling. The
+  third is `sched/lock` held by Python: that pass is tried again in 100 ms, and the samples go on.
+- **One daemon:** `run` takes `$STATE/acc-cored.lock` first. A second instance exits instead of
+  taking the socket. With `--wait-lock` (launchd's job, whose KeepAlive would restart an exiting
+  one every 10 s) it waits for the lock instead.
+- **Signals:** SIGUSR1 goes only to a pid above 1 and within `pid_t` that is still the job's
+  wrapper (`is_wrapper`). A `child_pgid` is a process group only when it's an int above 1 and
+  below 2**31 (`group_id`, on both sides): `killpg(-N)` is `kill(N)`, `killpg(0)` the sender's own
+  group, 1 is launchd, and past `pid_t` Python's `os.kill` raises OverflowError, not OSError. That
+  applies to the orphan's SIGTERM in `reap`, `safety`'s SIGSTOP and SIGCONT, and `kill_child`.
+- **After a reboot:** a wrapper writes this boot's `kern.bootsessionuuid` into its entry
+  (`boot_session`). `reap` drops an entry from another session with no signal: nothing of it
+  lives, and its pid and group belong to other processes now. `p_uniqueid` counts again from each
+  boot (early on it equals the pid: launchd is 1, a pid 351 has uid 351), so the same (pid, uid)
+  pair can come back. No clock decides: every `settimeofday` moves `kern.boottime`, and a step
+  forward by Δ would have dropped the entries of a boot's first Δ seconds while their jobs ran on
+  unaccounted. A signal needs the entry's session to be this one (`same_boot`), so an entry without
+  one (written before it existed) gets none, and an unknown session (the kernel didn't answer)
+  makes nothing stale and signals nobody. `reap` never signals its own process group either.
+- **pids reused within one boot** (they wrap here every ~25 minutes, ~4000 a minute). A process is
+  told by its `p_uniqueid` (`PROC_PIDUNIQIDENTIFIERINFO`): the kernel gives it at fork and not again
+  until a reboot, so a reused pid has another one and a clock change doesn't move it. Unlike
+  `proc_bsdinfo`, it's readable for other users' processes too (a wrapper started with sudo, root's
+  launchd).
+  - A wrapper writes its own uid into its entry (`pid_uid`), and counts as alive only while its pid
+    still has that uid (`owned`). Otherwise its entry goes, as for a dead wrapper. An entry without
+    one (written before it existed, or not an int of Int64 at 0 or above) only needs its pid alive,
+    as before.
+  - A wrapper also writes its child's uid (`child_uid`) when it starts the job. A job's group is
+    signalled (reap's SIGCONT + SIGTERM, safety's SIGSTOP and SIGCONT) only while its leader still
+    has that uid (`group_of`). An entry without it, or without a numeric `started_at` (an int of
+    Int64, as acc-cored reads it), gets no signal.
+  - So a group's identity is (session, group, uid), with no clock in it.
+  - acc-cored puts no watch on an entry from another boot or on a group that isn't the job's.
+  - Cost: one `proc_pidinfo` per entry and pass, microseconds. Earlier versions compared the
+    kernel's start in seconds with `enqueued_at` (the wall clock): off by 1-2 s, wrong after a clock
+    step back, and reap then SIGTERMed a live job. The start stamp in µs, compared for equality,
+    fixed that but gave EPERM for root's processes, so a wrapper under sudo looked dead.
+
+The control socket is `$STATE/acc-cored.sock`: mode 0600, JSON lines, and every peer's uid is
+checked (`LOCAL_PEERCRED`). A peer that closes before its answer (a wrapper whose call timed out)
+costs nothing: `run` ignores SIGPIPE (the commands that print keep the default, so a `| head`
+ends them), sends use `MSG_NOSIGNAL`, and a client XNU refuses
+`SO_NOSIGPIPE` for (EINVAL: the peer closed before `accept`) is closed without a write. Unchecked,
+~60 such clients killed the daemon (exit 141), and with it every engine in it.
+
+### Parity
+
+- `tests/acc_cored/sched_replay.py fuzz` builds synthetic states. They cover queues and running jobs
+  (local and Depot, small, native, paused, stalled, passed heads, starving heads, simulators), plus
+  memory readings, guard snapshots and configs. Each one runs through sched.py's own five functions.
+  `record` reads the live state and readings without writing anything. The fixtures carry the boot
+  session (now and then unknown; entries from another boot with a pid and uid the kernel gives
+  again, from before `boot_session`, or with an odd one), the reaper's own group and the processes' `p_uniqueid` (some a pid or group reused since,
+  some unreadable, some entries from before `pid_uid`, some uids no Int64 holds or of another type), and `child_pgid` takes odd values too: negative, 0, 1, `true`,
+  2**40, a string, the reaper's own group.
+- `acc-cored sched-replay` runs the native pass on every fixture. The state, the admissions and the
+  signals sent must match. A file with no fixture fails, and so does `fuzz` when Python dropped every
+  one, or when `<src>` holds no sched.py (the stdlib has a `sched` too, and every fixture would
+  raise).
+- `tests/test_acc_cored.py` runs 300 fuzzed fixtures. Their Python side runs on 3.12 or newer (the
+  suite's own interpreter, else the first `python3.1x` or `python3` on PATH that is): from 3.12
+  `sum()` of floats is compensated, and acc-cored mirrors that, as the live sched.py runs on 3.14.
+  On 3.9 a sum such as 0.17 + 4.49 + 2.395 rounds to 7.05, not 7.06.
+
+Results on 2026-10-10:
+- fuzz: 10,500 of 10,500 fixtures identical (again after the review fixes, 2026-10-11), and
+  12,000 of 12,000 with the reboot and own-group rules (seeds 7 and 11, Python 3.14), and again
+  12,000 of 12,000 with the `p_uniqueid` identity (seed 7: 3,463 live wrappers whose pid is another
+  process now, 3,098 odd uids, 645 reused groups, 685 expected signals);
+- live: 10 of 10 recorded passes identical (6 on 2026-10-10, 4 on 2026-10-11, one job running).
+
+### Cost
+
+End to end with a scratch `HOME`, `SCHED_FAKE_MEMORY` and 20 s jobs started at once. The wrapper
+numbers come from `proc_pid_rusage` on each wrapper process:
+
+| Jobs | | wrapper CPU (median) | wrapper wakeups (median) | acc-cored |
+|---|---|---|---|---|
+| 4 | wrappers' own loops | 1.40 ms/s | 4.86/s | |
+| 4 | with acc-cored | 0.05 ms/s | 0.21/s | 51.2 ms in total, 3.1 MB footprint |
+| 8 | wrappers' own loops | 1.28 ms/s | 5.00/s | |
+| 8 | with acc-cored | 0.05 ms/s | 0.21/s | 106.2 ms in total (about 4.4 ms/s), 15 wakeups/s, 3.6 MB |
+
+With eight jobs that is about 10 ms/s and 40 wakeups/s for the wrappers' own loops, against about
+4.8 ms/s and 17 wakeups/s with acc-cored. Every job finished with rc 0 and a history row in all
+runs.
+
+The queue frees faster too. Three jobs waited on memory that freed 10 s in. The jobs started
+0.24 to 0.26 s after the change with the wrappers' own polling, and 0.06 to 0.09 s with acc-cored.
+
+The test jobs are sleeping processes. A real build's tree is larger, so a wrapper's own sampling
+costs more there (2.5 to 5 ms/s per job, see [What the loops cost](#what-the-loops-cost)).
+
+Two timings change:
+- `safety` and `refresh_memory` now run once a second in total, not once a second per wrapper. A
+  cascade of pauses under swap growth is therefore slower, one job a second at most.
+- A running wrapper enforces `class_timeout_s` when it wakes, every 5 s. Its SIGKILL can come up to
+  about 5 s later than with the wrapper's own 4 Hz loop.
+
 ## Switching
 
 Not done by this branch. The plan:
@@ -162,5 +299,8 @@ Not done by this branch. The plan:
 - Standalone installs swap `com.filip.claude-acc.devguard` for a `cored` plist.
 - Undo: bootout the cored job and bootstrap the devguard plist again.
 
-Both loops hold `devguard.lock`, so they never run together. `acc-cored guard --shadow FILE` runs
+The scheduler needs no switch of its own. Wrappers use acc-cored only while it runs with `--sched`
+and marks the state, and they fall back on their own when it stops.
+
+Both guard loops hold `devguard.lock`, so they never run together. `acc-cored guard --shadow FILE` runs
 the native loop beside the Python one, observe-only, and writes its state to FILE.
