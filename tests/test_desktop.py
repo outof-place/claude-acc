@@ -434,6 +434,46 @@ def _signed_real_helper():
     return p if os.path.exists(p) else None
 
 
+def _footprint_mb(pid):
+    """Pamięć procesu jak kolumna "Pamięć" w Monitorze aktywności (rusage_info_v0.ri_phys_footprint)."""
+    import ctypes
+
+    class RUsage(ctypes.Structure):
+        _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [(n, ctypes.c_uint64) for n in (
+            "user", "system", "pkg_idle", "interrupt", "pageins", "wired", "resident", "footprint",
+            "start", "exit")]
+
+    usage = RUsage()
+    ctypes.CDLL("/usr/lib/libSystem.B.dylib").proc_pid_rusage(pid, 0, ctypes.byref(usage))
+    return usage.footprint / 1e6
+
+
+class RealHelperMemory(unittest.TestCase):
+    """`serve` nie trzyma obiektów z poprzednich żądań. Bez puli autorelease na żądanie każdy zrzut
+    zostawał w pamięci: 2026-10-13 trzy procesy `serve` miały po 18-19 GB i zapchały swap. `init`
+    z dużym polem odtwarza to bez uprawnień do ekranu: przed poprawką 50 żądań po 2 MB to +112 MB,
+    po niej +13 MB."""
+
+    def test_serve_memory_stays_flat_across_requests(self):
+        path = _signed_real_helper()
+        if not path:
+            self.skipTest("brak zbudowanego pomocnika")
+        proc = subprocess.Popen([path, "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            line = json.dumps({"op": "init", "pad": "x" * 2_000_000}) + "\n"
+            for i in range(50):
+                proc.stdin.write(line)
+                proc.stdin.flush()
+                self.assertTrue(json.loads(proc.stdout.readline())["ok"])
+                if i == 0:
+                    first = _footprint_mb(proc.pid)
+            self.assertLess(_footprint_mb(proc.pid) - first, 40)
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=10)
+            proc.stdout.close()
+
+
 @unittest.skipUnless(os.environ.get("CLAUDE_ACC_DESKTOP_LIVE") == "1", "live smoke off (set CLAUDE_ACC_DESKTOP_LIVE=1)")
 class LiveSmoke(unittest.TestCase):
     """Na żywo, prawdziwy pomocnik, nieszkodliwe cele: nowy dokument TextEdit, okna Findera, zrzut.
