@@ -476,14 +476,17 @@ def pin_competitors(name, domains, path=None):
 # ---------- sieć i pamięć podręczna ----------
 
 
-def http_get(url, headers=None, timeout=20, limit=MAX_BODY):
-    """GET z naszym User-Agentem; status HTTP wraca w Resp (4xx i 5xx też), sieć to FetchError."""
+def http_get(url, headers=None, timeout=20, limit=MAX_BODY, partial=False):
+    """GET z naszym User-Agentem; status HTTP wraca w Resp (4xx i 5xx też), sieć to FetchError.
+    Treść ponad limit to FetchError, a z partial=True tylko jej początek (tytuł strony)."""
     req = urllib.request.Request(url, headers=dict({"User-Agent": UA}, **(headers or {})))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read(limit + 1)
             if len(body) > limit:
-                raise FetchError("odpowiedź za duża")
+                if not partial:
+                    raise FetchError("odpowiedź za duża")
+                body = body[:limit]
             return Resp(resp.status, body, dict(resp.headers), resp.geturl())
     except urllib.error.HTTPError as exc:
         try:
@@ -764,11 +767,11 @@ class Site:
         self.robots = None
         self.requests = 0
 
-    def get(self, url, limit=MAX_BODY):
+    def get(self, url, limit=MAX_BODY, partial=False):
         """Jedno zapytanie z tempem na host: (status, treść, adres po przekierowaniach)."""
         self.ctx.pace(f"host-{self.host}", self.ctx.host_interval)
         self.requests += 1
-        resp = self.ctx.fetch(url, timeout=20, limit=limit)
+        resp = self.ctx.fetch(url, timeout=20, limit=limit, partial=partial)
         return resp.status, resp.body, resp.url
 
     def cached(self, kind, url, ttl, produce, keep=lambda value: value is not None):
@@ -845,7 +848,9 @@ class Site:
                     found, children, named = parse_sitemap(body)
                 except (ValueError, ET.ParseError, OSError, EOFError) as exc:
                     return {"error": str(exc)[:80]}
-                return {"pages": found[:cap], "children": children[:200], "titles": {u: t for u, t in named.items() if u in set(found[:cap])}}
+                kept = found[:cap]
+                listed = set(kept)
+                return {"pages": kept, "children": children[:200], "titles": {u: t for u, t in named.items() if u in listed}}
 
             got = self.cached("sitemap", url, ttl, produce, keep=lambda v: not v.get("transient"))
             if got.get("error"):
@@ -854,7 +859,7 @@ class Site:
             pages.extend(got["pages"][: cap - len(pages)])
             titles.update(got["titles"])
             queue.extend(sorted(got["children"], key=lambda u: 0 if SITEMAP_PREFER_RE.search(u) else 1))
-        return pages, titles, problems
+        return list(OrderedDict.fromkeys(pages)), titles, problems
 
     def title(self, url):
         if not self.allowed(url):
@@ -862,7 +867,7 @@ class Site:
 
         def produce():
             try:
-                status, body, _ = self.get(url, limit=TITLE_BYTES)
+                status, body, _ = self.get(url, limit=TITLE_BYTES, partial=True)
             except FetchError:
                 return None
             if status >= 500:

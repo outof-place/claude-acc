@@ -47,8 +47,10 @@ class FakeNet:
     def __init__(self, route):
         self.route, self.calls, self.unknown, self.queues = route, [], [], {}
 
-    def __call__(self, url, timeout=20, limit=seo.MAX_BODY, headers=None):
+    def __call__(self, url, timeout=20, limit=seo.MAX_BODY, headers=None, partial=False):
         self.calls.append(url)
+        self.partial = getattr(self, "partial", {})
+        self.partial[url] = partial
         got = self.route(url)
         if isinstance(got, list):
             queue = self.queues.setdefault(url, list(got))
@@ -277,6 +279,8 @@ class GapTest(Base):
         gap = gaps[texts.index("nawadnianie kropelkowe cebuli")]
         self.assertEqual(gap["ev"][0]["domain"], "rival.test")
         self.assertEqual(gap["ev"][0]["title"], "Nawadnianie kropelkowe cebuli | Rival")  # tytuł strony
+        self.assertTrue(net.partial["https://rival.test/blog/nawadnianie-kropelkowe-cebuli"])  # duża strona: sam początek
+        self.assertFalse(net.partial["https://rival.test/post-sitemap.xml"])
         self.assertIsNone(to_pin)  # konkurencja już przypięta
         self.assertEqual(net.unknown, [])
 
@@ -512,6 +516,21 @@ def serve(routes):
     server = Server(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+class FetchTest(unittest.TestCase):
+    def test_title_read_keeps_the_start_of_a_large_page(self):
+        """Czerwony, gdy strona większa niż limit tytułu przepada (FetchError) zamiast oddać początek
+        z <title>, albo gdy mapa strony ponad limit przechodzi obcięta (zepsuty XML po cichu)."""
+        page = "<html><head><title>Duża strona</title></head><body>".encode() + b"x" * 300000 + b"</body></html>"
+        server = serve(lambda path, query: page)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}/strona"
+        got = seo.http_get(url, limit=1000, partial=True)
+        self.assertEqual(len(got.body), 1000)
+        self.assertIn(b"<title>Du", got.body)
+        with self.assertRaises(seo.FetchError):
+            seo.http_get(url, limit=1000)
 
 
 class DryRunTest(Base):
