@@ -18,7 +18,8 @@ let usage = """
            acc-cored sched-scan [--sims-since T] [--sims-only]   native_scan() as JSON (parity)
            acc-cored caps-watch [SECONDS] [--report FILE|-]  how often the capped folders change (FSEvents), nothing run;
                the report (`acc.py devguard caps --dry-run`) adds the folders a run matched, as the guard watches them
-           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--for SECONDS] [--wait-lock]   the daemon
+           acc-cored run [--guard | --shadow-guard FILE] [--sched] [--accswitch | --accswitch-shadow FILE] [--for SECONDS] [--wait-lock]
+                                   the daemon
     """
 
 func json(_ value: Any) -> String {
@@ -278,8 +279,16 @@ case "run":
         engine.start()
         schedEngine = engine
     }
+    var switchEngine: SwitchEngine?
+    let switchShadow = value("--accswitch-shadow", in: args)
+    if args.contains("--accswitch") || switchShadow != nil {
+        let engine = SwitchEngine(.init(home: home, shadowPath: switchShadow))
+        engine.start()
+        switchEngine = engine
+    }
     let guardRunning = guardEngine
     let schedRunning = schedEngine
+    let switchRunning = switchEngine
     let control = ControlSocket(path: state + "/acc-cored.sock") { request in
         switch request["op"]?.string {
         case "sched.final":
@@ -288,6 +297,7 @@ case "run":
             return .object(PyObject([
                 ("ok", true), ("pid", .int(Int(getpid()))), ("guard", .bool(guardRunning != nil)), ("sched", .bool(schedRunning != nil)),
                 ("wakes", .int(schedRunning?.wakeCount.load(ordering: .relaxed) ?? 0)),
+                ("accswitch", switchRunning.map { .object($0.status()) } ?? .bool(false)),
             ]))
         default:
             return .object(PyObject([("ok", false), ("error", "unknown op")]))
@@ -301,6 +311,7 @@ case "run":
     signal(SIGINT, SIG_IGN)
     let stopAll = { (code: Int32) in
         control.stop()
+        switchRunning?.stop()
         schedRunning?.stop()
         guardRunning?.stop()
         exit(code)

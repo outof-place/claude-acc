@@ -165,7 +165,12 @@ final class Store {
     /// What `status --json` prints, written by every tick (launchd runs one every 2 minutes).
     private static let tickSnapshot = CLI.directory + "/status.json"
     /// A tick snapshot older than this means the ticks stopped: the script runs itself again.
+    /// A slot of acc-cored that skipped the tick counts as the snapshot's time (`SwitchSlot`).
     private static let tickSnapshotMaxAge: TimeInterval = 180
+    private static let switchSlot = CLI.directory + "/accswitch-slot.json"
+    @ObservationIgnored private var latestSlot: SwitchSlot?
+    /// acc-cored's last check (a skipped slot, or a tick that ended with 0); nil without acc-cored's ticks.
+    private(set) var switchCheckedAt: Double?
 
     /// The minute's reading. With the panel closed the tick's file stands in for the script,
     /// whose every run spawns ~20 Keychain reads; open, the panel asks the script as before.
@@ -184,7 +189,14 @@ final class Store {
            fresh.generatedAt > (latestSnapshot?.generatedAt ?? 0) {
             show(fresh)
         }
-        return Date.now.timeIntervalSince1970 - (latestSnapshot?.generatedAt ?? 0) <= Self.tickSnapshotMaxAge
+        readSwitchSlot()
+        let seen = max(latestSnapshot?.generatedAt ?? 0, latestSlot?.vouches(for: latestSnapshot?.generatedAt) ?? 0)
+        return Date.now.timeIntervalSince1970 - seen <= Self.tickSnapshotMaxAge
+    }
+
+    private func readSwitchSlot() {
+        if let data = changedFile(Self.switchSlot) { latestSlot = Self.decode(SwitchSlot.self, from: data) }
+        if latestSlot?.checkedAt != switchCheckedAt { switchCheckedAt = latestSlot?.checkedAt }
     }
 
     private func show(_ fresh: Snapshot) {
@@ -205,6 +217,7 @@ final class Store {
         refreshing = true
         defer { refreshing = false }
         readLocal()
+        readSwitchSlot()
         repeat {
             refreshAgain = false
             let result = await CLI.run(["status", "--json"])

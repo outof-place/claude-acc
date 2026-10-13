@@ -277,15 +277,18 @@ def tool(name):
     """Pełna ścieżka narzędzia z PATH, szukana raz na przebieg. Z pełną ścieżką i bez
     close_fds subprocess startuje proces przez posix_spawn zamiast forka interpretera:
     około 2 ms mniej na wywołanie (zmierzone 10,8 -> 8,9 ms). Deskryptorów Pythona dziecko
-    i tak nie dziedziczy (PEP 446), więc blokada przebiegu zostaje w tym procesie."""
+    i tak nie dziedziczy (PEP 446), więc blokada przebiegu zostaje w tym procesie. Wewnątrz
+    `uninterrupted` (start_new_session) subprocess wraca do forka: te ~2 ms na wywołanie."""
     if name not in _TOOLS:
         _TOOLS[name] = shutil.which(name) or name
     return _TOOLS[name]
 
 
 def spawn(argv, **kwargs):
+    # w bloku uninterrupted dzieci (curl, security) dostają własną sesję: Ctrl-C, zamknięty terminal
+    # czy timeout agenta trafiają w całą grupę procesów i urwałyby odświeżenie w połowie
     return subprocess.run([tool(argv[0])] + argv[1:], capture_output=True, text=True, close_fds=False,
-                          check=False, **kwargs)
+                          check=False, start_new_session=_SHIELDED[0] > 0, **kwargs)
 
 
 # ---------- Pęk kluczy ----------
@@ -559,36 +562,114 @@ def needs_login(account, retry_after_hours=6, seen=False):
     return dead is not None and dead == token_mark(creds)
 
 
+class OutOfTime(BaseException):
+    """Termin przebiegu z acc-cored minął albo nie starcza na krok, którego nie wolno przerwać.
+    BaseException, bo po drodze do cmd_tick nie może go połknąć żadne `except Exception`
+    (depot_sync_safe): przebieg kończy się w całości, a nie pomija kroku i idzie dalej."""
+
+
+# Odświeżenie tokenu potrzebuje do REFRESH_BUDGET sekund: curl ma max-time 20, zapisy do Pęku
+# kluczy trwają ułamki sekundy.
+REFRESH_BUDGET = 30
+
+
+def in_time(need=0):
+    """Kooperacyjny limit czasu przebiegu: ACC_TICK_DEADLINE (epoka) to chwila, od której tick
+    uruchomiony przez acc-cored nie zaczyna nowej pracy, a krok, którego nie wolno przerwać,
+    zaczyna tylko z zapasem `need` sekund. Nikt ticku nie zabija; bez zmiennej (launchd,
+    polecenia ręczne) nic się nie zmienia."""
+    deadline = os.environ.get("ACC_TICK_DEADLINE")
+    if not deadline:
+        return
+    try:
+        left = float(deadline) - time.time()
+    except ValueError:
+        return
+    if left < need:
+        raise OutOfTime(f"termin przebiegu: zostało {max(left, 0):.0f} s, krok potrzebuje {need} s")
+
+
+# głębokość bloków uninterrupted: spawn() daje wtedy dzieciom własną sesję
+_SHIELDED = [0]
+
+
+class uninterrupted:
+    """Blok, którego SIGTERM, SIGINT ani SIGHUP nie przerywają: sygnał czeka do końca bloku i wtedy
+    działa tak, jak działałby bez niego (domyślnie kończy proces). Dzieci startowane w bloku mają
+    własną sesję, więc sygnał do całej grupy (Ctrl-C, zamknięty terminal) ich nie zabija. SIGKILL-a
+    odroczyć się nie da: acc-cored go tickowi nie wysyła, a launchd dopiero po ExitTimeOut (90 s,
+    więcej niż curl z max-time 20 i zapisy)."""
+
+    SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
+    # kończące najpierw: KeyboardInterrupt z SIGINT przerwałby ponowne wysłanie SIGTERM
+    ORDER = ("SIGTERM", "SIGHUP", "SIGINT")
+
+    def __enter__(self):
+        self.pending, self.previous = [], {}
+        try:
+            for name in self.SIGNALS:
+                sig = getattr(signal, name)
+                self.previous[sig] = signal.getsignal(sig)
+                signal.signal(sig, lambda got, _frame: self.pending.append(got))
+        except ValueError:  # poza głównym wątkiem sygnałów przejąć się nie da
+            self._restore()
+            quiet_log("uninterrupted: poza głównym wątkiem, odświeżenie bez ochrony przed sygnałami")
+        _SHIELDED[0] += 1
+        return self
+
+    def _restore(self):
+        for sig, handler in self.previous.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+        self.previous = {}
+
+    def __exit__(self, *_exc):
+        _SHIELDED[0] -= 1
+        self._restore()
+        for name in self.ORDER:
+            sig = getattr(signal, name)
+            if sig in self.pending:
+                os.kill(os.getpid(), sig)
+        return False
+
+
 def ensure_fresh(account, cfg, force=False):
-    """Odświeża token konta, gdy wygasa, i rozsyła go do wszystkich kopii."""
+    """Odświeża token konta, gdy wygasa, i rozsyła go do wszystkich kopii.
+
+    Od wysłania starego refresh tokenu do zapisu nowej pary we wszystkich kopiach przebieg nie
+    może się urwać: serwer już zużył stary token, a jego ponowne użycie karze unieważnieniem
+    całego konta (wylogowanie). Ten krok zaczyna się więc tylko z zapasem czasu (in_time)
+    i biegnie do końca bez względu na sygnały (uninterrupted).
+    """
     creds_json = account.creds_json
     if not creds_json:
         return None, "brak danych w Keychain"
     oauth = oauth_of(creds_json)
     if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
         return creds_json, "token ważny"
-    old_refresh = oauth.get("refreshToken")
-    body = f"grant_type=refresh_token&refresh_token={old_refresh}&client_id={CLIENT_ID}"
-    status, resp = http(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT})
-    if status != 200 or not resp or not resp.get("access_token"):
-        if status == 400:
-            mark_needs_login(account, creds_json)
-            return None, "wymaga ponownego logowania"
-        return None, f"odświeżenie tokenu nieudane (HTTP {status})"
-    clear_needs_login(account)
-    creds = json.loads(creds_json)
-    fresh = dict(creds["claudeAiOauth"])
-    fresh["accessToken"] = resp["access_token"]
-    if isinstance(resp.get("expires_in"), (int, float)):
-        fresh["expiresAt"] = int(time.time() * 1000) + int(resp["expires_in"] * 1000)
-    if resp.get("refresh_token"):
-        fresh["refreshToken"] = resp["refresh_token"]
-    if resp.get("scope"):
-        fresh["scopes"] = resp["scope"].split(" ")
-    creds["claudeAiOauth"] = fresh
-    new_json = json.dumps(creds, separators=(",", ":"))
-    kc_write(MANAGED_SERVICE, account.id, new_json)
-    propagate(old_refresh, new_json, cfg)
+    in_time(REFRESH_BUDGET)
+    with uninterrupted():
+        old_refresh = oauth.get("refreshToken")
+        body = f"grant_type=refresh_token&refresh_token={old_refresh}&client_id={CLIENT_ID}"
+        status, resp = http(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT})
+        if status != 200 or not resp or not resp.get("access_token"):
+            if status == 400:
+                mark_needs_login(account, creds_json)
+                return None, "wymaga ponownego logowania"
+            return None, f"odświeżenie tokenu nieudane (HTTP {status})"
+        clear_needs_login(account)
+        creds = json.loads(creds_json)
+        fresh = dict(creds["claudeAiOauth"])
+        fresh["accessToken"] = resp["access_token"]
+        if isinstance(resp.get("expires_in"), (int, float)):
+            fresh["expiresAt"] = int(time.time() * 1000) + int(resp["expires_in"] * 1000)
+        if resp.get("refresh_token"):
+            fresh["refreshToken"] = resp["refresh_token"]
+        if resp.get("scope"):
+            fresh["scopes"] = resp["scope"].split(" ")
+        creds["claudeAiOauth"] = fresh
+        new_json = json.dumps(creds, separators=(",", ":"))
+        kc_write(MANAGED_SERVICE, account.id, new_json)
+        propagate(old_refresh, new_json, cfg)
     return new_json, "token odświeżony"
 
 
@@ -1081,8 +1162,11 @@ def owner_of(creds_json, accounts):
     token = oauth_of(creds_json).get("accessToken")
     if not token:
         return None
-    email = (((fetch_profile(token) or {}).get("account") or {}).get("email") or "").lower()
+    status, profile = profile_request(token)
+    email = ((((profile or {}) if status == 200 else {}).get("account") or {}).get("email") or "").lower()
     if not email:
+        if status != 401:
+            _BLIND.add("profil")  # 429, sieć, błąd serwera: czyje to konto, nie wiadomo
         return None
     # etykieta z Orca potrafi kłamać, więc liczy się też prawdziwy e-mail z pamięci profilu
     known = load_state().get("identity", {})
@@ -1280,6 +1364,7 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
     for a in accounts:
         if a.id == exclude_id or a.email in cfg["never"]:
             continue
+        in_time()  # po terminie przebiegu z acc-cored: reszta kont w następnym slocie
         if needs_login(a, seen=True):
             rows.append({"account": a, "data": None, "why": "wymaga ponownego logowania",
                          "usable": False, "error": True})
@@ -1402,6 +1487,7 @@ def depot_sync(accounts, cfg, active, force=False):
     depot = depot_bin(cfg)
     if not depot:
         return None
+    _DEPOT_DUE["at"] = "slot"  # każda ścieżka poza szybką: następny przebieg, jak dotąd
     state = load_state()
     now = time.time()
     min_valid = cfg["depot_min_valid_hours"] * 3600
@@ -1410,6 +1496,11 @@ def depot_sync(accounts, cfg, active, force=False):
             and state.get("depot_expires_at", 0) - now > min_valid:
         data, _ = cached_usage(current, cfg, max_age=600, refresh=False)
         if data and has_room(data, cfg):
+            # ta ścieżka zmienia się, gdy token sandboxów straci zapas ważności albo odczyt
+            # konta sandboxów przestanie starczać (max_age wyżej)
+            hit = load_json(USAGE_CACHE_PATH, {}).get(current.email)
+            if hit:
+                _DEPOT_DUE["at"] = min(state.get("depot_expires_at", 0) - min_valid, hit["ts"] + 600)
             return current.email  # konto sandboxów niesie, token ważny: nic do roboty
 
     rows = queue(survey(accounts, cfg, exclude_id=active.id if active else None, max_age=600))
@@ -2111,8 +2202,53 @@ def cmd_resume(cfg, _args):
     return 0
 
 
+# ---------- termin następnego przebiegu ----------
+#
+# acc-cored (natywny demon claude-acc, docs/acc-cored.md) może uruchamiać tick w tych samych
+# 2-minutowych slotach co launchd, ale tylko wtedy, gdy przebieg mógłby zrobić coś innego niż
+# poprzedni: zmienił się Pęk kluczy albo pliki, które tick czyta, minął termin, który tick sam
+# tu zapisał, albo od ostatniego przebiegu minęło 8 minut (panel w pasku menu uznaje automat
+# za żywy przez 10). Spokojny przebieg (konto niesie, automat stoi przy koncie wybranym w Orca
+# albo obcym runtime) zapisuje w stanie tick_due z najbliższym terminem, po którym jego wynik
+# by się zmienił; każdy inny przebieg: następny slot, jak dotąd. launchd niczego z tego nie
+# czyta i dalej uruchamia tick co 2 minuty.
+_TICK_DUE = {"quiet": False, "at": None, "why": ""}
+_DEPOT_DUE = {"at": None}
+# czego API w tym przebiegu nie powiedziało (owner_of): taki przebieg nie jest spokojny
+_BLIND = set()
+
+
+def quiet(at=None, why=""):
+    """Spokojny koniec przebiegu: bez zmian na wejściu następny zrobiłby to samo aż do `at`
+    (None: bez terminu, tylko zmiana na wejściu albo 8 minut przerwy). Gdy API w tym przebiegu
+    nie odpowiedziało (sieć, 429), następny slot może już wiedzieć więcej: wtedy nie."""
+    if _BLIND:
+        return
+    _TICK_DUE.update(quiet=True, at=at, why=why)
+
+
+def quiet_active(cfg, active):
+    """Spokojny koniec z aktywnym kontem, które niesie. Wynik zmienia się, gdy odczyt limitów
+    w pamięci przestaje starczać (active_max_age), gdy token aktywnego konta wygaśnie (wtedy
+    tick czeka na sesję, a po kwadransie odświeża sam) i w terminie z szybkiej ścieżki Depot.
+    Bez odczytu w pamięci albo przy Depot poza szybką ścieżką: następny slot."""
+    hit = load_json(USAGE_CACHE_PATH, {}).get(active.email)
+    if not hit or _DEPOT_DUE["at"] == "slot":
+        return
+    terms = [(hit["ts"] + active_max_age(active, cfg), "odczyt limitów aktywnego konta")]
+    expires = active.seen_oauth.get("expiresAt", 0) / 1000
+    if expires > time.time():
+        terms.append((expires, "token aktywnego konta wygasa"))
+    if _DEPOT_DUE["at"] is not None:
+        terms.append((_DEPOT_DUE["at"], "token albo konto sandboxów Depot"))
+    quiet(*min(terms))
+
+
 def cmd_tick(cfg, _args):
-    """Jeden przebieg pilnowania. Uruchamiany przez launchd co 2 minuty."""
+    """Jeden przebieg pilnowania. Uruchamiany przez launchd co 2 minuty albo przez acc-cored."""
+    _TICK_DUE.update(quiet=False, at=None, why="")
+    _DEPOT_DUE["at"] = None
+    _BLIND.clear()
     try:  # baner, gdy tik jobów stoi: sprawdza go proces inny niż ten tik (jobs.py, same pliki)
         import jobs
         jobs.heartbeat_alarm()
@@ -2121,24 +2257,52 @@ def cmd_tick(cfg, _args):
     lock = take_lock(wait=10)
     if not lock:
         return 0
-    update_state(last_tick=int(time.time()))  # aplikacja w pasku menu po tym widzi, że automat żyje
+    # aplikacja w pasku menu po last_tick widzi, że automat żyje; tick_due znika w tym samym zapisie,
+    # więc przebieg urwany przed końcem (wyjątek, sygnał) nie zostawia acc-cored starego spokoju
+    update_state(last_tick=int(time.time()), tick_due=None)
     if not cfg["limit_pause"] and drop_pause():
         # pauza wyłączona w config.json w trakcie epizodu: sesje budzą się, gdy plik znika
         log("pauza limitów wyłączona w konfiguracji, sesje wznawiają pracę")
     accounts = load_accounts()
     try:
         return tick(cfg, accounts)
+    except OutOfTime as err:
+        _TICK_DUE.update(quiet=False, at=None, why="")
+        quiet_log(f"tick: {err}, reszta w następnym slocie")
+        return 1
     finally:
-        save_status(cfg, accounts)
+        try:
+            update_state(tick_due=dict(_TICK_DUE))
+        except Exception as err:  # noqa: BLE001 - termin to wskazówka, przebieg ważniejszy
+            quiet_log(f"tick: zapis terminu nieudany: {err}")
+        if not save_status(cfg, accounts) and _TICK_DUE["quiet"]:
+            # bez świeżej migawki spokój kłamie: acc-cored poświadczałby starszą
+            try:
+                update_state(tick_due={"quiet": False, "at": None, "why": ""})
+            except Exception as err:  # noqa: BLE001
+                quiet_log(f"tick: zapis terminu nieudany: {err}")
+
+
+def quiet_log(line):
+    """log(), którego błąd (pełny dysk) nie przesłania wyniku przebiegu."""
+    try:
+        log(line)
+    except Exception:  # noqa: BLE001 - linia w logu nie jest ważniejsza od przebiegu
+        pass
 
 
 def save_status(cfg, accounts):
-    """Migawka dla aplikacji w pasku menu, jeszcze pod blokadą ticku. Jej błąd nie może
-    przesłonić wyniku ticku: aplikacja przy starym pliku sama uruchomi `status --json`."""
+    """Migawka dla aplikacji w pasku menu, jeszcze pod blokadą ticku; True, gdy zapisana. Jej błąd
+    nie może przesłonić wyniku ticku: aplikacja przy starym pliku sama uruchomi `status --json`.
+    Po terminie przebiegu z acc-cored (survey w migawce) migawki nie ma, a tick kończy się zwykle."""
     try:
         write_json(STATUS_PATH, snapshot(cfg, accounts))
+        return True
+    except OutOfTime as err:
+        quiet_log(f"tick: migawka pominięta, {err}")
     except Exception as err:
-        log(f"tick: zapis migawki nieudany: {err}")
+        quiet_log(f"tick: zapis migawki nieudany: {err}")
+    return False
 
 
 def tick(cfg, accounts):
@@ -2154,6 +2318,7 @@ def tick(cfg, accounts):
             log(f"tick: {HOST.name} ma wybrane konto {orca}, automat stoi, dopóki w {HOST.name} nie będzie System default")
             notify("Claude: automat wstrzymany", f"W {HOST.name} wybrane jest {orca}. Wybierz System default.")
             update_state(orca_notified=orca)
+        quiet(why=f"konto wybrane w {HOST.name}")
         return 0
     if load_state().get("orca_notified"):
         update_state(orca_notified=None)
@@ -2167,6 +2332,7 @@ def tick(cfg, accounts):
             log(f"tick: wpis runtime zawiera dane spoza {HOST.name}, nie przełączam")
             notify("Claude: nieznane konto", f"Runtime ma dane spoza {HOST.name}. Automat nic nie zmienia.")
             update_state(hands_off_notified=True)
+        quiet(why="obce dane w runtime")
         return 0
     if state.get("hands_off_notified"):
         update_state(hands_off_notified=False)
@@ -2197,9 +2363,11 @@ def tick(cfg, accounts):
         roomy = has_room(data, cfg)
     if roomy:
         end_pause(f"{active.email} ma znowu zapas")
+        quiet_active(cfg, active)
         return 0
     paused = os.path.exists(PAUSE_PATH)
     if carries and not paused:
+        quiet_active(cfg, active)
         return 0  # konto jeszcze niesie, nie ruszamy go
     # Kolejka z pamięci, a świeży odczyt tylko dla konta, na które naprawdę przechodzimy:
     # w pauzie i przy dobijaniu automat czytał wszystkie konta co dwie minuty, a zapas

@@ -13,6 +13,14 @@ def run(args):
     cmd = args[0]
     opt = lambda flag: args[args.index(flag) + 1] if flag in args else None
     key = f"{opt('-s')}|{opt('-a')}"
+    _store.signal_point(f"security {cmd} {key} start")
+    try:
+        return _run(cmd, opt, key, args)
+    finally:
+        _store.signal_point(f"security {cmd} {key} answer")
+
+
+def _run(cmd, opt, key, args):
     # każde wywołanie w kolejności: testy liczą odczyty Pęku kluczy na przebieg
     with open(os.path.join(_store.ROOT, "security.log"), "a") as log:
         log.write(f"{cmd} {key}\n")

@@ -15,6 +15,11 @@ for line in sys.stdin.read().splitlines():
         conf[k.strip()] = v
 url = conf.get("url", "")
 server = _store.load("server.json", {})
+_store.signal_point(f"curl {url} start")
+if server.get("offline"):
+    # brak sieci: curl nie dostaje odpowiedzi, kod HTTP 000
+    sys.stdout.write("\n000")
+    sys.exit(7)
 server.setdefault("log", []).append(url)
 # który token poszedł do którego adresu: testy profili Pod sprawdzają, że ich token czyta tylko limity
 os.makedirs(_store.ROOT, exist_ok=True)
@@ -24,6 +29,7 @@ with open(os.path.join(_store.ROOT, "curl-auth.log"), "a") as log:
 
 def reply(code, obj):
     _store.save("server.json", server)
+    _store.signal_point(f"curl {url} answer")
     sys.stdout.write(json.dumps(obj) + "\n" + str(code))
     sys.exit(0)
 
@@ -51,6 +57,7 @@ if url.endswith("/v1/oauth/token"):
     reused = server.get("consumed", {}).get(token)
     if reused:
         # ponowne użycie zużytego refresh tokenu: serwer unieważnia wszystkie tokeny konta
+        server["reuse_attempts"] = server.get("reuse_attempts", 0) + 1
         server["access"] = {k: v for k, v in server["access"].items() if v != reused}
         server["refresh"] = {k: v for k, v in server["refresh"].items() if v != reused}
         reply(400, {"error": "invalid_grant", "reason": "refresh token reuse"})

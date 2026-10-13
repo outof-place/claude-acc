@@ -52,6 +52,25 @@ struct Snapshot: Decodable {
     var anyNeedsLogin: Bool { accounts.contains { $0.status == .needsLogin } }
 }
 
+/// acc-cored's last accswitch slot (`accswitch-slot.json`). When acc-cored runs the ticks, a slot
+/// skips the tick when nothing it reads changed, so status.json ages while still true: a skipped
+/// slot names the snapshot it vouches for (`statusAt` = its `generatedAt`), checked at `at`.
+/// `checkedAt` is the last slot that was a check (a skip, or a tick that ended with 0): a tick that
+/// didn't start or crashed isn't one, so a dead switcher still shows as silent.
+struct SwitchSlot: Decodable {
+    let at: Double
+    let ran: Bool
+    let rc: Int?
+    let statusAt: Double?
+    let checkedAt: Double?
+
+    /// When the snapshot generated at `generatedAt` was last known current: a skipped slot's time.
+    func vouches(for generatedAt: Double?) -> Double? {
+        guard !ran, rc == nil, let statusAt, statusAt == generatedAt else { return nil }
+        return at
+    }
+}
+
 /// Monthly API credits of the Max plans, pooled across their Console organizations. The numbers
 /// are the Console reading (`credits balance`) minus spend callers reported since, so they are
 /// an estimate between readings; `checkedAt` is the oldest reading behind the total.

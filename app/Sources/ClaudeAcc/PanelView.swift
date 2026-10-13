@@ -162,7 +162,9 @@ private struct FooterBar: View {
 
     @ViewBuilder private var autoSwitch: some View {
         if let snapshot = store.snapshot {
-            let tickAge = snapshot.lastTick.map { now.timeIntervalSince1970 - $0 }
+            // acc-cored skips ticks that would change nothing: its last slot counts as a check
+            let checked = snapshot.lastTick.map { max($0, store.switchCheckedAt ?? 0) }
+            let tickAge = checked.map { now.timeIntervalSince1970 - $0 }
             let healthy = (tickAge ?? .infinity) < 600 && snapshot.orcaSelected == nil
             let t = snapshot.thresholds
             HStack(spacing: 7) {
@@ -176,9 +178,9 @@ private struct FooterBar: View {
                     } else if snapshot.lastTick == nil {
                         Text("Auto-switch hasn't run yet")
                     } else if healthy {
-                        Text("Auto-switch checked \(Format.ago(snapshot.lastTick, now: now))")
+                        Text("Auto-switch checked \(Format.ago(checked, now: now))")
                     } else {
-                        Text("Auto-switch silent since \(Format.ago(snapshot.lastTick, now: now))")
+                        Text("Auto-switch silent since \(Format.ago(checked, now: now))")
                     }
                 }
                 .lineLimit(1)

@@ -341,6 +341,98 @@ Two timings change:
 - A running wrapper enforces `class_timeout_s` when it wakes, every 5 s. Its SIGKILL can come up to
   about 5 s later than with the wrapper's own 4 Hz loop.
 
+## The account switcher's tick
+
+launchd runs `acc.py accswitch tick` every 120 s. A tick reads every account's Keychain item (about 27
+`security` processes), often asks the usage API, and costs about 2.4 to 2.9 ms/s. Most ticks change
+nothing: while the active account carries, the tick reads the same cached usage and returns.
+
+`acc-cored run --accswitch` keeps launchd's 120 s slots, but a slot runs the tick only when that
+tick could do something the last one didn't:
+- **An input changed** since the last tick ended. The inputs are the keychain files in
+  `~/Library/Keychains` (their stamps, never their contents), accswitch's config, pause, usage
+  cache and state, the jobs' held accounts, the host app's account list and its account selection
+  (`orca-data.json`). Without any keychain file every slot runs.
+  - A change during a tick isn't in its result: a change to an input other than `state.json` and
+    `usage-cache.json` (which the tick rewrites itself) runs the next slot too.
+  - The baseline moves only after a tick that ran, which `last_tick` tells: a tick that didn't get
+    the lock leaves what was due for the next slot.
+  - The host app is asked again (`orcahost.py`) when a file its choice depends on changes (each
+    host's `SingletonLock`, the Pod bundles, `owner.json`), and every slot while it fails.
+- **The last tick wasn't quiet, or its deadline passed.** The tick computes that deadline itself,
+  with its own functions, and writes it to `state.json` as `tick_due`:
+  - The tick is quiet when the active account carries, or when the switcher stands aside (an
+    account selected in the host app, foreign data in the runtime).
+  - Its deadline is the earliest of three times: when the active account's cached reading stops
+    being enough (`active_max_age`), when the active token expires (the tick then waits for a
+    session, and refreshes it itself after 15 minutes), and the deadline of Depot's fast path.
+  - Every other tick leaves the next slot, as today. So does a tick that ended early: its first
+    write (`last_tick`) clears `tick_due`, and one that doesn't exit with 0 or 1 runs the next slot.
+  - A tick isn't quiet when the profile API didn't answer it (no network, 429): foreign data in
+    the runtime is quiet only when the API named the account.
+- **Eight minutes passed** since the last tick. The menu bar calls the switcher silent after ten.
+- **`last_tick` is ahead of the clock** (the clock was set back): the tick writes a true one.
+
+### The tick is never killed
+
+A tick killed between a token refresh and its Keychain write leaves a used refresh token behind,
+and the server answers its reuse by revoking the account. acc-cored never signals a tick, and
+launchd sends SIGKILL only after the job's `ExitTimeOut` (90 s in the tick's plist: curl's 20 s and
+the writes fit in it):
+- The tick leads a process group of its own. acc-cored stops without waiting for it, and a tick
+  outlives acc-cored (launchd reaps it then). The next slot is scheduled when the tick ends.
+- Its timeout is cooperative. `ACC_TICK_DEADLINE` (100 s after its start) is when the tick stops
+  starting work: it reads no further account and starts a refresh only with 30 s left to finish
+  it. A tick past the deadline ends cleanly with 1 and leaves the rest to the next slot.
+- From the refresh request to its last Keychain write, SIGTERM, SIGINT and SIGHUP wait until the
+  block ends (`uninterrupted`). Terminating signals are delivered first, then SIGINT. The `curl`
+  and `security` children started in the block get a session of their own, so a signal to the
+  whole group (Ctrl-C, a closed terminal or pane, an agent's timeout) doesn't kill them halfway.
+- `tests/test_accswitch_uninterrupted.py` sends SIGTERM at every call of the fake `curl` and
+  `security`, at its start and just before it answers, then runs a normal tick. The server never
+  sees a used token, and every copy holds a live one. SIGINT and SIGHUP run inside the refresh.
+  The same runs again with the signal sent to the tick's whole process group. SIGKILL right
+  after the server's answer does leave a used token (the control).
+- A tick past the deadline in its status snapshot (`survey`) skips the snapshot and ends not
+  quiet: an older `status.json` must not be vouched for.
+
+### Slots on record
+
+Every slot writes `accswitch-slot.json`: `at`, whether it `ran` the tick and why (`reasons`), the
+tick's exit code (`rc`) and time (`tick_s`), the counts, and `checked_at`: the last slot that was a
+check, i.e. a skip or a tick that got the lock (a new `last_tick`) and ended with 0. A tick that
+didn't start (rc 127, with one line in `launchd.log` until a tick starts again), crashed, or found
+the lock held (a hung `claude-acc status`, say: the tick returns 0 then) is tried, not checked.
+The tick's output goes to `launchd.log`, as with launchd. `ping` returns the counts, the last slot and how long a running tick has run, without
+waiting for the engine's queue (an `orcahost.py` lookup may hold it).
+
+A skipped slot also names the `status.json` it vouches for (`status_at`, its `generated_at`):
+nothing a tick reads changed since that snapshot. It vouches only for the latest tick's snapshot
+(`generated_at` at least `last_tick`). The menu bar counts a vouched snapshot fresh from the slot's
+time, so with the panel closed it doesn't run `status --json` itself while ticks are skipped. The
+panel's "Auto-switch checked" counts from `checked_at`, so a dead switcher still goes silent.
+
+acc-cored never reads, refreshes or copies credentials. The tick stays Python's.
+
+Some refreshes are the panel's: other accounts' readings after 30 minutes, and an idle account's
+token near its expiry. They can come up to eight minutes later than today. They change what the
+panel shows, not which account the switcher picks: when the switcher looks for another account it
+reads again anyway.
+
+### Shadow
+
+`acc-cored run --accswitch-shadow FILE` runs nothing. It watches launchd's own ticks: a tick starts
+with its `last_tick` write and ends with `status.json`. For each tick it records whether this
+schedule would have run it, and what the tick changed:
+- hard: its own log lines, the Keychain file, the pause file, the active account's reading, or
+  state other than the panel's caches;
+- soft: other accounts' readings, the profile cache and the fingerprints.
+
+A claude-acc without `tick_due` gets an estimate from the files: the active reading's expiry, and
+Depot's. A pause is quiet only with the headroom the switcher takes an account with. The active
+token's expiry is not in any file, and the estimate doesn't check that Depot's CLI exists. The gap
+counts from the last tick the shadow schedule would have run.
+
 ## Switching
 
 Not done by this branch. The plan:
