@@ -1038,6 +1038,8 @@ def autocomplete(ctx, blog, seeds):
             except Stop as exc:
                 stopped = str(exc)
                 break
+            if state["fetched"] and state["fetched"] % 25 == 0:
+                cache.save()  # bieg zabity w połowie języka nie traci tego, o co już pytał
             for rank, text in enumerate(found):
                 text = clean(text, 120)
                 key = norm(text)
