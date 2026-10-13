@@ -5,8 +5,9 @@ Atrapy curl i security mają po dwa punkty na wywołanie (start i chwila tuż pr
 Test przerywa tick po kolei w każdym z nich, potem puszcza zwykły tick i sprawdza, że serwer
 nie dostał zużytego tokenu, a każda kopia konta trzyma token, który serwer jeszcze przyjmuje.
 Kontrola: SIGKILL (acc-cored tickowi go nie wysyła, launchd dopiero po ExitTimeOut 90 s) między
-odpowiedzią serwera a zapisem do Pęku kluczy naprawdę zostawia zużyty token, więc test widzi, co
-ma widzieć.
+odpowiedzią serwera a zapisem do Pęku kluczy naprawdę zostawia zużyty token. Skrót zapisany przed
+żądaniem trzyma następny przebieg z dala od niego (konto stoi), a bez skrótu ponowne użycie wraca,
+więc test widzi, co ma widzieć.
 
 Świat z tests/test_e2e.py (atrapy Pęku kluczy i API, osobny $HOME), prawdziwy accswitch.py.
 Punkty idą po 4 naraz (każdy w swoim $HOME): po kolei cały przegląd trwał 3,5 minuty.
@@ -154,7 +155,10 @@ class UninterruptedRefreshTest(unittest.TestCase):
         self.assertEqual(w.entry(scoped(w.config_dir))["claudeAiOauth"], fresh)
 
     def test_sigkill_after_the_answer_does_leave_a_used_token(self):
-        # kontrola: tego punktu Python nie obroni, dlatego nikt ticku nie zabija
+        # kontrola: SIGKILL-a Python nie odroczy (dlatego nikt ticku nie zabija), a nowa para ginie
+        # z procesem. Skrót tokenu zapisany przed żądaniem (#155) trzyma następny przebieg z dala od
+        # zużytego tokenu: konto stoi do ponownego logowania. Bez skrótu ponowne użycie wraca, więc
+        # test widzi, co ma widzieć
         points = self.points(idle_refresh)
         w = self.world(idle_refresh)
         w.run(
@@ -163,7 +167,11 @@ class UninterruptedRefreshTest(unittest.TestCase):
             FAKE_SIGNAL="KILL",
         )
         w.run("tick")
+        self.assertEqual(self.server(w).get("reuse_attempts", 0), 0)
+        self.assertIn("a@x", w.saved_state()["needs_login"])
 
+        w.state(consumed_tokens={}, needs_login={}, needs_login_token={})
+        w.run("tick")
         self.assertGreaterEqual(self.server(w).get("reuse_attempts", 0), 1)
 
     def test_a_snapshot_past_the_deadline_is_skipped_and_the_tick_is_not_quiet(self):

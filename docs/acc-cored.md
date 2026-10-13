@@ -393,6 +393,50 @@ the writes fit in it):
   sees a used token, and every copy holds a live one. SIGINT and SIGHUP run inside the refresh.
   The same runs again with the signal sent to the tick's whole process group. SIGKILL right
   after the server's answer does leave a used token (the control).
+- **A Keychain write that fails after the refresh** (#155): a SecurityAgent prompt timing out, a
+  locked keychain, rc ≠ 0. The new pair is then only in the tick's memory, and it never goes to a
+  file (a secret on disk). Instead:
+  - **Write-ahead:** before the request, the state keeps a 12-character hash of the refresh token
+    under its account (the last 16 per account, so other accounts' rotations never push one out).
+    If the state can't be written (a full disk), there's no refresh at all (fail closed).
+    - The hash comes off again when the server rejects the request (a 4xx), or when the request
+      never left the Mac (curl exit 5, 6, 7 or 35, or a curl that couldn't start).
+    - With no answer after the request went out (a timeout, a dropped connection), or a 5xx or any
+      other code (a gateway's 502 or 504 can come after the origin rotated the token), the hash
+      stays and the account is parked. So a server outage parks accounts, as a lost answer does.
+    - Such a token is never sent again, also not after `needs_login`'s 6 h retry. It's never
+      handed to the runtime either, not even while its access token is still valid.
+  - **The order of the writes:** the runtime entries of every config directory first (a Claude Code
+    session starting now would refresh with the used token), then the account's copy, each once.
+    Then whatever failed is retried after 1, 2, 4, 8 and 16 s, for at most 45 s from the first
+    attempt; with curl's 20 s that's still inside `ExitTimeOut`. The first round gets up to 30 s per
+    write, but not past those 45 s (at least 5 s, for a SecurityAgent prompt).
+  - **Lifting `needs_login`** (a state write) happens only after the Keychain writes, and its failure
+    doesn't stop them.
+  - **The pair in the runtime only:** if the account's copy failed but an entry of the managed
+    config directory has the pair, the account isn't parked. (A pair left only in another config
+    directory parks it: the read-back doesn't read there.)
+    - The next tick's read-back hands the pair to the copy.
+    - A switch in between first secures it (`keep_runtime_pair`), and refuses to switch while it
+      can't: overwriting the runtime would drop the only live pair. A login the profile API puts on
+      another account, or outside Orca, doesn't hold a switch.
+  - **The pair gone everywhere:** this is said loudly (log, stderr, a notification), without the
+    token, and the account is marked as needing a new login.
+  - **Runtime entries left with the used token:** these are listed in the state (`stale_runtime`),
+    and the next tick writes them the account's live pair, in any config directory. Read-back and
+    adopt never copy a used pair from the runtime over the account's copy.
+  - **Keychain writes go through `security -i`'s stdin with `-X <hex>`**, as credits.py and
+    runenv.py do, as in #161. The secret is in no process's arguments, and a timeout's error
+    carries neither argv nor output (`from None`). A line over 4094 bytes (a blob with many
+    `mcpOAuth` entries) goes through argv, since `security -i` would cut it.
+- `tests/test_accswitch_kc_retry.py` covers each of these with the fake `security`
+  (`FAKE_FAIL_WRITE_TIMES`, `FAKE_FAIL_WRITE_ALL`, services by comma) and the fake server
+  (`drop_answer`: the token used up, the answer lost; `gateway_error`: used up, then a 5xx). Each tick-level test checks that no token
+  the server ever issued is in the log, the state files (subfolders too), the notifications or a
+  tick's output.
+- In `tests/test_accswitch_uninterrupted.py`, the control (SIGKILL right after the server's answer)
+  now ends with the account parked, not a reuse. Without the hash the reuse comes back, which shows
+  the test still sees it.
 - A tick past the deadline in its status snapshot (`survey`) skips the snapshot and ends not
   quiet: an older `status.json` must not be vouched for.
 
