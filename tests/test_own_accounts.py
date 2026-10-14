@@ -32,7 +32,8 @@ class World(unittest.TestCase):
         w.server["usage"][email] = {"five_hour": {"utilization": 10, "resets_at": reset},
                                     "seven_day": {"utilization": weekly_used, "resets_at": week}}
 
-    def login_elsewhere(self, w, email, services=(BASE,), expired_for=None, access_alive=True, mcp=None):
+    def login_elsewhere(self, w, email, services=(BASE,), expired_for=None, access_alive=True, mcp=None,
+                        weekly_used=10, expires_in=8 * 3600):
         """/login w sesji Claude Code: para tokenów konta, której nie zna żadna kopia, tylko we wpisach runtime."""
         w.server["counter"] += 1
         n = w.server["counter"]
@@ -40,8 +41,8 @@ class World(unittest.TestCase):
         if access_alive:
             w.server["access"][access] = email
         w.server["refresh"][refresh] = email
-        self.usage(w, email)
-        expires = time.time() - expired_for if expired_for is not None else time.time() + 8 * 3600
+        self.usage(w, email, weekly_used)
+        expires = time.time() - expired_for if expired_for is not None else time.time() + expires_in
         oauth = {"accessToken": access, "refreshToken": refresh, "expiresAt": int(expires * 1000)}
         for service in services:
             blob = {"claudeAiOauth": oauth}
@@ -355,6 +356,64 @@ class SwitchKeepsUnknownLoginTest(World):
         self.assertEqual(w.entry(BASE)["claudeAiOauth"], new)
         self.assertEqual(w.entry(scoped(w.config_dir))["claudeAiOauth"], a["claudeAiOauth"])
         self.assertEqual(self.own_accounts(w), {})
+
+    def test_a_pair_still_in_a_session_entry_is_left_to_that_session(self):
+        # review MUST C: after the adoption the old account stays live in the other entry; its
+        # session refreshes it, and a second refresh of the same refresh token kills the account
+        w = self.world()
+        a = w.account("a@x", weekly_used=10, expires_in=60)
+        w.runtime(a, services=[scoped(w.config_dir)])
+        self.login_elsewhere(w, "new@x", weekly_used=100, expires_in=30)
+        w.write()
+
+        r = w.run("tick")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("new@x", self.own_accounts(w))
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+        self.assertIn(a["claudeAiOauth"]["refreshToken"], self.server(w)["refresh"])
+
+    def test_an_idle_account_nobody_holds_is_still_refreshed(self):
+        w = self.world()
+        a = w.account("a@x")
+        b = w.account("b@x", expires_in=60)
+        w.runtime(a)
+        w.write()
+
+        r = w.run("switch", "b@x")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(w.calls("/v1/oauth/token")), 1)
+        self.assertNotEqual(w.entry(BASE)["claudeAiOauth"]["refreshToken"], b["claudeAiOauth"]["refreshToken"])
+
+    def test_a_pod_profile_item_is_never_written_even_as_config_dir(self):
+        w = self.world(pod=True)
+        a = w.account("a@x")
+        w.account("b@x")
+        profile = add_profile(w, "p@x")
+        cfg_path = os.path.join(w.state_dir, "config.json")
+        cfg = json.load(open(cfg_path))
+        cfg["config_dir"] = profile["home"]
+        json.dump(cfg, open(cfg_path, "w"))
+        w.runtime(a, services=[BASE])
+        w.write()
+
+        w.run("switch", "b@x")
+
+        writes = [k for cmd, k in w.keychain_calls() if cmd != "find-generic-password"]
+        self.assertFalse([k for k in writes if k.startswith(profile["service"] + "|")], writes)
+        with open(os.path.join(w.fake, "keychain.json")) as f:
+            self.assertEqual(json.load(f)[f"{profile['service']}|{USER}"], profile["blob"])
+
+    def test_tick_adopts_a_login_with_no_accounts_yet(self):
+        w = self.world()
+        new = self.login_elsewhere(w, "new@x", services=(BASE, scoped(w.config_dir)))
+        w.write()
+
+        w.run("tick")
+
+        own = self.own_accounts(w)
+        self.assertEqual(self.copy(w, own["new@x"])["claudeAiOauth"], new)
 
     def test_switch_refuses_when_it_cannot_tell_whose_login_it_would_overwrite(self):
         w = self.world()
