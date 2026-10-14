@@ -497,15 +497,60 @@ def system_browser():
     return None
 
 
+# ścieżka WS, gdy DevToolsActivePort jest nieczytelny: serwer przełącznika z inspect przyjmuje
+# każde /devtools/browser/<id> (sprawdzone w Brave 1.97 / Chromium 155, 14.10.2026), Allow i tak pilnuje
+FALLBACK_WS_PATH = "/devtools/browser/claude-acc"
+
+
 def active_port(cfg, name):
-    """(port, ścieżka WS) z DevToolsActivePort; plik potrafi zostać po zamknięciu przeglądarki."""
+    """(port, ścieżka WS) z DevToolsActivePort; plik potrafi zostać po zamknięciu przeglądarki.
+
+    macOS 27 chroni dane innych aplikacji: katalogu profilu Brave nie czyta nikt poza Brave (EPERM
+    także pod launchd). Wtedy port bierzemy z gniazda nasłuchującego głównego procesu przeglądarki."""
     path = os.path.join(cfg["browsers"][name]["user_data"], "DevToolsActivePort")
     try:
         with open(path) as f:
             lines = f.read().split("\n")
         return int(lines[0]), lines[1].strip()
+    except PermissionError:
+        port = listening_port(cfg, name)
+        return (port, FALLBACK_WS_PATH) if port else None
     except (OSError, ValueError, IndexError):
         return None
+
+
+def main_pids(cfg, name):
+    """Pidy głównego procesu przeglądarki na domyślnym profilu (bez --user-data-dir: osobne
+    instancje z własnym profilem, np. do konsol Google, mają własne porty i tu się nie liczą)."""
+    app = cfg["browsers"][name]["app"].rstrip("/") + "/Contents/MacOS/"
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,args="], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid.isdigit() and args.startswith(app) and "/Helpers/" not in args and "--user-data-dir" not in args:
+            pids.append(int(pid))
+    return pids
+
+
+def listening_port(cfg, name):
+    """Port debugowania z gniazda TCP na 127.0.0.1, na którym słucha główny proces przeglądarki."""
+    ports = []
+    for pid in main_pids(cfg, name):
+        try:
+            out = subprocess.run(["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.splitlines():
+            m = re.match(r"^n(?:127\.0\.0\.1|\[::1\]|localhost):(\d+)$", line)
+            if m:
+                ports.append(int(m.group(1)))
+    if not ports:
+        return None
+    return 9222 if 9222 in ports else min(ports)
 
 
 def port_alive(port):
@@ -576,10 +621,16 @@ def auto_allow_worker(pid, stop):
 
 
 def pref_enabled(cfg, name):
-    """Przełącznik z chrome://inspect (Local State: devtools.remote_debugging.user-enabled)."""
+    """Przełącznik z chrome://inspect (Local State: devtools.remote_debugging.user-enabled).
+
+    Profil nieczytelny (ochrona danych aplikacji w macOS 27): działająca przeglądarka bez gniazda
+    debugowania ma przełącznik wyłączony; niedziałająca liczy się jako włączona, bo jedyne, co
+    wiadomo, to że trzeba ją uruchomić (pierwsze narzędzie po starcie pokaże prawdziwy stan)."""
     try:
         with open(os.path.join(cfg["browsers"][name]["user_data"], "Local State")) as f:
             state = json.load(f)
+    except PermissionError:
+        return listening_port(cfg, name) is not None if main_pids(cfg, name) else True
     except (OSError, ValueError):
         return None
     return bool(((state.get("devtools") or {}).get("remote_debugging") or {}).get("user-enabled"))
