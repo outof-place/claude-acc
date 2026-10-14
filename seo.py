@@ -2,8 +2,9 @@
 """Research słów kluczowych dla blogów: `claude-acc seo research <blog> [--dry]`.
 
     claude-acc seo research BLOG [--dry] [--ai]
+    claude-acc seo audit BLOG [--dry]
     claude-acc seo config [--json]
-    claude-acc seo schema
+    claude-acc seo schema [audit]
     claude-acc seo bing-key [--remove]
 
 Jeden silnik dla czterech blogów (outofplace, matura, agromalz, renggli). Bieg zbiera frazy z
@@ -52,9 +53,13 @@ W jobie (CLAUDE_ACC_JOB_RESULT) wynik idzie według kontraktu blogów: znacznik 
 zapisem keywords.json, JSON wyniku, blok WYNIK; kod 0 OPUBLIKOWANO (keywords.json zapisany), 1
 BŁĄD (zła konfiguracja albo żadne źródło nic nie dało: do ponowienia).
 
+Audyt SEO (`seo audit`, skaner w stylu Ahrefs: alerty Ahrefs z poczty, własny crawler, Bing) jest w
+seoaudit.py; tu tylko komenda.
+
 Pliki (~/.local/share/claude-acc/seo/):
   config.json                  konfiguracja blogów (schemat w README, `seo config`)
   <blog>/keywords.json         wynik, schemat v1 (`seo schema`)
+  <blog>/audit.json            wynik audytu, schemat v1 (`seo schema audit`); state.json obok
   <blog>/ai-visibility.jsonl   linia na bieg: ile zapytań cytuje domenę bloga (przybliżone)
   cache/                       autocomplete, robots.txt, mapy stron, tytuły, wybór konkurencji,
                                Bing; rate/ to blokady tempa na host
@@ -1981,8 +1986,12 @@ def cmd_config(args):
     for name in sorted(config["blogs"]):
         try:
             blog = blog_config(config, name)
-            rows.append({"blog": name, "ok": True, "domain": blog["domain"], "langs": blog["langs"],
-                         "competitors": blog["competitors"], "budget_usd": blog["budget_usd"]})  # fmt: skip
+            row = {"blog": name, "ok": True, "domain": blog["domain"], "langs": blog["langs"],
+                   "competitors": blog["competitors"], "budget_usd": blog["budget_usd"], "audit": None}  # fmt: skip
+            if blog.get("audit") is not None:
+                cfg = audit_module().audit_config(blog)
+                row["audit"] = {k: cfg.get(k) for k in ("canonical_host", "sitemap", "llms", "indexnow_key_url", "ahrefs_project", "bing_site")}
+            rows.append(row)
         except UsageError as exc:
             rows.append({"blog": name, "ok": False, "error": str(exc)})
     if as_json:
@@ -1993,14 +2002,35 @@ def cmd_config(args):
         if row["ok"]:
             comps = ", ".join(row["competitors"]) or "jeszcze nie wybrana (pierwszy bieg)"
             print(f"  {row['blog']}: {row['domain']}, języki {', '.join(row['langs'])}, konkurencja: {comps}")
+            audit = row["audit"]
+            if audit:
+                print(f"    audyt: {audit['canonical_host']}, mapa {audit['sitemap']}, Ahrefs: {audit['ahrefs_project'] or 'brak projektu'}, "
+                      f"Bing: {audit['bing_site'] or 'brak'}, IndexNow: {audit['indexnow_key_url'] or 'brak klucza'}")  # fmt: skip
+            else:
+                print("    audyt: brak sekcji audit (seo audit nie ruszy)")
         else:
             print(f"  {row['blog']}: BŁĄD {row['error']}")
     return 0 if all(r["ok"] for r in rows) else 1
 
 
 def cmd_schema(args):
+    if args and args[0] == "audit":
+        return print(json.dumps(audit_module().SCHEMA_V1, indent=1, ensure_ascii=False)) or 0
     print(json.dumps(SCHEMA_V1, indent=1, ensure_ascii=False))
     return 0
+
+
+def audit_module():
+    """seoaudit.py z tym samym modułem seo: uruchomiony jako __main__ (seo.py, acc.py) ten plik nie
+    jest jeszcze `seo` w sys.modules, a bez tego seoaudit dostałby drugą kopię z innym UsageError."""
+    sys.modules.setdefault("seo", sys.modules[__name__])
+    import seoaudit
+
+    return seoaudit
+
+
+def cmd_audit(args):
+    return audit_module().cmd_audit(args)
 
 
 def cmd_bing_key(args):
@@ -2033,7 +2063,7 @@ def cmd_bing_key(args):
     return 0
 
 
-COMMANDS = {"research": cmd_research, "config": cmd_config, "schema": cmd_schema, "bing-key": cmd_bing_key}
+COMMANDS = {"research": cmd_research, "audit": cmd_audit, "config": cmd_config, "schema": cmd_schema, "bing-key": cmd_bing_key}
 USAGE = "\n".join(line for line in __doc__.splitlines() if line.startswith("    claude-acc seo"))
 
 
