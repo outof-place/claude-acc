@@ -363,6 +363,9 @@ def kc_write(service, account, contents, timeout=30):
     Wpis, którego linia nie przeniesie (blob z wieloma mcpOAuth dłuższy niż SECURITY_LINE_MAX po
     zamianie na szesnastkowy albo nazwa z cudzysłowem, backslashem, końcem linii), idzie jak przed
     1.31.13, w argumentach: ucięty zapis albo odmowa zgubiłyby świeżo wydaną parę tokenów."""
+    if service in profile_services():
+        # twarda reguła profili aplikacji (niżej): ich wpisów nie zapisujemy, nawet gdy config_dir to profil
+        raise RuntimeError(f"{service} to wpis profilu {HOST.name}, claude-acc go nie zapisuje")
     _KC_SEEN.pop((service, account), None)  # po nieudanym albo przerwanym zapisie nie wiadomo, co tam leży
     secret = contents.encode().hex()
     line = f'add-generic-password -U -s "{service}" -a "{account}" -X {secret}'
@@ -617,6 +620,13 @@ def ensure_fresh(account, cfg, force=False):
     oauth = oauth_of(creds_json)
     if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
         return creds_json, "token ważny"
+    if not force and held_by_session(oauth, cfg) and time.time() - oauth.get("expiresAt", 0) / 1000 <= IDLE_REFRESH_AFTER:
+        # Tę parę trzyma wpis runtime, więc odświeża ją sesja Claude Code, jak token aktywnego konta:
+        # po przejęciu logowania z /login konto sprzed niego zostaje żywe w drugim wpisie, a dwa
+        # odświeżenia jednego refresh tokenu unieważniają konto. Sami tylko po kwadransie snu sesji.
+        if oauth.get("expiresAt", 0) > time.time() * 1000:
+            return creds_json, "token odświeży sesja"
+        return None, "token właśnie wygasł, czekam, aż odświeży go sesja"
     old_refresh = oauth.get("refreshToken")
     body = f"grant_type=refresh_token&refresh_token={old_refresh}&client_id={CLIENT_ID}"
     status, resp = http(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT})
@@ -640,6 +650,13 @@ def ensure_fresh(account, cfg, force=False):
     kc_write(MANAGED_SERVICE, account.id, new_json)
     propagate(old_refresh, new_json, cfg)
     return new_json, "token odświeżony"
+
+
+def held_by_session(oauth, cfg):
+    """Czy refresh token tej pary leży w którymś wpisie runtime (sesje Claude Code go odświeżają)."""
+    refresh = oauth.get("refreshToken")
+    return bool(refresh) and any(oauth_of(kc_peek(s, KEYCHAIN_USER)).get("refreshToken") == refresh
+                                 for s in runtime_services(cfg))
 
 
 def fetch_usage(access_token, who):
@@ -2377,8 +2394,6 @@ def save_status(cfg, accounts):
 
 
 def tick(cfg, accounts):
-    if not accounts:
-        return 1
     orca = orca_selected(accounts)
     if orca:
         # Orca sama pilnuje wybranego konta i odświeża jego token: drugi gracz
@@ -2402,6 +2417,8 @@ def tick(cfg, accounts):
     for account, _ in adopted:
         accounts.append(account)
         notify("Claude: nowe konto", f"{account.email} z logowania w sesji jest teraz kontem claude-acc")
+    if not accounts:
+        return 1
     state = load_state()
     active = find_active(accounts, cfg)
 
