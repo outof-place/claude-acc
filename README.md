@@ -751,6 +751,66 @@ The job's result follows the blog pipeline contract: the side-effect marker befo
 
 Each cluster: `id` (`c01`), `target` (the phrase to write for), `lang`, `secondary[]`, `questions[]` (for an FAQ), `intent` (`informational`, `commercial`, `transactional`, `navigational`), `format`, `action` (`new` or `refresh`) with `url` (the post to refresh, else `null`), `score` (0 to 100) from `demand`, `winnability` and `fit` (0 to 1 each), `ranks_today` and `ranking` (`{position, impressions, page}` from GSC or `null`), `sources[]`, `evidence[]` (`{source: gsc|autocomplete|bing|competitor, phrase, ...}`: impressions and position, the autocomplete query, seed and rank, or the competitor's domain, URL and title), `ai_answer` (`{cited, sources[], answer}` or `null`) and `note` (one line in Polish).
 
+## SEO audit
+
+`claude-acc seo audit <blog>` is an Ahrefs-style scanner for one of the blogs. It writes `~/.local/share/claude-acc/seo/<blog>/audit.json`, which the blog's own SEO loop reads: content problems carry the exact fix the loop applies through its gates, code problems carry the evidence for a person. It makes no Claude call, so a run is deterministic and costs nothing. Three sources:
+
+- **Ahrefs Site Audit alerts** from `contact@outofplace.space`, read through claude-acc's own mail gateway (`mail.py`: the mailbox is selected read-only and bodies are fetched with `BODY.PEEK`, so nothing gets marked read). The project in the subject, `(Sprawnamatura) 3XX redirect: 411 URLs`, maps to a blog through `audit.ahrefs_project`; projects that are not one of the blogs (Fiveseasons) are skipped. From the newest crawl summary within `ahrefs.max_age_days` (45) it records each listed issue with its URL count, change, the `New` mark, the mail date and the Ahrefs view link; older mails only push back the date an issue was first seen. The summaries carry no page URLs, only counts, so URLs come from the crawl; blog URLs that do appear in a body are kept as samples. A mail is data: it is parsed, a line that reads like an instruction is dropped, and no link in it is ever opened.
+- **Our own crawler,** driven by the blog's sitemap plus the posts from the research config. It sends `claude-acc-seo-audit/1 (+https://www.outofplace.space/; contact@outofplace.space)`, honours `robots.txt` for that agent (RFC 9309: exact token, longest match, `Allow` wins a tie), keeps one keep-alive connection per worker (`concurrency`, 3), starts at most one request per `interval_s` (0.15 s) across workers, waits on a 429 or 5xx for `Retry-After` or 5, 20 and 60 s, and gives the host up for the run after 15 failures in a row. Requests are conditional (`If-None-Match`, `If-Modified-Since`) where the server sent an `ETag` or `Last-Modified`. Pages it has no facts for (new, or older than 60 days) go first, then posts, then the pages it saw longest ago; when `time_cap_min` (30) runs out, pages it did not reach come from the facts of earlier runs (up to 60 days old) and the crawl is marked incomplete, so a few capped runs still cover the whole site even when the posts alone do not fit in one run. Measured on 14.10: outofplace 52 URLs in 1 minute, agromalz 660 in 2, matura 3,481 in 15, renggli 586 of 1,105 in the 30-minute cap (its pages take 4 to 7 s when Vercel revalidates), so renggli runs with `time_cap_min` 45.
+- **Bing Webmaster Tools** `GetCrawlIssues` for `audit.bing_site`, once `claude-acc seo bing-key` has stored a key. Without a key the source is skipped quietly; the key never reaches a log or an error text.
+
+Each source can fail on its own: `sources` in `audit.json` says what was missing and why, and the run still writes the file. Only a run where the crawl got no page and neither Ahrefs nor Bing said anything ends in BŁĄD (retryable), and the previous `audit.json` stays.
+
+**What the crawl checks:** status codes and redirect chains and loops of every sitemap URL and every internal link, canonical and hreflang target; internal links to 3xx and 4xx pages (in a post's body or in the template); canonical present, single, on the canonical host, pointing at a 200 page, and sitemap URLs that canonicalise elsewhere; hreflang self-reference, `x-default`, targets and return tags; title and meta description length (`title`, `description` per blog) and duplicates, with a note when the duplicates are language versions of one page; h1 missing or repeated; JSON-LD that parses, Article (BlogPosting and the other Article types) on posts, the fields Google requires for Article, FAQPage, HowTo and BreadcrumbList, and posts without BreadcrumbList when 80% of posts have it; noindex on a sitemap URL or a post; orphan posts (only with the full link picture, 95% of pages); sitemap `lastmod` missing, in the future or older than the post's `dateModified`; posts missing from the sitemap; images without `alt` in a page's body; every post (or one of its language versions) listed in `llms.txt` or an `llms.txt` it links to on the same host; the IndexNow key file; and AI crawler access. For GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, Claude-SearchBot, PerplexityBot, Google-Extended and Bingbot it evaluates the `robots.txt` rules for the token on the home page and a post, and for the bots that fetch pages themselves (all but Google-Extended, which Google documents as a robots.txt token only, fetched by Googlebot) it requests both pages with the bot's User-Agent and records status and time. A refusal (401, 403, 406, 429, 451, 5xx) where our own agent gets 200 is a server block; over `ai_slow_ms` (2000) is slow.
+
+**Two kinds of issue.** `content` issues hit posts and carry `fixes[]`, one per change: `replace_link` (`from`, `to` the final URL, `anchor`, the `chain` of statuses; only when every hop is a permanent 301 or 308, because a 302, 303 or 307 target can change, as with Matura's random-task links, and such links are a code notice instead), `unlink_keep_anchor` (`href`, `anchor`, `status`), `add_hreflang` (on the post missing the return tag: `hreflang`, `href`), `rewrite_meta` (`field` title or description, `current`, `length`, `min`, `max`, the template `suffix` such as ` | Agro-Malz` that is part of `current` but not of the post's own field, and `duplicate_of` for duplicates; the rewrite itself is the repo loop's job) and `add_alt` (`src`). A link counts as body content when it sits inside `main` or `article` (or anywhere, on pages without them) and outside `nav`, `header`, `footer` and `aside`, and the same link with the same text does not repeat across 30% of posts. Everything else is `code`, with `evidence`. Each issue names its `found_by` (`crawl`, `ahrefs`, `bing`) and `since`, the date each source first reported it (an Ahrefs date is the mail's).
+
+**Escalation.** A code issue escalates once: when it first meets the bar, the job ends PILNE (exit 5) and Polid tells Filip. The bar is an AI bot blocked by `robots.txt` or by the server, or an `error`-weight code issue on at least 20 URLs or 5% of the sitemap, whichever is smaller (never fewer than 3). `state.json` remembers what escalated; an issue leaves it only when a run that fully checked that kind of problem no longer finds it, so its return escalates again. Ahrefs-only issues never escalate (no URLs of our own behind them), and warnings and notices go to WYNIK only.
+
+`--dry` prints the top issues with evidence, the content-fixable subset, Ahrefs next to the crawl and the AI bot table, and writes no `audit.json`, no `state.json` and no job result. The fetch cache under `seo/cache/audit-<host>.json` is still written, as with `seo research`.
+
+**Weekly jobs.** One light job per blog on Saturday evening, before the Sunday research jobs and the next blog slots:
+
+```sh
+claude-acc jobs add seo-audit-matura --cwd ~/.local/share/claude-acc/seo --entry 'claude-acc seo audit matura' \
+  --budget-usd 0.1 --light --footprint-gb 1 --run-min 60 --days so --at 22:30
+```
+
+The result follows the blog pipeline contract: the side-effect marker before `audit.json` is replaced, OPUBLIKOWANO (or PILNE with the escalated issues and their URLs), the sources that failed in `notes`, and a WYNIK block.
+
+**Config.** An `audit` object per blog in `seo/config.json`, plus an optional top-level `ahrefs` (`mailbox`, `from`, `max_age_days`):
+
+```json
+{"matura": {"audit": {
+  "canonical_host": "www.sprawnamatura.pl",
+  "sitemap": "https://www.sprawnamatura.pl/sitemap.xml",
+  "llms": "https://www.sprawnamatura.pl/llms.txt",
+  "indexnow_key_url": "https://www.sprawnamatura.pl/<key>.txt",
+  "ahrefs_project": "Sprawnamatura",
+  "bing_site": "https://sprawnamatura.pl/",
+  "title": [20, 60], "description": [120, 160], "title_suffix": [" | Sprawna Matura"],
+  "time_cap_min": 30, "concurrency": 3, "interval_s": 0.15, "ai_slow_ms": 2000
+}}}
+```
+
+The hreflang languages are the blog's `locales`; the posts are its `posts` source. `bing_site` is the site as registered in Bing Webmaster Tools (some are without `www`). `claude-acc seo config` shows the audit fields per blog.
+
+**`audit.json` (schema v1).** `claude-acc seo schema audit` prints the JSON Schema the file is checked against before it is written.
+
+| Field | Meaning |
+|---|---|
+| `schema`, `v` | `claude-acc.seo.audit`, `1` |
+| `blog`, `domain`, `site`, `generated_at` | which blog, when |
+| `sources[]` | `{name, ok, skipped, degraded, count, detail}` for `ahrefs`, `crawl`, `bing` |
+| `crawl` | `urls`, `fetched`, `not_modified`, `from_cache`, `missing`, `targets` (link targets checked), `requests`, `seconds`, `complete`, `time_cap_s`, `checks` (llms, IndexNow, orphans), `problems` |
+| `ai_bots[]` | per bot: `robots` (allow or the disallowed paths), `robots_group` (its own group or `*`), `fetch` (`[{url, status, ms}]` or `null` for a token-only bot) |
+| `ahrefs[]` | each Ahrefs issue with its count and change next to the crawl's count for the same kind of problem (`crawl_type`, `crawl_count`; `null` where the crawl does not count it, such as Ahrefs' every noindex page) |
+| `escalation` | `floor` (URLs that count as many) and the ids escalated in this run |
+| `summary` | `issues`, `content`, `code`, `fixes`, `new` |
+| `issues[]` | escalated first, then by weight, code before content, then by count |
+
+Each issue: `id` (`type` or `type|subject`, such as `ai_robots_blocked|ClaudeBot` or `title_length|za długi`; lengths split into `za długi`, `za krótki` and `brak` like Ahrefs' issues), `type`, `subject`, `kind` (`content` or `code`), `severity` (`error`, `warning`, `notice`), `title` (Polish), `found_by[]`, `since` (`{source: date}`), `first_seen`, `new`, `count` (URLs, or the Ahrefs count for an Ahrefs-only issue), `urls[]` (up to 50), `evidence` (`crawl` lines, `ahrefs` with the mail's numbers and link, `bing`), `fixes[]` (each with `page`, `action`, `since`) and `escalate`.
+
 ## Desktop gateway
 
 `claude-acc desktop mcp` is a stdio MCP server with Anthropic's computer use toolset (`computer_toolset_20260801`), the tools Claude models are trained on, under their own names and inputs: `screenshot`, `zoom`, `cursor_position`, `mouse_move`, `left_mouse_down`, `left_mouse_up`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `left_click_drag`, `scroll`, `type`, `key`, `hold_key` and `wait`. It drives the whole macOS desktop the way the browser gateway drives your Chrome: the agent takes a `screenshot` of the active display, then clicks and types at coordinates in that screenshot's pixel space. `claude-acc desktop install` registers it as `desktop` in your user scope with the `desktop` skill and the shared prompt hint; scripts call any member with `claude-acc desktop <member> '<json>'`.
