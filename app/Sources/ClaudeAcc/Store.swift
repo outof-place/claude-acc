@@ -8,6 +8,8 @@ final class Store {
     enum Busy: Equatable {
         case switching(String)
         case loggingIn(String)
+        /// `claude-acc add`: a new account signs in in the browser.
+        case adding
     }
 
     struct Notice: Equatable {
@@ -524,6 +526,28 @@ final class Store {
         // back from the browser the script ignores Cancel and finishes saving, so the result decides
         if result.status == 0 {
             notice = Notice(text: "Signed in \(account.email)")
+        } else if loginCancelled {
+            notice = Notice(text: "Sign-in cancelled")
+        } else {
+            notice = Notice(text: result.message.isEmpty ? "Sign-in failed" : result.message, isError: true)
+        }
+        await refresh()
+    }
+
+    /// A new Claude account: `claude-acc add` signs it in in the browser and keeps it as a claude-acc
+    /// account, switchable and in the rotation. An account Pod adds is Pod's profile, shown read-only.
+    func addAccount() async {
+        guard busy == nil else { return }
+        loginCancelled = false
+        busy = .adding
+        notice = nil
+        let result = await CLI.run(CLI.process(["add"])) { [weak self] pid in
+            Task { @MainActor in self?.loginPID = pid }
+        }
+        loginPID = nil
+        busy = nil
+        if result.status == 0 {
+            notice = Notice(text: "Account added")
         } else if loginCancelled {
             notice = Notice(text: "Sign-in cancelled")
         } else {
