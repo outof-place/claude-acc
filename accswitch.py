@@ -620,12 +620,16 @@ def ensure_fresh(account, cfg, force=False):
     oauth = oauth_of(creds_json)
     if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
         return creds_json, "token ważny"
-    if not force and held_by_session(oauth, cfg) and time.time() - oauth.get("expiresAt", 0) / 1000 <= IDLE_REFRESH_AFTER:
+    if held_by_session(oauth, cfg) and time.time() - oauth.get("expiresAt", 0) / 1000 <= IDLE_REFRESH_AFTER:
         # Tę parę trzyma wpis runtime, więc odświeża ją sesja Claude Code, jak token aktywnego konta:
         # po przejęciu logowania z /login konto sprzed niego zostaje żywe w drugim wpisie, a dwa
         # odświeżenia jednego refresh tokenu unieważniają konto. Sami tylko po kwadransie snu sesji.
-        if oauth.get("expiresAt", 0) > time.time() * 1000:
+        # Także po 401 (force): ten sam 401 dostaje sesja i sama odświeży. Bez znacznika "do
+        # zalogowania": odstawiłby zdrowe konto na 6 godzin.
+        if not force and oauth.get("expiresAt", 0) > time.time() * 1000:
             return creds_json, "token odświeży sesja"
+        if force:
+            return None, "parę trzyma sesja Claude Code, odświeży ją sama"
         return None, "token właśnie wygasł, czekam, aż odświeży go sesja"
     old_refresh = oauth.get("refreshToken")
     body = f"grant_type=refresh_token&refresh_token={old_refresh}&client_id={CLIENT_ID}"

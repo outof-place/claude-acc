@@ -373,6 +373,61 @@ class SwitchKeepsUnknownLoginTest(World):
         self.assertEqual(w.calls("/v1/oauth/token"), [])
         self.assertIn(a["claudeAiOauth"]["refreshToken"], self.server(w)["refresh"])
 
+    def held_pair_with_dead_access(self, w):
+        """b@x active in the base entry; a@x's pair live in the ~/.claude entry (expiring later, so no
+        alignment), its access token rejected (401) while its refresh token still works."""
+        b = w.account("b@x", weekly_used=100)
+        a = w.account("a@x", weekly_used=10, expires_in=9 * 3600)
+        w.runtime(b, services=[BASE])
+        w.runtime(a, services=[scoped(w.config_dir)])
+        del w.server["access"][a["claudeAiOauth"]["accessToken"]]
+        w.write()
+        return a, b
+
+    def assert_left_to_its_session(self, w, a):
+        self.assertEqual(w.calls("/v1/oauth/token"), [])
+        state = os.path.join(w.state_dir, "state.json")
+        marks = json.load(open(state)).get("needs_login", {}) if os.path.exists(state) else {}
+        self.assertNotIn("a@x", marks)
+        self.assertIn(a["claudeAiOauth"]["refreshToken"], self.server(w)["refresh"])
+        self.assertEqual(w.entry(scoped(w.config_dir))["claudeAiOauth"], a["claudeAiOauth"])
+
+    def test_a_held_pair_on_401_is_left_to_its_session_in_the_tick(self):
+        # lead's MUST before 1.31.15: the forced refresh after a 401 bypassed the held-pair rule
+        w = self.world()
+        a, _ = self.held_pair_with_dead_access(w)
+
+        w.run("tick")
+
+        self.assert_left_to_its_session(w, a)
+
+    def test_switch_to_a_held_pair_on_401_refuses_without_refreshing(self):
+        w = self.world()
+        a, b = self.held_pair_with_dead_access(w)
+
+        r = w.run("switch", "a@x")
+
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("trzyma sesja", r.stdout + r.stderr)
+        self.assert_left_to_its_session(w, a)
+        self.assertEqual(w.entry(BASE)["claudeAiOauth"], b["claudeAiOauth"])
+
+    def test_an_unheld_pair_on_401_still_gets_its_forced_refresh(self):
+        w = self.world()
+        b = w.account("b@x")
+        c = w.account("c@x")
+        w.runtime(b)
+        del w.server["access"][c["claudeAiOauth"]["accessToken"]]
+        w.write()
+
+        r = w.run("switch", "c@x")
+
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(w.calls("/v1/oauth/token")), 1)
+        live = w.entry(BASE)["claudeAiOauth"]
+        self.assertNotEqual(live["refreshToken"], c["claudeAiOauth"]["refreshToken"])
+        self.assertIn(live["refreshToken"], self.server(w)["refresh"])
+
     def test_an_idle_account_nobody_holds_is_still_refreshed(self):
         w = self.world()
         a = w.account("a@x")
