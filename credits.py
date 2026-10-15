@@ -107,19 +107,23 @@ PURPOSE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 API_KEY_RE = re.compile(r"sk-ant-(?:api|usr)[0-9A-Za-z_-]+")
 # komunikat API ("Your credit balance is too low...") i Claude Code ("Credit balance is too low")
 EXHAUSTED_RE = re.compile(rb"credit balance (?:is )?too low", re.IGNORECASE)
-# linia zdarzenia Claude Code (stream-json, json); komunikat błędu API trafia tylko do `result`
-EVENT_RE = re.compile(rb'\{\s*"type"\s*:\s*"([a-z_]+)"')
+# zdarzenia stream-json Claude Code, które niosą treść sesji: to, co przeczytała, napisała albo zobaczyła
+SESSION_EVENT_RE = re.compile(rb'\{\s*"type"\s*:\s*"(?:user|assistant|system|stream_event|tool_progress)"')
 
 
 class ExhaustionScan:
     """Czy wyjście komendy powiedziało, że kredyt się skończył; strumień przychodzi kawałkami.
 
-    Zdanie liczy się w zwykłej linii tekstu (`claude -p` w trybie text, logi przebiegów) i w
-    zdarzeniu `result`. Pozostałe zdarzenia stream-json (`user`, `assistant`, `system`) niosą też to,
-    co sesja przeczytała albo napisała: 15.10 bieg v1-radar miał na stdout README claude-acc z tym
-    zdaniem, zabity z innego powodu skończył się kodem 143, a organizacja 3@ została oznaczona jako
-    pusta przy $112 kredytu. Zdanie nie ma końca linii, więc wystarczy pamiętać początek i ogon
-    bieżącej linii."""
+    Nie liczy się zdanie w linii zdarzenia sesji Claude Code (`user`, `assistant`, `system`,
+    `stream_event`, `tool_progress` na początku linii): te zdarzenia niosą też to, co sesja przeczytała
+    albo napisała. 15.10 bieg v1-radar miał na stdout README claude-acc z tym zdaniem, zabity z innego
+    powodu skończył się kodem 143, a organizacja 3@ została oznaczona jako pusta przy $112 kredytu.
+    Liczy się każda inna linia: tekst `claude -p`, logi przebiegów, zdarzenie `result` Claude Code
+    (2.1.299 zaczyna je od `{"duration_api_ms":`, z `"type":"result"` w środku) i ciało błędu API
+    (`{"type":"error",...}`). Nowy typ zdarzenia liczy się jak dotąd, więc w razie wątpliwości bieg
+    raczej oznaczy organizację, niż przegapi koniec kredytu. `--output-format json --verbose` wypisuje
+    całą sesję jako jedną tablicę w jednej linii i liczy się w całości. Zdanie nie ma końca linii,
+    więc wystarczy pamiętać początek i ogon bieżącej linii."""
 
     KEEP = 64
 
@@ -127,15 +131,14 @@ class ExhaustionScan:
         self.head, self.tail, self.seen = b"", b"", False
 
     def feed(self, chunk):
-        lines = chunk.split(b"\n")
-        for i, part in enumerate(lines):
+        for i, part in enumerate(chunk.split(b"\n")):
             if i:  # nowa linia
                 self.head, self.tail = b"", b""
-            head = (self.head + part)[: self.KEEP]
+            if len(self.head) < self.KEEP:
+                self.head = (self.head + part[: self.KEEP])[: self.KEEP]
             if not self.seen and EXHAUSTED_RE.search(self.tail + part):
-                event = EVENT_RE.match(head)
-                self.seen = not event or event.group(1) == b"result"
-            self.head, self.tail = head, (self.tail + part)[-self.KEEP :]
+                self.seen = not SESSION_EVENT_RE.match(self.head)
+            self.tail = (self.tail + part)[-self.KEEP :]
         return self.seen
 
 
