@@ -536,6 +536,19 @@ class Facts(Base):
         self.assertEqual((rec["outcome"], rec["retryable"], rec["override"]), ("BŁĄD", True, "billing"))
         self.assertTrue(rec["switch_payment"])
 
+    def test_credit_phrase_on_stdout_empties_the_org_only_outside_session_events(self):
+        # 15.10, bieg v1-radar: zdanie z README, które sesja przeczytała (zdarzenie stream-json `user` na
+        # stdout), przy kodzie różnym od 0 oznaczyło organizację 3@ jako pustą
+        self.w.add_job()
+        before = self.w.account(PAYER)["remaining_usd"]
+        read = json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "requests fail with *credit balance is too low*"}]}})
+        r, rec = self.w.run_job(FAKE_JOB_SAY=read, FAKE_JOB_EXIT="1")
+        self.assertEqual(rec["outcome"], "BŁĄD", r.stderr)
+        self.assertEqual(self.w.account(PAYER)["remaining_usd"], before)
+        r, rec = self.w.run_job(FAKE_JOB_SAY="Credit balance is too low", FAKE_JOB_EXIT="1")
+        self.assertEqual(self.w.account(PAYER)["remaining_usd"], 0.0, r.stderr)
+
     def test_auth_and_rate_limit_errors_override_and_ask_for_another_payment_source(self):
         self.w.add_job()
         for error, kind in (("401", "auth"), ("429", "limit")):
