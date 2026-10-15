@@ -1570,10 +1570,10 @@ def run_command(run, command):
         previous[sig] = signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
     try:
         sel = selectors.DefaultSelector()
-        tails, gone, seen, stopped, exited_at, stop_at = {}, set(), False, None, None, None
+        scans, gone, seen, stopped, exited_at, stop_at = {}, set(), False, None, None, None
         for pipe, target in ((proc.stdout, 1), (proc.stderr, 2)):
             sel.register(pipe, selectors.EVENT_READ, target)
-            tails[target] = b""
+            scans[target] = credits.ExhaustionScan()
         limit = run.budget_usd * STOP_FACTOR
         # także po zamknięciu rur, dopóki komenda żyje (`exec > log 2>&1`): budżet i alarmy dalej działają
         while sel.get_map() or proc.poll() is None:
@@ -1582,9 +1582,7 @@ def run_command(run, command):
                 if not chunk:
                     sel.unregister(item.fileobj)
                     continue
-                window = tails[item.data] + chunk
-                seen = seen or bool(credits.EXHAUSTED_RE.search(window))
-                tails[item.data] = window[-64:]
+                seen = scans[item.data].feed(chunk) or seen
                 if item.data not in gone:
                     try:
                         credits.write_all(item.data, chunk)

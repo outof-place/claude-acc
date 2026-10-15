@@ -403,6 +403,46 @@ class Balance(unittest.TestCase):
         self.assertIn("kredyty API: zostało $587.50", r.stdout)
 
 
+# końcowe zdarzenie `claude -p --output-format stream-json` przy wyczerpanym kredycie, w kolejności kluczy
+# z Claude Code 2.1.299: wspólne pola najpierw, `"type":"result"` w środku linii
+RESULT_EXHAUSTED = (b'{"duration_api_ms":0,"is_error":true,"num_turns":1,"subtype":"success","api_error_status":400,'
+                    b'"result":"Credit balance is too low","type":"result","duration_ms":1,"uuid":"u-1"}')
+# ciało błędu API (platform.claude.com/docs/en/api/errors), np. wypisane przez curl --fail-with-body
+API_ERROR_BODY = (b'{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low '
+                  b'to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."}}')
+
+
+class ExhaustionScanTest(unittest.TestCase):
+    """Skan wyjścia komendy, kawałek po kawałku, jak czyta go `exec`, `run` i runner jobów."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("credits_for_scan", os.path.join(ROOT, "credits.py"))
+        cls.credits = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.credits)
+
+    def scan(self, *chunks):
+        s = self.credits.ExhaustionScan()
+        return [s.feed(c) for c in chunks][-1]
+
+    def test_phrase_deep_inside_a_long_session_event_split_across_reads_does_not_count(self):
+        # wynik narzędzia w stream-json to jedna linia setek KB; os.read oddaje ją po 64 KB
+        head = b'{"type":"user","message":{"content":[{"type":"tool_result","content":"'
+        self.assertFalse(self.scan(head + b"x" * 65536, b"y" * 1000 + b"credit balance is too low", b'"}]}}\n'))
+
+    def test_session_event_whose_start_arrives_in_pieces_does_not_count(self):
+        self.assertFalse(self.scan(b'{"ty', b'pe":"user","x":"credit balance is too low"}\n'))
+
+    def test_plain_line_after_session_events_counts_even_when_split(self):
+        self.assertTrue(self.scan(b'{"type":"assistant","message":{}}\nCredit bal', b"ance is too low\n"))
+
+    def test_claude_code_result_event_counts(self):
+        self.assertTrue(self.scan(b'{"type":"system","subtype":"init"}\n', RESULT_EXHAUSTED + b"\n"))
+
+    def test_api_error_body_counts(self):
+        self.assertTrue(self.scan(API_ERROR_BODY + b"\n"))
+
+
 class Exec(unittest.TestCase):
     def setUp(self):
         self.w = World()
@@ -473,6 +513,29 @@ class Exec(unittest.TestCase):
         r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", child)
         self.assertEqual(r.returncode, 0)
         self.assertEqual(self.w.account("d@example.com")["remaining_usd"], 200.0)
+
+    def test_phrase_a_stream_json_session_read_or_wrote_is_not_an_interruption(self):
+        # 15.10, bieg v1-radar: sesja w stream-json przeczytała README claude-acc ze zdaniem o kredycie, wynik
+        # narzędzia poszedł na stdout, a bieg zabity z innego powodu skończył się kodem 143: 3@ oznaczone jako puste
+        read = json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "once they run out, requests fail with *credit balance is too low*"}]}})
+        wrote = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "The README says: Credit balance is too low."}]}})
+        child = f"print({read!r}); print({wrote!r}); raise SystemExit(1)"
+        r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", child)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(self.w.account("d@example.com")["remaining_usd"], 200.0)
+
+    def test_billing_error_in_the_stream_json_result_or_an_api_error_body_still_ends_76(self):
+        # `exec` nie ma licznika: ten skan to jedyne wykrycie końca kredytu
+        for line in (RESULT_EXHAUSTED, API_ERROR_BODY):
+            with self.subTest(line=line[:20]):
+                w = World()
+                w.pool()
+                child = "import sys; sys.stdout.buffer.write(%r); raise SystemExit(1)" % (line + b"\n")
+                r = w.run("exec", "--purpose", "polid-t", "--", PY, "-c", child)
+                self.assertEqual(r.returncode, 76, r.stderr)
+                self.assertEqual(w.account("d@example.com")["remaining_usd"], 0.0)
 
 
 # dziecko `exec --no-env`: woła helper tak jak Claude Code apiKeyHelper (sh, stdout do rury)
