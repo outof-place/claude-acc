@@ -646,6 +646,61 @@ class Idle(unittest.TestCase):
         self.assertFalse(hub.conns["chrome"].live)
 
 
+class LockedProfile(unittest.TestCase):
+    """macOS 27 chroni dane innych aplikacji: profilu Brave nie czyta nikt poza Brave. Port bierzemy
+    wtedy z gniazda nasłuchującego głównego procesu, a ścieżka WS jest dowolna (FALLBACK_WS_PATH)."""
+
+    APP = "/Applications/Brave Browser.app"
+    MAIN = APP + "/Contents/MacOS/Brave Browser"
+    HELPER = APP + "/Contents/Frameworks/Brave Browser Framework.framework/Helpers/Brave Browser Helper.app/Contents/MacOS/Brave Browser Helper --type=gpu-process"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(dir=TMP)
+        for name in ("DevToolsActivePort", "Local State"):
+            path = os.path.join(self.dir, name)
+            with open(path, "w") as f:
+                f.write("9222\n/devtools/browser/x\n" if name == "DevToolsActivePort" else "{}")
+            os.chmod(path, 0)
+        self.addCleanup(lambda: [os.chmod(os.path.join(self.dir, n), 0o600) for n in ("DevToolsActivePort", "Local State")])
+        self.cfg = config({"browsers": {"brave": {"user_data": self.dir, "app": self.APP}}})
+        self.ps, self.lsof = "", {}
+
+    def run_fake(self, cmd, **kwargs):
+        if cmd[0] == "ps":
+            out = self.ps
+        elif cmd[0] == "lsof":
+            out = self.lsof.get(int(cmd[cmd.index("-p") + 1]), "")
+        else:
+            raise AssertionError(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+
+    def call(self, fn):
+        with mock.patch.object(browser.subprocess, "run", side_effect=self.run_fake):
+            return fn(self.cfg, "brave")
+
+    def test_the_port_comes_from_the_main_process_listener(self):
+        self.ps = f"  101 {self.MAIN}\n  102 {self.HELPER}\n  103 {self.MAIN} --user-data-dir=/tmp/google --remote-debugging-port=9333\n"
+        self.lsof = {101: "p101\nf106\nn127.0.0.1:9222\n", 102: "p102\nf1\nn127.0.0.1:7000\n", 103: "p103\nf9\nn127.0.0.1:9333\n"}
+        self.assertEqual(self.call(browser.active_port), (9222, browser.FALLBACK_WS_PATH))
+        self.assertTrue(self.call(browser.pref_enabled))
+
+    def test_helpers_and_other_profiles_are_not_the_browser(self):
+        self.ps = f"  102 {self.HELPER}\n  103 {self.MAIN} --user-data-dir=/tmp/google --remote-debugging-port=9333\n"
+        self.lsof = {102: "p102\nf1\nn127.0.0.1:7000\n", 103: "p103\nf9\nn127.0.0.1:9333\n"}
+        self.assertIsNone(self.call(browser.active_port))
+        self.assertTrue(self.call(browser.pref_enabled))  # nie działa: trzeba ją uruchomić, nie przełączać
+
+    def test_a_running_browser_without_a_listener_has_debugging_off(self):
+        self.ps = f"  101 {self.MAIN}\n"
+        self.lsof = {101: "p101\nf20\nn*:5353\n"}
+        self.assertIsNone(self.call(browser.active_port))
+        self.assertFalse(self.call(browser.pref_enabled))
+
+    def test_a_readable_file_still_wins(self):
+        os.chmod(os.path.join(self.dir, "DevToolsActivePort"), 0o600)
+        self.assertEqual(self.call(browser.active_port), (9222, "/devtools/browser/x"))
+
+
 class CliOwner(unittest.TestCase):
     """Wywołania z wiersza to osobne procesy: karty należą do sesji agenta, z której przyszły."""
 
