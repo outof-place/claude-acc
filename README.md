@@ -811,6 +811,86 @@ The hreflang languages are the blog's `locales`; the posts are its `posts` sourc
 
 Each issue: `id` (`type` or `type|subject`, such as `ai_robots_blocked|ClaudeBot` or `title_length|za długi`; lengths split into `za długi`, `za krótki` and `brak` like Ahrefs' issues), `type`, `subject`, `kind` (`content` or `code`), `severity` (`error`, `warning`, `notice`), `title` (Polish), `found_by[]`, `since` (`{source: date}`), `first_seen`, `new`, `count` (URLs, or the Ahrefs count for an Ahrefs-only issue), `urls[]` (up to 50), `evidence` (`crawl` lines, `ahrefs` with the mail's numbers and link, `bing`), `fixes[]` (each with `page`, `action`, `since`) and `escalate`.
 
+## SEO radar
+
+`claude-acc seo radar <blog> [--dry] [--no-web]` collects what is new and popular in the blog's field over the last `window_days` (7) and writes `~/.local/share/claude-acc/seo/<blog>/radar.json`, which the blog's planner reads to pick the day's topic: a breaking release gets a post the same or the next morning. For outofplace that is what Anthropic, Vercel and the Next.js and React teams publish, and what developers say about it. Free sources only, each configured per blog:
+
+- **Feeds** (`feed`): RSS or Atom, such as nextjs.org/feed.xml, vercel.com/atom and react.dev/rss.xml.
+- **GitHub releases** (`github`): the repo's `releases.atom`. Prereleases (canary, alpha, beta, rc, preview, nightly) are skipped unless `keep_prerelease`.
+- **Sitemaps with `lastmod`** (`sitemap`): Anthropic has no feed, so its sitemap gives the `/news` and `/engineering` pages changed in the window; each page's own `article:published_time` or `datePublished` decides whether it is new or only edited (`robots.txt` honoured, page facts cached for 90 days).
+- **Release notes pages** (`notes`): `md-headings` for the Claude docs in Markdown (a dated heading, then one entry per bullet) and `html-dates` for the Claude apps Help Center page (an `<h3>` date, then one entry per bold paragraph).
+- **Hacker News** (`hn`): the Algolia search API, by keyword and by URL (`url: true`, such as `nextjs.org`). Algolia also matches story text and comments, so a story from a keyword query counts only when its title or URL names a tracked entity.
+
+Reddit's anonymous JSON answers 403, X has no free API and none of this uses a paid one. Fetching is polite: `claude-acc-seo-radar/1 (+https://www.outofplace.space; contact@outofplace.space)`, conditional requests (`If-None-Match`, `If-Modified-Since`) with the items kept in `seo/cache/radar-http.json` so a 304 or an outage still has them, at most one request per second per host (the same lock files as research and audit), a pause on 429 or 503 for `Retry-After` or 10 and 30 s, after which the host is closed for the run, and one retry after a network error (platform.claude.com sometimes fails DNS from here). HN answers are cached for 3 hours, npm counts for a day.
+
+**Events.** Items from different sources about the same thing are one event: the same URL, or the same release (entity and version from a source that announces its own releases, `releases: true`). A story or post with that entity and version elsewhere (HN, a blog) joins the release. An official security notice of an entity and that entity's releases whose notes mention security within 48 hours are one event too (on 14.10 the Next.js Security Update, v16.4.1 and v15.5.28). Quiet patch releases of one entity (one source, under 30 HN points, no security) fold into one `rollup` event. Each event has a `kind` (`release`, `announcement`, `article`, `discussion`: only HN), the entities and versions it is about, its published and first-seen times, and:
+
+- **popularity:** HN points and comments summed over its stories (a lookup by URL adds stories for up to 20 events the keyword queries missed), the number of independent sources, npm weekly downloads for an entity with a package, and search demand for its phrase from research's sources: Google autocomplete in the blog's languages (cached 36 hours), plus GSC and Bing when the blog has them;
+- **urgency**, by the rule below;
+- **covered:** whether the blog already wrote about it, from its posts (the `posts` source) and their titles in `llms.txt`. A post with the entity and the event's version counts; for an event without a version, a post whose title words cover 60% of the event's. A post about the same entity without that version is only `related`;
+- **proposal:** `type` (`release`, `tutorial`, `digest`), the blog `category` of the entity, an `angle`, EN and PL `keywords` and a `demo` idea for the blog's lab. A security event gets an upgrade angle and a demo without exploit code.
+
+**Urgency rule.** Entities have a `tier` (1 can be breaking, 2 cannot); an event without an entity counts as tier 3.
+
+- `breaking`: a tier-1 entity, published in the last 48 hours, and one of: a major or minor release (not a rollup) seen in at least 2 independent sources or with at least 50 HN points; a security release or notice from an official source; an official announcement or article with at least 150 HN points or 3 sources. An HN discussion is never breaking.
+- `high`: published in the last 7 days and one of: a major or minor release of a tracked entity; an official security notice of a tracked entity; at least 100 HN points; a tier-1 official event with at least 2 sources or 30 HN points.
+- `normal`: everything else.
+
+Within an urgency, events sort by `score` (0 to 100): tier weight (1, 0.7, 0.4) × (0.30 HN + 0.20 extra sources + 0.10 npm downloads + 0.20 demand + 0.20 freshness over 7 days), each part on a 0 to 1 log scale.
+
+**X, indirectly.** Once per run one Sonnet session with WebSearch and WebFetch looks at the top `x_events` (8) events: what developers say, which X posts and threads news sites, HN and blogs cite (X itself cannot be searched for free), who already covered the event well and what a new post could add (the gap). It sharpens the angle and the demo of those events. It runs like research's web sessions: `WebSearch`, `WebFetch` and `Write` to one answer file in an empty temporary directory (`dontAsk`, `--safe-mode`, no MCP, no Bash), a cap of 0.60 USD within the blog's `budget_usd`, and the answer is data: control characters and markup are stripped, a line that reads like an instruction is dropped, an X post counts only on x.com or twitter.com, and the blog's own pages never count as someone else's coverage. `--no-web` skips the session (0 USD).
+
+Every source can fail on its own: the radar is thinner and `sources` says what was missing and why, and the run still writes the file. Only a run where no source delivered anything ends in BŁĄD (retryable), and the previous `radar.json` stays. Outside a run, a radar with the web session re-runs itself under `credits run --purpose seo-radar-<blog>`.
+
+`--dry` prints the 15 best events with their evidence and the sources, and writes nothing in the blog folder: no `radar.json`, no `radar-state.json`, no job result. The fetch cache under `seo/cache/` is still written.
+
+**Daily job.** One light job per blog, before its first slot (outofplace: 05:30):
+
+```sh
+claude-acc jobs add seo-radar-outofplace --cwd ~/.local/share/claude-acc/seo --entry 'claude-acc seo radar outofplace' \
+  --budget-usd 1 --light --footprint-gb 1 --run-min 45 --every 1d --at 04:40
+```
+
+The result follows the blog pipeline contract: the side-effect marker before `radar.json` is replaced, OPUBLIKOWANO with the event counts and the breaking titles, the sources that failed in `notes`, and a WYNIK block.
+
+**Config.** A `radar` object per blog in `seo/config.json`; `claude-acc seo config` lists its sources:
+
+```json
+{"outofplace": {"radar": {
+  "window_days": 7,
+  "entities": [
+    {"name": "Next.js", "aliases": ["next.js", "nextjs"], "tier": 1, "npm": "next", "category": "nextjs-react", "phrase": "next.js"},
+    {"name": "Anthropic", "aliases": ["anthropic"], "tier": 2, "category": "ai-dev"}
+  ],
+  "sources": [
+    {"id": "nextjs-blog", "kind": "feed", "label": "Next.js blog", "url": "https://nextjs.org/feed.xml", "entity": "Next.js", "releases": true},
+    {"id": "gh-nextjs", "kind": "github", "label": "vercel/next.js", "repo": "vercel/next.js", "entity": "Next.js", "include": "^v\\d"},
+    {"id": "anthropic-news", "kind": "sitemap", "label": "Anthropic news", "url": "https://www.anthropic.com/sitemap.xml",
+     "include": "^/news/[^/]+$", "event": "announcement", "entity": "Anthropic", "releases": true},
+    {"id": "claude-platform-notes", "kind": "notes", "format": "md-headings", "label": "Claude Platform release notes",
+     "url": "https://platform.claude.com/docs/en/release-notes/overview.md", "entity": "Claude API",
+     "release_title": "(?i)launch|introduc|now available|generally available|released"},
+    {"id": "hn", "kind": "hn", "label": "Hacker News", "queries": [{"q": "next.js", "entity": "Next.js"}, {"q": "nextjs.org", "url": true, "entity": "Next.js"}]}
+  ],
+  "limits": {"events": 80, "x_events": 8, "demand_events": 16, "hn_lookups": 20}
+}}}
+```
+
+`entity` on a source is the default entity of its items when the title names none (an entity named in the title wins). `include`, `exclude` and `release_title` are regular expressions on the title (on the path for a sitemap). `event` is the kind of a non-release item (`announcement` or `article`). An HN query takes `min_points` (5 for a URL query, 20 otherwise). The config is generic, so another blog can get its own sources (standards and regulation news for Renggli).
+
+**`radar.json` (schema v1).** `claude-acc seo schema radar` prints the JSON Schema the file is checked against before it is written.
+
+| Field | Meaning |
+|---|---|
+| `schema`, `v` | `claude-acc.seo.radar`, `1` |
+| `blog`, `domain`, `generated_at`, `window_days` | which blog, when, how far back |
+| `sources[]` | `{name, ok, skipped, degraded, count, detail}` per configured source, plus `hn-adresy`, `npm`, `demand`, `gsc`, `bing`, `posts`, `llms`, `x` |
+| `x` | `{approx: true, checked, with_x_posts, checked_at}` or `null` without the web session |
+| `summary` | `events`, `breaking`, `high`, `normal`, `covered`, `new` |
+| `events[]` | up to `limits.events` (80), breaking first, then high, then normal, each by `score` |
+
+Each event: `id` (`e` and 8 hex digits, stable across runs), `kind`, `title`, `url` (the primary source), `entities[]` (`{name, version, level, primary}`), `version` and `level` (`major`, `minor`, `patch`, or `null`), `rollup` (the folded patch versions or `null`), `published_at`, `first_seen_at` and `new` (from `radar-state.json`), `age_hours`, `urgency` and `urgency_reason` (Polish), `score`, `popularity` (`hn` `{points, comments, stories[]}` or `null`, `sources`, `source_ids[]`, `npm_weekly` `{package, downloads}` or `null`, `demand` `{phrase, score, autocomplete{lang-country: 0..1}, gsc, bing}`), `items[]` (up to 8 `{source, kind, title, url, published_at}`), `summary`, `covered` (`{covered, posts[], related[]}`, each `{url, title, match}`), `x` (`{discussion, x_posts[{url, summary}], covered_by[{url, title, note}], gap}` or `null`) and `proposal` (`{type, category, angle, keywords{en[], pl[]}, demo}`).
+
 ## Desktop gateway
 
 `claude-acc desktop mcp` is a stdio MCP server with Anthropic's computer use toolset (`computer_toolset_20260801`), the tools Claude models are trained on, under their own names and inputs: `screenshot`, `zoom`, `cursor_position`, `mouse_move`, `left_mouse_down`, `left_mouse_up`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`, `left_click_drag`, `scroll`, `type`, `key`, `hold_key` and `wait`. It drives the whole macOS desktop the way the browser gateway drives your Chrome: the agent takes a `screenshot` of the active display, then clicks and types at coordinates in that screenshot's pixel space. `claude-acc desktop install` registers it as `desktop` in your user scope with the `desktop` skill and the shared prompt hint; scripts call any member with `claude-acc desktop <member> '<json>'`.

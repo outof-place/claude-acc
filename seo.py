@@ -3,8 +3,9 @@
 
     claude-acc seo research BLOG [--dry] [--ai]
     claude-acc seo audit BLOG [--dry]
+    claude-acc seo radar BLOG [--dry] [--no-web]
     claude-acc seo config [--json]
-    claude-acc seo schema [audit]
+    claude-acc seo schema [audit|radar]
     claude-acc seo bing-key [--remove]
 
 Jeden silnik dla czterech blogów (outofplace, matura, agromalz, renggli). Bieg zbiera frazy z
@@ -54,12 +55,14 @@ zapisem keywords.json, JSON wyniku, blok WYNIK; kod 0 OPUBLIKOWANO (keywords.jso
 BŁĄD (zła konfiguracja albo żadne źródło nic nie dało: do ponowienia).
 
 Audyt SEO (`seo audit`, skaner w stylu Ahrefs: alerty Ahrefs z poczty, własny crawler, Bing) jest w
-seoaudit.py; tu tylko komenda.
+seoaudit.py, a radar tematów (`seo radar`: co wydały Anthropic, Vercel i zespół Next.js, o czym mówią
+programiści) w seoradar.py; tu tylko komendy.
 
 Pliki (~/.local/share/claude-acc/seo/):
   config.json                  konfiguracja blogów (schemat w README, `seo config`)
   <blog>/keywords.json         wynik, schemat v1 (`seo schema`)
   <blog>/audit.json            wynik audytu, schemat v1 (`seo schema audit`); state.json obok
+  <blog>/radar.json            wynik radaru, schemat v1 (`seo schema radar`); radar-state.json obok
   <blog>/ai-visibility.jsonl   linia na bieg: ile zapytań cytuje domenę bloga (przybliżone)
   cache/                       autocomplete, robots.txt, mapy stron, tytuły, wybór konkurencji,
                                Bing; rate/ to blokady tempa na host
@@ -126,11 +129,13 @@ SESSION_TIMEOUT = 20 * 60
 MAX_WORDS = 8  # dłuższa fraza nie trafia do puli
 
 # ile sesja może wydać najwyżej; razem mieszczą się w budżecie bloga (domyślnie 1 USD)
-# discovery biegnie raz na blog (potem konkurencja jest przypięta); WebSearch to ok. 0,04 USD za szukanie
-CAPS = {"discovery": 0.60, "cluster": 0.35, "ai": 0.45}
-TURNS = {"discovery": 30, "cluster": 6, "ai": 30}
-EFFORT = {"discovery": "low", "cluster": "medium", "ai": "low"}
+# discovery biegnie raz na blog (potem konkurencja jest przypięta); WebSearch to ok. 0,04 USD za szukanie;
+# radar to jedna sesja na bieg (rozmowy programistów o najważniejszych zdarzeniach, seoradar.py)
+CAPS = {"discovery": 0.60, "cluster": 0.35, "ai": 0.45, "radar": 0.60}
+TURNS = {"discovery": 30, "cluster": 6, "ai": 30, "radar": 30}
+EFFORT = {"discovery": "low", "cluster": "medium", "ai": "low", "radar": "low"}
 WEB_TOOLS = ("WebSearch", "WebFetch")
+WEB_KINDS = ("discovery", "ai", "radar")  # sesje, które czytają sieć; reszta dostaje tylko plik wyjścia
 
 DEFAULT_LIMITS = {
     "seeds": 20,  # nasion na język
@@ -1115,8 +1120,8 @@ def bing_stats(ctx, blog, pool):
 
 
 def session_argv(kind, out_path):
-    """Linia `claude` dla sesji: sieć tylko w discovery i ai; zawsze jeden plik wyjścia."""
-    web = kind in ("discovery", "ai")
+    """Linia `claude` dla sesji: sieć tylko w WEB_KINDS (discovery, ai, radar); zawsze jeden plik wyjścia."""
+    web = kind in WEB_KINDS
     tools = list(WEB_TOOLS if web else ()) + ["Write"]
     # Edit(//ścieżka) to ścieżka bezwzględna; reguła Edit obejmuje też Write
     allow = list(WEB_TOOLS if web else ()) + [f"Edit(/{os.path.realpath(out_path)})"]
@@ -1947,12 +1952,15 @@ def research(ctx, blog, dry=False, ai=None, config_path=None, out_dir=None):
     return 0
 
 
-def wrap(name, blog, args):
-    """Poza biegiem (bez CLAUDE_ACC_RUN) ta sama komenda idzie przez `credits run`: płatnik z puli,
-    licznik i strażnik dla każdej sesji Claude."""
-    cmd = [sys.executable, os.path.join(HERE, "credits.py"), "run", "--purpose", f"seo-research-{name}",
-           "--budget-usd", f"{blog['budget_usd']:g}", "--awake-minutes", "150", "--",
-           sys.executable, os.path.realpath(__file__), "research", name] + args  # fmt: skip
+AWAKE_MINUTES = {"research": 150, "radar": 45}  # ile czuwania credits run daje biegowi komendy
+
+
+def wrap(name, blog, args, sub="research"):
+    """Poza biegiem (bez CLAUDE_ACC_RUN) ta sama komenda (research albo radar) idzie przez `credits
+    run`: płatnik z puli, licznik i strażnik dla każdej sesji Claude."""
+    cmd = [sys.executable, os.path.join(HERE, "credits.py"), "run", "--purpose", f"seo-{sub}-{name}",
+           "--budget-usd", f"{blog['budget_usd']:g}", "--awake-minutes", str(AWAKE_MINUTES[sub]), "--",
+           sys.executable, os.path.realpath(__file__), sub, name] + args  # fmt: skip
     os.makedirs(SEO_DIR, exist_ok=True)
     return subprocess.call(cmd, cwd=SEO_DIR)
 
@@ -1987,10 +1995,14 @@ def cmd_config(args):
         try:
             blog = blog_config(config, name)
             row = {"blog": name, "ok": True, "domain": blog["domain"], "langs": blog["langs"],
-                   "competitors": blog["competitors"], "budget_usd": blog["budget_usd"], "audit": None}  # fmt: skip
+                   "competitors": blog["competitors"], "budget_usd": blog["budget_usd"], "audit": None, "radar": None}  # fmt: skip
             if blog.get("audit") is not None:
                 cfg = audit_module().audit_config(blog)
                 row["audit"] = {k: cfg.get(k) for k in ("canonical_host", "sitemap", "llms", "indexnow_key_url", "ahrefs_project", "bing_site")}
+            if blog.get("radar") is not None:
+                cfg = radar_module().radar_config(blog)
+                row["radar"] = {"window_days": cfg["window_days"], "sources": [s["id"] for s in cfg["sources"]],
+                                "entities": [e["name"] for e in cfg["entities"]]}  # fmt: skip
             rows.append(row)
         except UsageError as exc:
             rows.append({"blog": name, "ok": False, "error": str(exc)})
@@ -2008,6 +2020,11 @@ def cmd_config(args):
                       f"Bing: {audit['bing_site'] or 'brak'}, IndexNow: {audit['indexnow_key_url'] or 'brak klucza'}")  # fmt: skip
             else:
                 print("    audyt: brak sekcji audit (seo audit nie ruszy)")
+            radar = row["radar"]
+            if radar:
+                print(f"    radar: {radar['window_days']} dni, {plural(len(radar['sources']), 'źródło', 'źródła', 'źródeł')}: {', '.join(radar['sources'])}")
+            else:
+                print("    radar: brak sekcji radar (seo radar nie ruszy)")
         else:
             print(f"  {row['blog']}: BŁĄD {row['error']}")
     return 0 if all(r["ok"] for r in rows) else 1
@@ -2016,6 +2033,8 @@ def cmd_config(args):
 def cmd_schema(args):
     if args and args[0] == "audit":
         return print(json.dumps(audit_module().SCHEMA_V1, indent=1, ensure_ascii=False)) or 0
+    if args and args[0] == "radar":
+        return print(json.dumps(radar_module().SCHEMA_V1, indent=1, ensure_ascii=False)) or 0
     print(json.dumps(SCHEMA_V1, indent=1, ensure_ascii=False))
     return 0
 
@@ -2031,6 +2050,18 @@ def audit_module():
 
 def cmd_audit(args):
     return audit_module().cmd_audit(args)
+
+
+def radar_module():
+    """seoradar.py z tym samym modułem seo, z tego samego powodu co audit_module."""
+    sys.modules.setdefault("seo", sys.modules[__name__])
+    import seoradar
+
+    return seoradar
+
+
+def cmd_radar(args):
+    return radar_module().cmd_radar(args)
 
 
 def cmd_bing_key(args):
@@ -2063,7 +2094,8 @@ def cmd_bing_key(args):
     return 0
 
 
-COMMANDS = {"research": cmd_research, "audit": cmd_audit, "config": cmd_config, "schema": cmd_schema, "bing-key": cmd_bing_key}
+COMMANDS = {"research": cmd_research, "audit": cmd_audit, "radar": cmd_radar, "config": cmd_config, "schema": cmd_schema,
+            "bing-key": cmd_bing_key}
 USAGE = "\n".join(line for line in __doc__.splitlines() if line.startswith("    claude-acc seo"))
 
 
