@@ -107,6 +107,36 @@ PURPOSE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 API_KEY_RE = re.compile(r"sk-ant-(?:api|usr)[0-9A-Za-z_-]+")
 # komunikat API ("Your credit balance is too low...") i Claude Code ("Credit balance is too low")
 EXHAUSTED_RE = re.compile(rb"credit balance (?:is )?too low", re.IGNORECASE)
+# linia zdarzenia Claude Code (stream-json, json); komunikat błędu API trafia tylko do `result`
+EVENT_RE = re.compile(rb'\{\s*"type"\s*:\s*"([a-z_]+)"')
+
+
+class ExhaustionScan:
+    """Czy wyjście komendy powiedziało, że kredyt się skończył; strumień przychodzi kawałkami.
+
+    Zdanie liczy się w zwykłej linii tekstu (`claude -p` w trybie text, logi przebiegów) i w
+    zdarzeniu `result`. Pozostałe zdarzenia stream-json (`user`, `assistant`, `system`) niosą też to,
+    co sesja przeczytała albo napisała: 15.10 bieg v1-radar miał na stdout README claude-acc z tym
+    zdaniem, zabity z innego powodu skończył się kodem 143, a organizacja 3@ została oznaczona jako
+    pusta przy $112 kredytu. Zdanie nie ma końca linii, więc wystarczy pamiętać początek i ogon
+    bieżącej linii."""
+
+    KEEP = 64
+
+    def __init__(self):
+        self.head, self.tail, self.seen = b"", b"", False
+
+    def feed(self, chunk):
+        lines = chunk.split(b"\n")
+        for i, part in enumerate(lines):
+            if i:  # nowa linia
+                self.head, self.tail = b"", b""
+            head = (self.head + part)[: self.KEEP]
+            if not self.seen and EXHAUSTED_RE.search(self.tail + part):
+                event = EVENT_RE.match(head)
+                self.seen = not event or event.group(1) == b"result"
+            self.head, self.tail = head, (self.tail + part)[-self.KEEP :]
+        return self.seen
 
 
 class CreditsError(Exception):
@@ -867,19 +897,17 @@ def run_watched(command, env):
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
     sel = selectors.DefaultSelector()
-    tails, gone, seen = {}, set(), False
+    scans, gone, seen = {}, set(), False
     for pipe, target in ((proc.stdout, 1), (proc.stderr, 2)):
         sel.register(pipe, selectors.EVENT_READ, target)
-        tails[target] = b""
+        scans[target] = ExhaustionScan()  # zdanie rozcięte między dwa kawałki też się znajdzie
     while sel.get_map():
         for item, _ in sel.select():
             chunk = os.read(item.fileobj.fileno(), 65536)
             if not chunk:
                 sel.unregister(item.fileobj)
                 continue
-            window = tails[item.data] + chunk
-            seen = seen or bool(EXHAUSTED_RE.search(window))
-            tails[item.data] = window[-64:]  # zdanie rozcięte między dwa kawałki też się znajdzie
+            seen = scans[item.data].feed(chunk) or seen
             if item.data not in gone:
                 try:
                     write_all(item.data, chunk)

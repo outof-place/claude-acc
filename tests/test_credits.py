@@ -403,6 +403,29 @@ class Balance(unittest.TestCase):
         self.assertIn("kredyty API: zostało $587.50", r.stdout)
 
 
+class ExhaustionScanTest(unittest.TestCase):
+    """Skan wyjścia komendy, kawałek po kawałku, jak czyta go `exec`, `run` i runner jobów."""
+
+    def scan(self, *chunks):
+        spec = importlib.util.spec_from_file_location("credits_for_scan", os.path.join(ROOT, "credits.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        s = module.ExhaustionScan()
+        return [s.feed(c) for c in chunks][-1]
+
+    def test_phrase_deep_inside_a_long_session_event_split_across_reads_does_not_count(self):
+        # wynik narzędzia w stream-json to jedna linia setek KB; os.read oddaje ją po 64 KB
+        head = b'{"type":"user","message":{"content":[{"type":"tool_result","content":"'
+        self.assertFalse(self.scan(head + b"x" * 65536, b"y" * 1000 + b"credit balance is too low", b'"}]}}\n'))
+
+    def test_plain_line_after_session_events_counts_even_when_split(self):
+        self.assertTrue(self.scan(b'{"type":"assistant","message":{}}\nCredit bal', b"ance is too low\n"))
+
+    def test_result_event_counts_and_another_tool_json_line_counts_too(self):
+        self.assertTrue(self.scan(b'{"type":"result","is_error":true,"result":"Credit balance is too low"}\n'))
+        self.assertTrue(self.scan(b'{"error":{"message":"Your credit balance is too low to access the API"}}\n'))
+
+
 class Exec(unittest.TestCase):
     def setUp(self):
         self.w = World()
@@ -473,6 +496,27 @@ class Exec(unittest.TestCase):
         r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", child)
         self.assertEqual(r.returncode, 0)
         self.assertEqual(self.w.account("d@example.com")["remaining_usd"], 200.0)
+
+    def test_phrase_a_stream_json_session_read_or_wrote_is_not_an_interruption(self):
+        # 15.10, bieg v1-radar: sesja w stream-json przeczytała README claude-acc ze zdaniem o kredycie, wynik
+        # narzędzia poszedł na stdout, a bieg zabity z innego powodu skończył się kodem 143: 3@ oznaczone jako puste
+        read = json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "once they run out, requests fail with *credit balance is too low*"}]}})
+        wrote = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "The README says: Credit balance is too low."}]}})
+        child = f"print({read!r}); print({wrote!r}); raise SystemExit(1)"
+        r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", child)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(self.w.account("d@example.com")["remaining_usd"], 200.0)
+
+    def test_billing_error_in_the_stream_json_result_still_ends_76(self):
+        # Claude Code kładzie komunikat błędu API do zdarzenia `result` (stream-json i json)
+        result = json.dumps({"type": "result", "subtype": "success", "is_error": True,
+                             "result": "Credit balance is too low"})
+        child = f"print({result!r}); raise SystemExit(1)"
+        r = self.w.run("exec", "--purpose", "polid-t", "--", PY, "-c", child)
+        self.assertEqual(r.returncode, 76, r.stderr)
+        self.assertEqual(self.w.account("d@example.com")["remaining_usd"], 0.0)
 
 
 # dziecko `exec --no-env`: woła helper tak jak Claude Code apiKeyHelper (sh, stdout do rury)
