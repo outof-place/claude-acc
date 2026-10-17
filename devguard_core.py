@@ -503,6 +503,9 @@ class Pressure:
         history.append([now, self.swap_used, swapouts])
         state["swap_history"] = history
         first = history[0]
+        # wiek okna przyrostu: akcja strażnika albo hamulca zeruje okno (swap_history = []), więc po
+        # niej przyrost liczy się z krótszego czasu (B-3); rejestr niesie to pole przy decyzjach
+        self.swap_window_s = round(now - first[0], 1)
         self.swap_growth = self.swap_used - first[1]
         self.swapouts = (
             (swapouts - first[2])
@@ -2194,13 +2197,42 @@ def brake(cfg, world, state, now, enforce, acted):
         return None
     if level < 3 and not runaway and (acted is not None or now - state.get("last_action", 0) < cfg["cooldown_seconds"]):
         return None
-    reaped = lastresort.reap(world, state, sys.modules[__name__], level=level, cfg=cfg)
+    # wiersz `kill` mówi, że po nim okno przyrostu swapu startuje od zera (niżej)
+    reaped = lastresort.reap(world, state, sys.modules[__name__], level=level, cfg=cfg,
+                             event_fields={"swap_window_reset": True})
     if reaped:
         state["brake_at"] = now
         state["last_action"] = now
         # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
         state["swap_history"] = []
     return reaped
+
+
+# pierścień rodzin pamięci dla wiersza `stage`: tyle próbek, co tyle sekund (ok. 2 min wstecz), żeby
+# policzyć, co rosło przed zmianą stopnia: ciężka praca czy pamięć długo żyjąca (R1)
+INVENTORY_RING = (5, 30)
+
+
+def family_sizes(inv):
+    """{rodzina: footprint} z inwentarza (inventory) albo {}."""
+    return {name: f.get("footprint") for name, f in ((inv or {}).get("families") or {}).items()}
+
+
+def remember_inventory(state, now):
+    """Próbka rodzin do pierścienia state["inventory_ring"], najwyżej co INVENTORY_RING[1] sekund."""
+    ring = state.setdefault("inventory_ring", [])
+    if not ring or now - ring[-1]["at"] >= INVENTORY_RING[1]:
+        ring.append({"at": now, "families": family_sizes(state.get("inventory"))})
+        del ring[: -INVENTORY_RING[0]]
+
+
+def record(ev, world, **fields):
+    """Wiersz rejestru decyzji ($STATE/events.jsonl) z powodami i sygnałami pamięci tej samej chwili
+    (world.pressure), tą samą drogą co wiersz `kill` hamulca (lastresort.record): błąd rejestru nigdy
+    nie zatrzymuje strażnika."""
+    import lastresort
+
+    lastresort.record(sys.modules[__name__], ev, getattr(world, "pressure", None), fields)
 
 
 def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
@@ -2227,12 +2259,25 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
                 # przyrost swapu sprzed akcji nie może wywołać następnej: pomiar od nowa
                 state["swap_history"] = []
                 acted = plan
+                unit = getattr(plan, "unit", None)
+                record("stop", world, plan=plan.action, code=getattr(plan, "code", None),
+                       reason=getattr(plan, "reason", None), unit=getattr(unit, "label", None),
+                       ports=list(getattr(unit, "ports", None) or []), size=getattr(unit, "footprint", None),
+                       swap_window_reset=True)
             break
     stage = getattr(world.pressure, "stage", 0)
     inv = state.get("inventory") or {}
     if hasattr(world, "table") and world.table and (stage >= 1 or now - inv.get("at", 0) >= 30):
         state["inventory"] = inventory(world.table, world.units, now)
+        remember_inventory(state, now)
     reaped = brake(cfg, world, state, now, enforce, acted)
+    # po hamulcu: odczyt dysku i zapis wiersza nie opóźniają zabicia przy awarii. Tick na próbę (`guard
+    # status` bez świeżej migawki, `once --dry-run`) stanu nie zapisuje, a jego „poprzedni stopień” to
+    # stara migawka z dysku: jego zmiana stopnia nie jest zmianą, którą strażnik przeszedł
+    if stage != previous and not dry_run:
+        ring = state.get("inventory_ring") or []
+        record("stage", world, stage=stage, previous=previous, families=family_sizes(state.get("inventory")),
+               families_at=(state.get("inventory") or {}).get("at"), ring_oldest=ring[0] if ring else None)
     history = state.setdefault("history", [])
     if not history or now - history[-1][0] >= 30:
         p = world.pressure

@@ -25,6 +25,30 @@ import devguard_core as dg
 import lastresort as lr
 
 MB = 1024**2
+
+
+def setUpModule():
+    # tick, brake i reap piszą rejestr decyzji do devguard_core.STATE_DIR: w tych testach do katalogu
+    # tymczasowego, nigdy do prawdziwego ~/.local/share/claude-acc
+    import shutil
+    import tempfile
+
+    global _STATE_PATCH, _STATE_TMP
+    _STATE_TMP = tempfile.mkdtemp(prefix="lastresort-state-")
+    _STATE_PATCH = mock.patch.object(dg, "STATE_DIR", _STATE_TMP)
+    _STATE_PATCH.start()
+    unittest.addModuleCleanup(shutil.rmtree, _STATE_TMP, True)
+    unittest.addModuleCleanup(_STATE_PATCH.stop)
+
+
+def read_events(state_dir):
+    path = os.path.join(state_dir, "events.jsonl")
+    if not os.path.exists(path):
+        return []
+    import json
+
+    with open(path) as f:
+        return [json.loads(line) for line in f]
 GB = 1024**3
 NOW = 1_800_000_000.0
 
@@ -277,6 +301,81 @@ class ReapTest(unittest.TestCase):
         lr.reap(self.world({200: (1, MCP)}), state, core)
         self.assertEqual(len(state["lastresort"]), 50)
         self.assertEqual(state["lastresort"][-1]["pid"], 200)
+
+    def pressure(self, **extra):
+        """Sygnały strażnika z jednej chwili (Pressure), tak jak w prawdziwym tick()."""
+        p = types.SimpleNamespace(
+            stage=2, stage_reasons=["kompresor 25.0 GB (52% RAM)"], level=2, reasons=["swap 10.0 GB i rośnie"],
+            ram=48 * GB, compressed=25 * GB, segments=420_000, segments_limit=1_000_000, swap_used=10 * GB,
+            swap_growth=600 * MB, swapouts=1200, kernel=2, available=18, swap_window_s=117.5,
+        )
+        for name, value in extra.items():
+            setattr(p, name, value)
+        return p
+
+    def test_kill_event_carries_stage_reasons_and_signals(self):
+        """Wydanie A (A2): każde zabicie ma wiersz `kill` z powodami stopnia i sygnałami tej samej
+        chwili. Bez niego G-B1 i G-B2 (siedem dób rejestru) nie mają z czego liczyć: dziś reap
+        zostawia tylko linię logu i 7 pól w stanie, bez powodów i sygnałów."""
+        import tempfile
+
+        state_dir = tempfile.mkdtemp(prefix="reap-events-")
+        self.addCleanup(__import__("shutil").rmtree, state_dir, True)
+        table = {200: (1, MCP), 201: (200, "node child"), 300: (1, MCP)}
+        core = FakeCore({200: 600 * MB, 201: 300 * MB, 300: 200 * MB}, {})
+        core.STATE_DIR = state_dir
+        world = types.SimpleNamespace(table=table, units=[], now=NOW, pressure=self.pressure())
+        state = {}
+        line = lr.reap(world, state, core, level=2)
+        (row,) = read_events(state_dir)
+        self.assertEqual(row["ev"], "kill")
+        self.assertEqual(
+            {k: row[k] for k in ("code", "pid", "job", "tree_n", "size", "level", "result")},
+            {"code": "orphan", "pid": 200, "job": None, "tree_n": 2, "size": 900 * MB, "level": 2,
+             "result": "zatrzymany"},
+        )
+        self.assertEqual(row["stage_reasons"], ["kompresor 25.0 GB (52% RAM)"])
+        self.assertEqual((row["guard_level"], row["guard_reasons"]), (2, ["swap 10.0 GB i rośnie"]))
+        self.assertEqual(
+            {k: row[k] for k in ("compressed", "segments", "segments_limit", "swap_used", "swap_growth",
+                                 "swapouts", "kernel", "available", "swap_window_s")},
+            {"compressed": 25 * GB, "segments": 420_000, "segments_limit": 1_000_000, "swap_used": 10 * GB,
+             "swap_growth": 600 * MB, "swapouts": 1200, "kernel": 2, "available": 18, "swap_window_s": 117.5},
+        )
+        self.assertIsInstance(row["pgid_n"], int)
+        self.assertGreater(row["disk_free_gb"], 0)
+        self.assertFalse(row["swap_window_reset"])  # sam reap okna nie zeruje; brake dopisuje swoje
+        for key in ("ts", "up", "boot"):
+            self.assertIn(key, row)
+        self.assertIn(f"pid {row['pid']}", line)  # wiersz i linia logu mówią o tym samym zabiciu
+        # wybór, sygnały i pamięć dla panelu bez zmian
+        self.assertEqual(core.killed, [[200, 201]])
+        self.assertEqual(state["lastresort"][0]["pid"], 200)
+        # wołający dopisuje swoje pola (brake: okno swapu od nowa)
+        core = FakeCore({200: 2 * GB}, {})
+        core.STATE_DIR = state_dir
+        lr.reap(self.world({200: (1, MCP)}), {}, core, event_fields={"swap_window_reset": True})
+        self.assertTrue(read_events(state_dir)[-1]["swap_window_reset"])
+        # atrapa bez katalogu stanu: reap działa jak dotąd, bez rejestru
+        self.assertIsNotNone(lr.reap(self.world({200: (1, MCP)}), {}, FakeCore({200: 2 * GB}, {})))
+        self.assertEqual(len(read_events(state_dir)), 2)
+
+    def test_runaway_is_its_own_event(self):
+        """Uciekinier (dawny memory-guard) ginie na każdym stopniu: osobny wiersz `runaway`, żeby L1
+        (wyłączenie memory-guard) liczyło jego zabicia, a nie zabicia hamulca."""
+        import tempfile
+
+        state_dir = tempfile.mkdtemp(prefix="reap-events-")
+        self.addCleanup(__import__("shutil").rmtree, state_dir, True)
+        table = {101: (1, CLAUDE), 102: (101, "/bin/zsh -c node t.js"), 103: (102, "node t.js")}
+        core = FakeCore({101: MB, 102: MB, 103: 25 * GB}, {103: 5})
+        core.STATE_DIR = state_dir
+        world = types.SimpleNamespace(table=table, units=[], now=NOW,
+                                      pressure=self.pressure(stage=0, stage_reasons=[], level=0, reasons=[]))
+        lr.reap(world, {}, core, level=0)
+        (row,) = read_events(state_dir)
+        self.assertEqual((row["ev"], row["code"], row["pid"], row["level"]), ("runaway", "runaway", 103, 0))
+        self.assertEqual(row["stage_reasons"], [])
 
 
 class TickTest(unittest.TestCase):
@@ -534,6 +633,13 @@ def synthetic_agent(test, mb):
     return agent, shell, child, table
 
 
+# proces joba (perl pod inną nazwą, jak wyżej) i jego dziecko, które zakłada własną sesję, a z nią grupę
+# procesów (setsid(2), jak os.setsid() w Pythonie); oba wypisują pid i grupę, potem śpią
+GROUPS_PL = ('use POSIX (); $| = 1; my $pid = fork(); '
+             'if ($pid == 0) { POSIX::setsid(); print "child $$ ", getpgrp(), "\\n"; sleep 120; exit 0; } '
+             'print "parent $$ ", getpgrp(), "\\n"; sleep 120;\n')
+
+
 class BrakeOnRealProcessesTest(unittest.TestCase):
     """Hamulec na prawdziwym drzewie: udawany agent, jego powłoka i proces z balastem, który
     ignoruje SIGTERM. Błąd, który łapie: „nie chcą zginąć” przy procesie, który ginie po
@@ -561,6 +667,46 @@ class BrakeOnRealProcessesTest(unittest.TestCase):
         self.assertEqual(agent.stdout.readline().strip(), "shell 0")  # powłoka skończyła sama, kodem 0
         self.assertEqual(state["lastresort"][0]["code"], "runaway")
         self.assertIn("wznowienie: cd ", line)
+        # wiersz rejestru na prawdziwym drzewie: grupa procesów policzona, zanim drzewo zginęło
+        (row,) = [r for r in read_events(dg.STATE_DIR) if r["pid"] == child]
+        self.assertEqual((row["ev"], row["tree_n"], row["pgid_n"], row["level"]), ("runaway", 1, 1, 3))
+
+    def test_job_tree_with_its_own_session_counts_two_process_groups(self):
+        """B-4: pauza schedulera (SIGSTOP grupy joba) nie sięga potomka, który założył własną sesję, a
+        `pgid_n` w wierszu `kill` mówi, ile grup miało drzewo. Prawdziwe drzewo joba: powłoka joba
+        (własna grupa, jak child_pgid schedulera), jej dziecko w tej grupie i wnuk po setsid(). Pomyłka,
+        którą łapie: grupy liczone po zabiciu drzewa (0) albo jedna grupa na drzewo (1)."""
+        import tempfile
+
+        d = tempfile.mkdtemp(prefix="brake-groups-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        worker = os.path.join(d, "worker")
+        os.symlink("/usr/bin/perl", worker)  # /usr/bin/perl to NEVER (^/usr/bin/): hamulec go nie weźmie
+        with open(os.path.join(d, "groups.pl"), "w") as f:
+            f.write(GROUPS_PL)
+        # stderr bez powłoki: `Terminated: 15` po zabiciu dziecka to szum
+        shell = subprocess.Popen(["/bin/sh", "-c", f"{worker} {d}/groups.pl; true"], stdout=subprocess.PIPE,
+                                 stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+                                 start_new_session=True)
+        self.addCleanup(lambda: (subprocess.run(["pkill", "-9", "-f", d]), shell.wait(), shell.stdout.close()))
+        seen = dict(shell.stdout.readline().split(" ", 1) for _ in range(2))
+        parent, parent_group = (int(x) for x in seen["parent"].split())
+        child, child_group = (int(x) for x in seen["child"].split())
+        self.assertEqual((parent_group, child_group), (shell.pid, child))  # dwie grupy naprawdę
+        table = {pid: (ppid, command) for pid, ppid, command in dg.processes() if pid in (shell.pid, parent, child)}
+        job = {"id": "j-groups", "pid": os.getpid(), "child_pgid": shell.pid, "cmd": "./scripts/e2e.sh",
+               "label": "./scripts/e2e.sh", "agent": {}}
+        world = types.SimpleNamespace(table=table, units=[], now=NOW, pressure=types.SimpleNamespace())
+        # próg klasy `job` (1 GB, 1 min) zdjęty: test liczy grupy, a nie wybiera ofiarę po rozmiarze
+        classes = tuple(("job", c[1], None, 0, 2) if c[0] == "job" else c for c in lr.CLASSES)
+        with mock.patch.object(dg, "log", lambda line: None), mock.patch.object(dg, "notify_quiet", mock.Mock()), \
+                mock.patch.object(lr, "sched_jobs", lambda core: [job]), mock.patch.object(lr, "CLASSES", classes):
+            line = lr.reap(world, {}, dg, level=2, cfg={"brake": {"brake_grace_seconds": 1}})
+        self.assertIn("zatrzymany", line)
+        (row,) = [r for r in read_events(dg.STATE_DIR) if r["job"] == "j-groups"]
+        self.assertEqual((row["ev"], row["code"], row["pid"]), ("kill", "job", parent))
+        self.assertEqual((row["tree_n"], row["pgid_n"]), (2, 2))
+        self.assertEqual(shell.wait(timeout=10), 0)  # powłoka joba nietknięta, skończyła sama
 
 
 if __name__ == "__main__":
