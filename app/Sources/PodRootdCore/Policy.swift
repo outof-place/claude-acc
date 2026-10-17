@@ -5,7 +5,7 @@ import XPC
 /// Who may send which tier (docs/pod-rootd.md, "Tiers"). Pod's Electron process runs its helpers
 /// with ELECTRON_RUN_AS_NODE, so the RunAsNode fuse stays on and any local process can run Pod's
 /// signed binary as Node: it gets tier A only. `pod-rootctl` can be run by anything, so its tier B
-/// needs an approval; Pod Menu's tier B comes from a click.
+/// needs an approval; Pod Menu's and PodNative's tier B comes from a click.
 public struct VerbPolicy: Sendable {
     public var allowed: [VerbTier: Set<Caller>]
     /// Callers whose tier B needs an `Approval`: authenticated now, or within `grace` for the same parent.
@@ -19,7 +19,7 @@ public struct VerbPolicy: Sendable {
     }
 
     public static let standard = VerbPolicy(
-        allowed: [.a: [.app, .menu, .cli], .b: [.menu, .cli]], approvalNeeded: [.cli], grace: 5 * 60)
+        allowed: [.a: [.app, .menu, .cli, .native], .b: [.menu, .cli, .native]], approvalNeeded: [.cli], grace: 5 * 60)
 
     public func permits(_ tier: VerbTier, for caller: Caller) -> Bool {
         allowed[tier]?.contains(caller) ?? false
@@ -43,8 +43,8 @@ nonisolated public struct PeerPolicy: Sendable {
         self.refused = refused
     }
 
-    /// Team `PodRootd.teamIdentifier`, Developer ID, the hardened runtime, one of the three signing
-    /// identifiers; Pod Menu and pod-rootctl also with library validation (`codesign --options
+    /// Team `PodRootd.teamIdentifier`, Developer ID, the hardened runtime, one of the four signing
+    /// identifiers; Pod Menu, pod-rootctl and PodNative also with library validation (`codesign --options
     /// runtime,library`), so nothing can be injected into a tier B caller. An Apple Development or
     /// non-hardened copy with the right team and identifier is turned away (docs/pod-rootd.md,
     /// "Signing").

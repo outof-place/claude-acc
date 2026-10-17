@@ -83,7 +83,7 @@ Token buckets per caller and verb class; a refusal says when to retry.
 
 Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`, `VerbPolicy`):
 
-| Tier | Verbs | Pod Menu | `pod-rootctl` | Pod (Electron, `codes.pod.app`) |
+| Tier | Verbs | Pod Menu, PodNative | `pod-rootctl` | Pod (Electron, `codes.pod.app`) |
 |---|---|---|---|---|
 | A: harmless, rate-limited | `status`, `fans.set`, `lid.hold`, `lid.release`; `shaper.set` scoped to the session at 6 Mb/s or more; `shaper.clear` of the caller's own session limit | yes | yes, no prompt | yes, except `lid.hold` |
 | B: changes the system | `power.mode`, `sysctl.*`, `shaper.*`, `spotlight.*`, `fsguard.set`, `launchd.parkOrphans`, `logs.pruneDiagnostics`, `legacy.*`, `restoreDefaults` | yes, no prompt: the click is the consent | only approved | never |
@@ -111,8 +111,11 @@ Every verb has a tier, and every caller a set of tiers it may send (`Verb.tier`,
   `codes.pod.app`. Electron Pod reaches tier B only through Pod Menu or `pod-rootctl`. For the
   same reason a lid hold from `codes.pod.app` is tier B: a closed-lid hold keeps a Mac awake in a
   bag, and Stay Awake is Pod Menu's anyway.
-- PodNative (nt-lean's Swift shell, `codes.pod.native` while it is a second window) is not
-  admitted. Once it ships as `codes.pod.app` without Electron, it gets tier B like Pod Menu.
+- PodNative (`codes.pod.native`) is the outer Pod.app of the one-app layout, which nests Electron
+  as `Contents/Helpers/Pod Runtime.app` (still `codes.pod.app`). It is claude-acc's host once Pod
+  Menu retires from Pod installs, so it gets what Pod Menu gets: tier A including `lid.hold`, and
+  tier B from its own UI on a click. Like Pod Menu it must run with the hardened runtime and library
+  validation (`codesign --options runtime,library`) and without `get-task-allow`.
 
 ## What moves out of root
 

@@ -115,17 +115,18 @@ func debuggablePeerRejected() async throws {
     #expect(PeerPolicy(listener: admit, callers: [(.menu, admit)], refused: [admit]).classify { _ in true } == nil)
 }
 
-@Test("Pod Menu and the CLI need library validation too; Electron Pod the hardened runtime only")
+@Test("Pod Menu, the CLI and PodNative need library validation too; Electron Pod the hardened runtime only")
 func hardeningPerCaller() {
     #expect(PeerPolicy.hardening(.menu) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
+    #expect(PeerPolicy.hardening(.native) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
     #expect(PeerPolicy.hardening(.cli) == [.isHardenedRuntimeEnforced, .isLibraryValidationRequired])
     #expect(PeerPolicy.hardening(.app) == [.isHardenedRuntimeEnforced])
 }
 
-@Test("the production policy names the three signing identities of team 75Y2KR6P5W")
+@Test("the production policy names the four signing identities of team 75Y2KR6P5W")
 func productionCallers() throws {
     let policy = try PeerPolicy.production()
-    #expect(policy.callers.map(\.0) == [.app, .menu, .cli])
+    #expect(policy.callers.map(\.0) == [.app, .menu, .cli, .native])
     // nothing here is signed by that team, so no identity matches
     #expect(policy.classify { _ in false } == nil)
     // a sender that matches everything is debuggable too, and that wins

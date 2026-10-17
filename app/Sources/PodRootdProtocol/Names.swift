@@ -12,6 +12,9 @@ public enum PodRootd {
     public static let menuIdentifier = "com.filip.claude-acc.menubar"
     /// The CLI the scripts run (`pod-rootctl`).
     public static let cliIdentifier = "codes.pod.rootctl"
+    /// Pod.app's native shell (PodNative): the outer app of the one-app layout, which nests
+    /// Electron as Contents/Helpers/Pod Runtime.app (still `appIdentifier`).
+    public static let nativeIdentifier = "codes.pod.native"
 
     /// Label and Mach service of the helper in the Pod build with this bundle id.
     public static func serviceName(appIdentifier: String = appIdentifier) -> String {
@@ -60,12 +63,15 @@ public enum Caller: String, Codable, Sendable, CaseIterable {
     case menu
     /// `pod-rootctl`, which the scripts run.
     case cli
+    /// PodNative, Pod.app's native shell: claude-acc's host once Pod Menu retires from Pod installs.
+    case native
 
     public var signingIdentifier: String {
         switch self {
         case .app: PodRootd.appIdentifier
         case .menu: PodRootd.menuIdentifier
         case .cli: PodRootd.cliIdentifier
+        case .native: PodRootd.nativeIdentifier
         }
     }
 }

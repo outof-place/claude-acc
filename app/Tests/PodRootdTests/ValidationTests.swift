@@ -95,7 +95,8 @@ func names() {
     #expect(PodRootd.serviceName(appIdentifier: "codes.pod.canary") == "codes.pod.canary.rootd")
     #expect(PodRootd.installedProgram() == "/Library/PrivilegedHelperTools/codes.pod.app.rootd")
     #expect(PodRootd.installedPlist() == "/Library/LaunchDaemons/codes.pod.app.rootd.plist")
-    #expect(Caller.allCases.map(\.signingIdentifier) == ["codes.pod.app", "com.filip.claude-acc.menubar", "codes.pod.rootctl"])
+    #expect(Caller.allCases.map(\.signingIdentifier)
+        == ["codes.pod.app", "com.filip.claude-acc.menubar", "codes.pod.rootctl", "codes.pod.native"])
     #expect(PodRootd.helperRequirementText(notarized: true)
         == "anchor apple generic and certificate leaf[subject.OU] = \"75Y2KR6P5W\" and identifier \"codes.pod.rootd\" and notarized")
 }

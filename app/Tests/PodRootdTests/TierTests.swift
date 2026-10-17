@@ -87,6 +87,16 @@ func menuTierB() {
     for verb in tierB { #expect(rig.send(verb, as: .menu).refusal != .needsApproval(verb: verb.name), "\(verb.name)") }
 }
 
+@Test("PodNative, as Pod Menu: tier A including the lid hold, tier B without a prompt (its UI sends B on a click)")
+func nativeAsMenu() {
+    let rig = Rig()
+    for verb in tierA where verb.name != "lid.release" { #expect(rig.send(verb, as: .native).refusal == nil, "\(verb.name)") }
+    #expect(rig.backend.sleepIsDisabled)
+    rig.send(.lidRelease, as: .native)
+    for verb in tierB { #expect(rig.send(verb, as: .native).refusal != .needsApproval(verb: verb.name), "\(verb.name)") }
+    for verb in tierB { #expect(rig.send(verb, as: .native).refusal != .verbNotAllowed(verb: verb.name, caller: .native), "\(verb.name)") }
+}
+
 @Test("the CLI: tier A without a prompt; tier B refused until approved, an approval in the request lets it through")
 func cliNeedsApproval() {
     let rig = Rig()
