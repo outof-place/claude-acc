@@ -248,6 +248,11 @@ public final class GuardEngine: @unchecked Sendable {
             GuardLog.release(write: true)
             state = next
             save()
+            // the stage changed in a tick native keeps: its row, as Python's tick writes one (shadow
+            // observes only; a handed-over tick's row is Python's)
+            if !options.shadow, let row = result.stageRow {
+                GuardEvents.record("stage", pressure: result.world.pressure, fields: row, stateDir: GuardPaths.state(options.home))
+            }
         }
         // check_caps runs in Python's loop on every enforcing tick (`enforce and qos`); its caps_at
         // goes to the file now, so a Python loop taking over doesn't run the caps again at once

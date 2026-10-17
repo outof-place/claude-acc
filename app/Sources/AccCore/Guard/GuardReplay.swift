@@ -144,6 +144,19 @@ public enum GuardReplay {
         let brake: PyJSON = result.brakeDue ? .int(result.world.pressure.stage) : .null
         let pyBrake = expect["brake"] ?? .null
         if brake != pyBrake { out.differences.append("brake: native \(brake.dumps()) python \(pyBrake.dumps())") }
+        // the registry rows Python's tick wrote (devguard_core.record: lastresort's signals, then the
+        // fields), but for the clocks and the disk's free space: a stage that changed has its `stage`
+        // row; fixtures from before the registry have no list
+        if let pyEvents = expect["events"] {
+            var rows: [PyJSON] = []
+            if let row = result.stageRow {
+                var o = PyObject([("ev", .string("stage"))])
+                for (k, v) in GuardEvents.signals(result.world.pressure, diskFree: .null) where k != "disk_free_gb" { o[k] = v }
+                for (k, v) in row { o[k] = v }
+                rows.append(.object(o))
+            }
+            compare("events", .array(rows), pyEvents, into: &out.differences)
+        }
         let logs = PyJSON.array((GuardLog.capture ?? []).filter { $0.0 == "log" }.map { .string($0.1) })
         compare("log", logs, expect["log"] ?? .array([]), into: &out.differences)
         out.missing = probes.missing
