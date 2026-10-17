@@ -26,10 +26,12 @@ Komendy:
   adopt             logowanie z /login w sesji Claude Code (wpis Claude Code, którego nie zna żadne
                     konto) staje się kontem claude-acc i kontem aktywnym, bez przeglądarki
   remove <email> [--json]
+  remove --id <id> [--json]
                     usuń konto dodane w claude-acc (add, adopt): jego katalog, kopię w Pęku kluczy
                     i wpisy w stanie. Odmawia konta aktywnego, nieznanego, z działającymi sesjami
-                    i kont z Orca albo Pod; w terminalu pyta o potwierdzenie. --json: {"removed": e-mail}
-                    albo {"error", "reason"} i kod wyjścia 1
+                    i kont z Orca albo Pod; w terminalu pyta o potwierdzenie. <email> usuwa każde konto
+                    claude-acc o tym adresie, --id tylko wiersz o tym `id` ze `status --json`.
+                    --json: {"removed": e-mail} (z --id także "id") albo {"error", "reason"} i kod wyjścia 1
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
   resume            zdejmij pauzę limitów ręcznie (do czasu, aż limity wrócą)
   pause [on|off]    pauza limitów: stan, włącz albo wyłącz (domyślnie wyłączona)
@@ -1766,8 +1768,9 @@ def snapshot(cfg, accounts=None):
         "limit_pause": bool(cfg["limit_pause"]),
         "drain": bool(cfg["drain"]),
         "credits": credits_summary(),
-        # co umie ta wersja: aplikacja (Ustawienia Poda) pokazuje Usuń tylko, gdy jest tu "remove"
-        "capabilities": ["remove"],
+        # co umie ta wersja: aplikacja (Ustawienia Poda) pokazuje Usuń tylko, gdy jest tu "remove",
+        # a usuwa po id wiersza (`remove --id`), gdy jest tu "remove-by-id"
+        "capabilities": ["remove", "remove-by-id"],
         "accounts": items,
     }
 
@@ -2195,21 +2198,38 @@ class Refusal(Exception):
         self.text = text
 
 
+def listed_accounts(root):
+    """(id, adres) każdego konta w katalogu według jego pliku, w porządku id. Czyta pliki, nie Pęk kluczy:
+    konto bez wpisu w Pęku kluczy (przerwane usuwanie) też da się dokończyć."""
+    for acct_id in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+        try:
+            address = load_json(os.path.join(root, acct_id, "auth", "oauth-account.json"), {}).get("emailAddress")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(address, str):
+            yield acct_id, address
+
+
 def accounts_by_address(email):
-    """Konta o tym adresie według ich plików: ([(id, adres)] dodane w claude-acc, [id] z Orca albo Pod).
-    Czyta pliki, nie Pęk kluczy: konto bez wpisu w Pęku kluczy (przerwane usuwanie) też da się dokończyć."""
+    """Konta o tym adresie: ([(id, adres)] dodane w claude-acc, [id] z Orca albo Pod)."""
     want = email.strip().lower()
+    named = lambda root: [(i, a) for i, a in listed_accounts(root) if a.strip().lower() == want]
+    return named(OWN_ACCOUNTS_DIR), [acct_id for acct_id, _ in named(ACCOUNTS_DIR)]
 
-    def named(root):
-        for acct_id in sorted(os.listdir(root)) if os.path.isdir(root) else []:
-            try:
-                address = load_json(os.path.join(root, acct_id, "auth", "oauth-account.json"), {}).get("emailAddress")
-            except (OSError, ValueError, AttributeError):
-                continue
-            if isinstance(address, str) and address.strip().lower() == want:
-                yield acct_id, address
 
-    return list(named(OWN_ACCOUNTS_DIR)), [acct_id for acct_id, _ in named(ACCOUNTS_DIR)]
+def account_by_id(acct_id):
+    """[(id, adres)] konta claude-acc, które ma ten wiersz `status --json`, albo Refusal. Id porównujemy
+    z nazwami folderów, nigdy nie składamy go w ścieżkę. Wiersz aplikacji (konto z jej folderu, profil
+    Pod) to not_owned, id bez wiersza to unknown."""
+    own = dict(listed_accounts(OWN_ACCOUNTS_DIR))
+    if acct_id in own:
+        return [(acct_id, own[acct_id])]
+    host_row = dict(listed_accounts(ACCOUNTS_DIR)).get(acct_id)
+    if host_row is None:
+        host_row = next((p.email for p in load_profiles([]) if f"profile:{p.id}" == acct_id), None)
+    if host_row is not None:
+        raise Refusal("not_owned", f"{host_row} belongs to {HOST.name}, not to claude-acc. Remove it in {HOST.name}.")
+    raise Refusal("unknown", f"claude-acc has no account with id {acct_id}.")
 
 
 def entry_owner(service, accounts):
@@ -2288,15 +2308,19 @@ def runs_holding(email):
     return count
 
 
-def removal_plan(cfg, email):
-    """[(id, adres)] kont do usunięcia albo Refusal. Tylko czyta."""
-    own, host = accounts_by_address(email)
-    if not own:
-        if host or any(p.email.lower() == email.strip().lower() for p in load_profiles([])):
-            raise Refusal("not_owned", f"{email} belongs to {HOST.name}, not to claude-acc. Remove it in {HOST.name}.")
-        raise Refusal("unknown", f"claude-acc has no account {email}.")
+def removal_plan(cfg, email=None, acct_id=None):
+    """[(id, adres)] kont do usunięcia albo Refusal. Tylko czyta. Z adresem: wszystkie konta claude-acc
+    o tym adresie. Z id wiersza: tylko to jedno konto, a wiersz aplikacji odmawia (not_owned)."""
+    if acct_id is not None:
+        own = account_by_id(acct_id)
+    else:
+        own, host = accounts_by_address(email)
+        if not own:
+            if host or any(p.email.lower() == email.strip().lower() for p in load_profiles([])):
+                raise Refusal("not_owned", f"{email} belongs to {HOST.name}, not to claude-acc. Remove it in {HOST.name}.")
+            raise Refusal("unknown", f"claude-acc has no account {email}.")
     address = own[0][1]
-    ids = {acct_id for acct_id, _ in own}
+    ids = {own_id for own_id, _ in own}
     accounts = load_accounts()
     sessions = 0
     # Konto, którego logowanie leży w zarządzanym wpisie albo bazowym, wróciłoby w ciągu dwóch minut:
@@ -2407,23 +2431,35 @@ def confirm_removal(email):
 
 def cmd_remove(cfg, args):
     """Usuwa konto dodane w claude-acc (add, adopt). Konta z Orca i profile Poda należą do aplikacji,
-    nie do nas, więc je odrzuca. --json: {"removed": e-mail} (kod 0) albo {"error", "reason"} (kod 1)."""
+    nie do nas, więc je odrzuca. <email> usuwa każde konto claude-acc o tym adresie, --id <id> (id wiersza
+    ze `status --json`) tylko ten wiersz. --json: {"removed": e-mail} (z --id także "id"; kod 0) albo
+    {"error", "reason"} (kod 1)."""
     as_json = "--json" in args
     rest = [a for a in args if a != "--json"]
-    if len(rest) != 1 or rest[0].startswith("-"):
-        print("usage: claude-acc remove <email> [--json]", file=sys.stderr)
+    by_id = "--id" in rest
+    if by_id:
+        at = rest.index("--id")
+        names, others = rest[at + 1:at + 2], rest[:at] + rest[at + 2:]
+        valid = len(names) == 1 and names[0].strip() != "" and not names[0].startswith("-") and not others
+        usage = "usage: claude-acc remove --id <id> [--json]"
+    else:
+        names, valid = rest, len(rest) == 1 and not rest[0].startswith("-")
+        usage = "usage: claude-acc remove <email> [--json]"
+    if not valid:
+        print(usage, file=sys.stderr)
         return 2
     asks = not as_json and sys.stdin.isatty() and sys.stdout.isatty()
     if not as_json and not asks:
         print("claude-acc remove asks before it deletes, and there is no terminal to ask on. "
               "Run it in a terminal, or pass --json to remove without asking.", file=sys.stderr)
         return 2
-    email, lock = rest[0].strip(), None
+    name, lock = (names[0] if by_id else names[0].strip()), None  # id jest dokładny, adres przycinamy
+    plan_for = (lambda: removal_plan(cfg, acct_id=name)) if by_id else (lambda: removal_plan(cfg, email=name))
     try:
         lock = take_lock(wait=25)
         if not lock:
             raise Refusal("busy", "Another claude-acc run is in progress. Try again in a moment.")
-        plan = removal_plan(cfg, email)
+        plan = plan_for()
         if asks:
             lock.close()  # nie trzymamy blokady, gdy czekamy na człowieka: tick stałby dwie minuty i więcej
             if not confirm_removal(plan[0][1]):
@@ -2432,7 +2468,7 @@ def cmd_remove(cfg, args):
             lock = take_lock(wait=25)
             if not lock:
                 raise Refusal("busy", "Another claude-acc run is in progress. Try again in a moment.")
-            plan = removal_plan(cfg, email)  # w czasie pytania mogła ruszyć sesja albo zmienić się konto aktywne
+            plan = plan_for()  # w czasie pytania mogła ruszyć sesja albo zmienić się konto aktywne
         for acct_id, address in plan:
             remove_account(acct_id, address)
         removed = plan[0][1]
@@ -2445,15 +2481,16 @@ def cmd_remove(cfg, args):
     except Exception as err:  # noqa: BLE001 - z --json aplikacja dostaje zawsze JSON
         if not as_json:
             raise
-        log(f"remove: {email}: błąd {err}")
-        print(json.dumps({"error": f"Could not remove {email}: {err}", "reason": "failed"},
+        log(f"remove: {name}: błąd {err}")
+        print(json.dumps({"error": f"Could not remove {name}: {err}", "reason": "failed"},
                          ensure_ascii=False, separators=(",", ":")))
         return 1
     finally:
         if lock:
             lock.close()
     if as_json:
-        print(json.dumps({"removed": removed}, ensure_ascii=False, separators=(",", ":")))
+        done = {"removed": removed, "id": plan[0][0]} if by_id else {"removed": removed}
+        print(json.dumps(done, ensure_ascii=False, separators=(",", ":")))
     else:
         print(f"Removed {removed} from claude-acc.")
     return 0
