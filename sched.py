@@ -1367,7 +1367,9 @@ GENERIC_NEVER = re.compile(
     r"|(serve|server|watch|daemon)$"
 )
 # podkomendy skryptu, które tylko pytają albo sprzątają (`stack.sh status`, `cli.js help`)
-LIGHT_SUBCOMMANDS = re.compile(r"^(status|stop|down|kill|ps|ls|list|help|version|show|whoami|info)$")
+# (`env`: `stack.sh env` wypisuje zmienne stosu, 33 biegi przez plock, szczyt najwyżej 0,03 GB, M3; `reset`
+# nie: 0,85 GB szczytu, ponad LIGHT_PRIOR)
+LIGHT_SUBCOMMANDS = re.compile(r"^(status|stop|down|kill|ps|ls|list|help|version|show|whoami|info|env)$")
 # programy po pełnej ścieżce spoza projektu: systemowe, z Homebrew, aplikacje; tę samą listę ma
 # bramka hooka (devguard.HOOK_GATE)
 SYSTEM_PATHS = ("/usr/", "/bin/", "/sbin/", "/System/", "/opt/homebrew/", "/Library/", "/Applications/")
@@ -1841,6 +1843,37 @@ def finish_job(raw):
         "env": raw["env"],
         "label": label,
     }
+
+
+# interpreter powłoki przed skryptem i jego flagi z argumentem (`bash -o pipefail x.sh down`)
+SHELL_PROGRAMS = ("bash", "sh", "zsh")
+SHELL_VALUE_FLAGS = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
+
+
+def light_script(argv, cwd):
+    """Czy argv z plocka to lekka podkomenda skryptu projektu (`stack.sh down`, `bash stack.sh status`,
+    `env E2E_STACK_OFFSET=3 bash stack.sh env`): po zdjęciu opakowań z WRAPPER_FLAGS, słów VAR= i
+    interpretera powłoki z flagami zostaje plik skryptu w cwd (.sh albo ze /), a po nim podkomenda z
+    LIGHT_SUBCOMMANDS. Plock owija cały skrypt, a classify nie widzi w nim pracy, więc taka komenda
+    czekała jako opaque_job z priorem 8 GB (T11)."""
+    _env, words, _wrap = strip_prefix(list(argv))
+    if words and os.path.basename(words[0]) in SHELL_PROGRAMS:
+        words = words[1:]
+        while words and words[0][:1] in ("-", "+") and words[0] != "--":
+            flag = words[0]
+            if not flag.startswith("--") and set(flag[1:]) & {"c", "s"}:
+                return False  # komenda w napisie (-c) albo ze stdin (-s): nie plik skryptu
+            words = words[2:] if flag in SHELL_VALUE_FLAGS else words[1:]
+        if words[:1] == ["--"]:
+            words = words[1:]
+    if len(words) < 2:
+        return False
+    script = words[0]
+    if not (script.endswith(".sh") or "/" in script):
+        return False
+    if not os.path.isfile(os.path.join(cwd, os.path.expanduser(script))):
+        return False
+    return bool(LIGHT_SUBCOMMANDS.match(words[1]))
 
 
 def opaque_job(argv, cwd):
@@ -3519,6 +3552,9 @@ def cmd_run(args):
     cwd = os.getcwd()
     job = classify(command, cwd, argv=argv)
     if job is None and argv and opts.get("via") == "plock":
+        if light_script(argv, cwd):
+            # lekka podkomenda skryptu (`stack.sh down`): od razu, bez kolejki i historii
+            return exec_plain(command, argv)
         job = opaque_job(argv, cwd)
     if job is None:
         return exec_plain(command, argv)

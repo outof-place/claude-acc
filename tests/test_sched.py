@@ -131,6 +131,10 @@ def real_clock():
     return time.time(), time.clock_gettime(time.CLOCK_UPTIME_RAW), int(re.search(r"sec = (\d+)", boot).group(1))
 
 
+# skrypt stosu e2e projektu (Portivo: scripts/e2e/stack.sh), którego lekkie podkomendy idą przez plock
+STACK = "scripts/e2e/" + "stack.sh"
+
+
 class Paths(unittest.TestCase):
     """Moduł z wszystkimi ścieżkami w katalogu testu i pamięcią z pliku."""
 
@@ -2641,6 +2645,38 @@ class RunTest(unittest.TestCase):
         for key in ("predicted_gb", "predicted_from", "free_for_admission_gb", "wait_up_s", "wait_wall_s",
                     "wait_reason", "depot_blocker", "ts", "up", "boot"):
             self.assertIn(key, row)
+
+    def test_plock_light_subcommand_skips_the_queue(self):
+        """T11, M3, M4: plock owija cały skrypt (`stack.sh down`), classify nie widzi w nim pracy, więc
+        lekka podkomenda czekała jako opaque_job z priorem 8 GB (10-05..10-17: `down` 57 razy, 0,73 h;
+        `env` 33 razy, 0,75 h; szczyt najwyżej 0,03 GB). Teraz biegnie od razu, bez kolejki i historii;
+        `up` i `reset` (szczyt 0,85 GB) dalej czekają."""
+        stack = STACK
+        write(os.path.join(self.repo, stack), '#!/bin/sh\necho "stack $1"\n', 0o755)
+        self.set_memory(2)  # 0,96 GB dostępne: 8 GB nie mieści się nawet na pustym Macu
+
+        def plock(*argv, timeout="5"):
+            p = subprocess.Popen(["/usr/bin/python3", SCRIPT, "run", "--via", "plock", "--timeout", timeout, "--", *argv],
+                                 cwd=self.repo, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.procs.append(p)
+            return p
+
+        for argv in (
+            [stack, "down"],
+            ["bash", stack, "status"],
+            ["env", "E2E_STACK_OFFSET=3", "bash", stack, "env"],
+            ["env", "E2E_GO_WRAPPER=x", "E2E_STACK_OFFSET=3", "bash", stack, "down"],
+        ):
+            began = time.time()
+            rc, out, err = self.done(plock(*argv))
+            self.assertEqual((rc, out.strip()), (0, f"stack {argv[-1]}"), (argv, err))
+            self.assertLess(time.time() - began, 3, argv)
+        self.assertEqual(self.history(), [])
+        state = os.path.join(self.sched_dir, "state.json")
+        self.assertFalse(os.path.exists(state) and self.state()["queue"])
+        for sub in ("up", "reset"):
+            rc, _, err = self.done(plock("bash", stack, sub, timeout="1"))
+            self.assertEqual(rc, 75, (sub, err))
 
     def cancel(self, *args):
         done = subprocess.run(
