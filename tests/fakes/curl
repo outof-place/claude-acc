@@ -39,6 +39,9 @@ if url.endswith("/api/oauth/usage"):
         reply(403, {"error": "forbidden"})
     reply(200, server["usage"][email])
 if url.endswith("/api/oauth/profile"):
+    if email and email in server.get("profile_down_for", []):
+        # API profilu chwilowo nie odpowiada na tokeny tego konta (testy: "nie wiem, czyje to logowanie")
+        reply(503, {"error": "overloaded"})
     if not email:
         reply(401, {"error": "invalid token"})
     reply(200, {"account": {"email": email},
