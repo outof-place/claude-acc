@@ -2724,9 +2724,9 @@ def reap(state):
     dead = [j for j in state["queue"] if not alive(j.get("pid"))]
     if dead:
         state["queue"] = [j for j in state["queue"] if j not in dead]
-        clock = clock_now()
+        clock, guard = clock_now(), guard_fields()
         for j in dead:
-            record("dequeue", job_fields(j), wait_fields(j, clock), cause="reap")
+            record("dequeue", job_fields(j), wait_fields(j, clock), guard, cause="reap")
 
 
 # rezerwa po rozgrzewce: job, który przebiegł max(60 s, połowę prognozy czasu), najwyżej 300 s,
@@ -3392,9 +3392,9 @@ def safety(state, cfg):
             victim["paused_at"] = time.time()
             victim["pause_reason"] = f"swap +{growth:.1f} GB in 2 min"
             state["today"]["pauses"] += 1
-            record("pause", job_fields(victim), reason=victim["pause_reason"], swap_growth_2m_gb=growth,
-                   level_pct=mem["level_pct"], pressure=mem.get("pressure"), pauses_today=state["today"]["pauses"],
-                   local_jobs=len(local))
+            record("pause", job_fields(victim), guard_fields(), reason=victim["pause_reason"],
+                   swap_growth_2m_gb=growth, level_pct=mem["level_pct"], pressure=mem.get("pressure"),
+                   pauses_today=state["today"]["pauses"], local_jobs=len(local))
     elif paused and growth < 0.1 and mem["level_pct"] >= 30:
         job = min(paused, key=lambda j: j.get("paused_at", 0))
         if time.time() - job.get("paused_at", 0) >= 30:
@@ -3404,8 +3404,9 @@ def safety(state, cfg):
                 pass
             job["paused"] = False
             job["pause_reason"] = None
-            record("resume", job_fields(job), paused_s=round(time.time() - job.get("paused_at", 0), 1),
-                   swap_growth_2m_gb=growth, level_pct=mem["level_pct"])
+            record("resume", job_fields(job), guard_fields(),
+                   paused_s=round(time.time() - job.get("paused_at", 0), 1), swap_growth_2m_gb=growth,
+                   level_pct=mem["level_pct"])
 
 
 # ---------- run ----------
@@ -3668,7 +3669,8 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                     state = load_state(cfg)
                     state["queue"] = [j for j in state["queue"] if j["id"] != jid]
                     save_state(state)
-                record("dequeue", job_fields(entry), wait_fields(entry, clock), cause="timeout", timeout=timeout)
+                record("dequeue", job_fields(entry), wait_fields(entry, clock), guard_fields(), cause="timeout",
+                       timeout=timeout)
                 log(f"timeout {timeout:.0f}s w kolejce")
                 return EXIT_TIMEOUT
             with Locked():
@@ -3682,7 +3684,7 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                     state["queue"] = [j for j in state["queue"] if j["id"] != jid]
                     update_queue_view(state, cfg)
                     save_state(state)
-                    record("dequeue", job_fields(me), wait_fields(me, clock), cause="cancel")
+                    record("dequeue", job_fields(me), wait_fields(me, clock), guard_fields(), cause="cancel")
                     cancelled = True
                     break
                 if me is None:
@@ -3746,6 +3748,14 @@ def guard_stage_view(snap=None):
         return None, None, None
 
 
+def guard_fields():
+    """Pola stopnia hamulca do wiersza rejestru (N1): `guard_stage`, `guard_stage_reasons` i
+    `guard_age_s` z migawki strażnika (guard_stage_view). Niosą je `admit`, `dequeue`, `pause` i
+    `resume`: decyzja schedulera przy stopniu 2 to co innego niż przy 0."""
+    stage, reasons, age = guard_stage_view()
+    return {"guard_stage": stage, "guard_stage_reasons": reasons, "guard_age_s": age}
+
+
 def admitted_entry(state, entry, clock):
     """Wspólne dla startu lokalnego i na Depot: zegar startu, czekanie po ścianie (`waited_s`, jak
     dotąd) i bez snu (`waited_up_s`), ostatni powód czekania; wpis wychodzi z kolejki. Zwraca
@@ -3764,14 +3774,13 @@ def record_admit(state, entry, job, how, waits):
     strażnika razem z jej wiekiem (scheduler stopnia sam nie liczy)."""
     mem = state.get("memory") or {}
     route = entry.get("route") or {}
-    stage, reasons, age = guard_stage_view()
-    record("admit", job_fields(entry), waits, how=how, where=entry["where"], passed=entry.get("passed"),
+    record("admit", job_fields(entry), waits, guard_fields(), how=how, where=entry["where"],
+           passed=entry.get("passed"),
            predicted_gb=entry.get("mem_predicted_gb"), predicted_wall_s=entry.get("predicted_wall_s"),
            predicted_from=entry.get("predicted_from"), p=entry.get("p"),
            free_for_admission_gb=mem.get("free_for_admission_gb"), available_gb=mem.get("available_gb"),
            simple=(job or {}).get("simple"), depot_blocker=(job or {}).get("depot_blocker"),
-           route_text=route.get("text"), route_why=route.get("why"),
-           guard_stage=stage, guard_stage_reasons=reasons, guard_age_s=age)
+           route_text=route.get("text"), route_why=route.get("why"))
 
 
 def start_local(state, entry, why, job=None, how=None, clock=None):

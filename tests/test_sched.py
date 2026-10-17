@@ -187,6 +187,18 @@ class Paths(unittest.TestCase):
         self.assertIsNotNone(j, command)
         return j
 
+    def guard_snapshot(self, stage, reasons, age_s):
+        """Migawka strażnika w devguard-state.json: stopień hamulca z powodami, sprzed `age_s` sekund."""
+        # budżet strażnika na jeden dev serwer: rezerwa na dev serwery jak bez migawki (4 GB)
+        with open(S.DEVGUARD_STATE, "w") as f:
+            json.dump({"snapshot": {"at": time.time() - age_s, "budget": 4 * S.GB, "total": 0,
+                                    "pressure": {"stage": stage, "stage_reasons": reasons, "level": 1}}}, f)
+
+    def assert_guard_view(self, row, stage, reasons, age_s):
+        """Wiersz rejestru niesie stopień hamulca, jego powody i wiek migawki (N1)."""
+        self.assertEqual((row["guard_stage"], row["guard_stage_reasons"]), (stage, reasons), row["ev"])
+        self.assertAlmostEqual(row["guard_age_s"], age_s, delta=3)
+
     def state(self):
         st = S.load_state(self.cfg)
         S.refresh_memory(st, self.cfg)
@@ -2013,8 +2025,10 @@ class StateTest(Paths):
         self.assertEqual(S.devserver_reserve_gb(), 5.0)  # 4 (max_server_gb) + 1
 
     def test_dead_waiter_reaped_writes_dequeue_event(self):
-        """Wydanie A (A3): czekający, którego wrapper zginął (np. zabity limitem Basha), znikał z
-        kolejki bez śladu; teraz wiersz `dequeue` z przyczyną `reap`, zegarami i powodem czekania."""
+        """Wydanie A (A3, N1): czekający, którego wrapper zginął (np. agent przerwał komendę albo jego
+        sesja się skończyła), znikał z kolejki bez śladu; teraz wiersz `dequeue` z przyczyną `reap`,
+        zegarami, powodem czekania i stopniem hamulca z migawki strażnika razem z jej wiekiem."""
+        self.guard_snapshot(2, ["swap 12.0 GB i rośnie"], 4)
         st = self.state()
         now = time.time()
         st["queue"] = [
@@ -2030,6 +2044,7 @@ class StateTest(Paths):
         self.assertEqual((row["via"], row["class"]), ("hook", "charter-service:vet:tree"))
         self.assertEqual(row["wait_reason"], "waiting for 8.3 GB, 2.0 free")
         self.assertAlmostEqual(row["wait_wall_s"], 30, delta=2)
+        self.assert_guard_view(row, 2, ["swap 12.0 GB i rośnie"], 4)
 
     def test_today_rolls_over_and_reap(self):
         st = self.state()
@@ -2052,7 +2067,9 @@ class SafetyTest(Paths):
     def test_pause_and_resume_write_events(self):
         """Wydanie A (A3): pauza i wznowienie schedulera (SIGSTOP i SIGCONT grupy joba) mają wiersze
         `pause` i `resume`; licznik `today.pauses` zeruje się co dobę, więc bez nich nie da się
-        policzyć pauz z 7 dób (T12). Reguła pauzy bez zmian."""
+        policzyć pauz z 7 dób (T12). Reguła pauzy bez zmian. Oba wiersze niosą stopień hamulca z
+        migawki strażnika i jej wiek (N1): pauza schedulera przy stopniu 2 to co innego niż przy 0."""
+        self.guard_snapshot(1, ["kompresor 20.0 GB (42% RAM)"], 6)
         st = self.state()
         now = time.time()
         st["running"] = [
@@ -2076,6 +2093,8 @@ class SafetyTest(Paths):
                          ("swap +1.2 GB in 2 min", 1.2, 20))
         self.assertEqual((pause["via"], pause["class"], pause["pauses_today"]), ("plock", "m:build:tree", 1))
         self.assertAlmostEqual(resume["paused_s"], 31, delta=2)
+        for row in rows:
+            self.assert_guard_view(row, 1, ["kompresor 20.0 GB (42% RAM)"], 6)
 
 
 class SleepTest(Paths):
@@ -2592,8 +2611,16 @@ class RunTest(unittest.TestCase):
 
     def test_queue_timeout_writes_dequeue_event(self):
         """Wydanie A (A3, A4): zdjęcie z kolejki (timeout, cancel) ma wiersz `dequeue` z czekaniem
-        po uptime i po ścianie. Obalenie A4: `dequeue` z przyczyną `timeout` i `wait_up_s` krótszym
-        od --timeout znaczyłoby, że kolejka liczy sen jako czekanie."""
+        po uptime i po ścianie i ze stopniem hamulca z migawki strażnika razem z jej wiekiem (N1).
+        Obalenie A4: `dequeue` z przyczyną `timeout` i `wait_up_s` krótszym od --timeout znaczyłoby,
+        że kolejka liczy sen jako czekanie."""
+        state_dir = os.path.join(self.home, ".local/share/claude-acc")
+        os.makedirs(state_dir, exist_ok=True)
+        # budżet strażnika na jeden dev serwer: rezerwa na dev serwery jak bez migawki (4 GB), więc drugi
+        # `go vet` dalej czeka
+        with open(os.path.join(state_dir, "devguard-state.json"), "w") as f:
+            json.dump({"snapshot": {"at": time.time() - 4, "budget": 4 * 1024**3, "total": 0, "pressure": {
+                "stage": 1, "stage_reasons": ["kompresor 20.0 GB (42% RAM)"], "level": 1}}}, f)
         first = self.start("cd apps/charter-service && go vet ./...", sleep="5")
         self.wait_for(lambda: len(self.state()["running"]) == 1)
         late = self.start("cd apps/charter-service && go vet ./...", via="hook", extra=("--timeout", "1"))
@@ -2614,6 +2641,10 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.done(queued)[0], 130)
         rows = [r for r in self.events() if r["ev"] == "dequeue"]
         self.assertEqual([(r["cause"], r["job"]) for r in rows[1:]], [("cancel", jid)])
+        for row in rows:
+            self.assertEqual((row["guard_stage"], row["guard_stage_reasons"]), (1, ["kompresor 20.0 GB (42% RAM)"]))
+            self.assertGreaterEqual(row["guard_age_s"], 4)
+            self.assertLess(row["guard_age_s"], 30)
         self.done(first)
 
     def hooked(self, event, *flags, **env):
