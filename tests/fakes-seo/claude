@@ -1,0 +1,20 @@
+#!/usr/bin/python3
+"""Atrapa `claude` dla testów seo.py: dopisuje argv i katalog do $FAKE_SEO_LOG i kładzie gotową
+odpowiedź ($FAKE_SEO_ANSWERS/<rodzaj>.json) do jedynego pliku, który sesja może pisać (reguła
+Edit(//...) z --settings). Rodzaj z treści promptu: cluster, ai albo discovery."""
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+prompt = sys.stdin.read()
+allow = json.loads(argv[argv.index("--settings") + 1])["permissions"]["allow"]
+out = [rule[len("Edit(/"):-1] for rule in allow if rule.startswith("Edit(")][0]
+kind = "cluster" if "You plan blog content" in prompt else "ai" if "answer engine" in prompt else "discovery"
+with open(os.environ["FAKE_SEO_LOG"], "a") as f:
+    f.write(json.dumps({"kind": kind, "argv": argv, "cwd": os.getcwd()}) + "\n")
+with open(os.path.join(os.environ["FAKE_SEO_ANSWERS"], kind + ".json")) as f:
+    answer = json.load(f)
+with open(out, "w") as f:
+    json.dump(answer, f)
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "gotowe", "total_cost_usd": 0.02}))

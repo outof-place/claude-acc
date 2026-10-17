@@ -33,8 +33,14 @@ if args[:1] == ["outdated"]:
 
 if args[:1] == ["upgrade"]:
     kind = "casks" if "--cask" in args else "formulae"
+    names = [a for a in args[1:] if not a.startswith("--")]
+    # sprawdzenie przed budową ze źródła (formuła z tapu bez butelki) przerywa całe polecenie
+    if any(brew[kind][name].get("fatal") for name in names):
+        print("Error: Your Xcode (26.6 => /Applications/Xcode-26.6.app/Contents/Developer) "
+              "at /Applications/Xcode.app is too outdated.", file=sys.stderr)
+        sys.exit(1)
     rc = 0
-    for name in [a for a in args[1:] if not a.startswith("--")]:
+    for name in names:
         item = brew[kind][name]
         if item.get("pinned"):
             continue
