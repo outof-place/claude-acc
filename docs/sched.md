@@ -86,6 +86,9 @@ Pliki w `~/.local/share/claude-acc/sched/`:
 | `depot.json` | `sched.py depot`, pod `flock` na `depot.lock` | biegi Depot CI całej organizacji dla karty (niżej) |
 | `config.json` | człowiek | nadpisania domyślnych ustawień (niżej) |
 
+Obok, w `~/.local/share/claude-acc/`, leży `events.jsonl`: rejestr decyzji schedulera i hamulca
+(sekcja „`events.jsonl`” niżej).
+
 ## Kiedy `state.json` się zmienia
 
 - Od razu przy każdej zmianie stanu: zgłoszenie joba, wpuszczenie, wyprzedzenie, decyzja o Depot,
@@ -117,7 +120,17 @@ queue[]            joby, które czekają, w kolejności wpuszczania
 overtakes[]        10 ostatnich wyprzedzeń
 recent[]           8 ostatnich skończonych jobów
 today              bilans dnia
+clock              [ściana, uptime, rozruch] z ostatniego obrotu kolejki (niżej)
 ```
+
+Czas czekania i biegu liczy się zegarem bez snu Maca: `up` to `CLOCK_UPTIME_RAW` (sekundy od
+rozruchu, które nie rosną, gdy Mac śpi), `boot` to identyfikator rozruchu (`kern.bootsessionuuid`).
+Dwa odczyty `up` da się porównać tylko przy tym samym `boot`; wpis bez `*_up` (sprzed wydania A) albo
+z innym `boot` (sprzed restartu) liczy się po ścianie, jak dawniej. Tak liczą się `waited_s` w
+kolejce, `--timeout`, `starve_s`, `aging_s`, 30 s „sam na Macu”, rozgrzewka rezerwy i ponowna trasa
+co 15 s, więc noc z zamkniętą pokrywą nie jest czekaniem. Pola `*_at` zostają ścienne (panel, pauza
+`safety`). `clock` zapisuje każdy obrót kolejki; gdy od poprzedniego obrotu w tym samym rozruchu
+ściana poszła o ponad 60 s dalej niż `up`, Mac spał między nimi i rejestr dostaje wiersz `wake`.
 
 ### `memory`
 
@@ -164,12 +177,18 @@ free_for_admission_gb + headroom_gb = host.ram_gb` (po zaokrągleniu).
 | `small` | czy job jest mały (`mem_predicted_gb ≤ small_gb` i `predicted_wall_s ≤ small_wall_s`): może wyprzedzać |
 | `count1_dropped` | scheduler zdjął `-count=1` (wynik może przyjść z cache testów), patrz niżej |
 | `native_tool`, `exclusive` | natywny job: narzędzie (`xcodebuild`, `portivo-mobile`, `simulator`…) i czy zajmuje jedyne miejsce na natywny build |
+| `via` | którędy job przyszedł: `hook` (hook PreToolUse agenta), `plock` (`plock.py go`), `cli` (`claude-acc run`, skrypty) |
+| `bash_limit_s` | limit narzędzia Bash komendy z haka Claude Code w sekundach (`timeout` z wywołania, inaczej `BASH_DEFAULT_TIMEOUT_MS`, inaczej 120); `null` dla komendy w tle, Codeksa i spoza haka. Tylko pomiar: po tym limicie Claude Code przenosi komendę w tło, a ona czeka dalej na swoim miejscu; kolejka nigdy się na nim nie kończy |
+| `enqueued_up`, `boot` | chwila zgłoszenia na zegarze bez snu i rozruch, z którego pochodzi (wyżej) |
 
 Tylko w `running[]`:
 
 | pole | znaczenie |
 |---|---|
 | `started_at`, `elapsed_s` | start biegu (po wpuszczeniu) i czas od startu |
+| `started_up` | start biegu na zegarze bez snu |
+| `waited_s`, `waited_up_s` | czekanie w kolejce po ścianie i bez snu Maca |
+| `wait_reason` | ostatni `reason.text` z kolejki, zanim job wystartował; `null`, gdy wpuszczony od razu |
 | `eta_s`, `progress` | `max(0, predicted_wall_s - elapsed_s)` i `min(0.99, elapsed_s / predicted_wall_s)` |
 | `mem_now_gb`, `mem_peak_gb` | suma `phys_footprint` procesów joba (drzewo i grupa procesów) teraz i najwięcej do tej pory; 0 dla Depot |
 | `cpu_cores` | średnio zajęte rdzenie od startu (CPU / czas) |
@@ -182,7 +201,8 @@ Tylko w `queue[]`:
 | pole | znaczenie |
 |---|---|
 | `position` | 1 = następny do wpuszczenia |
-| `enqueued_at`, `waited_s` | kiedy się zgłosił i ile już czeka |
+| `enqueued_at`, `waited_s` | kiedy się zgłosił i ile już czeka (bez snu Maca) |
+| `routed_at`, `routed_up` | ostatnia decyzja o trasie, po ścianie i bez snu; trasa liczy się na nowo co 15 s czekania |
 | `eta_start_s` | przewidywane sekundy do startu |
 | `reason` | `{code, need_gb, free_gb, after[], text}`; `code`: `memory` (czeka na pamięć), `head` (mieści się, ale mógłby opóźnić start joba, który czeka najdłużej, patrz backfill wyżej), `pressure` (devguard: presja), `deciding` (scheduler jeszcze liczy trasę), `native` (inny natywny build trzyma miejsce), `simulators` (`portivo-mobile up` czeka na wolny symulator); `after` to id jobów, na których koniec czeka |
 
@@ -278,8 +298,20 @@ Jeden wiersz JSON na skończony bieg, dopisywany na końcu pliku. Wiersze `where
 ts, id, where (local|depot), class, module, repo, label, p, peak_gb, sys_drop_gb, wall_s, cpu_s,
 wait_s, rc, agent, worktree, depot_run_id, runner, units, cost_usd,
 choice, why, local_eta_s, depot_eta_s, lambda, predicted_gb, predicted_wall_s, count1_dropped,
-native_built
+lang, cancelled, multi, stalled_s, via, wait_reason, up_wait_s, up_wall_s, boot, native_built
 ```
+
+`wait_s` i `wall_s` zostają ścienne: z `wall_s` scheduler uczy się czasu biegu, więc zmiana jego
+znaczenia zmieniłaby decyzje. Pola od wydania A (wiersze starsze ich nie mają):
+
+| pole | znaczenie |
+|---|---|
+| `via` | `hook`, `plock` albo `cli`, jak w `running[]` |
+| `wait_reason` | ostatni powód czekania w kolejce; `null`, gdy job wystartował od razu |
+| `up_wait_s`, `up_wall_s` | czekanie i bieg bez snu Maca (`CLOCK_UPTIME_RAW`); po nocy z zamkniętą pokrywą mniejsze od `wait_s` i `wall_s` |
+| `boot` | identyfikator rozruchu (`kern.bootsessionuuid`), z którego pochodzi `up_*` |
+
+`predict` tych pól nie czyta.
 
 `native_built` (tylko joby natywne): czy w trakcie biegu naprawdę ruszyła kompilacja; `portivo-mobile
 up` z gotowym klientem w cache jej nie ma.
@@ -456,6 +488,18 @@ spoza schedulera, bo wzrost tego joba jest już w jego przewidywaniu.
 sam woła scheduler, jak `sm-heavy.sh` albo `plock.py`) uruchamia komendę od razu: jej pamięć liczy
 się w drzewie zewnętrznego joba, a drugie czekanie na tę samą pamięć mogłoby czekać na siebie.
 
+### Skrypt przez `plock.py go`
+
+`plock.py go` (Portivo) przekazuje schedulerowi cały skrypt: `sched.py run --via plock -- ARGV`.
+Gdy `classify` nie widzi w nim pracy, skrypt czeka jako `opaque_job`: klasa
+`<repo>:script:<nazwa pliku>`, na start 8 GB, potem p90 z historii. Wyjątek to lekka podkomenda
+skryptu projektu (`light_script`): po zdjęciu opakowań (`env` z flagami, słowa `VAR=`, interpreter
+`bash|sh|zsh` z flagami) zostaje plik skryptu w katalogu komendy (`.sh` albo ze `/`), a po nim
+`status`, `stop`, `down`, `kill`, `ps`, `ls`, `list`, `help`, `version`, `show`, `whoami`, `info` albo
+`env`. Taka komenda biegnie od razu, bez kolejki, historii i wiersza w rejestrze: `stack.sh down` i
+`stack.sh env` czekały tak dawniej na 8 GB przy szczycie najwyżej 0,03 GB. `reset` (0,85 GB szczytu)
+i `up` dalej czekają, a `bash -c '...'` i `bash -s` nie są plikiem skryptu.
+
 ### `git grep`
 
 Hook dokłada `-I` (pomiń pliki binarne) do `git grep` agenta, który nie ma `-I`, `-a`, `--text`
@@ -471,6 +515,44 @@ PreToolUse z matcherem `Bash`: `claude-acc-hook codex`, a bez natywnego frontu `
 tylko nasz. Codex uruchamia nowy hook dopiero po zaufaniu mu w `/hooks`. Przepisaną komendę przyjmuje
 tylko z `permissionDecision: "allow"`, więc owinięte komendy nie pytają o zgodę (Orka i tak
 uruchamia Codeksa z `--dangerously-bypass-approvals-and-sandbox`).
+
+## `events.jsonl`: rejestr decyzji
+
+`~/.local/share/claude-acc/events.jsonl` (`events.py`) to jeden wiersz JSON na decyzję schedulera i
+hamulca pamięci. Leży w `$STATE`, a nie w `~/Library/Logs`, które mole czyści, i nie idzie przez
+janitor (ten obcina `devguard.log` do 1000 linii). Przy 32 MiB plik przechodzi w `events.jsonl.1`
+(poprzedni `.1` znika). Zapis idzie pod `flock` na `events.lock`, czeka na niego najwyżej 1 s, a zamek
+w ręku zatrzymanego pisarza kończy zapis bez wiersza: rejestr to pomiar, więc jego błąd nigdy nie
+zatrzymuje hamulca, haka ani wrappera. Zegar wiersza czyta się pod zamkiem, więc wiersze leżą w
+kolejności `up`.
+
+Każdy wiersz zaczyna się od `ts` (ściana), `up` (`CLOCK_UPTIME_RAW`, bez snu), `boot`
+(`kern.bootsessionuuid`) i `ev`, potem pola rodzaju:
+
+| `ev` | kto pisze | pola |
+|---|---|---|
+| `admit` | scheduler przy każdym wpuszczeniu, lokalnie i na Depot | joba, czekania i hamulca (niżej), `how` (`fits`, `quick`, `alone`, `overcommit`; wyprzedzenie: `small`, `quick`, `ends`, `beside`, `short`, `aged`; `depot:<cel>`), `where`, `passed`, `predicted_gb`, `predicted_wall_s`, `predicted_from`, `p`, `free_for_admission_gb`, `available_gb`, `simple`, `depot_blocker`, `route_text`, `route_why` |
+| `dequeue` | scheduler, gdy czekający schodzi z kolejki bez startu | joba, czekania i hamulca, `cause` (`timeout`: własne `--timeout`, z polem `timeout`; `cancel`: `sched cancel`; `reap`: wrapper czekającego zginął) |
+| `pause`, `resume` | `safety`: SIGSTOP i SIGCONT grupy joba przy rosnącym swapie | joba i hamulca; `pause`: `reason`, `swap_growth_2m_gb`, `level_pct`, `pressure`, `pauses_today`, `local_jobs`; `resume`: `paused_s`, `swap_growth_2m_gb`, `level_pct` |
+| `wake` | scheduler, gdy między obrotami kolejki Mac spał | `slept_s`, `since_ts`, `queued`, `running` |
+| `kill`, `runaway` | hamulec (`lastresort.reap`) po zabiciu drzewa; `runaway` to proces ponad pół RAM | sygnały (niżej), `job` (id joba schedulera albo `null`), `code` (klasa ofiary), `pid`, `tree_n`, `pgid_n` (grupy procesów drzewa, liczone przed zabiciem), `size`, `level`, `result`, `command`, `swap_window_reset` (`true`, gdy po nim okno przyrostu swapu liczy się od zera) |
+| `stage` | strażnik (`devguard_core.tick`), gdy stopień hamulca się zmienił, po decyzji hamulca, nigdy w ticku na próbę | sygnały, `stage`, `previous`, `families` (pamięć rodzin teraz), `families_at`, `ring_oldest` (najstarsza próbka pierścienia rodzin, ok. 2 min wstecz) |
+| `stop` | strażnik po akcji planu innej niż ostrzeżenie | sygnały, `plan`, `code`, `reason`, `unit`, `ports`, `size`, `swap_window_reset: true` |
+
+Grupy pól:
+
+- joba: `job` (id), `class`, `via`, `label`;
+- czekania: `wait_up_s` (bez snu), `wait_wall_s`, `wait_reason`, `bash_limit_s` (limit Basha komendy z
+  haka albo `null`; `wait_up_s` ponad nim to komenda, którą Claude Code przeniósł w tło, zanim
+  wystartowała);
+- hamulca (N1): `guard_stage`, `guard_stage_reasons` i `guard_age_s` z migawki strażnika
+  (`devguard-state.json`), bez progu świeżości: czytający sam ocenia wiek;
+- sygnały pamięci tej samej chwili: `stage_reasons`, `guard_level`, `guard_reasons`, `compressed`,
+  `segments`, `segments_limit`, `swap_used`, `swap_growth`, `swapouts`, `kernel`, `available`,
+  `swap_window_s`, `disk_free_gb`.
+
+Wiersz nie zmienia żadnej decyzji: `tests/test_decision_replay.py` porównuje kogo hamulec gasi, kogo
+scheduler wstrzymuje i jak zmienia się stan z tablicami policzonymi na kodzie sprzed rejestru.
 
 ## Hamulec strażnika
 
