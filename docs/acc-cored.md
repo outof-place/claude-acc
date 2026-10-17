@@ -117,6 +117,13 @@ memory pressure (a Dispatch memory-pressure source).
   - A caps run in flight finishes before the loop starts.
 - **Kept between ticks:** process lines and their pattern answers (`ProcCache`, see
   [Readers](#readers)).
+- **The decision registry** (`$STATE/events.jsonl`, events.py): a tick native keeps writes the
+  `stage` row when the brake's stage changed, with lastresort's signals of that moment and the
+  families of the inventory ring (`state["inventory_ring"]`: a sample at most every 30 s, the last
+  five), the way devguard_core's tick does. Same lock (`events.lock`, at most a second's wait), one
+  `O_APPEND` write, rotation at 32 MiB. The rows of what Python does (`stop`, `kill`, `runaway`) come
+  from Python's tick after a handover, so a handed-over tick has only Python's rows, and the shadow
+  writes none. The replay compares the `stage` row's fields with the ones Python's tick recorded.
 
 ### Parity
 

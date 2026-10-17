@@ -416,6 +416,9 @@ public struct Pressure {
     public var segments: Int?
     public var segmentsLimit: Int?
     public var swapGrowth: Int
+    /// How far back the growth window reaches: an action of the guard or the brake empties
+    /// swap_history, so right after one the growth counts over less time (the registry carries it)
+    public var swapWindowS: Double
     public var swapouts: Int
     public var swapping: Bool
     public var reasons: [String] = []
@@ -445,6 +448,8 @@ public struct Pressure {
         state["swap_history"] = .array(history)
         // an entry someone else wrote may be short: what it lacks reads as no growth
         let first = history[0].array ?? []
+        let since = first.first?.double ?? now
+        swapWindowS = GuardText.round(now - since, 1)
         let base = first.count > 1 ? (first[1].int ?? GuardText.int(first[1].double ?? 0)) : swapUsed
         swapGrowth = swapUsed &- base
         if let s = swapoutsNow, first.count > 2, let f = first[2].int {

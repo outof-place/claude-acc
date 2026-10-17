@@ -163,7 +163,7 @@ def set_orca(o, s):
 
 def run_tick(dg, janitor, lastresort, probe, cfg, state, orca, now, absolute, marker, cli=None):
     """One tick with every action replaced by a recorder; returns what Python decided."""
-    calls, logs, notes, reaps = [], [], [], []
+    calls, logs, notes, reaps, events = [], [], [], [], []
 
     def execute(cfg_, plan, world, state_):
         if (
@@ -174,12 +174,21 @@ def run_tick(dg, janitor, lastresort, probe, cfg, state, orca, now, absolute, ma
         calls.append({"unit": plan.unit.key, "action": plan.action, "code": plan.code})
         return False
 
-    def reap(world, state_, module, level, cfg):
+    def reap(world, state_, module, level, cfg, **_):
         reaps.append(level)
 
-    real = (dg.execute, lastresort.reap, dg.log, janitor.notify, dg.started_at)
+    def record(ev, world, **fields):
+        # the registry row devguard_core.record writes, but for the clocks and the disk's free space
+        # (not a reading of the fixture): a recording never appends to the real $STATE/events.jsonl
+        row = dict(ev=ev, **lastresort.signals(getattr(world, "pressure", None)))
+        row.pop("disk_free_gb", None)
+        row.update(fields)
+        events.append(row)
+
+    real = (dg.execute, lastresort.reap, dg.log, janitor.notify, dg.started_at, dg.record)
     dg.execute = execute
     lastresort.reap = reap
+    dg.record = record
     dg.log = lambda line: logs.append(line)
     janitor.notify = lambda title, text: notes.append([title, text])
 
@@ -212,13 +221,14 @@ def run_tick(dg, janitor, lastresort, probe, cfg, state, orca, now, absolute, ma
             cfg, state, orca, dry_run=False, now=now, qos=False
         )
     finally:
-        dg.execute, lastresort.reap, dg.log, janitor.notify, dg.started_at = real
+        dg.execute, lastresort.reap, dg.log, janitor.notify, dg.started_at, dg.record = real
     act = calls[0] if calls else None
     return {
         "plans": [p.summary() for p in plans],
         "act": act,
         "calls": calls,
         "brake": reaps[0] if reaps else None,
+        "events": events,
         "log": logs,
         "notify": notes,
     }

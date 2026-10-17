@@ -150,27 +150,29 @@ extension PyJSON: ExpressibleByBooleanLiteral, ExpressibleByIntegerLiteral,
 // MARK: - dumps
 
 extension PyJSON {
-    /// json.dumps(value) with the defaults: ensure_ascii, ", " and ": ", NaN as NaN.
-    public func dumps() -> String {
+    /// json.dumps(value) with the defaults: ensure_ascii, ", " and ": ", NaN as NaN. With
+    /// `ensureASCII` false, as json.dumps(ensure_ascii=False): only `"`, `\\` and the control
+    /// characters below U+0020 are escaped, everything else is written as it is.
+    public func dumps(ensureASCII: Bool = true) -> String {
         var out = ""
         out.reserveCapacity(4096)
-        write(to: &out)
+        write(to: &out, ensureASCII: ensureASCII)
         return out
     }
 
-    func write(to out: inout String) {
+    func write(to out: inout String, ensureASCII: Bool = true) {
         switch self {
         case .null: out += "null"
         case .bool(let b): out += b ? "true" : "false"
         case .int(let i): out += String(i)
         case .double(let d): out += Self.repr(d)
-        case .string(let s): Self.quote(s, into: &out)
+        case .string(let s): Self.quote(s, into: &out, ensureASCII: ensureASCII)
         case .raw(let text): out += text
         case .array(let a):
             out += "["
             for (i, v) in a.enumerated() {
                 if i > 0 { out += ", " }
-                v.write(to: &out)
+                v.write(to: &out, ensureASCII: ensureASCII)
             }
             out += "]"
         case .object(let o):
@@ -179,15 +181,16 @@ extension PyJSON {
             for (k, v) in o {
                 if !first { out += ", " }
                 first = false
-                Self.quote(k, into: &out)
+                Self.quote(k, into: &out, ensureASCII: ensureASCII)
                 out += ": "
-                v.write(to: &out)
+                v.write(to: &out, ensureASCII: ensureASCII)
             }
             out += "}"
         }
     }
 
-    static func quote(_ s: String, into out: inout String) {
+    static func quote(_ s: String, into out: inout String, ensureASCII: Bool = true) {
+        guard ensureASCII else { return quoteUnicode(s, into: &out) }
         out += "\""
         for unit in s.utf16 {
             switch unit {
@@ -202,6 +205,27 @@ extension PyJSON {
             default:
                 let hex = String(unit, radix: 16)
                 out += "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
+            }
+        }
+        out += "\""
+    }
+
+    /// json's ESCAPE (ensure_ascii=False): `"`, `\\`, and U+0000-U+001F (short forms where JSON has them)
+    static func quoteUnicode(_ s: String, into out: inout String) {
+        out += "\""
+        for scalar in s.unicodeScalars {
+            switch scalar.value {
+            case 0x22: out += "\\\""
+            case 0x5C: out += "\\\\"
+            case 0x0A: out += "\\n"
+            case 0x0D: out += "\\r"
+            case 0x09: out += "\\t"
+            case 0x08: out += "\\b"
+            case 0x0C: out += "\\f"
+            case 0x00..<0x20:
+                let hex = String(scalar.value, radix: 16)
+                out += "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
+            default: out.unicodeScalars.append(scalar)
             }
         }
         out += "\""

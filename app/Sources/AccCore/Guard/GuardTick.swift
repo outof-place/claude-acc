@@ -575,6 +575,34 @@ public struct GuardTickResult {
     public var plans: [Plan]
     public var actable: [Plan]
     public var brakeDue: Bool
+    /// The `stage` row's fields when this tick changed the brake's stage (devguard_core.tick, after
+    /// the brake): written to the registry by whoever keeps the tick. A tick handed to Python
+    /// isn't kept, and Python's tick writes its own row.
+    public var stageRow: PyObject?
+}
+
+/// INVENTORY_RING: this many samples of the memory families, at most one per this many seconds
+/// (about 2 minutes back), so the `stage` row shows what grew before the stage changed
+let inventoryRing = (count: 5, every: 30.0)
+
+/// family_sizes(inv): {family: footprint} of an inventory, or {}
+func familySizes(_ inventory: PyJSON?) -> PyObject {
+    var out = PyObject()
+    for (name, family) in inventory?["families"]?.object ?? PyObject() {
+        out[name] = family["footprint"] ?? .null
+    }
+    return out
+}
+
+/// remember_inventory(state, now): one sample of the families in state["inventory_ring"], at most
+/// every INVENTORY_RING[1] seconds, the last INVENTORY_RING[0] kept
+func rememberInventory(_ state: inout PyObject, now: Double) {
+    var ring = state["inventory_ring"]?.array ?? []
+    if ring.isEmpty || now - (ring.last?["at"]?.double ?? 0) >= inventoryRing.every {
+        ring.append(.object(PyObject([("at", .double(now)), ("families", .object(familySizes(state["inventory"])))])))
+        if ring.count > inventoryRing.count { ring.removeFirst(ring.count - inventoryRing.count) }
+    }
+    state["inventory_ring"] = .array(ring)
 }
 
 /// tick(cfg, state, orca, qos) up to the actions: the state is updated the way Python's tick updates
@@ -596,8 +624,17 @@ public func guardTick(
     let inv = state["inventory"]?.object
     if !world.table.order.isEmpty && (stage >= 1 || now - (inv?["at"]?.double ?? 0) >= 30) {
         state["inventory"] = Profile.measure("inventory") { inventory(world, probes: probes) }
+        rememberInventory(&state, now: now)
     }
     let brake = enforce && brakeDue(cfg, world, state, now: now)
+    var stageRow: PyObject?
+    if stage != previous {
+        let ring = state["inventory_ring"]?.array ?? []
+        stageRow = PyObject([
+            ("stage", .int(stage)), ("previous", .int(previous)), ("families", .object(familySizes(state["inventory"]))),
+            ("families_at", state["inventory"]?["at"] ?? .null), ("ring_oldest", ring.first ?? .null),
+        ])
+    }
     var history = state["history"]?.array ?? []
     if history.isEmpty || now - (history.last?.array?.first?.double ?? 0) >= 30 {
         let p = world.pressure
@@ -607,7 +644,7 @@ public func guardTick(
     state["history"] = .array(history)
     if enforce, let shaper { shaper.shape(cfg, world, probes: probes) }
     state["snapshot"] = Profile.measure("snapshot") { snapshot(cfg, world, plans, state: state) }
-    return GuardTickResult(world: world, plans: plans, actable: actable, brakeDue: brake)
+    return GuardTickResult(world: world, plans: plans, actable: actable, brakeDue: brake, stageRow: stageRow)
 }
 
 /// Whether execute() would do something rather than return False: a warn repeats at most hourly.

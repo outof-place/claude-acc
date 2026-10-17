@@ -523,4 +523,56 @@ func pythonLoopEndLine() throws {
     engine.stop()
 }
 
+@Test("engine: a stage change in a tick native keeps writes one `stage` row; a handed-over tick and the shadow write none")
+func stageRows() throws {
+    let home = try scratchHome("stagerows")
+    defer { try? FileManager.default.removeItem(atPath: home) }
+    let state = GuardPaths.state(home)
+    Files.mkdirs(state)
+    let config = state + "/devguard.json"
+    #expect(Files.writeAtomic(config, #"{"mode": "observe", "caps_minutes": 0, "notify": false}"#))
+    final class World: @unchecked Sendable { var now = 1_791_000_000.0; var compressed = 25; var once = 0 }
+    let w = World()
+    let rows = { (path: String) -> [PyObject] in
+        ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "").split(separator: "\n").compactMap { (try? PyJSON.loads(String($0)))?.object }
+    }
+    let engine = GuardEngine(.init(home: home, shadow: false, python: ["/nonexistent/python"]))
+    GuardLog.notifications = false
+    engine.probesFactory = { pressureWorld(home: home, now: w.now, compressedGB: w.compressed) }
+    engine.runner = { _ in w.once += 1; return 0 }
+
+    engine.benchTick()  // 25 of 48 GB compressed: stage 2 from 0, observing, so native keeps the tick
+    var seen = rows(state + "/events.jsonl")
+    #expect(seen.count == 1)
+    #expect(seen.first?["ev"] == .string("stage") && seen.first?["stage"] == .int(2) && seen.first?["previous"] == .int(0))
+    #expect(seen.first?["guard_level"] != nil && seen.first?["swap_window_s"] != nil)
+    w.now += 5
+    engine.benchTick()  // still stage 2: no row
+    #expect(rows(state + "/events.jsonl").count == 1)
+    w.now += 5
+    w.compressed = 1
+    engine.benchTick()  // back to 0
+    seen = rows(state + "/events.jsonl")
+    #expect(seen.count == 2 && seen.last?["stage"] == .int(0) && seen.last?["previous"] == .int(2))
+
+    // enforcing, the brake is due at stage 2: the tick goes to Python, whose own tick writes the row
+    #expect(Files.writeAtomic(config, #"{"mode": "enforce", "caps_minutes": 0, "notify": false}"#))
+    w.now += 5
+    w.compressed = 25
+    engine.benchTick()
+    #expect(w.once == 1)
+    #expect(rows(state + "/events.jsonl").count == 2)
+    engine.stop()
+
+    // the shadow observes only
+    let other = try scratchHome("stagerows-shadow")
+    defer { try? FileManager.default.removeItem(atPath: other) }
+    Files.mkdirs(GuardPaths.state(other))
+    let shadow = GuardEngine(.init(home: other, shadow: true, shadowPath: other + "/shadow.json", python: ["/nonexistent/python"]))
+    shadow.probesFactory = { pressureWorld(home: other, now: w.now, compressedGB: 25) }
+    shadow.benchTick()
+    #expect(!FileManager.default.fileExists(atPath: GuardPaths.state(other) + "/events.jsonl"))
+    shadow.stop()
+}
+
 }
