@@ -48,6 +48,11 @@ import shlex
 
 import orcahost
 
+try:
+    import events  # rejestr decyzji ($STATE/events.jsonl)
+except ImportError:  # rejestr to pomiar: hamulec działa i bez niego
+    events = None
+
 MB = 1024**2
 GB = 1024**3
 MINUTE = 60
@@ -119,6 +124,45 @@ DEFAULTS = {
     "brake_grace_seconds": 8,
     "emergency_grace_seconds": 3,
 }
+
+
+# sygnały pamięci z Pressure strażnika, które wiersz rejestru niesie z tej samej chwili co decyzję
+SIGNALS = ("compressed", "segments", "segments_limit", "swap_used", "swap_growth", "swapouts", "kernel",
+           "available", "swap_window_s")
+
+
+def signals(pressure):
+    """Powody i sygnały jednej chwili do wiersza rejestru: powody stopnia, poziom i powody strażnika,
+    sygnały pamięci z Pressure (brak pola to None) i wolne miejsce na dysku."""
+    out = {
+        "stage_reasons": list(getattr(pressure, "stage_reasons", None) or []),
+        "guard_level": getattr(pressure, "level", None),
+        "guard_reasons": list(getattr(pressure, "reasons", None) or []),
+    }
+    out.update((name, getattr(pressure, name, None)) for name in SIGNALS)
+    out["disk_free_gb"] = disk_free_gb()
+    return out
+
+
+def disk_free_gb(path="/System/Volumes/Data"):
+    """Wolne miejsce wolumenu danych w GB albo None."""
+    try:
+        st = os.statvfs(path)
+        return round(st.f_bavail * st.f_frsize / GB, 1)
+    except OSError:
+        return None
+
+
+def pgid_count(pids):
+    """Ile grup procesów ma drzewo (B-4: pauza grupy nie sięga potomków z własną grupą); liczone,
+    zanim drzewo zginie."""
+    groups = set()
+    for pid in pids:
+        try:
+            groups.add(os.getpgid(pid))
+        except OSError:
+            pass
+    return len(groups)
 
 
 def settings(cfg):
@@ -334,6 +378,22 @@ def resume_of(pid, job, core):
     return (f"cd {shlex.quote(cwd)} && " if cwd else "") + shlex.join(argv)
 
 
+def record(core, ev, pressure, fields, extra=None):
+    """Wiersz rejestru decyzji w katalogu stanu strażnika (core.STATE_DIR) z sygnałami tej chwili,
+    polami decyzji i polami wołającego (`extra`, mają pierwszeństwo); atrapa bez katalogu stanu i
+    brak events.py: bez wiersza. Nigdy nie przerywa hamulca."""
+    state_dir = getattr(core, "STATE_DIR", None)
+    if events is None or not state_dir:
+        return
+    try:
+        row = signals(pressure)
+        row.update(fields)
+        row.update(extra or {})
+        events.append(state_dir, ev, **row)
+    except Exception:
+        pass
+
+
 def sched_jobs(core):
     """Lokalne joby schedulera, które biegną (sched/state.json), albo []."""
     path = os.path.join(core.STATE_DIR, "sched", "state.json") if hasattr(core, "STATE_DIR") else None
@@ -341,11 +401,13 @@ def sched_jobs(core):
     return [j for j in (data or {}).get("running", []) if j.get("where") == "local" and j.get("child_pgid")]
 
 
-def reap(world, state, core, level=2, cfg=None, dry_run=False):
+def reap(world, state, core, level=2, cfg=None, dry_run=False, event_fields=None):
     """Jedno drzewo mniej; zwraca opis akcji albo None.
 
     core: moduł devguard_core (usage, terminate, log, janitor, mach time); level: stopień z
-    `stage`; dry_run: tylko wybór, bez sygnałów, wpisu do logu i powiadomienia."""
+    `stage`; dry_run: tylko wybór, bez sygnałów, wpisu do logu i powiadomienia. Każde zabicie ma
+    wiersz `kill` (uciekinier: `runaway`) w rejestrze core.STATE_DIR/events.jsonl z powodami stopnia
+    i sygnałami z world.pressure; event_fields: pola wołającego dopisane do tego wiersza."""
     s = settings(cfg or {})
     table = world.table
     skip = {os.getpid()}
@@ -395,6 +457,7 @@ def reap(world, state, core, level=2, cfg=None, dry_run=False):
             pids = tree
 
         grace = s["emergency_grace_seconds"] if level >= 3 else s["brake_grace_seconds"]
+        groups = pgid_count(tree)
         left = core.terminate(_Tree, table, grace=grace)
         result = "zatrzymany" if not left else f"nie chcą zginąć: {left}"
     line = (
@@ -406,10 +469,15 @@ def reap(world, state, core, level=2, cfg=None, dry_run=False):
     if dry_run:
         return line
     core.log(line)
-    events = state.setdefault("lastresort", [])
-    events.append({"at": world.now, "code": code, "pid": pid, "size": size, "result": result,
+    # ostatnie zabicia dla panelu (devguard-state.json); rejestr niżej trzyma pełny wiersz
+    recent = state.setdefault("lastresort", [])
+    recent.append({"at": world.now, "code": code, "pid": pid, "size": size, "result": result,
                    "level": level, "resume": resume})  # fmt: skip
-    del events[:-50]
+    del recent[:-50]
+    record(core, "runaway" if code == "runaway" else "kill", getattr(world, "pressure", None), {
+        "job": (job or {}).get("id"), "code": code, "pid": pid, "tree_n": len(tree), "pgid_n": groups, "size": size,
+        "level": level, "result": result, "command": command[:160], "swap_window_reset": False,
+    }, event_fields)
     try:
         notify = getattr(core, "notify_quiet", None) or core.janitor.notify
         notify("Strażnik: ostatnia linia", f"{label}: {core.janitor.human(size)} zwolnione")
