@@ -142,7 +142,7 @@ struct FansCard: View {
     var body: some View {
         Card("Load & Heat", symbol: "thermometer.medium") {
             VStack(alignment: .leading, spacing: 12) {
-                LoadMeters(load: store.load)
+                LoadMeters(store: store)
                 if let state = live {
                     readings(state)
                     HStack(spacing: 6) {
@@ -230,8 +230,11 @@ struct FansCard: View {
 }
 
 /// CPU and GPU load like Activity Monitor: all cores, split into performance and efficiency.
+/// It reads the load itself: a new sample every tick re-runs these meters, not the whole card.
 private struct LoadMeters: View {
-    let load: LoadReading?
+    let store: Store
+
+    private var load: LoadReading? { store.load }
 
     var body: some View {
         HStack(spacing: 14) {

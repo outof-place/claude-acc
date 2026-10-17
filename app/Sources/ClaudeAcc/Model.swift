@@ -436,6 +436,14 @@ struct HotspotState: Decodable, Equatable {
     let delayP90Ms: Double?
     /// False while no probe comes back: the daemon lifts the limit rather than shape blind.
     let shaping: Bool?
+
+    /// The same reading but for `at`, which the daemon renews on every write.
+    func sameReading(as other: HotspotState?) -> Bool {
+        guard let other else { return false }
+        return enabled == other.enabled && active == other.active && iface == other.iface && via == other.via
+            && rateKbps == other.rateKbps && txKbps == other.txKbps && delayP90Ms == other.delayP90Ms
+            && shaping == other.shaping
+    }
 }
 
 // MARK: - Fans (`fans-state.json`, written by the root fanctl daemon)
