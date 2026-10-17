@@ -1120,6 +1120,41 @@ class HookTest(Paths):
         again = dict(event, tool_input=updated)
         self.assertIsNone(S.hook_rewrite(again))  # już owinięte
 
+    def hook_argv(self, **tool_input):
+        event = {"tool_name": "Bash", "cwd": self.repo,
+                 "tool_input": dict({"command": "cd apps/charter-service && go test ./internal/money/"}, **tool_input)}
+        out = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
+        self.assertEqual({k: v for k, v in out.items() if k != "command"},
+                         {k: v for k, v in tool_input.items()})  # reszta tool_input bez zmian
+        return shlex.split(out["command"])
+
+    def run_opts(self, argv):
+        opts, _command, _argv = S.parse_run_args(argv[argv.index("run") + 1:])
+        return opts
+
+    def test_hook_passes_timeout_from_tool_input(self):
+        """Wydanie A (A5): komenda na pierwszym planie czekała w kolejce bez limitu, aż Bash zabił
+        wrapper po swoim timeoutcie (kod 143, czekający zdjęty dopiero przez reap). Teraz kolejka
+        kończy się kodem 75 o 15 s przed limitem Basha: 600 000 ms daje --timeout 585."""
+        self.assertEqual(self.run_opts(self.hook_argv(timeout=600000))["timeout"], "585")
+        self.assertEqual(self.run_opts(self.hook_argv(timeout=3600000))["timeout"], "3585")
+        self.assertEqual(self.run_opts(self.hook_argv(timeout=5000))["timeout"], "1")  # nigdy 0 ani mniej
+
+    def test_hook_default_bash_limit_gives_105(self):
+        """Bez `timeout` Bash ma 120 000 ms (schemat narzędzia: "default 120000"), a z ustawionym
+        BASH_DEFAULT_TIMEOUT_MS ten domyślny limit."""
+        env = {k: v for k, v in os.environ.items() if k != "BASH_DEFAULT_TIMEOUT_MS"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(self.run_opts(self.hook_argv())["timeout"], "105")
+        with mock.patch.dict(os.environ, {"BASH_DEFAULT_TIMEOUT_MS": "300000"}):
+            self.assertEqual(self.run_opts(self.hook_argv())["timeout"], "285")
+
+    def test_background_command_gets_no_timeout(self):
+        """Komenda w tle (run_in_background) nie ma limitu Basha: czeka, ile trzeba."""
+        argv = self.hook_argv(run_in_background=True, timeout=600000)
+        self.assertNotIn("--timeout", argv)
+        self.assertNotIn("timeout", self.run_opts(argv))
+
     def test_hook_runs_through_the_managed_python_and_launcher(self):
         python = os.path.join(S.STATE_DIR, "python")
         launcher = os.path.join(S.STATE_DIR, "acc.py")

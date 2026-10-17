@@ -4443,8 +4443,29 @@ def runner():
     return ["/usr/bin/python3", SELF]
 
 
+# limit narzędzia Bash Claude Code, gdy tool_input nie ma `timeout` (schemat narzędzia: "default 120000,
+# max 3600000"); inny domyślny daje BASH_DEFAULT_TIMEOUT_MS, które Claude Code bierze z ustawień
+BASH_DEFAULT_TIMEOUT_MS = 120000
+# kolejka kończy się kodem 75 (EXIT_TIMEOUT) tyle sekund przed limitem Basha: agent widzi „timeout w
+# kolejce”, zanim Bash zabije wrapper, a czekający nie zostaje w kolejce do reapu
+QUEUE_MARGIN_S = 15
+
+
+def bash_queue_timeout(tool_input):
+    """--timeout kolejki dla komendy agenta: limit Basha minus QUEUE_MARGIN_S, najmniej 1 s; None
+    dla komendy w tle (run_in_background), której Bash nie ogranicza."""
+    if tool_input.get("run_in_background"):
+        return None
+    try:
+        ms = float(tool_input.get("timeout") or os.environ.get("BASH_DEFAULT_TIMEOUT_MS") or BASH_DEFAULT_TIMEOUT_MS)
+    except (TypeError, ValueError):
+        ms = BASH_DEFAULT_TIMEOUT_MS
+    return max(1, int(ms / 1000 - QUEUE_MARGIN_S))
+
+
 def hook_rewrite(event):
-    """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run."""
+    """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run, z
+    --timeout kolejki o QUEUE_MARGIN_S krótszym od limitu Basha (bash_queue_timeout)."""
     if event.get("tool_name") != "Bash":
         return None
     tool_input = event.get("tool_input") or {}
@@ -4473,6 +4494,9 @@ def hook_rewrite(event):
         }
     command = fixed
     parts = runner() + ["run", "--via", "hook"]
+    limit = bash_queue_timeout(tool_input)
+    if limit is not None:
+        parts += ["--timeout", str(limit)]
     if event.get("session_id"):
         parts += ["--session", str(event["session_id"])]
     agent = event.get("agent_type") or event.get("subagent_type")
