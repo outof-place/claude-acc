@@ -10,6 +10,7 @@ i komend to devguard.py.
 Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 """
 
+import contextlib
 import json
 import os
 import shlex
@@ -224,13 +225,242 @@ PIN_HOLD = {"target": ":3747", "level": "hold", "until": None, "reason": "film"}
 
 class CapsCommandTest(unittest.TestCase):
     def test_caps_runs_check_caps_once_with_a_fresh_state(self):
-        with mock.patch.object(dg, "check_caps") as check:
+        with mock.patch.object(dg, "check_caps", return_value=None) as check, mock.patch("builtins.print") as out:
             self.assertEqual(dg.cmd_caps(dg.load_config(), ["--dry-run"]), 0)
             self.assertEqual(dg.cmd_caps(dg.load_config(), []), 0)
         self.assertEqual([c.args[1] for c in check.call_args_list], [{}, {}])
         self.assertEqual([c.kwargs["dry_run"] for c in check.call_args_list], [True, False])
+        self.assertEqual(json.loads(out.call_args.args[0]),
+                         {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": [], "shallow": [], "headroom": None})
         self.assertIn("caps", dg.COMMANDS)
         self.assertIn("caps [--dry-run]", entry.__doc__)
+
+    def test_a_fresh_entry_over_the_limit_reports_when_it_may_go(self):
+        # acc-cored calls the caps again only after a change in their folders, a busy entry, or this time
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old, new = os.path.join(tmp, "p", "builds", "old"), os.path.join(tmp, "p", "builds", "new")
+        for path in (old, new):
+            os.makedirs(path)
+            with open(os.path.join(path, "blob"), "wb") as f:
+                f.write(b"x" * 65536)
+        jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(tmp, "*", "builds"), "max_gb": 1e-6, "keep": 0,
+                                                       "fresh_minutes": 10}])  # fmt: skip
+        with mock.patch.object(dg.janitor, "load_config", return_value=jcfg), mock.patch.object(dg, "log"), \
+                mock.patch("builtins.print") as out:
+            self.assertEqual(dg.cmd_caps(dg.load_config(), ["--dry-run"]), 0)
+        report = json.loads(out.call_args.args[0])
+        self.assertTrue(report["ran"])
+        self.assertEqual(report["busy"], 0)
+        newest = max(max(os.stat(p).st_mtime, os.stat(p).st_ctime) for p in (old, new))
+        self.assertLessEqual(report["retry_at"], newest + 600)
+        self.assertGreater(report["retry_at"], time.time() + 590)
+
+    def caps_world(self, tmp, **cap):
+        """Dwa wpisy po 64 KiB pod limitem 1 KB: starszy idzie (keep 0, nie świeże)."""
+        builds = os.path.join(tmp, "p", "builds")
+        for name in ("old", "new"):
+            os.makedirs(os.path.join(builds, name))
+            with open(os.path.join(builds, name, "blob"), "wb") as f:
+                f.write(b"x" * 65536)
+            os.utime(os.path.join(builds, name), (time.time() - 3600,) * 2)
+        return dict(dg.janitor.DEFAULT_CONFIG, caps=[dict({"path": os.path.join(tmp, "*", "builds"), "max_gb": 1e-6,
+                                                           "keep": 0, "fresh_minutes": 0}, **cap)])  # fmt: skip
+
+    def report(self, jcfg, **patches):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(dg.janitor, "load_config", return_value=jcfg))
+            stack.enter_context(mock.patch.object(dg, "log"))
+            for name, value in patches.items():
+                stack.enter_context(mock.patch.object(dg.janitor, name, value))
+            out = stack.enter_context(mock.patch("builtins.print"))
+            self.assertEqual(dg.cmd_caps(dg.load_config(), ["--dry-run"]), 0)
+        return json.loads(out.call_args.args[0])
+
+    def test_the_report_names_the_matched_folders_by_their_real_paths(self):
+        # acc-cored watches them too: a folder under the glob that is a link lives elsewhere
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp)
+        target = os.path.join(tmp, "elsewhere", "builds")
+        os.makedirs(target)
+        os.makedirs(os.path.join(tmp, "q"))
+        os.symlink(target, os.path.join(tmp, "q", "builds"))
+
+        report = self.report(jcfg)
+
+        self.assertEqual(sorted(report["folders"]),
+                         sorted([os.path.realpath(os.path.join(tmp, "p", "builds")), os.path.realpath(target)]))
+
+    def test_busy_counts_what_may_free_itself_and_failed_du(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp)
+        in_use = mock.Mock()
+        in_use.busy.return_value = True
+        with mock.patch.object(dg.janitor.Sweep, "usage", in_use):
+            self.assertEqual(self.report(jcfg)["busy"], 2)  # both entries in use
+        self.assertEqual(self.report(jcfg, du_size=lambda _p: None)["busy"], 2)  # du failed on both
+        # protected: it stays so, and a busy that never ends would keep the gate open for good
+        protected = dict(jcfg, protect=[tmp])
+        self.assertEqual(self.report(protected)["busy"], 0)
+
+    def test_the_report_gives_the_tightest_folder_s_headroom(self):
+        # acc-cored counts a drop of free space only when it could push a cap over its limit
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp, max_gb=1)
+        report = self.report(jcfg)
+        sizes = sum(dg.janitor.du_size(os.path.join(tmp, "p", "builds", n)) for n in ("old", "new"))
+        self.assertEqual(report["headroom"], dg.janitor.GB - sizes)
+        # over the limit with both entries removable: what's left is empty
+        self.assertAlmostEqual(self.report(self.caps_world_again(tmp))["headroom"], 1e-6 * dg.janitor.GB)
+
+    def caps_world_again(self, tmp):
+        return dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(tmp, "*", "builds"), "max_gb": 1e-6,
+                                                       "keep": 0, "fresh_minutes": 0}])  # fmt: skip
+
+    def test_a_linked_folder_without_builds_yet_is_reported_too(self):
+        # wt1 -> poza prefiksem wzorca: miejsce na builds w celu, nie cały cel (edycja w nim nie budzi)
+        tmp, far = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for path in (tmp, far):
+            self.addCleanup(shutil.rmtree, path, True)
+        jcfg = self.caps_world(tmp)
+        os.makedirs(os.path.join(far, "worktree", "src"))
+        os.symlink(os.path.join(far, "worktree"), os.path.join(tmp, "wt1"))
+        # wewnątrz prefiksu: acc-cored i tak to widzi, więc nic osobno
+        os.makedirs(os.path.join(tmp, "repo", ".perf"))
+        os.symlink(os.path.join(tmp, "repo", ".perf"), os.path.join(tmp, "wt2"))
+
+        folders = self.report(jcfg)["folders"]
+
+        spot = os.path.join(os.path.realpath(os.path.join(far, "worktree")), "builds")
+        self.assertIn(spot, folders)
+        self.assertNotIn(os.path.realpath(os.path.join(far, "worktree")), folders)
+        self.assertFalse([f for f in folders if "repo" in f], folders)
+
+    def test_a_link_anywhere_along_the_glob_reports_where_the_folder_would_be(self):
+        tmp, far, third = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+        for path in (tmp, far, third):
+            self.addCleanup(shutil.rmtree, path, True)
+        os.makedirs(os.path.join(tmp, "caps"))
+        os.makedirs(os.path.join(far, "out"))
+        os.symlink(far, os.path.join(tmp, "caps", "wt1"))
+
+        def folders(glob_tail):
+            jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(tmp, "caps", "*", *glob_tail),
+                                                          "max_gb": 1, "keep": 0, "fresh_minutes": 0}])  # fmt: skip
+            return self.report(jcfg)["folders"]
+
+        real = os.path.realpath(far)
+        # a fixed part after the wildcard: the link is one level above the folder's parent
+        self.assertEqual(folders(["out", "builds"]), [os.path.join(real, "out", "builds")])
+        # a folder on the way not made yet
+        self.assertEqual(folders(["gone", "builds"]), [os.path.join(real, "gone", "builds")])
+        # a link on the fixed part itself goes on to its own target
+        os.rmdir(os.path.join(far, "out"))
+        os.symlink(third, os.path.join(far, "out"))
+        self.assertEqual(folders(["out", "builds"]), [os.path.join(os.path.realpath(third), "builds")])
+        # another wildcard further down: the target's fixed part, and links below it leave it too
+        os.makedirs(os.path.join(third, "runs", "r1"))
+        elsewhere = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        os.symlink(elsewhere, os.path.join(third, "runs", "r2"))
+        self.assertEqual(sorted(folders(["out", "runs", "*", "builds"])),
+                         sorted([os.path.join(os.path.realpath(third), "runs"),
+                                 os.path.join(os.path.realpath(elsewhere), "builds")]))  # fmt: skip
+
+    def test_a_link_before_another_wildcard_is_watched_shallow_and_dangling_links_resolve(self):
+        tmp, far, third = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+        for path in (tmp, far, third):
+            self.addCleanup(shutil.rmtree, path, True)
+        os.makedirs(os.path.join(tmp, "caps"))
+        os.makedirs(os.path.join(far, "t1", "s0", "builds"))
+        os.makedirs(os.path.join(far, "t1", "s1", "src"))
+        os.symlink(os.path.join(far, "t1"), os.path.join(tmp, "caps", "l1"))
+
+        def report(*tail):
+            jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(tmp, "caps", *tail), "max_gb": 1, "keep": 0,
+                                                          "fresh_minutes": 0}])  # fmt: skip
+            return self.report(jcfg)
+
+        t1 = os.path.realpath(os.path.join(far, "t1"))
+        # caps/*/*/builds with l1 -> a worktree: its own entries only, and a deep watch per folder in it
+        got = report("*", "*", "builds")
+        self.assertEqual(got["shallow"], [t1])
+        self.assertEqual(sorted(got["folders"]), [os.path.join(t1, "s0", "builds"), os.path.join(t1, "s1", "builds")])
+        self.assertNotIn(t1, got["folders"])
+        # a link to a file: nothing will be under it (a dangling one may become a folder, below)
+        with open(os.path.join(far, "notes.txt"), "w") as f:
+            f.write("x")
+        os.symlink(os.path.join(far, "notes.txt"), os.path.join(tmp, "caps", "notes"))
+        self.assertFalse([f for f in report("*", "builds")["folders"] if "notes" in f])
+        self.assertEqual(report("*")["shallow"], [t1])
+        # a link whose target isn't there yet, and one on the fixed part
+        os.symlink(os.path.join(far, "later"), os.path.join(tmp, "caps", "wt2"))
+        self.assertIn(os.path.join(os.path.realpath(far), "later", "builds"), report("*", "builds")["folders"])
+        os.makedirs(os.path.join(far, "x"))
+        os.symlink(os.path.join(third, "out"), os.path.join(far, "x", "out"))
+        os.symlink(os.path.join(far, "x"), os.path.join(tmp, "caps", "wt3"))
+        self.assertIn(os.path.join(os.path.realpath(third), "out", "builds"), report("*", "out", "builds")["folders"])
+
+    def test_the_headroom_is_the_minimum_over_folders(self):
+        # ciasny folder pierwszy: „ostatni wygrywa” i max dałyby luźny
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name in ("tight", "loose"):
+            os.makedirs(os.path.join(tmp, name, "e"))
+            with open(os.path.join(tmp, name, "e", "blob"), "wb") as f:
+                f.write(b"x" * 65536)
+        gb = dg.janitor.GB
+        cap = {"keep": 0, "fresh_minutes": 0}
+        jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[dict(cap, path=os.path.join(tmp, "tight"), max_gb=131072 / gb),
+                                                     dict(cap, path=os.path.join(tmp, "loose"), max_gb=1)])  # fmt: skip
+        size = dg.janitor.du_size(os.path.join(tmp, "tight", "e"))
+        self.assertEqual(self.report(jcfg)["headroom"], 131072 - size)
+
+    def test_entries_kept_by_keep_over_the_limit_leave_a_positive_headroom(self):
+        # incydent: snapshot większy od limitu, keep=1. Wzrost tego, co zostaje, niczego nie zmieni,
+        # więc zapas to limit, a nie ujemna liczba (która dawała próg minimalny i przebieg co interwał)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        jcfg = self.caps_world(tmp, keep=1)
+        self.assertAlmostEqual(self.report(jcfg)["headroom"], 1e-6 * dg.janitor.GB)
+        # mały najnowszy w `keep`, duży starszy idzie: nic nie zostaje przez rozmiar, więc limit,
+        # a nie limit minus mały (`i >= keep` w regule)
+        mixed = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, mixed, True)
+        for name, size, age in (("old", 262144, 3600), ("new", 65536, 60)):  # the order is by birth
+            os.makedirs(os.path.join(mixed, "b", name))
+            with open(os.path.join(mixed, "b", name, "blob"), "wb") as f:
+                f.write(b"x" * size)
+            os.utime(os.path.join(mixed, "b", name), (time.time() - age,) * 2)
+        jcfg = dict(dg.janitor.DEFAULT_CONFIG, caps=[{"path": os.path.join(mixed, "b"), "max_gb": 131072 / dg.janitor.GB, "keep": 1,
+                                                      "fresh_minutes": 0}])  # fmt: skip
+        self.assertEqual(self.report(jcfg)["headroom"], 131072)
+        # wpis zostawiony przez rozmiar za `keep`: zapas liczony od niego
+        jcfg = self.caps_world_again(tmp)
+        jcfg["caps"][0].update(max_gb=1, keep=1)
+        sizes = sum(dg.janitor.du_size(os.path.join(tmp, "p", "builds", n)) for n in ("old", "new"))
+        self.assertEqual(self.report(jcfg)["headroom"], dg.janitor.GB - sizes)
+
+    def test_du_with_an_unreadable_subfolder_still_measures(self):
+        # du prints the total and exits 1: a size, not a failure that keeps the gate open
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        locked = os.path.join(tmp, "entry", "locked")
+        os.makedirs(locked)
+        with open(os.path.join(tmp, "entry", "blob"), "wb") as f:
+            f.write(b"x" * 65536)
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o755)
+        if subprocess.run(["du", "-sk", os.path.join(tmp, "entry")], capture_output=True).returncode == 0:
+            self.skipTest("du reads the folder anyway (root)")
+        self.assertGreaterEqual(dg.janitor.du_size(os.path.join(tmp, "entry")), 65536)
+
+    def test_acc_cored_reads_the_caps_without_janitors_defaults(self):
+        # CapsWatch.swift reads janitor.json's "caps" as written: a default cap here would go unwatched
+        self.assertEqual(dg.janitor.DEFAULT_CONFIG["caps"], [])
 
 
 class NoteTest(unittest.TestCase):

@@ -269,12 +269,21 @@ def run(cmd, timeout=600):
     return done.stdout if done.returncode == 0 else None
 
 
-def du_bytes(path):
-    out = run(["du", "-sk", path], timeout=900)
+def du_size(path):
+    """du -sk w bajtach albo None, gdy du się nie udało (jego limit czasu, fork pod obciążeniem).
+    Kod 1 z sumą na wyjściu (podkatalog bez prawa odczytu) to wciąż pomiar."""
     try:
-        return int(out.split()[0]) * 1024
-    except (AttributeError, IndexError, ValueError):
-        return 0
+        done = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=900, env=ENV)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return int(done.stdout.split()[0]) * 1024
+    except (IndexError, ValueError):
+        return None
+
+
+def du_bytes(path):
+    return du_size(path) or 0
 
 
 def disk():
@@ -459,6 +468,16 @@ class Sweep:
         self.dry_run = dry_run
         self.items = []  # (zadanie, ścieżka albo opis, bajty)
         self.skipped = []  # (zadanie, ścieżka, powód)
+        # najbliższa chwila, w której wpis pominięty jako świeży (zapis w toku) może już pójść:
+        # do niej, bez zmian w katalogach, przebieg limitów nie zrobiłby nic innego
+        self.retry_at = None
+        # dla acc-cored (devguard caps): katalogi, które dopasowały globy limitów (rzeczywiste
+        # ścieżki: katalog-dowiązanie leży gdzie indziej), wpisy, których du nie zmierzyło, i ile
+        # najciaśniejszy z katalogów może jeszcze urosnąć, zanim przebieg cokolwiek by usunął
+        self.cap_folders = []
+        self.cap_shallow = []
+        self.du_failures = 0
+        self.cap_headroom = None
         self.warnings = []
         self.failures = []  # (zadanie, błąd) dla panelu
         self.protect = [expand(p) for p in cfg["protect"]]
@@ -951,6 +970,68 @@ def task_uv(sw, _scan):
     sw.record("uv", "uv cache prune", before - du_bytes(cache))
 
 
+CAP_MAGIC = re.compile(r"[*?[]")
+
+
+def cap_spots(pattern):
+    """Gdzie folder z limitem może leżeć poza tym, co acc-cored już widzi (statyczny prefiks
+    wzorca): za dowiązaniem gdziekolwiek po drodze, które z niego wychodzi (wt1 -> repo/.perf),
+    także zanim folder albo katalog po drodze powstanie, także za dowiązaniem, którego cel jeszcze
+    nie istnieje. Zwraca (głębokie, płytkie):
+    - głębokie: rzeczywista ścieżka celu plus dalsza stała część wzorca, obserwowane z całą
+      zawartością; nie cały dowiązany katalog, więc edycja w nim nie budzi limitów;
+    - płytkie: cel dowiązania, po którym od razu idzie kolejna gwiazdka (caps/*/*/builds,
+      l1 -> worktree): tylko jego własne wpisy (nowy podkatalog), a foldery pod nim jako głębokie."""
+    parts = pattern.split("/")
+    first = next((i for i, part in enumerate(parts) if CAP_MAGIC.search(part)), len(parts))
+    deep, shallow = [], []
+
+    def walk(base, base_real, covered, rest):
+        # base istnieje; covered(r): acc-cored już widzi zmiany pod rzeczywistą ścieżką r
+        if not rest:
+            return
+        name, more = rest[0], rest[1:]
+        paths = glob.glob(os.path.join(glob.escape(base), name)) if CAP_MAGIC.search(name) else [os.path.join(base, name)]
+        for path in paths:
+            link = os.path.islink(path)
+            if not link and not os.path.isdir(path):
+                continue
+            if link and os.path.exists(path) and not os.path.isdir(path):
+                continue  # dowiązanie do pliku: nic pod nim nie powstanie (wiszące może być katalogiem)
+            # realpath tylko dla dowiązań (w 3.9 to czysty Python i dominował koszt spaceru)
+            real = os.path.realpath(path) if link or name in (".", "..") else os.path.join(base_real, os.path.basename(path))
+            if covered(real):
+                if os.path.isdir(path):
+                    walk(path, real, covered, more)
+                continue
+            fixed = []
+            for part in more:
+                if CAP_MAGIC.search(part):
+                    break
+                fixed.append(part)
+            # najgłębszy istniejący katalog stałej części i to, czego jeszcze nie ma; realpath
+            # rozwiązuje też dowiązania, których cel jeszcze nie istnieje
+            cur, k = path, 0
+            while k < len(fixed) and os.path.isdir(os.path.join(cur, fixed[k])):
+                cur, k = os.path.join(cur, fixed[k]), k + 1
+            spot = os.path.realpath(os.path.join(cur, *fixed[k:]))
+            if fixed:
+                if spot not in deep:
+                    deep.append(spot)
+                if k == len(fixed):
+                    walk(cur, spot, lambda r, s=spot: r == s or r.startswith(s.rstrip("/") + "/"), more[k:])
+            else:
+                if spot not in shallow:
+                    shallow.append(spot)
+                if os.path.isdir(path):
+                    walk(path, spot, lambda r: False, more)
+
+    top = "/".join(parts[:first]) or "/"
+    real_top = os.path.realpath(top)
+    walk(top, real_top, lambda r: r == real_top or r.startswith(real_top.rstrip("/") + "/"), parts[first:])
+    return deep, shallow
+
+
 def task_caps(sw, _scan):
     """Limit na katalogi z wynikami agentów: najstarsze wpisy ponad `max_gb` idą do kasacji.
 
@@ -962,9 +1043,20 @@ def task_caps(sw, _scan):
         limit = cap.get("max_gb", 10) * GB
         keep = cap.get("keep", 1)
         fresh = time.time() - cap.get("fresh_minutes", 10) * 60
-        for folder in sorted(glob.glob(os.path.expanduser(cap["path"]))):
+        pattern = os.path.expanduser(cap["path"])
+        # foldery za dowiązaniami, które wychodzą z prefiksu wzorca: acc-cored obserwuje ich miejsca
+        deep, shallow = cap_spots(pattern)
+        for spot in deep:
+            if spot not in sw.cap_folders:
+                sw.cap_folders.append(spot)
+        for spot in shallow:
+            if spot not in sw.cap_shallow:
+                sw.cap_shallow.append(spot)
+        for folder in sorted(glob.glob(pattern)):
             if not os.path.isdir(folder):
                 continue
+            if os.path.realpath(folder) not in sw.cap_folders:
+                sw.cap_folders.append(os.path.realpath(folder))
             try:
                 entries = [
                     e.path
@@ -976,15 +1068,31 @@ def task_caps(sw, _scan):
             # kolejność po dacie powstania: rsync -a kopiuje mtime źródła, więc mtime kłamie
             entries.sort(key=born, reverse=True)
             total = 0
+            room = None
             for i, path in enumerate(entries):
-                total += du_bytes(path)
-                if i < keep or total <= limit or changed(path) > fresh:
+                size = du_size(path)
+                if size is None:
+                    sw.du_failures += 1  # za niska suma: następny przebieg liczy jeszcze raz
+                total += size or 0
+                if i >= keep and total <= limit:
+                    # ostatni wpis zostawiony przez rozmiar: dopiero wzrost ponad to zmieni przebieg
+                    room = limit - total
+                if i < keep or total <= limit:
+                    continue
+                last = changed(path)
+                if last > fresh:
+                    ripe = last + cap.get("fresh_minutes", 10) * 60
+                    sw.retry_at = ripe if sw.retry_at is None else min(sw.retry_at, ripe)
                     continue
                 if sw.usage.busy(path):
                     sw.skip("caps", path, "w użyciu")
                     continue
                 name = os.path.basename(path)
                 sw.remove("caps", path, lambda n, want=name: n == want)
+            # nic nie zostaje przez rozmiar (wszystko w `keep` albo idzie): wzrost tego, co zostaje,
+            # niczego nie zmieni; limit to skończona górna granica (JSON nie zna nieskończoności)
+            room = limit if room is None else room
+            sw.cap_headroom = room if sw.cap_headroom is None else min(sw.cap_headroom, room)
 
 
 # granica czasu dla każdego katalogu: pliki zmienione wcześniej już przeszły kompresję

@@ -2062,14 +2062,15 @@ def check_pending(world, state):
 
 
 def check_caps(cfg, state, now, dry_run):
-    """Limity katalogów z wynikami agentów: zadanie janitora, ale co kilka minut, a nie co 3 h."""
+    """Limity katalogów z wynikami agentów: zadanie janitora, ale co kilka minut, a nie co 3 h.
+    Przebieg zwraca swój Sweep (None, gdy nie było czego sprawdzać)."""
     every = cfg["caps_minutes"] * MINUTE
     if not every or now - state.get("caps_at", 0) < every:
-        return
+        return None
     state["caps_at"] = now
     jcfg = janitor.load_config()
     if not jcfg.get("caps"):
-        return
+        return None
     sweep = janitor.Sweep(jcfg, dry_run)
     janitor.task_caps(sweep, None)
     if sweep.freed:
@@ -2078,6 +2079,7 @@ def check_caps(cfg, state, now, dry_run):
             f"caps: {verb} {janitor.human(sweep.freed)}: "
             + ", ".join(short(p) for _, p, _ in sweep.items)
         )
+    return sweep
 
 
 def shape(cfg, world):
@@ -2396,9 +2398,32 @@ def cmd_once(cfg, args):
 
 def cmd_caps(cfg, args):
     """Limity katalogów z wynikami agentów raz, teraz: to samo, co pętla robi co caps_minutes.
-    acc-cored (natywny strażnik) woła to we własnym rytmie, bo sam katalogów nie kasuje."""
-    check_caps(cfg, {}, time.time(), dry_run="--dry-run" in args)
+    acc-cored (natywny strażnik) woła to we własnym rytmie, bo sam katalogów nie kasuje.
+
+    Na wyjściu jedna linia JSON: ile zwolniono, ile wpisów pominięto jako używane (tego żadna
+    zmiana w katalogu nie zapowie, więc trzeba sprawdzić znowu) i kiedy wpis pominięty jako
+    świeży może już pójść. acc-cored bez zmian w katalogach limitów i przed tym terminem nie
+    woła limitów znowu."""
+    sweep = check_caps(cfg, {}, time.time(), dry_run="--dry-run" in args)
+    print(json.dumps(caps_report(sweep)))
     return 0
+
+
+def caps_report(sweep):
+    """Raport przebiegu limitów dla acc-cored. Zajęte to tylko to, co może się zwolnić bez śladu
+    w katalogach: wpis w użyciu, wpis, którego nie dało się przenieść, i pomiar du, który padł.
+    "Chronione" i "w gicie" trwają, więc wieczne "zajęte" wyłączałoby bramkę na zawsze.
+    folders to katalogi dopasowane przez globy i miejsca za dowiązaniami, które wychodzą z prefiksu
+    globu (rzeczywiste ścieżki, cap_spots), a acc-cored też je obserwuje; shallow to cele dowiązań,
+    po których idzie kolejna gwiazdka: acc-cored widzi tam tylko ich własne wpisy;
+    headroom (bajty), ile najciaśniejszy z nich może urosnąć, zanim przebieg coś by usunął: mniejszy
+    ubytek wolnego miejsca nie zmieni wyniku."""
+    if sweep is None:
+        return {"ran": False, "freed": 0, "busy": 0, "retry_at": None, "folders": [], "shallow": [], "headroom": None}
+    busy = [s for s in sweep.skipped if s[0] == "caps" and (s[2] == "w użyciu" or s[2].startswith("nie da się przenieść"))]
+    return {"ran": True, "freed": sweep.freed, "busy": len(busy) + sweep.du_failures,
+            "retry_at": sweep.retry_at, "folders": sweep.cap_folders, "shallow": sweep.cap_shallow,
+            "headroom": sweep.cap_headroom}
 
 
 def cmd_status(cfg, args):

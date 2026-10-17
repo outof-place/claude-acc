@@ -96,6 +96,55 @@ memory pressure (a Dispatch memory-pressure source).
     the brake back, as in Python.
   - Every other plan is tried again on the next tick. Python's reading may disagree for a moment
     (pressure flickering), and it acts as soon as it agrees.
+- **Caps, only when they can do something:** a caps run walks every entry of the capped folders with
+  `du -sk`: 17 processes and about 1.8 s of CPU per run here, every `caps_minutes`. Its outcome
+  changes only in these cases, so at each interval `CapsWatch` lets a run through only then:
+  - something under a capped folder changed, or `janitor.json` did.
+    - FSEvents watch the real paths of the globs' static prefixes and of the folders the last run
+      matched (a folder under the glob may be a link to elsewhere), or their nearest existing
+      parent. A link anywhere along a glob that leaves its static prefix is reported too: the
+      link's real target plus the glob's fixed part after it (`wt1 -> repo` with `caps/*/out/builds`
+      gives `repo/out/builds`), even before those folders exist or while the link dangles, and not
+      the whole linked folder, so an edit elsewhere in it doesn't wake the caps.
+    - A link right before another wildcard (`caps/*/*/builds`, `l1 -> a worktree`) has no fixed
+      part: its target is watched shallow, and each folder found under it is reported as above.
+      FSEvents (without per-file events) names a folder on every file written in it, so an event
+      naming a shallow folder counts only when its subfolders and links changed since the run
+      started: one made, removed or renamed, or a link in it retargeted or swapped for a folder.
+      A file such as `t1/README` doesn't count.
+    - Above a watched folder (the stream sees those events under a shallow root, or at the nearest
+      existing parent of a folder not made yet), an event counts only when the next folder on the
+      way came or went since the run started: one stat. A file written in `t1/s0` with
+      `t1/s0/builds` there, a file in `t1/s1` before `t1/s1/builds` exists, or a write in a
+      `~/.cache` that has no `perf` folder yet, doesn't count; `mkdir t1/s1/builds` does.
+    - A link to a file is skipped: nothing can be made under it. A dangling link still counts, since
+      it may become a folder.
+    - A folder under another watched path adds no root. Once the watch is due, further events
+      cost a flag check.
+    - The paths and their roots are computed again at every interval, so a folder made later (in
+      any letter case) re-arms the stream. A root replaced by a rename is reported (`WatchRoot`).
+    - A lost-events flag counts as a change.
+  - free space on a watched volume dropped since the last run by at least a threshold: a file
+    growing behind an open descriptor gets no event until it's closed.
+    - The threshold is the tightest folder's headroom from the last run's report, compared as a
+      Double, and never less than a floor: a tenth of the smallest cap, the floor itself at most
+      1 GiB.
+    - A folder's headroom is its limit minus the running total at the last entry the run keeps by
+      size (an index past `keep`, the total still within the limit): growth of what stays changes
+      the next run only past that. With no entry kept by size (all within `keep`, or the rest
+      removed), it's the limit itself, a finite stand-in for "no growth matters".
+    - Free space is sampled on every guard tick (a statfs per root), and the drop counts from the
+      highest free space seen since the run, so space freed meanwhile doesn't hide it;
+  - the time the last run reported passed: an entry skipped as fresh (a write in progress) may go;
+  - the last run skipped an entry in use or one it couldn't move, or `du` failed on one (no total;
+    exit 1 with a total, an unreadable subfolder, is a size): no event says that changed, so the
+    next interval runs again. Protected entries and ones in git stay so,
+    and don't count.
+  - A cap whose path only expanduser or the working directory can place (`~user/`, `$HOME/`, a
+    relative path), or a stream that didn't start, runs at every interval, as in Python.
+
+  Six hours bound the rest. `devguard caps` prints its report as one JSON line (`busy`, `retry_at`,
+  `folders`, `headroom`). The stream holds its watch, and the guard stops it when it stops.
 - **Config types:** a `devguard.json` value whose type differs from the default's is read
   differently by the two sides. `"runtimes": "node"` still finds servers in Python, where `in`
   works on a string, and finds none here. The brake's own keys count too. While such a value is

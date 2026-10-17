@@ -116,7 +116,8 @@ public final class GuardEngine: @unchecked Sendable {
     /// tests: the readings, Python's `once` and the caps run in place of the Mac's and the scripts'
     var probesFactory: (() -> GuardProbes)?
     var runner: (([String]) -> Int32)?
-    var capsRunner: (() -> Void)?
+    var capsRunner: (() -> PyObject?)?
+    lazy var capsWatch = CapsWatch(home: options.home, queue: queue)
     /// the devguard.json keys last found of the wrong type (logged when they change)
     var mismatchLogged: [String] = []
     var capsRunning = false
@@ -161,6 +162,7 @@ public final class GuardEngine: @unchecked Sendable {
             pressureSource?.cancel()
             // Python's loop goes first: an orphan would keep devguard.lock and guard on its own
             endPythonLoop()
+            capsWatch.stop()
             if !options.shadow { shaper.restoreAll() }
             GuardLog.write("koniec strażnika (acc-cored)")
             if lockFd >= 0 {
@@ -255,7 +257,10 @@ public final class GuardEngine: @unchecked Sendable {
             }
         }
         // check_caps runs in Python's loop on every enforcing tick (`enforce and qos`); its caps_at
-        // goes to the file now, so a Python loop taking over doesn't run the caps again at once
+        // goes to the file now, so a Python loop taking over doesn't run the caps again at once.
+        // Free space is sampled on every tick: growth and space freed within one caps interval
+        // would otherwise hide each other
+        if enforce, cfg.number("caps_minutes") > 0 { capsWatch.sample() }
         if enforce, capsDue(cfg, now: probes.now) {
             save()
             runCaps()
@@ -454,28 +459,35 @@ public final class GuardEngine: @unchecked Sendable {
 
     // MARK: caps
 
+    /// check_caps's interval (caps_at), and then whether the run could do anything new (CapsWatch)
     func capsDue(_ cfg: GuardConfig, now: Double) -> Bool {
         let every = cfg.number("caps_minutes") * MINUTE
         guard every > 0, !capsRunning, now - (state["caps_at"]?.double ?? 0) >= every else { return false }
         state["caps_at"] = .double(now)
-        return true
+        return capsWatch.due(now: now)
     }
 
     func runCaps() {
+        capsWatch.started(now: lastTick)
         if let capsRunner {
-            capsRunner()
+            capsWatch.finished(capsRunner())
             return
         }
         capsRunning = true
         let argv = options.python + ["devguard", "caps"]
         DispatchQueue.global(qos: .background).async { [weak self] in
-            _ = Spawn.run(argv, log: nil, timeout: 1800)
-            self?.capsFinished()
+            let out = Spawn.output(argv, timeout: 1800)
+            let line = out.map { String(decoding: $0, as: UTF8.self) }?.split(separator: "\n").last.map(String.init)
+            let report = line.flatMap { try? PyJSON.loads($0) }?.object
+            self?.capsFinished(report)
         }
     }
 
-    func capsFinished() {
-        queue.async { self.capsRunning = false }
+    func capsFinished(_ report: PyObject?) {
+        queue.async {
+            self.capsRunning = false
+            self.capsWatch.finished(report)
+        }
     }
 }
 
