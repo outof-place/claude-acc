@@ -3,7 +3,7 @@
 zamka na wszystko. Natywne to buildy iOS i Androida (xcodebuild, expo run, eas build --local,
 gradle, pod install) i start symulatora; jeden taki build to 6-12 GB, więc czeka jak ciężki Go.
 
-  sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli]
+  sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli] [--bash-limit S]
                (--shell 'KOMENDA' | -- ARGV...)
   sched.py status [--json]
   sched.py cancel <job-id|pane> [--queued] [--kill] [--json]
@@ -278,12 +278,14 @@ def job_fields(job):
 
 
 def wait_fields(job, clock):
-    """Ile i na co wpis czekał: bez snu (`wait_up_s`; wpis sprzed wydania A: po ścianie), po ścianie
-    i ostatni powód z widoku kolejki."""
+    """Ile i na co wpis czekał: bez snu (`wait_up_s`; wpis sprzed wydania A: po ścianie), po ścianie,
+    ostatni powód z widoku kolejki i limit narzędzia Bash komendy z haka (`bash_limit_s`, null poza
+    hakiem Claude Code): `wait_up_s` ponad nim to komenda przeniesiona w tło jeszcze w kolejce."""
     return {
         "wait_up_s": round(since(job, "enqueued", clock["ts"], clock), 1),
         "wait_wall_s": round(clock["ts"] - (job.get("enqueued_at") or clock["ts"]), 1),
         "wait_reason": (job.get("reason") or {}).get("text"),
+        "bash_limit_s": job.get("bash_limit_s"),
     }
 
 
@@ -2702,7 +2704,8 @@ def save_cache(cache):
 
 def reap(state):
     """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM, a martwy
-    czekający (wrapper zabity na przykład limitem Basha) zostawia wiersz `dequeue` z przyczyną `reap`."""
+    czekający (wrapper przerwany przez agenta albo zabity z końcem jego sesji) zostawia wiersz
+    `dequeue` z przyczyną `reap`."""
     keep = []
     for job in state["running"]:
         if alive(job.get("pid")):
@@ -3487,7 +3490,7 @@ def parse_run_args(args):
             command = args[i + 1]
             i += 2
             continue
-        if a in ("--timeout", "--session", "--agent", "--via") and i + 1 < len(args):
+        if a in ("--timeout", "--session", "--agent", "--via", "--bash-limit") and i + 1 < len(args):
             opts[a[2:]] = args[i + 1]
             i += 2
             continue
@@ -3508,6 +3511,14 @@ def exec_plain(command, argv):
         return 2
     os.execvp(target[0], target)
     return 127
+
+
+def number(text):
+    """Liczba z argumentu albo None."""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def new_entry(job, command, argv, opts):
@@ -3540,6 +3551,8 @@ def new_entry(job, command, argv, opts):
         "outside": bool(job.get("outside") or job.get("floor_gb")),
         "pid": os.getpid(),
         "via": opts.get("via", "cli"),
+        # limit narzędzia Bash komendy z haka: tylko pomiar, kolejka się na nim nie kończy (bash_limit_s)
+        "bash_limit_s": number(opts.get("bash-limit")),
         "enqueued_at": clock["ts"],
         # ten sam moment bez snu Maca; wpis bez nich (sprzed wydania A) liczy się po ścianie
         "enqueued_up": clock["up"],
@@ -4452,28 +4465,35 @@ def runner():
 
 
 # limit narzędzia Bash Claude Code, gdy tool_input nie ma `timeout` (schemat narzędzia: "default 120000,
-# max 3600000"); inny domyślny daje BASH_DEFAULT_TIMEOUT_MS, które Claude Code bierze z ustawień
+# max 3600000"; inny domyślny daje BASH_DEFAULT_TIMEOUT_MS z env ustawień). Po limicie Claude Code
+# (2.1.302) komendy nie zabija, tylko przenosi ją w tło (`timedOutAfterMs`: "Set when the command hit
+# its timeout and was auto-backgrounded"), więc czekający zostaje w kolejce na swoim miejscu, a limit
+# idzie tylko do pomiaru (bash_limit_s). Kolejka nigdy się na nim nie kończy: kod 75 przed limitem
+# odbierałby czekającemu miejsce i aging, a komendzie Codeksa (bez `timeout`) dawałby 105 s
 BASH_DEFAULT_TIMEOUT_MS = 120000
-# kolejka kończy się kodem 75 (EXIT_TIMEOUT) tyle sekund przed limitem Basha: agent widzi „timeout w
-# kolejce”, zanim Bash zabije wrapper, a czekający nie zostaje w kolejce do reapu
-QUEUE_MARGIN_S = 15
+# klucz, który devguard.admit_codex dokłada do zdarzenia: komenda Codeksa, którego narzędzie powłoki nie
+# ma limitu Basha
+CODEX_EVENT_KEY = "claude_acc_codex"
 
 
-def bash_queue_timeout(tool_input):
-    """--timeout kolejki dla komendy agenta: limit Basha minus QUEUE_MARGIN_S, najmniej 1 s; None
-    dla komendy w tle (run_in_background), której Bash nie ogranicza."""
-    if tool_input.get("run_in_background"):
+def bash_limit_s(event):
+    """Limit narzędzia Bash tej komendy w sekundach, tylko do pomiaru: wpis kolejki i wiersze `admit` i
+    `dequeue` (`bash_limit_s`) mówią, ile z czekania agent miał na pierwszym planie, zanim Claude Code
+    przeniósł komendę w tło. None dla komendy w tle (run_in_background), dla Codeksa (CODEX_EVENT_KEY)
+    i dla `timeout`, którego nie da się przeczytać."""
+    tool_input = event.get("tool_input") or {}
+    if tool_input.get("run_in_background") or event.get(CODEX_EVENT_KEY):
         return None
     try:
         ms = float(tool_input.get("timeout") or os.environ.get("BASH_DEFAULT_TIMEOUT_MS") or BASH_DEFAULT_TIMEOUT_MS)
     except (TypeError, ValueError):
-        ms = BASH_DEFAULT_TIMEOUT_MS
-    return max(1, int(ms / 1000 - QUEUE_MARGIN_S))
+        return None
+    return round(ms / 1000, 1)
 
 
 def hook_rewrite(event):
-    """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run, z
-    --timeout kolejki o QUEUE_MARGIN_S krótszym od limitu Basha (bash_queue_timeout)."""
+    """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run, z limitem
+    Basha do pomiaru (--bash-limit, bash_limit_s), nigdy z --timeout kolejki."""
     if event.get("tool_name") != "Bash":
         return None
     tool_input = event.get("tool_input") or {}
@@ -4502,9 +4522,9 @@ def hook_rewrite(event):
         }
     command = fixed
     parts = runner() + ["run", "--via", "hook"]
-    limit = bash_queue_timeout(tool_input)
+    limit = bash_limit_s(event)
     if limit is not None:
-        parts += ["--timeout", str(limit)]
+        parts += ["--bash-limit", f"{limit:g}"]
     if event.get("session_id"):
         parts += ["--session", str(event["session_id"])]
     agent = event.get("agent_type") or event.get("subagent_type")

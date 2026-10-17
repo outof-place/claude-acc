@@ -33,6 +33,7 @@ os.environ["PATH"] = os.pathsep.join(
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "sched.py")
+DEVGUARD = os.path.join(ROOT, "devguard.py")
 
 _spec = importlib.util.spec_from_file_location("acc_sched", SCRIPT)
 S = importlib.util.module_from_spec(_spec)
@@ -1131,41 +1132,6 @@ class HookTest(Paths):
         self.assertEqual(argv[-2:], ["--shell", original])
         again = dict(event, tool_input=updated)
         self.assertIsNone(S.hook_rewrite(again))  # już owinięte
-
-    def hook_argv(self, **tool_input):
-        event = {"tool_name": "Bash", "cwd": self.repo,
-                 "tool_input": dict({"command": "cd apps/charter-service && go test ./internal/money/"}, **tool_input)}
-        out = S.hook_rewrite(event)["hookSpecificOutput"]["updatedInput"]
-        self.assertEqual({k: v for k, v in out.items() if k != "command"},
-                         {k: v for k, v in tool_input.items()})  # reszta tool_input bez zmian
-        return shlex.split(out["command"])
-
-    def run_opts(self, argv):
-        opts, _command, _argv = S.parse_run_args(argv[argv.index("run") + 1:])
-        return opts
-
-    def test_hook_passes_timeout_from_tool_input(self):
-        """Wydanie A (A5): komenda na pierwszym planie czekała w kolejce bez limitu, aż Bash zabił
-        wrapper po swoim timeoutcie (kod 143, czekający zdjęty dopiero przez reap). Teraz kolejka
-        kończy się kodem 75 o 15 s przed limitem Basha: 600 000 ms daje --timeout 585."""
-        self.assertEqual(self.run_opts(self.hook_argv(timeout=600000))["timeout"], "585")
-        self.assertEqual(self.run_opts(self.hook_argv(timeout=3600000))["timeout"], "3585")
-        self.assertEqual(self.run_opts(self.hook_argv(timeout=5000))["timeout"], "1")  # nigdy 0 ani mniej
-
-    def test_hook_default_bash_limit_gives_105(self):
-        """Bez `timeout` Bash ma 120 000 ms (schemat narzędzia: "default 120000"), a z ustawionym
-        BASH_DEFAULT_TIMEOUT_MS ten domyślny limit."""
-        env = {k: v for k, v in os.environ.items() if k != "BASH_DEFAULT_TIMEOUT_MS"}
-        with mock.patch.dict(os.environ, env, clear=True):
-            self.assertEqual(self.run_opts(self.hook_argv())["timeout"], "105")
-        with mock.patch.dict(os.environ, {"BASH_DEFAULT_TIMEOUT_MS": "300000"}):
-            self.assertEqual(self.run_opts(self.hook_argv())["timeout"], "285")
-
-    def test_background_command_gets_no_timeout(self):
-        """Komenda w tle (run_in_background) nie ma limitu Basha: czeka, ile trzeba."""
-        argv = self.hook_argv(run_in_background=True, timeout=600000)
-        self.assertNotIn("--timeout", argv)
-        self.assertNotIn("timeout", self.run_opts(argv))
 
     def test_hook_runs_through_the_managed_python_and_launcher(self):
         python = os.path.join(S.STATE_DIR, "python")
@@ -2648,6 +2614,69 @@ class RunTest(unittest.TestCase):
         rows = [r for r in self.events() if r["ev"] == "dequeue"]
         self.assertEqual([(r["cause"], r["job"]) for r in rows[1:]], [("cancel", jid)])
         self.done(first)
+
+    def hooked(self, event, *flags, **env):
+        """Wyjście prawdziwego haka `devguard.py admit` (z `flags`, np. --codex) na tym HOME, ze
+        zdarzeniem JSON na stdin; PATH bez rtk, więc komenda w środku opakowania zostaje bez jego
+        przepisania. Opakowanie woła sched.py z $STATE, jak po instalacji: tu dowiązanie do tego z repo."""
+        installed = os.path.join(self.home, ".local/share/claude-acc/sched.py")
+        if not os.path.exists(installed):
+            os.makedirs(os.path.dirname(installed), exist_ok=True)
+            os.symlink(SCRIPT, installed)
+        done = subprocess.run(["/usr/bin/python3", DEVGUARD, "admit", *flags], input=json.dumps(event),
+                              env=dict(self.env, PATH=self.bin + os.pathsep + "/usr/bin:/bin", **env),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)["hookSpecificOutput"]
+
+    def run_hooked(self, command):
+        """Owinięta komenda tak, jak uruchamia ją narzędzie powłoki agenta: zsh -c w katalogu zdarzenia."""
+        p = subprocess.Popen(["/bin/zsh", "-c", command], cwd=self.repo, env=dict(self.env, FAKE_GO_SLEEP="0.3"),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        return p
+
+    def test_hook_command_outwaits_its_bash_limit_in_the_queue(self):
+        """Claude Code 2.1.302 nie zabija komendy po limicie narzędzia Bash, tylko przenosi ją w tło
+        (schemat: `timedOutAfterMs` "Set when the command hit its timeout and was auto-backgrounded";
+        sonda: `time.sleep(6)` przy timeout 2000 skończyła się w tle kodem 0). Kolejka, która kończyła
+        się kodem 75 o 15 s przed tym limitem (507fce6), odbierała czekającemu miejsce w kolejce i
+        aging. Komenda z haka czeka więc, ile trzeba; limit Basha idzie tylko do wierszy rejestru
+        (`bash_limit_s`): ile z czekania agent miał na pierwszym planie."""
+        first = self.start("cd apps/charter-service && go vet ./...", sleep="5")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        out = self.hooked({"tool_name": "Bash", "session_id": "s-hook", "cwd": self.repo,
+                           "tool_input": {"command": "cd apps/charter-service && go vet ./...", "timeout": 2000}})
+        self.assertEqual(out["updatedInput"]["timeout"], 2000)  # limit narzędzia zostaje agenta
+        rc, _, err = self.done(self.run_hooked(out["updatedInput"]["command"]))
+        self.assertEqual(rc, 0, err)  # nie 75: kolejka nie poddaje się przed limitem Basha
+        self.assertEqual(self.done(first)[0], 0)
+        (row,) = [r for r in self.history() if r.get("via") == "hook"]
+        self.assertGreater(row["up_wait_s"], 2.0)  # czekał dłużej niż limit Basha
+        (admit,) = [r for r in self.events() if r["ev"] == "admit" and r["via"] == "hook"]
+        self.assertEqual(admit["bash_limit_s"], 2.0)
+        self.assertGreater(admit["wait_up_s"], admit["bash_limit_s"])
+        self.assertEqual([r for r in self.events() if r["ev"] == "dequeue"], [])
+
+    def test_codex_command_outwaits_the_default_bash_limit(self):
+        """Codex 0.159 (`devguard.py admit --codex`) nie podaje `timeout` wcale, więc 507fce6 dawało jego
+        komendzie domyślne 120 s Basha minus 15 i po 105 s w kolejce kod 75. Tu BASH_DEFAULT_TIMEOUT_MS
+        16000 skraca ten domyślny limit do 1 s kolejki (bez tego test czekałby 105 s). Komenda czeka i
+        biegnie, a wiersz `admit` nie ma limitu Basha: narzędzie powłoki Codeksa go nie ma."""
+        first = self.start("cd apps/charter-service && go vet ./...", sleep="5")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        out = self.hooked({"tool_name": "shell", "session_id": "s-codex", "cwd": self.repo,
+                           "tool_input": {"command": ["bash", "-lc", "cd apps/charter-service && go vet ./..."]}},
+                          "--codex", BASH_DEFAULT_TIMEOUT_MS="16000")
+        self.assertEqual(out["permissionDecision"], "allow")
+        rc, _, err = self.done(self.run_hooked(out["updatedInput"]["command"]))
+        self.assertEqual(rc, 0, err)  # nie 75 po domyślnym limicie Basha
+        self.assertEqual(self.done(first)[0], 0)
+        (row,) = [r for r in self.history() if r.get("via") == "hook"]
+        self.assertGreater(row["up_wait_s"], 1.0)
+        (admit,) = [r for r in self.events() if r["ev"] == "admit" and r["via"] == "hook"]
+        self.assertIsNone(admit["bash_limit_s"])
+        self.assertEqual([r for r in self.events() if r["ev"] == "dequeue"], [])
 
     def test_history_row_has_via_and_wait_reason(self):
         """Wydanie A (A3): wiersz historii mówi, którędy job przyszedł (hook, plock, cli), na co
