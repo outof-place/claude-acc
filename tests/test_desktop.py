@@ -423,13 +423,25 @@ class AutoAllow(unittest.TestCase):
             os.environ["CLAUDE_ACC_DESKTOP_HELPER"] = FAKE
 
 
+def _built_helper():
+    """Najświeższy pomocnik zbudowany z tego drzewa albo None. Swift 6.4 buduje do
+    `.build/out/Products/<Conf>/` (z dowiązaniem `.build/<conf>`), starszy SwiftPM do `.build/<arch>/<conf>/`;
+    z kilku buildów wygrywa najnowszy, bo stary mógł zostać po zmianie źródeł."""
+    build = os.path.join(ROOT, "app", ".build")
+    found = set()
+    for conf in ("release", "debug"):
+        dirs = [os.path.join(build, "out", "Products", conf.capitalize()), os.path.join(build, conf)]
+        dirs += [os.path.join(build, arch, conf) for arch in ("arm64-apple-macosx", "x86_64-apple-macosx")]
+        found |= {os.path.realpath(p) for p in (os.path.join(d, "claude-acc-desktop") for d in dirs) if os.path.isfile(p)}
+    return max(found, key=os.path.getmtime) if found else None
+
+
 def _signed_real_helper():
-    """Prawdziwy pomocnik: najpierw $STATE, potem build dev. None, gdy brak."""
-    for arch in ("arm64-apple-macosx", "x86_64-apple-macosx"):
-        for conf in ("release", "debug"):
-            p = os.path.join(ROOT, "app", ".build", arch, conf, "claude-acc-desktop")
-            if os.path.exists(p):
-                return p
+    """Pomocnik do testu na żywo: build z tego drzewa, a bez niego zainstalowany w $STATE (ma zgody
+    Dostępności i Nagrywania ekranu). None, gdy brak obu."""
+    built = _built_helper()
+    if built:
+        return built
     p = os.path.join(os.path.expanduser("~"), ".local/share/claude-acc", "claude-acc-desktop")
     return p if os.path.exists(p) else None
 
@@ -455,9 +467,10 @@ class RealHelperMemory(unittest.TestCase):
     po niej +13 MB."""
 
     def test_serve_memory_stays_flat_across_requests(self):
-        path = _signed_real_helper()
+        # tylko build z tego drzewa: zainstalowany pomocnik to kod innej wersji, więc wynik nie mówiłby nic o tej
+        path = _built_helper()
         if not path:
-            self.skipTest("brak zbudowanego pomocnika")
+            self.skipTest("brak pomocnika zbudowanego z tego drzewa (cd app && swift build)")
         proc = subprocess.Popen([path, "serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
             line = json.dumps({"op": "init", "pad": "x" * 2_000_000}) + "\n"
