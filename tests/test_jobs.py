@@ -118,6 +118,38 @@ class World(RunWorld):
     def tight(self):
         write_json(self.memory, {"level": 5, "ram_gb": 48, "swap_gb": 0, "pressure": "normal"})
 
+    def roomy_when(self, ready, timeout=120):
+        """Pamięć wraca, gdy ready() jest prawdą, czyli po zdarzeniu w stanie biegu albo schedulera, nie
+        po czasie od startu testu: pod obciążeniem bieg startował później i czekał krócej niż limit."""
+
+        def watch():
+            deadline = time.time() + timeout
+            while not ready() and time.time() < deadline:
+                time.sleep(0.05)
+            try:
+                self.roomy()
+            except OSError:
+                pass  # test już się skończył i sprzątnął $HOME
+
+        threading.Thread(target=watch, daemon=True).start()
+
+    def run_log_has(self, text, name="blog"):
+        cur = self.current(name)
+        try:
+            return bool(cur) and text in read(cur["log"])
+        except (OSError, KeyError):
+            return False
+
+    def queued_for(self, seconds, agent="jobs-blog"):
+        """Krok agenta czeka w kolejce schedulera (state.json) co najmniej `seconds` od wpisu do kolejki;
+        wait_s w historii schedulera liczy się od tej samej chwili."""
+        state = read_json_file(os.path.join(self.state, "sched", "state.json")) or {}
+        return any(
+            (job.get("agent") or {}).get("name") == agent and job.get("where") is None
+            and time.time() - float(job.get("enqueued_at") or time.time()) >= seconds
+            for job in state.get("queue") or [] if isinstance(job, dict)
+        )  # fmt: skip
+
     def env(self, **extra):
         env = super().env()
         env.update(
@@ -781,10 +813,13 @@ class Memory(Base):
     def test_precheck_limit_counts_from_its_own_start_not_from_the_wait_for_memory(self):
         self.w.add_job(admit_min="1", precheck_min="0.05", footprint_gb="2")  # precheck: 3 s
         self.w.tight()
-        threading.Timer(4, self.w.roomy).start()
-        r, rec = self.w.run_job(FAKE_PRECHECK_SLEEP="1.5")
+        # pamięć wraca, gdy bieg już czeka w bramce; wpuszcza go dopiero jej następne sprawdzenie
+        # (co 5 s czuwania), więc przed precheckiem bieg czeka dłużej niż limit prechecku
+        self.w.roomy_when(lambda: self.w.run_log_has("czekam na pamięć"))
+        r, rec = self.w.run_job()
         self.assertEqual(rec["outcome"], "OPUBLIKOWANO", rec["reason"])
-        self.assertGreaterEqual(rec["awake_seconds"], 4)
+        # czas biegu poza precheckiem przekracza limit: liczony od startu biegu, zatrzymałby precheck
+        self.assertGreater(rec["awake_seconds"] - rec["precheck"]["awake_seconds"], 3)
         self.assertLess(rec["precheck"]["awake_seconds"], 3)
 
     def test_heavy_step_is_admitted_by_the_memory_scheduler_while_the_run_goes(self):
@@ -799,7 +834,8 @@ class Memory(Base):
         # Renggli 09.10: precheck czekał 5 min 20 s w kolejce schedulera za cudzym `go test`
         self.w.add_job(precheck_min="0.1", footprint_gb="0")  # precheck: 6 s
         self.w.tight()
-        threading.Timer(9, self.w.roomy).start()
+        # pamięć wraca, gdy krok czeka w kolejce dłużej niż limit prechecku
+        self.w.roomy_when(lambda: self.w.queued_for(7))
         r, rec = self.w.run_job(FAKE_PRECHECK_HEAVY="1")
         self.assertEqual(rec["outcome"], "OPUBLIKOWANO", rec["reason"])
         self.assertEqual(rec["precheck"]["exit_code"], 0)
@@ -809,7 +845,8 @@ class Memory(Base):
     def test_time_a_heavy_step_waits_in_the_memory_queue_does_not_count_toward_the_limit(self):
         self.w.add_job(run_min="0.1", footprint_gb="0")  # bieg: 6 s; bramka pamięci tylko na hamulec
         self.w.tight()
-        threading.Timer(9, self.w.roomy).start()
+        # pamięć wraca, gdy krok czeka w kolejce dłużej niż limit biegu
+        self.w.roomy_when(lambda: self.w.queued_for(7))
         r, rec = self.w.run_job(FAKE_JOB_HEAVY="1")
         self.assertEqual(rec["outcome"], "OPUBLIKOWANO", rec["reason"])
         self.assertIsNone(rec["stopped"])
