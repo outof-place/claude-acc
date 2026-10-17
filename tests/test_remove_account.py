@@ -95,9 +95,10 @@ class RemoveWorld(World):
         self.assertEqual(self.tree(w), before_tree)
         self.assertEqual(self.keychain(w), before_keychain)
 
-    def on_terminal(self, w, args, answer=None):
+    def on_terminal(self, w, args, answer=None, who=None):
         """Uruchamia remove z terminalem (pty) pod stdin, stdout i stderr. Z answer czeka na pytanie
-        i odpowiada; bez niego (odmowa) czeka na koniec. Zwraca (kod, wszystko, co poszło na terminal)."""
+        o `who` (domyślnie args[0]) i odpowiada; bez niego (odmowa) czeka na koniec.
+        Zwraca (kod, wszystko, co poszło na terminal)."""
         path = os.path.join(w.fake, "sessions.json")
         with open(path, "w") as f:
             json.dump([], f)
@@ -129,8 +130,8 @@ class RemoveWorld(World):
 
         try:
             if answer is not None:
-                pump(until=PROMPT.format(args[0]))
-                self.assertIn(PROMPT.format(args[0]).encode(), seen)
+                pump(until=PROMPT.format(who or args[0]))
+                self.assertIn(PROMPT.format(who or args[0]).encode(), seen)
                 os.write(master, answer.encode() + b"\n")
             pump()
             code = proc.wait(timeout=30)
@@ -288,11 +289,231 @@ class StatusTest(RemoveWorld):
         r = w.run("status", "--json")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         status = json.loads(r.stdout)
-        self.assertIn("remove", status["capabilities"])
+        self.assertEqual(status["capabilities"], ["remove", "remove-by-id"])
         removable = {row["email"]: row["removable"] for row in status["accounts"]}
         self.assertEqual(removable, {"a@x": False, "b@x": False, "c@x": True, "p@x": False})
         # to samo, co remove powie po kliknięciu: wiersz z removable false odmawia not_owned
         self.refusal(self.run_remove(w, "b@x", "--json"), "not_owned")
+
+
+class RemoveByIdTest(RemoveWorld):
+    """`remove --id <id>`: Pod wysyła id wiersza ze `status --json`, więc kliknięcie w wiersz profilu albo konta
+    z folderu aplikacji nie może usunąć konta claude-acc o tym samym adresie."""
+
+    def own_twin(self, w, email, acct_id):
+        """Konto claude-acc o tym samym adresie co konto aplikacji, ale pod własnym id i z własnymi tokenami."""
+        w.server["counter"] += 1
+        n = w.server["counter"]
+        access, refresh = f"at-{acct_id}-{n}", f"rt-{acct_id}-{n}"
+        w.server["access"][access] = email
+        w.server["refresh"][refresh] = email
+        blob = {"claudeAiOauth": {"accessToken": access, "refreshToken": refresh,
+                                  "expiresAt": int((time.time() + 8 * 3600) * 1000)}}
+        folder = os.path.join(w.state_dir, "accounts", acct_id, "auth")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "oauth-account.json"), "w") as f:
+            json.dump({"emailAddress": email}, f)
+        w.keychain[f"{w.service}|{acct_id}"] = json.dumps(blob)
+        return blob
+
+    def rows(self, w):
+        r = w.run("status", "--json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return json.loads(r.stdout)["accounts"]
+
+    def twin_world(self):
+        """Pod z kontem b@x w swoim folderze danych i kontem claude-acc o tym samym adresie: dwa wiersze, jeden e-mail."""
+        w = self.world(pod=True)
+        w.runtime(w.account("a@x"))
+        w.account("b@x")  # id-b, z folderu Poda
+        self.own_twin(w, "b@x", "own-b")
+        w.write()
+        return w
+
+    def test_the_app_row_with_the_same_address_is_refused_and_the_own_row_is_removed_alone(self):
+        w = self.twin_world()
+        by_id = {row["id"]: row for row in self.rows(w) if row["email"] == "b@x"}
+        self.assertEqual({i: row["removable"] for i, row in by_id.items()}, {"id-b": False, "own-b": True})
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        sentence = self.refusal(self.run_remove(w, "--id", "id-b", "--json"), "not_owned")
+
+        self.assertIn("Pod", sentence)
+        self.assert_nothing_changed(w, before, kc_before)
+        r = self.run_remove(w, "--id", "own-b", "--json")
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, '{"removed":"b@x","id":"own-b"}\n', ""))
+        # tylko wiersz claude-acc zniknął: folder i wpis w Pęku kluczy konta Poda stoją, jego wiersz jest dalej na liście
+        self.assertEqual(self.own_accounts(w), {})
+        self.assertEqual(self.keychain(w), {k: v for k, v in kc_before.items() if k != f"{w.service}|own-b"})
+        after = self.tree(w)
+        self.assertEqual(set(before) - set(after), {".local/share/claude-acc/accounts/own-b/auth/oauth-account.json"})
+        left = [(row["id"], row["removable"]) for row in self.rows(w) if row["email"] == "b@x"]
+        self.assertEqual(left, [("id-b", False)])
+
+    def test_a_pod_profile_row_is_not_owned_whether_or_not_claude_acc_has_its_address(self):
+        w = self.world(pod=True)
+        w.runtime(w.account("a@x"))
+        add_profile(w, "p@x", "p1")
+        add_profile(w, "c@x", "p2")
+        self.own_twin(w, "c@x", "own-c")
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        for profile in ("profile:p1", "profile:p2"):
+            sentence = self.refusal(self.run_remove(w, "--id", profile, "--json"), "not_owned")
+            self.assertIn("Pod", sentence)
+        self.assert_nothing_changed(w, before, kc_before)
+        self.assertEqual(list(self.own_accounts(w)), ["c@x"])
+
+    def test_an_id_that_matches_no_row_is_unknown(self):
+        w = self.world(pod=True)
+        w.runtime(w.account("a@x"))
+        self.own_twin(w, "c@x", "own-c")
+        add_profile(w, "p@x", "p1")
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        # e-mail nie jest id; id usuniętego wiersza i profilu, którego nie ma, też nie
+        for ident in ("nobody", "c@x", "id-zzz", "profile:gone", "profile:", "OWN-C", "own-c/", "own-c "):
+            sentence = self.refusal(self.run_remove(w, "--id", ident, "--json"), "unknown")
+            self.assertIn(ident, sentence)
+        self.assert_nothing_changed(w, before, kc_before)
+
+    def test_an_id_is_matched_against_the_rows_never_followed_as_a_path(self):
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        self.own_twin(w, "c@x", "own-c")
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        for ident in ("../accounts/own-c", "./own-c", "own-c/../own-c", os.path.join(w.state_dir, "accounts", "own-c")):
+            self.refusal(self.run_remove(w, "--id", ident, "--json"), "unknown")
+        self.assert_nothing_changed(w, before, kc_before)
+
+    def test_a_removed_id_is_unknown_the_second_time(self):
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        self.own(w, "c@x")
+        w.write()
+
+        first = self.run_remove(w, "--id", "id-c", "--json")
+        second = self.run_remove(w, "--id", "id-c", "--json")
+
+        self.assertEqual((first.returncode, first.stdout, first.stderr), (0, '{"removed":"c@x","id":"id-c"}\n', ""))
+        self.refusal(second, "unknown")
+
+    def test_the_refusals_of_remove_by_email_hold_by_id(self):
+        # active: o niej myślą wpisy runtime
+        w = self.world()
+        w.account("a@x")
+        _, blob = self.own(w, "c@x")
+        w.runtime(blob)
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+        self.assertIn("switch", self.refusal(self.run_remove(w, "--id", "id-c", "--json"), "active"))
+        self.assert_nothing_changed(w, before, kc_before)
+
+        # in_use: żywa sesja na innym katalogu czyta jej logowanie
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        _, blob = self.own(w, "c@x")
+        w.keychain[f"{scoped(w.other_dir)}|{USER}"] = json.dumps(blob)
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+        r = self.run_remove(w, "--id", "id-c", "--json", sessions=[w.other_dir, w.other_dir])
+        self.assertIn("2 Claude Code sessions", self.refusal(r, "in_use"))
+        self.assert_nothing_changed(w, before, kc_before)
+
+        # in_use: bieg zadania płaci tym adresem
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        self.own(w, "c@x")
+        w.write()
+        held = os.path.join(w.state_dir, "jobs", "held-accounts.json")
+        os.makedirs(os.path.dirname(held))
+        with open(held, "w") as f:
+            json.dump({"v": 1, "accounts": [dict(job="blog", since=1, email="c@x", pid=os.getpid(),
+                                                 until=time.time() + 3600)]}, f)
+        before, kc_before = self.tree(w), self.keychain(w)
+        self.assertIn("1 scheduled run", self.refusal(self.run_remove(w, "--id", "id-c", "--json"), "in_use"))
+        self.assert_nothing_changed(w, before, kc_before)
+
+    def test_a_keychain_failure_by_id_changes_nothing(self):
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        self.own(w, "c@x")
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        r = self.run_remove(w, "--id", "id-c", "--json", FAKE_FAIL_DELETE_SERVICE=w.service)
+
+        self.assertIn("Keychain", self.refusal(r, "failed"))
+        self.assert_nothing_changed(w, before, kc_before)
+
+    def test_a_malformed_command_is_a_usage_error_and_removes_nothing(self):
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        self.own(w, "c@x")
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        for args in (("--id",), ("--id", "--json"), ("--id", "id-c", "id-c", "--json"), ("--id", "id-c", "c@x", "--json"),
+                     ("c@x", "--id", "id-c", "--json"), ("--id", "", "--json"), ("--id", "  ", "--json"),
+                     ("--id", "id-c", "--id", "id-c", "--json")):
+            r = self.run_remove(w, *args)
+            self.assertEqual((r.returncode, r.stdout), (2, ""), (args, r.stderr))
+            self.assertIn("usage: claude-acc remove --id <id> [--json]", r.stderr)
+        self.assert_nothing_changed(w, before, kc_before)
+
+    def test_on_a_terminal_it_asks_about_the_address_of_the_row(self):
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        self.own(w, "c@x")
+        w.write()
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        code, shown = self.on_terminal(w, ["--id", "id-c"], answer="n", who="c@x")
+
+        self.assertEqual(code, 1, shown)
+        self.assertIn("Not removed.", shown)
+        self.assert_nothing_changed(w, before, kc_before)
+        code, shown = self.on_terminal(w, ["--id", "id-c"], answer="y", who="c@x")
+        self.assertEqual(code, 0, shown)
+        self.assertIn("Removed c@x from claude-acc.", shown)
+        self.assertEqual(self.own_accounts(w), {})
+
+    def test_on_a_terminal_a_refusal_comes_before_the_question(self):
+        w = self.twin_world()
+
+        code, shown = self.on_terminal(w, ["--id", "id-b"])
+
+        self.assertEqual(code, 1, shown)
+        self.assertNotIn("[y/N]", shown)
+        self.assertIn("belongs to Pod", shown)
+        self.assertEqual(list(self.own_accounts(w)), ["b@x"])
+
+    def test_every_row_of_status_removes_exactly_when_it_says_removable(self):
+        # Pod pokazuje Usuń po `removable` i wysyła `id` wiersza: dla każdego wiersza oba muszą się zgadzać
+        w = self.world(pod=True)
+        w.runtime(w.account("a@x"))
+        w.account("b@x")
+        self.own_twin(w, "b@x", "own-b")
+        self.own_twin(w, "c@x", "own-c")
+        add_profile(w, "p@x", "p1")
+        w.write()
+        rows = self.rows(w)
+        self.assertEqual(sorted((row["id"], row["removable"]) for row in rows),
+                         [("id-a", False), ("id-b", False), ("own-b", True), ("own-c", True), ("profile:p1", False)])
+
+        for row in rows:
+            r = self.run_remove(w, "--id", row["id"], "--json")
+            if row["removable"]:
+                self.assertEqual(json.loads(r.stdout), {"removed": row["email"], "id": row["id"]}, row)
+            else:
+                self.refusal(r, "not_owned")
+
+        self.assertEqual(self.own_accounts(w), {})
+        self.assertEqual(sorted(row["id"] for row in self.rows(w)), ["id-a", "id-b", "profile:p1"])
 
 
 class RefusalsTest(RemoveWorld):
