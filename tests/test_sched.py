@@ -678,6 +678,30 @@ class RouteTest(Paths):
         )
         self.assertNotIn("--with", S.depot_target(vet, 13.7, 41, self.cfg, {})["argv"])
 
+    def test_depot_exec_runs_the_argv_where_it_was_typed(self):
+        # `make -C apps/charter-service money-wire` z korzenia: --dir modułu i -C w argv dawały na
+        # Depot podwójne apps/charter-service, czyli exit 2 bez logu (run gq805h0pvv, 2026-10-17)
+        def tail(command):
+            argv = S.depot_target(self.job(command), 13.7, 41, self.cfg, {})["argv"]
+            return argv[3:]
+
+        self.assertEqual(
+            tail("make -C apps/charter-service money-wire"),
+            ["--", "make", "-C", "apps/charter-service", "money-wire"],
+        )
+        self.assertEqual(
+            tail("go -C apps/charter-service vet ./..."),
+            ["--", "go", "-C", "apps/charter-service", "vet", "./..."],
+        )
+        self.assertEqual(
+            tail("cd apps/charter-service/internal && go test -run TestX ./moneyfmt/"),
+            ["--dir", "apps/charter-service/internal", "--", "go", "test", "-run", "TestX", "./moneyfmt/"],
+        )
+        self.assertEqual(
+            tail("cd apps/charter-service && go vet ./..."),
+            ["--dir", "apps/charter-service", "--", "go", "vet", "./..."],
+        )
+
 
 class PlanTest(Paths):
     def entry(self, jid, gb, small=False, ago=0):

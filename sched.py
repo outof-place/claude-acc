@@ -1741,6 +1741,7 @@ def classify(command, cwd, argv=None):
         if job:
             job["argv"] = words
             job["env"] = env
+            job["at"] = at
             found.append(job)
     finishers = {"node": finish_node, "native": finish_native, "generic": finish_generic}
     jobs = list(nested)
@@ -1752,6 +1753,9 @@ def classify(command, cwd, argv=None):
             # make poza modułem Go: przepis jak każdy inny skrypt
             done = finish_generic(dict(raw, lang="generic", kind="script", tool="make", sig=f"make:{raw['target']}"))
         if done:
+            # katalog, w którym argv ma sens; `-C` w argv już przesunął katalog modułu, więc to nie
+            # katalog modułu (depot_target, --dir)
+            done.setdefault("argv_dir", raw.get("at"))
             jobs.append(done)
     if not jobs:
         return None
@@ -2338,7 +2342,13 @@ def depot_target(job, gb, wall, cfg, cache):
     measured = etas.get(f"depot-exec-{cores}/exec") or {}
     eta = float(measured.get("p50_s") or 0) or (DEPOT_SETUP_S + 15 + wall)
     units = cores / 2 * eta / 60
-    module = job["module"] if job["module"] != "." else None
+    # --dir to katalog, w którym komenda została wpisana, nie katalog modułu: `make -C
+    # apps/charter-service money-wire` z korzenia niesie -C w argv, a --dir modułu dawał na Depot
+    # podwójne apps/charter-service ("No such file or directory", exit 2 bez logu, 2026-10-17)
+    where = os.path.relpath(job["argv_dir"], repo) if job.get("argv_dir") else job["module"]
+    if where.startswith(".."):
+        return None
+    module = where if where != "." else None
     return {
         "target": "depot-exec",
         "job": "exec",
