@@ -237,7 +237,7 @@ def events_module():
 
 
 def clock_now():
-    """Zegary tej chwili {"ts": ściana, "up": uptime bez snu, "boot": sekunda rozruchu} (events.now).
+    """Zegary tej chwili {"ts": ściana, "up": uptime bez snu, "boot": identyfikator rozruchu} (events.now).
     Uptime to CLOCK_UPTIME_RAW, wspólny dla plocka (/usr/bin/python3 3.9.6) i haka (Python z $STATE):
     time.monotonic() na 3.9.6 liczy od startu procesu. Bez events.py sama ściana."""
     module = events_module()

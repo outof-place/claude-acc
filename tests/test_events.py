@@ -12,7 +12,6 @@ Uruchomienie: python3 -m unittest tests.test_events
 import json
 import os
 import plistlib
-import re
 import shutil
 import subprocess
 import sys
@@ -30,10 +29,10 @@ import events  # noqa: E402
 SYSTEM_PYTHON = "/usr/bin/python3"
 
 
-def kern_boottime():
-    """Sekunda rozruchu z `sysctl -n kern.boottime` (niezależnie od ctypes w events.py)."""
-    out = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
-    return int(re.search(r"sec = (\d+)", out).group(1))
+def kern_boot_session():
+    """Identyfikator rozruchu z `sysctl -n kern.bootsessionuuid` (niezależnie od ctypes w events.py)."""
+    return subprocess.run(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], capture_output=True, text=True,
+                          check=True).stdout.strip()
 
 
 def rows(path):
@@ -69,7 +68,11 @@ class EventsTest(unittest.TestCase):
         # uptime bez snu, a nie czas od startu tego procesu
         self.assertGreaterEqual(row["up"], before_up)
         self.assertLess(row["up"] - before_up, 5)
-        self.assertEqual(row["boot"], kern_boottime())
+        # rozruch to kern.bootsessionuuid, nie kern.boottime: XNU przesuwa boottime przy skoku zegara
+        # ściennego (osfmk/kern/clock.c, clock_set_calendar_microtime), więc po synchronizacji czasu
+        # te same odczyty uptime wyglądałyby na inny rozruch i liczyłyby się po ścianie
+        self.assertEqual(row["boot"], kern_boot_session())
+        self.assertRegex(row["boot"], r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
         # pole wołającego nie nadpisze zegara
         events.append(self.dir, "x", up=1, ts=2)
         last = rows(os.path.join(self.dir, "events.jsonl"))[-1]

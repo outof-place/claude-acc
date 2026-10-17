@@ -126,10 +126,11 @@ def read_events(state_dir):
 
 
 def real_clock():
-    """(ściana, uptime bez snu, sekunda rozruchu) tej chwili, bez kodu schedulera: CLOCK_UPTIME_RAW i
-    `sysctl -n kern.boottime`."""
-    boot = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.boottime"], capture_output=True, text=True).stdout
-    return time.time(), time.clock_gettime(time.CLOCK_UPTIME_RAW), int(re.search(r"sec = (\d+)", boot).group(1))
+    """(ściana, uptime bez snu, identyfikator rozruchu) tej chwili, bez kodu schedulera: CLOCK_UPTIME_RAW i
+    `sysctl -n kern.bootsessionuuid`."""
+    boot = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    return time.time(), time.clock_gettime(time.CLOCK_UPTIME_RAW), boot
 
 
 # skrypt stosu e2e projektu (Portivo: scripts/e2e/stack.sh), którego lekkie podkomendy idą przez plock
@@ -2151,7 +2152,7 @@ class SleepTest(Paths):
         out = subprocess.run(["/usr/bin/python3", "-I", "-c", code, SCRIPT], capture_output=True, text=True,
                              check=True).stdout.split()
         after = S.clock_now()
-        child_up, child_boot, version = float(out[0]), int(out[1]), out[2]
+        child_up, child_boot, version = float(out[0]), out[1], out[2]
         self.assertTrue(version.startswith("3.9"), version)
         self.assertLessEqual(before["up"], child_up)
         self.assertLessEqual(child_up, after["up"])
@@ -2174,7 +2175,7 @@ class SleepTest(Paths):
         st["queue"] = [
             queued("head", mem_predicted_gb=60.0, enqueued_at=ts - 20000),
             queued("legacy", enqueued_at=ts - 400),
-            queued("reboot", enqueued_at=ts - 500, enqueued_up=up - 20, boot=boot - 86400),
+            queued("reboot", enqueued_at=ts - 500, enqueued_up=up - 20, boot="00000000-0000-0000-0000-000000000000"),
             queued("slept", enqueued_at=ts - 13572, enqueued_up=up - 60, boot=boot),
         ]
         S.update_queue_view(st, self.cfg)

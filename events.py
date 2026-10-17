@@ -4,7 +4,7 @@
 Piszą go hamulec (lastresort.py: `kill`, `runaway`; devguard_core.py: `stage`, `stop`) i scheduler
 (sched.py: `admit`, `dequeue`, `pause`, `resume`, `wake`). Wiersz zaczyna się od zegarów tej samej
 chwili: `ts` (ściana, time.time), `up` (sekundy od rozruchu bez snu, CLOCK_UPTIME_RAW), `boot`
-(kern.boottime, sekunda rozruchu) i rodzaju `ev`, potem pola wołającego.
+(kern.bootsessionuuid, identyfikator rozruchu) i rodzaju `ev`, potem pola wołającego.
 
 Zegar bez snu to `time.clock_gettime(time.CLOCK_UPTIME_RAW)` ("does not increment while the system
 is asleep", man clock_gettime), a nie `time.monotonic()`: na /usr/bin/python3 3.9.6 monotonic liczy
@@ -42,23 +42,26 @@ EVENTS_PATH = os.path.join(STATE_DIR, NAME)
 # bieżącym pliku i drugie tyle w .1
 ROTATE_BYTES = 32 * 1024 * 1024
 LOCK_WAIT_S = 1.0
-_boot = []  # kern.boottime tego procesu: czytany raz
+_boot = []  # kern.bootsessionuuid tego procesu: czytany raz
 
 
 def boot():
-    """Sekunda rozruchu (kern.boottime.tv_sec) albo None, gdy sysctl się nie uda. Ta sama w każdym
-    procesie od rozruchu do rozruchu, więc mówi, czy dwa odczyty uptime da się porównać."""
+    """Identyfikator rozruchu (kern.bootsessionuuid, ten sam co `sysctl -n kern.bootsessionuuid`) albo
+    None, gdy sysctl się nie uda. Ten sam w każdym procesie od rozruchu do rozruchu, więc mówi, czy dwa
+    odczyty uptime da się porównać. Nie kern.boottime: XNU przesuwa go o różnicę przy każdym ustawieniu
+    zegara ściennego (osfmk/kern/clock.c, clock_set_calendar_microtime: "Also adjusts the boottime"),
+    więc po skoku czasu ten sam rozruch wyglądałby na inny, a czekanie liczyłoby się po ścianie."""
     if not _boot:
         value = None
         try:
             import ctypes
 
             libc = ctypes.CDLL(None)
-            tv = (ctypes.c_long * 2)()  # struct timeval: tv_sec (long), tv_usec (int) z wyrównaniem
-            size = ctypes.c_size_t(ctypes.sizeof(tv))
-            if libc.sysctlbyname(b"kern.boottime", tv, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0:
-                value = int(tv[0])
-        except (OSError, AttributeError, ValueError):
+            buf = ctypes.create_string_buffer(64)  # UUID: 36 znaków i NUL
+            size = ctypes.c_size_t(ctypes.sizeof(buf))
+            if libc.sysctlbyname(b"kern.bootsessionuuid", buf, ctypes.byref(size), None, ctypes.c_size_t(0)) == 0:
+                value = buf.value.decode() or None
+        except (OSError, AttributeError, ValueError, UnicodeDecodeError):
             pass
         _boot.append(value)
     return _boot[0]
@@ -70,7 +73,7 @@ def uptime():
 
 
 def now():
-    """Zegary tej chwili: {"ts": ściana, "up": uptime bez snu, "boot": sekunda rozruchu}."""
+    """Zegary tej chwili: {"ts": ściana, "up": uptime bez snu, "boot": identyfikator rozruchu}."""
     return {"ts": time.time(), "up": uptime(), "boot": boot()}
 
 
