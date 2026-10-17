@@ -18,7 +18,7 @@ final class MenuBarController: NSObject {
     init(store: Store) {
         self.store = store
         super.init()
-        panel.setContent(PanelView(store: store)) { [weak self] size in self?.place(size) }
+        panel.setContent(store: store) { [weak self] size in self?.place(size) }
         panel.onCancel = { [weak self] in self?.close() }
         // NSWorkspace posts it only on its own center, never on NotificationCenter.default
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -79,6 +79,7 @@ final class MenuBarController: NSObject {
     }
 
     private func open() {
+        panel.fitColumns()
         place(panel.contentSize)
         item?.button?.highlight(true)
         panel.present()
@@ -201,16 +202,85 @@ final class PanelWindow: NSPanel {
         onCancel?()
     }
 
-    func setContent<Content: View>(_ content: Content, resized: @escaping (CGSize) -> Void) {
-        let host = NSHostingView(rootView: content
-            .onGeometryChange(for: CGSize.self) { $0.size } action: { [weak self] size in
-                self?.contentSize = size
-                resized(size)
-            })
+    /// The panel's parts, each in an NSHostingView of its own (PanelView says why): the top banner,
+    /// the columns side by side at a fixed size, then the notices and the footer. The parts above and
+    /// below the columns report their height; `resized` gets the card's size whenever it changes.
+    func setContent(store: Store, resized: @escaping (CGSize) -> Void) {
+        self.resized = resized
+        let top = edge(PanelTop(store: store), store: store) { [weak self] in self?.topHeight = $0 }
+        let bottom = edge(PanelBottom(store: store), store: store) { [weak self] in self?.bottomHeight = $0 }
+        let columns = NSStackView(views: PanelColumn.allCases.map { column in
+            let host = NSHostingView(rootView: PanelPart(store: store) { PanelColumnView(column: column, store: store) })
+            host.sizingOptions = []
+            host.translatesAutoresizingMaskIntoConstraints = false
+            let height = host.heightAnchor.constraint(equalToConstant: PanelView.columnHeight)
+            columnHeights.append(height)
+            NSLayoutConstraint.activate([host.widthAnchor.constraint(equalToConstant: column.width), height])
+            return host
+        })
+        columns.orientation = .horizontal
+        columns.alignment = .top
+        columns.spacing = PanelColumn.spacing
+        let stack = NSStackView(views: [top.host, columns, bottom.host])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        let padding = PanelView.padding
+        stack.edgeInsets = NSEdgeInsets(top: padding, left: padding, bottom: padding, right: padding)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        backdrop.addSubview(stack)
+        // pinned at the top left only: the stack is as big as its parts, and the window follows it
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: backdrop.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: backdrop.leadingAnchor),
+            top.host.widthAnchor.constraint(equalTo: columns.widthAnchor),
+            bottom.host.widthAnchor.constraint(equalTo: columns.widthAnchor),
+        ])
+        edgeHeights = [top.height, bottom.height]
+        report()
+    }
+
+    /// The columns as tall as the screen under the menu bar allows now (PanelView.columnHeight).
+    func fitColumns() {
+        let height = PanelView.columnHeight
+        guard columnHeights.first?.constant != height else { return }
+        for constraint in columnHeights { constraint.constant = height }
+        report()
+    }
+
+    private var resized: ((CGSize) -> Void)?
+    private var columnHeights: [NSLayoutConstraint] = []
+    private var edgeHeights: [NSLayoutConstraint] = []
+    private var topHeight: CGFloat = 0 {
+        didSet { if topHeight != oldValue { report() } }
+    }
+    private var bottomHeight: CGFloat = 0 {
+        didSet { if bottomHeight != oldValue { report() } }
+    }
+
+    /// A part as wide as the columns and as tall as its content, which it reports.
+    private func edge<Content: View>(_ content: Content, store: Store, height: @escaping (CGFloat) -> Void)
+        -> (host: NSView, height: NSLayoutConstraint) {
+        let host = NSHostingView(rootView: PanelPart(store: store) {
+            content
+                .fixedSize(horizontal: false, vertical: true)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height($0) }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        })
+        host.sizingOptions = []
         host.translatesAutoresizingMaskIntoConstraints = false
-        backdrop.addSubview(host)
-        pin(host, to: backdrop)
-        contentSize = host.fittingSize
+        let constraint = host.heightAnchor.constraint(equalToConstant: 0)
+        constraint.isActive = true
+        return (host, constraint)
+    }
+
+    private func report() {
+        guard edgeHeights.count == 2 else { return }
+        edgeHeights[0].constant = topHeight
+        edgeHeights[1].constant = bottomHeight
+        let height = 2 * PanelView.padding + topHeight + (columnHeights.first?.constant ?? 0) + bottomHeight
+        contentSize = CGSize(width: PanelColumn.panelWidth, height: height)
+        resized?(contentSize)
     }
 
     /// The window frame that puts the card itself at `rect`.
@@ -245,6 +315,15 @@ final class PanelWindow: NSPanel {
         fade.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
         layer.add(drop, forKey: "in")
         layer.add(fade, forKey: "fade-in")
+    }
+
+    /// `--measure-panel`: shown at `origin`, off every display, without the drop and without
+    /// becoming key, so the app the user works in keeps the keyboard.
+    func showOffscreen(at origin: NSPoint) {
+        isOpen = true
+        card.layer?.opacity = 1
+        setFrameOrigin(origin)
+        orderFrontRegardless()
     }
 
     /// Eases back up into the menu bar while it fades, then leaves the screen; `done` runs

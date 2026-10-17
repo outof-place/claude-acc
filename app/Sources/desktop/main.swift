@@ -135,13 +135,18 @@ func emit(_ obj: [String: Any]) {
 
 let args = Array(CommandLine.arguments.dropFirst())
 if args.first == "serve" {
+    // Bez run loopa nic nie opróżnia puli autorelease, więc każde żądanie dostaje własną.
+    // Bez niej obiekty z AppKit (NSBitmapImageRep, PNG z każdego zrzutu) zostawały w pamięci
+    // na zawsze: 2026-10-13 trzy procesy `serve` miały po 18-19 GB.
     while let line = readLine(strippingNewline: true) {
         if line.isEmpty { continue }
-        guard let data = line.data(using: .utf8),
-              let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            emit(["ok": false, "error": "bad json"]); continue
+        autoreleasepool {
+            guard let data = line.data(using: .utf8),
+                  let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                emit(["ok": false, "error": "bad json"]); return
+            }
+            emit(handle(req))
         }
-        emit(handle(req))
     }
 } else if let json = args.first, let data = json.data(using: .utf8),
           let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {

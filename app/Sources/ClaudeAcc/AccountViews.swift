@@ -418,8 +418,17 @@ struct AccountsCard: View {
     }
 
     var body: some View {
-        if let snapshot = store.snapshot, !snapshot.others.isEmpty {
+        if let snapshot = store.snapshot {
             Card("Accounts", symbol: "person.2") {
+                if store.busy == .adding {
+                    AddAccountPrompt(store: store)
+                }
+                if snapshot.others.isEmpty {
+                    Text("Add another Claude account and auto-switch moves to it when this one runs out.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
                 CardScroll {
                 VStack(spacing: 2) {
                     ForEach(snapshot.others) { account in
@@ -444,12 +453,38 @@ struct AccountsCard: View {
                 }
                 .padding(.horizontal, -6)
                 .animation(.smooth(duration: 0.32), value: expanded)
+                }
             } accessory: {
-                Text("\(snapshot.others.count)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    if !snapshot.others.isEmpty {
+                        Text("\(snapshot.others.count)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Add Account", systemImage: "plus") { Task { await store.addAccount() } }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .help("Add a Claude account: sign in in your browser. It joins auto-switch like the others.")
+                        .disabled(store.busy != nil)
+                }
             }
         }
+    }
+}
+
+/// `claude-acc add` waits for the browser: the same prompt as signing an account in again.
+private struct AddAccountPrompt: View {
+    let store: Store
+
+    var body: some View {
+        HStack {
+            Label("Finish signing in in your browser", systemImage: "safari")
+                .foregroundStyle(.orange)
+            Spacer()
+            Button("Cancel") { store.cancelLogin() }
+                .panelButton()
+        }
+        .font(.callout)
     }
 }
 
@@ -512,6 +547,7 @@ private struct AccountRow: View {
         guard isHovered, !switchBlocked, account.status != .needsLogin else { return false }
         switch store.busy {
         case .switching(let email), .loggingIn(let email): return email != account.email
+        case .adding: return false
         case nil: return true
         }
     }

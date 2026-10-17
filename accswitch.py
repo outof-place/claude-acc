@@ -21,6 +21,15 @@ Komendy:
   switch <email>    przełącz na konkretne konto
   switch --auto     przełącz na następne z kolejki
   login <email>     zaloguj konto ponownie w przeglądarce, bez Orca i terminala
+  add [email]       dodaj nowe konto claude-acc: logowanie w przeglądarce (bez e-maila dowolne konto);
+                    konto, które claude-acc już ma, loguje się po prostu ponownie
+  adopt             logowanie z /login w sesji Claude Code (wpis Claude Code, którego nie zna żadne
+                    konto) staje się kontem claude-acc i kontem aktywnym, bez przeglądarki
+  remove <email> [--json]
+                    usuń konto dodane w claude-acc (add, adopt): jego katalog, kopię w Pęku kluczy
+                    i wpisy w stanie. Odmawia konta aktywnego, nieznanego, z działającymi sesjami
+                    i kont z Orca albo Pod; w terminalu pyta o potwierdzenie. --json: {"removed": e-mail}
+                    albo {"error", "reason"} i kod wyjścia 1
   tick              jeden przebieg pilnowania (uruchamiany przez launchd)
   resume            zdejmij pauzę limitów ręcznie (do czasu, aż limity wrócą)
   pause [on|off]    pauza limitów: stan, włącz albo wyłącz (domyślnie wyłączona)
@@ -71,6 +80,10 @@ HOST = orcahost.resolve()
 ORCA_DIR = HOST.user_data
 ACCOUNTS_DIR = os.path.join(ORCA_DIR, "claude-accounts")
 STATE_DIR = os.path.join(HOME, ".local/share/claude-acc")
+# konta dodane w claude-acc (add, adopt), w tym samym układzie co konta z Orca: <uuid>/auth/oauth-account.json.
+# Pod od wersji z profilami (#26801) nowych kont tam nie zapisuje, a jego profile zostają tylko do odczytu,
+# więc właścicielem kont jest claude-acc
+OWN_ACCOUNTS_DIR = os.path.join(STATE_DIR, "accounts")
 CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
 STATE_PATH = os.path.join(STATE_DIR, "state.json")
 HISTORY_PATH = os.path.join(STATE_DIR, "history.jsonl")
@@ -355,6 +368,9 @@ def kc_write(service, account, contents, timeout=30):
     Wpis, którego linia nie przeniesie (blob z wieloma mcpOAuth dłuższy niż SECURITY_LINE_MAX po
     zamianie na szesnastkowy albo nazwa z cudzysłowem, backslashem, końcem linii), idzie jak przed
     1.31.13, w argumentach: ucięty zapis albo odmowa zgubiłyby świeżo wydaną parę tokenów."""
+    if service in profile_services():
+        # twarda reguła profili aplikacji (niżej): ich wpisów nie zapisujemy, nawet gdy config_dir to profil
+        raise RuntimeError(f"{service} to wpis profilu {HOST.name}, claude-acc go nie zapisuje")
     _KC_SEEN.pop((service, account), None)  # po nieudanym albo przerwanym zapisie nie wiadomo, co tam leży
     secret = contents.encode().hex()
     line = f'add-generic-password -U -s "{service}" -a "{account}" -X {secret}'
@@ -513,12 +529,20 @@ class Account:
         return f"<{self.email}>"
 
 
+def account_files():
+    """(id, plik konta) wszystkich kont: najpierw te z Orca (ACCOUNTS_DIR), potem dodane w claude-acc."""
+    found, seen = [], set()
+    for root in (ACCOUNTS_DIR, OWN_ACCOUNTS_DIR):
+        for acct_id in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            info = os.path.join(root, acct_id, "auth", "oauth-account.json")
+            if acct_id not in seen and os.path.exists(info):
+                seen.add(acct_id)
+                found.append((acct_id, info))
+    return found
+
+
 def load_accounts():
-    if not os.path.isdir(ACCOUNTS_DIR):
-        return []
-    found = [(acct_id, os.path.join(ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json"))
-             for acct_id in sorted(os.listdir(ACCOUNTS_DIR))]
-    found = [(acct_id, info) for acct_id, info in found if os.path.exists(info)]
+    found = account_files()
     # wpisy wszystkich kont naraz: i tak zaraz są potrzebne do ustalenia aktywnego konta
     kc_read_many((MANAGED_SERVICE, acct_id) for acct_id, _ in found)
     return [Account(acct_id, json.load(open(info)).get("emailAddress"))
@@ -601,6 +625,17 @@ def ensure_fresh(account, cfg, force=False):
     oauth = oauth_of(creds_json)
     if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
         return creds_json, "token ważny"
+    if held_by_session(oauth, cfg) and time.time() - oauth.get("expiresAt", 0) / 1000 <= IDLE_REFRESH_AFTER:
+        # Tę parę trzyma wpis runtime, więc odświeża ją sesja Claude Code, jak token aktywnego konta:
+        # po przejęciu logowania z /login konto sprzed niego zostaje żywe w drugim wpisie, a dwa
+        # odświeżenia jednego refresh tokenu unieważniają konto. Sami tylko po kwadransie snu sesji.
+        # Także po 401 (force): ten sam 401 dostaje sesja i sama odświeży. Bez znacznika "do
+        # zalogowania": odstawiłby zdrowe konto na 6 godzin.
+        if not force and oauth.get("expiresAt", 0) > time.time() * 1000:
+            return creds_json, "token odświeży sesja"
+        if force:
+            return None, "parę trzyma sesja Claude Code, odświeży ją sama"
+        return None, "token właśnie wygasł, czekam, aż odświeży go sesja"
     old_refresh = oauth.get("refreshToken")
     body = f"grant_type=refresh_token&refresh_token={old_refresh}&client_id={CLIENT_ID}"
     status, resp = http(TOKEN_URL, body, {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": USER_AGENT})
@@ -624,6 +659,13 @@ def ensure_fresh(account, cfg, force=False):
     kc_write(MANAGED_SERVICE, account.id, new_json)
     propagate(old_refresh, new_json, cfg)
     return new_json, "token odświeżony"
+
+
+def held_by_session(oauth, cfg):
+    """Czy refresh token tej pary leży w którymś wpisie runtime (sesje Claude Code go odświeżają)."""
+    refresh = oauth.get("refreshToken")
+    return bool(refresh) and any(oauth_of(kc_peek(s, KEYCHAIN_USER)).get("refreshToken") == refresh
+                                 for s in runtime_services(cfg))
 
 
 def fetch_usage(access_token, who):
@@ -986,6 +1028,7 @@ def profile_items(accounts):
             "subscription_status": None,
             "subscription_since": p.since,
             "source": "profile",
+            "removable": False,
             "stale": stale,
             "host_selected": in_use,
         })
@@ -1120,13 +1163,17 @@ def owner_of(creds_json, accounts):
     token = oauth_of(creds_json).get("accessToken")
     if not token:
         return None
-    email = (((fetch_profile(token) or {}).get("account") or {}).get("email") or "").lower()
-    if not email:
-        return None
-    # etykieta z Orca potrafi kłamać, więc liczy się też prawdziwy e-mail z pamięci profilu
+    email = ((fetch_profile(token) or {}).get("account") or {}).get("email")
+    return account_for_email(accounts, email) if email else None
+
+
+def account_for_email(accounts, email):
+    """Konto o tym e-mailu albo None. Etykieta z Orca potrafi kłamać, więc liczy się też prawdziwy
+    e-mail z pamięci profilu."""
+    email = (email or "").lower()
     known = load_state().get("identity", {})
     return next((a for a in accounts
-                 if email in (a.email.lower(), ((known.get(a.id) or {}).get("email") or "").lower())), None)
+                 if email in ((a.email or "").lower(), ((known.get(a.id) or {}).get("email") or "").lower())), None)
 
 
 def works(creds_json):
@@ -1188,8 +1235,8 @@ def adopt_runtime(accounts, cfg):
 
     Zwykle to nasze konto, któremu sesja obróciła token, a kopia została w tyle.
     Przełączenie bez tego kroku kasowało jedyny żywy token i konto wymagało
-    ponownego logowania. Obce konto (spoza Orca) zostaje nadpisane, bo o to
-    użytkownik prosi, przełączając.
+    ponownego logowania. Żywe obce konto (spoza Orca) najpierw staje się kontem
+    claude-acc (keep_live_logins), a dopiero potem ustępuje miejsca przełączeniu.
     """
     raw = freshest_runtime(cfg)
     account = owner_of(raw, accounts)
@@ -1199,7 +1246,80 @@ def adopt_runtime(accounts, cfg):
         log(f"żywy token {account.email} z runtime zapisany do jego kopii w {HOST.name}")
 
 
-def switch_to(account, cfg, reason=""):
+def create_account(email, oauth, profile, how):
+    """Nowe konto claude-acc: kopia logowania pod nowym uuid i plik konta w OWN_ACCOUNTS_DIR, w układzie
+    kont z Orca, więc dalej to zwykłe konto: kolejka, przełączanie i limity. Najpierw wpis w Pęku
+    kluczy, potem plik: load_accounts widzi konto dopiero z oboma, więc przerwany zapis nie zostawia
+    konta bez danych logowania."""
+    import uuid
+
+    acct_id = str(uuid.uuid4())
+    # tylko konto: tokeny MCP z wpisu runtime należą do katalogu konfiguracji, nie do konta
+    kc_write(MANAGED_SERVICE, acct_id, with_oauth(None, oauth))
+    write_json(os.path.join(OWN_ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json"),
+               {"emailAddress": email, "addedAt": int(time.time()), "addedBy": how})
+    account = Account(acct_id, email)
+    if profile:
+        remember_identity(account, profile)
+    log(f"{how}: nowe konto {email}")
+    return account
+
+
+def profile_services():
+    """Wpisy Pęku kluczy profili aplikacji (pod obiema pisowniami katalogu), także bez znacznika
+    profile.json: tych logowań nigdy nie przejmujemy ani nie nadpisujemy."""
+    found = set()
+    for home in glob.glob(os.path.join(ORCA_DIR, orcahost.PROFILES_DIR, "*", "home")):
+        found |= {scoped_service(home), scoped_service(os.path.realpath(home))}
+    return found
+
+
+def keep_live_logins(accounts, cfg, how):
+    """Każde logowanie z wpisów runtime zostaje w kopii konta, zanim cokolwiek je nadpisze.
+
+    Wpisy runtime nadpisuje każde przełączenie i wyrównanie wpisów, a logowanie zrobione przez /login
+    w sesji Claude Code leży tylko tam: przełączenie kasowało jedyną kopię takiego konta. Teraz
+    logowanie, którego nie zna żadne konto, staje się nowym kontem claude-acc. Logowanie znanego konta
+    (sesja obróciła token albo zalogowała je od nowa) trafia do jego kopii, gdy jest nowsze od niej.
+    Wpisów profili aplikacji nie czytamy wcale.
+
+    Kim jest logowanie, mówi API profilu na jego własnym access tokenie. Tokenu, który już nie działa
+    (401: wygasł albo umarł), nigdy nie odświeżamy: to bywa stara para, której refresh token sesja
+    już zużyła, a ponowne użycie zużytego refresh tokenu unieważnia całe konto. Takie logowanie jest
+    niczyje. Żywe logowanie z /login tick przejmuje w ciągu dwóch minut, zanim wygaśnie.
+
+    Zwraca (nowe konta z ich danymi OAuth, [(wpis, dlaczego nie wiadomo, czyje to logowanie)])."""
+    adopted, unsure = [], []
+    known = list(accounts)
+    skip = profile_services()
+    for service in live_services(cfg):
+        if service in skip:
+            continue
+        raw = kc_read(service, KEYCHAIN_USER)
+        live = oauth_of(raw)
+        if not live.get("accessToken") or not live.get("refreshToken"):
+            continue
+        if any(same_login(a.seen_oauth, live) for a in known):
+            continue
+        status, profile = profile_request(live["accessToken"])
+        email = ((profile or {}).get("account") or {}).get("email") if status == 200 else None
+        if not email:
+            if status != 401:
+                unsure.append((service, f"API profilu nie odpowiada, HTTP {status}"))
+            continue
+        owner = account_for_email(known, email)
+        if owner is None:
+            account = create_account(email, live, profile, how)
+            known.append(account)
+            adopted.append((account, live))
+        elif live.get("expiresAt", 0) > owner.oauth.get("expiresAt", 0):
+            kc_write(MANAGED_SERVICE, owner.id, with_oauth(owner.creds_json, live))
+            clear_needs_login(owner)
+            log(f"{how}: nowsze logowanie {owner.email} z wpisu {service} zapisane do jego kopii")
+    return adopted, unsure
+
+
+def switch_to(account, cfg, reason="", *, accounts):
     creds_json, note = ensure_fresh(account, cfg)
     if not creds_json:
         raise RuntimeError(f"{account.email}: {note}")
@@ -1217,6 +1337,11 @@ def switch_to(account, cfg, reason=""):
     if status != 200:
         # 429 albo sieć: nie wiemy, czy token żyje, więc go nie ruszamy
         raise RuntimeError(f"API limitów chwilowo nie odpowiada (HTTP {status}), spróbuj za kilka minut")
+    _, unsure = keep_live_logins(accounts, cfg, "przed przełączeniem")
+    if unsure:
+        service, why = unsure[0]
+        raise RuntimeError(f"nie wiem, czyje logowanie leży we wpisie {service} ({why}), "
+                           "więc go nie nadpisuję; spróbuj za kilka minut")
     oauth = oauth_of(creds_json)
     for service in (scoped_service(cfg["config_dir"]), ACTIVE_SERVICE):
         kc_write(service, KEYCHAIN_USER, with_oauth(kc_read(service, KEYCHAIN_USER), oauth))
@@ -1302,7 +1427,7 @@ def cmd_heal(cfg, args):
         if not match and len(broken) == 1 and len(orphans) == 1:
             match = orphans[0]  # jedno chore konto, jeden bezpański token
         if not match:
-            print(f"  {account.email}: nie znalazłem żywego tokenu, zaloguj konto w {HOST.name}")
+            print(f"  {account.email}: nie znalazłem żywego tokenu, zaloguj konto: claude-acc login {account.email}")
             continue
         kc_write(MANAGED_SERVICE, account.id, with_oauth(account.creds_json, oauth_of(match[1])))
         orphans.remove(match)
@@ -1581,6 +1706,8 @@ def snapshot(cfg, accounts=None):
     cache = load_json(USAGE_CACHE_PATH, {})
     order = {r["account"].id: i for i, r in enumerate(queue(rows), 1)}
     now = time.time()
+    # `remove` usuwa tylko konta dodane w claude-acc (add, adopt); konto z folderu aplikacji odrzuca (not_owned)
+    own = set(os.listdir(OWN_ACCOUNTS_DIR)) if os.path.isdir(OWN_ACCOUNTS_DIR) else set()
     items = []
     for r in rows:
         a = r["account"]
@@ -1611,6 +1738,7 @@ def snapshot(cfg, accounts=None):
             "renews_at": renewal.timestamp() if renewal else None,
             "subscription_status": who.get("status"),
             "subscription_since": who.get("subscription_since") or None,
+            "removable": a.id in own,
         })
     # najpierw kolejka automatu, potem wypalone od najbliższego resetu tygodnia
     items.sort(key=lambda i: (not i["active"], i["queue"] or 99, i["status"] != "ok",
@@ -1638,6 +1766,8 @@ def snapshot(cfg, accounts=None):
         "limit_pause": bool(cfg["limit_pause"]),
         "drain": bool(cfg["drain"]),
         "credits": credits_summary(),
+        # co umie ta wersja: aplikacja (Ustawienia Poda) pokazuje Usuń tylko, gdy jest tu "remove"
+        "capabilities": ["remove"],
         "accounts": items,
     }
 
@@ -1789,11 +1919,12 @@ def who_once(cfg):
 
 
 def orca_accounts():
-    """Konta Orca z ich plików, bez odczytu Pęku kluczy (ten robi load_accounts dla wszystkich)."""
+    """Konta z ich plików (z Orca i dodane w claude-acc), bez odczytu Pęku kluczy (ten robi
+    load_accounts dla wszystkich)."""
     found = []
-    for acct_id in sorted(os.listdir(ACCOUNTS_DIR)) if os.path.isdir(ACCOUNTS_DIR) else []:
+    for acct_id, info in account_files():
         try:
-            with open(os.path.join(ACCOUNTS_DIR, acct_id, "auth", "oauth-account.json")) as f:
+            with open(info) as f:
                 found.append(Account(acct_id, json.load(f).get("emailAddress")))
         except (OSError, ValueError):
             pass
@@ -1844,6 +1975,14 @@ def cmd_switch(cfg, args):
     if orca:
         print(f"{HOST.name} ma wybrane konto {orca} i cofnie każde przełączenie. W {HOST.name} wybierz System default")
         return 1
+    adopted, unsure = keep_live_logins(accounts, cfg, "switch")
+    if unsure:
+        service, why = unsure[0]
+        print(f"nie wiem, czyje logowanie leży we wpisie {service} ({why}), więc go nie nadpisuję; spróbuj za kilka minut")
+        return 1
+    for account, _ in adopted:
+        accounts.append(account)
+        print(f"przejęto {account.email} z logowania w sesji jako konto claude-acc")
     active = find_active(accounts, cfg)
     if active:
         sync_back(active, cfg)
@@ -1854,7 +1993,7 @@ def cmd_switch(cfg, args):
         if not target:
             print(f"nie znam konta {args[0]}")
             return 1
-        switch_to(target, cfg, "ręcznie")
+        switch_to(target, cfg, "ręcznie", accounts=accounts)
         depot_sync_safe(accounts, cfg, target)
         print(f"przełączono na {target.email}")
         return 0
@@ -1862,7 +2001,7 @@ def cmd_switch(cfg, args):
     if not rows:
         print("żadne konto nie ma zapasu, sprawdź claude-acc status")
         return 1
-    switch_to(rows[0]["account"], cfg, "ręcznie --auto")
+    switch_to(rows[0]["account"], cfg, "ręcznie --auto", accounts=accounts)
     depot_sync_safe(accounts, cfg, rows[0]["account"])
     print(f"przełączono na {rows[0]['account'].email}")
     return 0
@@ -1888,15 +2027,94 @@ def cmd_login(cfg, args):
     email = args[0]
     target = next((a for a in load_accounts() if a.email == email), None)
     if not target:
-        print(f"nie znam konta {email}")
+        print(f"nie znam konta {email}; nowe konto: claude-acc add {email}")
         return 1
-    # jedno logowanie naraz: dwa przebiegi dzieliłyby katalog i wpis tymczasowy
+    login_lock, fresh, profile, error = browser_login(email)
+    if error:
+        print(error)
+        return 1
+    lock = take_lock(wait=60)
+    if not lock:
+        print("inny przebieg trwa zbyt długo, zaloguj się jeszcze raz za chwilę")
+        return 1
+    save_login(target, fresh, profile, cfg)
+    print(f"zalogowano {email}")
+    return 0
+
+
+def cmd_add(cfg, args):
+    """Nowe konto claude-acc: logowanie w przeglądarce jak w `login`, ale bez konta, które już znamy.
+
+    Konto dodane w Pod jest jego profilem: claude-acc pokazuje mu tylko limity i nie przełącza go
+    (patrz profile niżej). Konto dodane tutaj to zwykłe konto claude-acc: w rotacji, z przełączaniem
+    i limitami. Bez e-maila przeglądarka loguje dowolne konto; gdy to konto, które claude-acc już
+    ma, to po prostu jego ponowne logowanie.
+    """
+    email = args[0] if args else None
+    known = account_for_email(load_accounts(), email) if email else None
+    if known:
+        return cmd_login(cfg, [known.email])
+    login_lock, fresh, profile, error = browser_login(email)
+    if error:
+        print(error)
+        return 1
+    lock = take_lock(wait=60)
+    if not lock:
+        print("inny przebieg trwa zbyt długo, zaloguj się jeszcze raz za chwilę")
+        return 1
+    who = profile["account"]["email"]
+    target = account_for_email(load_accounts(), who)
+    if target:
+        save_login(target, fresh, profile, cfg)
+        print(f"{target.email} już jest w claude-acc: zalogowano je ponownie")
+        return 0
+    create_account(who, fresh, profile, "add")
+    print(f"dodano {who}")
+    return 0
+
+
+def cmd_adopt(cfg, _args):
+    """Logowanie zrobione przez /login w sesji Claude Code jako konto claude-acc, bez przeglądarki.
+
+    Takie logowanie leży tylko we wpisie runtime, a claude-acc go nie zna, więc nie pokazuje go,
+    nie liczy jego limitów, a przełączenie by je skasowało. adopt robi z niego nowe konto i konto
+    aktywne: drugi wpis zarządzanego katalogu dostaje to samo logowanie, jak przy przełączeniu
+    (jego dotychczasowe logowanie najpierw trafia do kopii swojego konta).
+    """
+    lock = take_lock(wait=25)
+    if not lock:
+        print("inny przebieg trwa zbyt długo, spróbuj za chwilę")
+        return 1
+    accounts = load_accounts()
+    adopted, unsure = keep_live_logins(accounts, cfg, "adopt")
+    for account, _ in adopted:
+        print(f"przejęto {account.email} jako konto claude-acc")
+    if adopted:
+        account, oauth = max(adopted, key=lambda pair: pair[1].get("expiresAt", 0))
+        align_runtime(cfg, oauth)
+        update_state(active_email=account.email, switched_at=int(time.time()), hands_off_notified=False)
+        log(f"adopt: aktywne konto {account.email}")
+        print(f"aktywne konto: {account.email}")
+    for service, why in unsure:
+        print(f"nie wiem, czyje logowanie leży we wpisie {service} ({why}), spróbuj za kilka minut")
+    if not adopted and not unsure:
+        print("we wpisach Claude Code nie ma żywego logowania spoza claude-acc")
+    return 1 if unsure and not adopted else 0
+
+
+def browser_login(email=None):
+    """`claude auth login` w pustym katalogu konfiguracji: Claude Code loguje w przeglądarce i zapisuje
+    dane do własnego, tymczasowego wpisu w Pęku kluczy, który zawsze sprzątamy. Bez e-maila
+    przeglądarka loguje dowolne konto.
+
+    (blokada logowania, dane OAuth, profil z API, None) albo (None, None, None, komunikat). Blokadę
+    trzymamy do końca zapisu: dwa przebiegi dzieliłyby katalog i wpis tymczasowy.
+    """
     login_lock = open(LOGIN_LOCK_PATH, "w")
     try:
         fcntl.flock(login_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("inne logowanie właśnie trwa, dokończ je albo anuluj")
-        return 1
+        return None, None, None, "inne logowanie właśnie trwa, dokończ je albo anuluj"
     workdir = os.path.join(STATE_DIR, "login")
     service = scoped_service(workdir)
     kc_delete(service, KEYCHAIN_USER)  # resztka po przerwanym przebiegu wygrałaby ze świeżym logowaniem
@@ -1908,15 +2126,14 @@ def cmd_login(cfg, args):
     # Anuluj w aplikacji wysyła SIGTERM: wyjątek w run() zabija też proces claude
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(130))
     try:
-        r = subprocess.run([claude, "auth", "login", "--claudeai", "--email", email], env=env,
+        r = subprocess.run([claude, "auth", "login", "--claudeai"] + (["--email", email] if email else []), env=env,
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
         raw = kc_read(service, KEYCHAIN_USER)
         creds_file = os.path.join(workdir, ".credentials.json")
         if not raw and os.path.exists(creds_file):
             raw = open(creds_file).read().strip()
     except subprocess.TimeoutExpired:
-        print("logowanie przerwane: przez 10 minut nie wróciła odpowiedź z przeglądarki")
-        return 1
+        return None, None, None, "logowanie przerwane: przez 10 minut nie wróciła odpowiedź z przeglądarki"
     finally:
         # od powrotu z przeglądarki do końca zapisu Anuluj już nie przerywa:
         # urwany zapis zostawiłby kopię Orca i runtime w rozjeździe
@@ -1928,22 +2145,21 @@ def cmd_login(cfg, args):
     token = fresh.get("accessToken")
     if r.returncode != 0 or not token or not fresh.get("refreshToken"):
         lines = plain(r.stderr or r.stdout).splitlines()
-        print(f"logowanie nieudane: {lines[-1] if lines else f'kod wyjścia {r.returncode}'}")
-        return 1
+        return None, None, None, f"logowanie nieudane: {lines[-1] if lines else f'kod wyjścia {r.returncode}'}"
     profile = fetch_profile(token)
     who = ((profile or {}).get("account") or {}).get("email")
     if not who:
-        print("nie udało się sprawdzić, na jakie konto się zalogowano, spróbuj jeszcze raz")
-        return 1
-    if who.lower() != email.lower():
+        return None, None, None, "nie udało się sprawdzić, na jakie konto się zalogowano, spróbuj jeszcze raz"
+    if email and who.lower() != email.lower():
         # nigdy nie zapisujemy cudzego konta pod tym wpisem: tak etykiety w Orca zaczęły kłamać
-        print(f"przeglądarka zalogowała {who}, a nie {email}. Wyloguj się z claude.ai albo użyj okna prywatnego")
-        return 1
+        return None, None, None, (f"przeglądarka zalogowała {who}, a nie {email}. "
+                                  "Wyloguj się z claude.ai albo użyj okna prywatnego")
+    return login_lock, fresh, profile, None
 
-    lock = take_lock(wait=60)
-    if not lock:
-        print("inny przebieg trwa zbyt długo, zaloguj się jeszcze raz za chwilę")
-        return 1
+
+def save_login(target, fresh, profile, cfg):
+    """Świeże logowanie do kopii konta i do wpisów runtime, które trzymają to konto."""
+    email = target.email
     old_refresh = target.oauth.get("refreshToken")
     kc_write(MANAGED_SERVICE, target.id, with_oauth(target.creds_json, fresh))
     # Wpisy runtime tego konta dostają nowy token, więc sesje wstają same. Które
@@ -1965,7 +2181,281 @@ def cmd_login(cfg, args):
     if cache.pop(email, None) is not None:
         write_json(USAGE_CACHE_PATH, cache)
     log(f"login: konto {email} zalogowane ponownie")
-    print(f"zalogowano {email}")
+
+
+# ---------- usuwanie konta ----------
+
+class Refusal(Exception):
+    """Odmowa `remove`. reason to kod dla aplikacji (active, unknown, in_use, not_owned, busy, failed),
+    text to zdanie po angielsku, bo pokazuje je ekran Ustawień Poda."""
+
+    def __init__(self, reason, text):
+        super().__init__(text)
+        self.reason = reason
+        self.text = text
+
+
+def accounts_by_address(email):
+    """Konta o tym adresie według ich plików: ([(id, adres)] dodane w claude-acc, [id] z Orca albo Pod).
+    Czyta pliki, nie Pęk kluczy: konto bez wpisu w Pęku kluczy (przerwane usuwanie) też da się dokończyć."""
+    want = email.strip().lower()
+
+    def named(root):
+        for acct_id in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+            try:
+                address = load_json(os.path.join(root, acct_id, "auth", "oauth-account.json"), {}).get("emailAddress")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(address, str) and address.strip().lower() == want:
+                yield acct_id, address
+
+    return list(named(OWN_ACCOUNTS_DIR)), [acct_id for acct_id, _ in named(ACCOUNTS_DIR)]
+
+
+def entry_owner(service, accounts):
+    """(konto, pewne): czyje logowanie leży we wpisie Pęku kluczy. pewne=False, gdy API profilu nie
+    odpowiedziało, więc nie wiadomo (401 to martwy token, czyli niczyj). Wpisów profili Pod nie czytamy."""
+    if service in profile_services():
+        return None, True
+    live = oauth_of(kc_read(service, KEYCHAIN_USER))
+    if not live.get("accessToken"):
+        return None, True
+    owner = next((a for a in accounts if same_login(a.seen_oauth, live)), None)
+    if owner:
+        return owner, True
+    status, profile = profile_request(live["accessToken"])
+    email = ((profile or {}).get("account") or {}).get("email") if status == 200 else None
+    if email:
+        return account_for_email(accounts, email), True
+    return None, status == 401
+
+
+def claude_session_dirs():
+    """CLAUDE_CONFIG_DIR (albo None) każdego żywego procesu Claude Code tego użytkownika, z tablicy
+    procesów tak jak runenv (KERN_PROCARGS2). CLAUDE_ACC_SESSIONS_FILE (lista {"config_dir"}) podstawia
+    ją w testach."""
+    fake = os.environ.get("CLAUDE_ACC_SESSIONS_FILE")
+    if fake:
+        return [row.get("config_dir") for row in load_json(fake, [])]
+    import runenv
+
+    found = []
+    for pid in runenv.own_pids():
+        info = runenv.procargs(pid) if pid != os.getpid() else None
+        if not info:
+            continue
+        exe, argv, env = info
+        if not exe or not argv or not argv[0] or exe.startswith(runenv.PLATFORM_PREFIXES) or not runenv.is_claude(exe, argv):
+            continue
+        found.append(env.get("CLAUDE_SECURESTORAGE_CONFIG_DIR") or env.get("CLAUDE_CONFIG_DIR"))
+    return found
+
+
+def sessions_using(account, accounts, cfg):
+    """Ile żywych procesów Claude Code czyta logowanie tego konta ze swojego wpisu. Wpisy zarządzanego
+    katalogu i bazowy pomijamy: ich logowanie to konto aktywne, a to odmawia osobno. Proces, którego
+    logowania nie da się przypisać do konta (API profilu milczy), nie liczy się: usunięcie kasuje tylko
+    kopię claude-acc, wpisu, z którego sesja czyta, nie rusza."""
+    live = set(live_services(cfg))
+    per_service = {}
+    for config_dir in claude_session_dirs():
+        service = scoped_service(config_dir) if config_dir else ACTIVE_SERVICE
+        per_service[service] = per_service.get(service, 0) + 1
+    count = 0
+    for service, n in per_service.items():
+        if service not in live:
+            owner, _ = entry_owner(service, accounts)
+            count += n if owner and owner.id == account.id else 0
+    return count
+
+
+def runs_holding(email):
+    """Ile żywych biegów `claude-acc jobs` płaci tym kontem (jobs/held-accounts.json, wpis z "until"
+    w przyszłości i żywym pid)."""
+    import runenv
+
+    try:
+        entries = load_json(os.path.join(STATE_DIR, "jobs", "held-accounts.json"), {})["accounts"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+    count = 0
+    for e in entries:
+        try:
+            held = e["email"].lower() == email.lower() and float(e["until"]) > time.time()
+            count += bool(held and runenv.pid_state(int(e["pid"]))[0])
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+    return count
+
+
+def removal_plan(cfg, email):
+    """[(id, adres)] kont do usunięcia albo Refusal. Tylko czyta."""
+    own, host = accounts_by_address(email)
+    if not own:
+        if host or any(p.email.lower() == email.strip().lower() for p in load_profiles([])):
+            raise Refusal("not_owned", f"{email} belongs to {HOST.name}, not to claude-acc. Remove it in {HOST.name}.")
+        raise Refusal("unknown", f"claude-acc has no account {email}.")
+    address = own[0][1]
+    ids = {acct_id for acct_id, _ in own}
+    accounts = load_accounts()
+    sessions = 0
+    # Konto, którego logowanie leży w zarządzanym wpisie albo bazowym, wróciłoby w ciągu dwóch minut:
+    # tick robi z takiego logowania konto (keep_live_logins). Dlatego sprawdzamy oba wpisy, nie tylko find_active
+    for account in (a for a in accounts if a.id in ids):
+        for service in live_services(cfg):
+            owner, sure = entry_owner(service, accounts)
+            if owner and owner.id == account.id:
+                raise Refusal("active", f"{address} is the account your sessions use now. Switch to another account "
+                                        "first (claude-acc switch <email>), then remove it.")
+            if not sure:
+                raise Refusal("busy", f"Could not tell whether {address} is the account your sessions use now "
+                                      "(Anthropic's profile API did not answer). Try again in a few minutes.")
+        sessions += sessions_using(account, accounts, cfg)
+    runs = runs_holding(address)
+    if sessions or runs:
+        used = [f"{n} {what}{'' if n == 1 else 's'}" for n, what in ((sessions, "Claude Code session"), (runs, "scheduled run")) if n]
+        raise Refusal("in_use", f"{address} is in use by {' and '.join(used)}. Close "
+                                f"{'it' if sessions + runs == 1 else 'them'} first, then remove the account.")
+    return own
+
+
+def forget_account(acct_id, email):
+    """Wpisy stanu claude-acc, które nazywają konto: stan, limity w pamięci, historia próbek, ostatnia
+    migawka panelu i listy last_resort oraz never w config.json. Pliki, w których konta nie ma, zostają
+    bez zmian (ani bajt). switch.log to dziennik zdarzeń, jego linii nie przepisujemy."""
+    key = email.strip().lower()
+    state = load_state()
+    before = json.dumps(state)
+    for table in ("needs_login", "needs_login_token", "api_backoff", "fingerprints"):
+        if isinstance(state.get(table), dict):
+            state[table] = {name: v for name, v in state[table].items() if name.lower() != key}
+    if isinstance(state.get("identity"), dict):
+        state["identity"].pop(acct_id, None)
+    if (state.get("active_email") or "").lower() == key:
+        del state["active_email"]
+    if (state.get("depot_email") or "").lower() == key:
+        # token tego konta został w sekrecie Depot; następny tick wyśle token innego konta
+        for name in ("depot_email", "depot_expires_at", "depot_token_mark", "depot_synced_at"):
+            state.pop(name, None)
+    if json.dumps(state) != before:
+        save_state(state)
+
+    cache = load_json(USAGE_CACHE_PATH, {})
+    names = [n for n in cache if n.lower() == key]
+    if names:
+        for name in names:
+            del cache[name]
+        write_json(USAGE_CACHE_PATH, cache)
+
+    if os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH) as f:
+            lines = f.readlines()
+
+        def mine(line):
+            try:
+                return json.loads(line)["email"].lower() == key
+            except (ValueError, KeyError, TypeError, AttributeError):
+                return False
+
+        kept = [line for line in lines if not mine(line)]
+        if len(kept) != len(lines):
+            tmp = f"{HISTORY_PATH}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                f.writelines(kept)
+            os.replace(tmp, HISTORY_PATH)
+
+    try:
+        status = load_json(STATUS_PATH, None)
+    except ValueError:
+        status = None  # uszkodzoną migawkę nadpisze następny tick
+    if isinstance(status, dict) and isinstance(status.get("accounts"), list):
+        rows = [r for r in status["accounts"] if not (isinstance(r, dict) and r.get("id") == acct_id)]
+        if len(rows) != len(status["accounts"]):
+            write_json(STATUS_PATH, dict(status, accounts=rows))
+
+    saved = load_json(CONFIG_PATH, {})
+    lists = {name: [e for e in saved[name] if not (isinstance(e, str) and e.lower() == key)]
+             for name in ("last_resort", "never") if isinstance(saved.get(name), list)}
+    if any(lists[name] != saved[name] for name in lists):
+        write_json(CONFIG_PATH, dict(saved, **lists))
+
+
+def remove_account(acct_id, email):
+    """Usuwa jedno konto claude-acc. Najpierw kopia w Pęku kluczy (gdy się nie uda, nic innego nie jest
+    ruszone), potem stan, na końcu katalog: dopóki katalog stoi, ponowne `remove` dokończy przerwane
+    usuwanie. Wpisów runtime sesji (Claude Code-credentials*) nie ruszamy, to nie nasze."""
+    folder = os.path.join(OWN_ACCOUNTS_DIR, acct_id)
+    if os.path.islink(folder) or os.path.realpath(os.path.dirname(folder)) != os.path.realpath(OWN_ACCOUNTS_DIR):
+        raise Refusal("failed", f"{folder} is not a plain folder of claude-acc. Nothing was removed.")
+    kc_delete(MANAGED_SERVICE, acct_id)
+    # dowodem jest tylko 44 (errSecItemNotFound): zablokowany Pęk kluczy też nie da odczytu, a wpis zostaje
+    probe = spawn(["security", "find-generic-password", "-s", MANAGED_SERVICE, "-a", acct_id], timeout=30)
+    if probe.returncode != 44:
+        raise Refusal("failed", f"Could not delete the Keychain item of {email}. Nothing else was removed.")
+    forget_account(acct_id, email)
+    shutil.rmtree(folder)
+    log(f"remove: konto {email} usunięte (katalog, wpis w Pęku kluczy, stan)")
+
+
+def confirm_removal(email):
+    try:
+        answer = input(f"Remove {email} from claude-acc? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def cmd_remove(cfg, args):
+    """Usuwa konto dodane w claude-acc (add, adopt). Konta z Orca i profile Poda należą do aplikacji,
+    nie do nas, więc je odrzuca. --json: {"removed": e-mail} (kod 0) albo {"error", "reason"} (kod 1)."""
+    as_json = "--json" in args
+    rest = [a for a in args if a != "--json"]
+    if len(rest) != 1 or rest[0].startswith("-"):
+        print("usage: claude-acc remove <email> [--json]", file=sys.stderr)
+        return 2
+    asks = not as_json and sys.stdin.isatty() and sys.stdout.isatty()
+    if not as_json and not asks:
+        print("claude-acc remove asks before it deletes, and there is no terminal to ask on. "
+              "Run it in a terminal, or pass --json to remove without asking.", file=sys.stderr)
+        return 2
+    email, lock = rest[0].strip(), None
+    try:
+        lock = take_lock(wait=25)
+        if not lock:
+            raise Refusal("busy", "Another claude-acc run is in progress. Try again in a moment.")
+        plan = removal_plan(cfg, email)
+        if asks:
+            lock.close()  # nie trzymamy blokady, gdy czekamy na człowieka: tick stałby dwie minuty i więcej
+            if not confirm_removal(plan[0][1]):
+                print("Not removed.")
+                return 1
+            lock = take_lock(wait=25)
+            if not lock:
+                raise Refusal("busy", "Another claude-acc run is in progress. Try again in a moment.")
+            plan = removal_plan(cfg, email)  # w czasie pytania mogła ruszyć sesja albo zmienić się konto aktywne
+        for acct_id, address in plan:
+            remove_account(acct_id, address)
+        removed = plan[0][1]
+    except Refusal as refusal:
+        if as_json:
+            print(json.dumps({"error": refusal.text, "reason": refusal.reason}, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(refusal.text, file=sys.stderr)
+        return 1
+    except Exception as err:  # noqa: BLE001 - z --json aplikacja dostaje zawsze JSON
+        if not as_json:
+            raise
+        log(f"remove: {email}: błąd {err}")
+        print(json.dumps({"error": f"Could not remove {email}: {err}", "reason": "failed"},
+                         ensure_ascii=False, separators=(",", ":")))
+        return 1
+    finally:
+        if lock:
+            lock.close()
+    if as_json:
+        print(json.dumps({"removed": removed}, ensure_ascii=False, separators=(",", ":")))
+    else:
+        print(f"Removed {removed} from claude-acc.")
     return 0
 
 
@@ -2195,8 +2685,6 @@ def save_status(cfg, accounts):
 
 
 def tick(cfg, accounts):
-    if not accounts:
-        return 1
     orca = orca_selected(accounts)
     if orca:
         # Orca sama pilnuje wybranego konta i odświeża jego token: drugi gracz
@@ -2210,6 +2698,18 @@ def tick(cfg, accounts):
         return 0
     if load_state().get("orca_notified"):
         update_state(orca_notified=None)
+    # logowanie z /login w sesji staje się kontem, zanim wyrównanie wpisów albo przełączenie je nadpisze;
+    # nowe konto od razu bierze udział w rozpoznaniu aktywnego i w kolejce (accounts to lista ticku)
+    adopted, unsure = keep_live_logins(accounts, cfg, "tick")
+    if unsure:
+        service, why = unsure[0]
+        log(f"tick: nie wiem, czyje logowanie leży we wpisie {service} ({why}), niczego nie zmieniam")
+        return 1
+    for account, _ in adopted:
+        accounts.append(account)
+        notify("Claude: nowe konto", f"{account.email} z logowania w sesji jest teraz kontem claude-acc")
+    if not accounts:
+        return 1
     state = load_state()
     active = find_active(accounts, cfg)
 
@@ -2272,7 +2772,7 @@ def tick(cfg, accounts):
         scrap = confirmed(jobs_free(drain_queue(rows)), cfg, lambda d: min(headroom(d)) >= DRAIN_FLOOR)
         if scrap:
             target = scrap["account"]
-            switch_to(target, cfg, f"{reason}; dobijanie, {scrap['why']}")
+            switch_to(target, cfg, f"{reason}; dobijanie, {scrap['why']}", accounts=accounts)
             keep_draining(reason)  # Depot bierze tylko konta z zapasem, więc resztek nie dotyka
             return 0
     if not candidates:
@@ -2287,7 +2787,7 @@ def tick(cfg, accounts):
         return 1
 
     target = candidates[0]["account"]
-    switch_to(target, cfg, reason)
+    switch_to(target, cfg, reason, accounts=accounts)
     end_pause(f"przełączono na {target.email}")
     depot_sync_safe(accounts, cfg, target)  # sandboxy nie mogą zostać na nowym koncie lokalnym
     left = headroom(candidates[0]["data"])[1]
@@ -2465,7 +2965,7 @@ def cmd_token(cfg, args):
 
 
 COMMANDS = {"status": cmd_status, "who": cmd_who, "plan": cmd_plan, "heal": cmd_heal,
-            "switch": cmd_switch, "login": cmd_login, "tick": cmd_tick, "resume": cmd_resume, "pause": cmd_pause, "drain": cmd_drain,
+            "switch": cmd_switch, "login": cmd_login, "add": cmd_add, "adopt": cmd_adopt, "remove": cmd_remove, "tick": cmd_tick, "resume": cmd_resume, "pause": cmd_pause, "drain": cmd_drain,
             "watch": cmd_watch, "depot": cmd_depot, "token": cmd_token}
 
 

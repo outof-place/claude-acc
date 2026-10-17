@@ -24,8 +24,8 @@ struct ClaudeAccApp: App {
             DictateFile.run(args[i + 1])
         }
         if args.contains("--widget-demo") { WidgetDemo.run() }
-        // a second copy would put a second ring in the menu bar
-        PodMenu.keepOneCopy()
+        // a second copy would put a second ring in the menu bar; a measuring one puts none
+        if !PanelMeasure.requested(args) { PodMenu.keepOneCopy() }
     }
 
     var body: some Scene {
@@ -116,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// URLs that arrive before the store exists: `open -g` that starts the app delivers its URL early.
     private var early: [URL] = []
     private var termination: TerminationSignal?
+    private var measure: PanelMeasure?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         termination = TerminationSignal { MainActor.assumeIsolated { NSApp.terminate(nil) } }
@@ -126,6 +127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // `--measure-panel`: the panel's cost, with no ring and nothing on screen (PanelMeasure)
+        if let measure = PanelMeasure(arguments: CommandLine.arguments) {
+            self.measure = measure
+            return
+        }
         let store = Store()
         self.store = store
         let menuBar = MenuBarController(store: store)
