@@ -5,6 +5,10 @@ No part of it may be used, copied, modified, merged, published, distributed,
 sublicensed or sold, in source or binary form, except under a written license
 from the copyright holder.
 
+This file is that written license for Pod (github.com/outof-place/pod): Pod may
+bundle, run and distribute this software, in binary form, as part of its
+builds and releases.
+
 Third-party components keep their own licenses.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
