@@ -53,6 +53,16 @@ for i in range(500):
 """
 
 
+# drugi proces trzyma zamek rejestru (jak pisarz zatrzymany SIGSTOP-em w środku zapisu), aż go zabić
+HOLDER = r"""
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+print("held", flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
 class EventsTest(unittest.TestCase):
     def setUp(self):
         self.dir = os.path.realpath(tempfile.mkdtemp(prefix="events-test-"))
@@ -105,6 +115,28 @@ class EventsTest(unittest.TestCase):
         # oba interpretery liczą ten sam uptime (systemowy), więc wiersze idą po nim w kolejności zapisu
         ups = [r["up"] for r in got]
         self.assertEqual(ups, sorted(ups))
+
+    def test_held_lock_gives_up_within_a_second(self):
+        """Zamek rejestru w ręku innego procesu (pisarz zatrzymany z zamkiem, np. job schedulera po
+        SIGSTOP w safety) nie zatrzymuje hamulca: append czeka najwyżej LOCK_WAIT_S i oddaje False, bez
+        wiersza. Pomyłka, którą łapie: blokujący flock, przy którym hamulec stoi, póki pisarz nie ruszy."""
+        lock = os.path.join(self.dir, "events.lock")
+        holder = subprocess.Popen([sys.executable, "-I", "-c", HOLDER, lock, "10"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        began = time.monotonic()
+        written = events.append(self.dir, "kill", job="j-1")
+        took = time.monotonic() - began
+        self.assertFalse(written)
+        self.assertLess(took, 1.2)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "events.jsonl")))
+        # zamek wolny: ten sam zapis przechodzi
+        holder.kill()
+        holder.wait()
+        self.assertTrue(events.append(self.dir, "kill", job="j-1"))
+        self.assertEqual([r["job"] for r in rows(os.path.join(self.dir, "events.jsonl"))], ["j-1"])
 
     def test_rotates_at_size_keeps_one_previous(self):
         path = os.path.join(self.dir, "events.jsonl")
