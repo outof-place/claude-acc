@@ -92,6 +92,8 @@ final class Store {
     /// Launches, quits, System Settings leaving the front and display changes, while the panel is open.
     @ObservationIgnored private var panelObservers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
     @ObservationIgnored private var live: Task<Void, Never>?
+    /// pod-services.json for Pod's Settings, asked again at every minute's poll (live app only).
+    @ObservationIgnored private var services: ServicesReport?
     /// The state files as last read: a file that didn't change costs one stat and wakes no view.
     @ObservationIgnored private var files: [String: StateFile] = [:]
     /// The newest readings while the panel is closed. The closed panel is still a live view
@@ -146,9 +148,11 @@ final class Store {
         }
         registerLoginItemUnlessTurnedOff()
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        services = ServicesReport()
         poller = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.poll()
+                await self?.services?.refresh()
                 // a baseline, so the panel opens with the last minute's load instead of a dash
                 self?.sampleLoad()
                 try? await Task.sleep(for: .seconds(60))
