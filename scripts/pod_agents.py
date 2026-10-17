@@ -7,8 +7,9 @@ w ~/Library/LaunchAgents.
 Agent z pakietu aplikacji nie zna ścieżek w HOME: zamiast `$STATE/python $STATE/acc.py <job>` startuje
 BundleProgram (pod-acc-run w Pod.app), który bierze HOME z bazy kont, dopisuje wyjście do tego samego
 logu w $STATE i uruchamia acc.py. Etykieta `<app-id>.acc.<job>` (tick, janitor, devguard, perf, updates,
-jobs), harmonogram, klasa procesu i reszta kluczy bez zmian; bez StandardOutPath/StandardErrorPath.
-Lista jobów to JOBS z setup.sh, więc nowy automat trafia do Pod sam.
+jobs, admit), harmonogram, klasa procesu i reszta kluczy bez zmian; bez StandardOutPath/StandardErrorPath.
+Lista jobów to JOBS z setup.sh, więc nowy automat trafia do Pod sam, i POD_JOBS: automaty, które ma
+tylko Pod (setup.sh nie kładzie ich w ~/Library/LaunchAgents).
 """
 
 import os
@@ -25,10 +26,17 @@ STATE_MARK = HOME_MARK + "/.local/share/claude-acc/"
 
 
 def jobs(setup=None):
-    """Etykiety z linii JOBS= w setup.sh, w jej kolejności."""
+    """Etykiety z linii JOBS= i potem POD_JOBS= w setup.sh, w ich kolejności."""
     with open(setup or os.path.join(ROOT, "setup.sh"), encoding="utf-8") as f:
-        line = next(x for x in f if x.startswith("JOBS="))
-    return line.split("=", 1)[1].strip().strip('"').split()
+        lines = f.readlines()
+    labels = []
+    for name in ("JOBS=", "POD_JOBS="):
+        line = next((x for x in lines if x.startswith(name)), None)
+        if line is None and name == "JOBS=":
+            raise ValueError("setup.sh: brak linii JOBS=")
+        if line is not None:
+            labels += line.split("=", 1)[1].strip().strip('"').split()
+    return labels
 
 
 def job_name(label):

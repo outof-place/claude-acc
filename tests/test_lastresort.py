@@ -443,13 +443,27 @@ class BrakeChooseTest(unittest.TestCase):
         table = {101: (1, CLAUDE), 102: (101, "/bin/zsh -c x"), 103: (102, "python acc.py sched run"),
                  104: (103, SCHED_SHELL), 105: (104, "node plugins/cli/main.ts capture"),
                  106: (105, CHROME)}
-        job = {"id": "j-1", "child_pgid": 104, "cmd": "pnpm sm capture", "label": "pnpm sm capture",
+        job = {"id": "j-1", "pid": 103, "child_pgid": 104, "cmd": "pnpm sm capture", "label": "pnpm sm capture",
                "agent": {"worktree": "/w/site"}}
         got = lr.choose(table, lambda pid: 700 * MB, lambda pid: 600, jobs=[job])
         self.assertEqual(got[0], "job")
         self.assertEqual(sorted(got[3]), [105, 106])  # bez powłoki joba i wrappera schedulera
         self.assertIs(got[5], job)
         self.assertEqual(lr.resume_of(105, job, None), "cd /w/site && pnpm sm capture")
+
+    def test_a_stale_entry_never_makes_a_foreign_tree_a_job(self):
+        # wpis po martwym wrapperze (pid 103): jego child_pgid 104 to dziś obcy proces z dużymi
+        # dziećmi; na stopniu 2 nie jest jobem, a żadna inna klasa go nie bierze
+        table = {101: (1, CLAUDE), 104: (1, "/usr/local/bin/some-daemon"), 105: (104, "node worker.js")}
+        stale = {"id": "j-1", "pid": 103, "child_pgid": 104, "cmd": "pnpm sm capture"}
+        self.assertIsNone(lr.choose(table, lambda pid: 3 * GB, lambda pid: 600, jobs=[stale]))
+        # ani wpis bez pidu wrappera, ani zepsuty (launchd jako wrapper pasowałby do każdej sieroty)
+        for bad in (None, 1, True, 0, -1, "103"):
+            job = {"child_pgid": 104} if bad is None else {"pid": bad, "child_pgid": 104}
+            self.assertIsNone(lr.choose(table, lambda pid: 3 * GB, lambda pid: 600, jobs=[job]), bad)
+        # żywy wrapper, którego powłoka to wciąż jego dziecko: job jak zawsze
+        live = {**table, 103: (101, "python acc.py sched run"), 104: (103, SCHED_SHELL)}
+        self.assertEqual(lr.choose(live, lambda pid: 3 * GB, lambda pid: 600, jobs=[stale])[0], "job")
 
     def test_any_agent_command_tree_only_in_an_emergency(self):
         table = {101: (1, CLAUDE), 102: (101, "/bin/zsh -c node capture.js"),

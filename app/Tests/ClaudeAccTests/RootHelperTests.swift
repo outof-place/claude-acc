@@ -3,6 +3,7 @@ import LightweightCodeRequirements
 import PodRootdClient
 import PodRootdCore
 import Security
+import SMCKit
 import Testing
 import XPC
 @testable import ClaudeAcc
@@ -58,13 +59,13 @@ private final class Machine {
         server = Server(engine: engine, peers: try admittingMe())
     }
 
-    /// Pod Menu's side, opening its sessions on this machine.
-    func podMenu() -> RootHelper {
+    /// Pod Menu's side, opening its sessions on this machine; `reader` stands in for the SMC.
+    func podMenu(reader: (() -> Reading)? = nil) -> RootHelper {
         RootHelper(appIdentifier: nil, connector: { [self] in
             connects += 1
             if down { throw CocoaError(.featureUnsupported) }
             return try PodRootdClient(endpoint: server.listenAnonymously())
-        }, ticking: false)
+        }, reader: reader, ticking: false)
     }
 }
 
@@ -153,4 +154,70 @@ func rootHelperFanPickChecked() async throws {
     #expect(machine.connects == 0)
     #expect(await helper.setFans("60") == nil)
     #expect(machine.engine.status().fans.mode == .fixed(FanPercent(unchecked: 60)))
+}
+
+@Test("closed, the SMC is read when the menu bar label asks, not on every 5 s tick; open, on every tick")
+func rootHelperReadsFansWhenLookedAt() async throws {
+    let machine = try Machine()
+    defer { machine.server.cancel() }
+    var reads = 0
+    let helper = machine.podMenu {
+        reads += 1
+        var reading = Reading()
+        reading.cpu = 91
+        return reading
+    }
+    await helper.tick()
+    #expect(helper.owns)
+    for _ in 0..<3 { await helper.tick() }
+    #expect(reads == 0)
+    #expect(helper.closedReading()?.cpu == 91)
+    #expect(reads == 1)
+
+    // opening the panel reads at once: the card counts a reading older than 15 s as no fan control
+    helper.panelOpen = true
+    #expect(reads == 2)
+    await helper.tick()
+    #expect(reads == 3)
+    // open, the label takes the tick's reading
+    #expect(helper.closedReading() != nil)
+    #expect(reads == 3)
+}
+
+@Test("the chart's history keeps 20 minutes whatever the pace of the readings")
+func rootHelperHistorySpan() async throws {
+    let machine = try Machine()
+    defer { machine.server.cancel() }
+    var at = 1_800_000_000.0
+    let helper = machine.podMenu {
+        var reading = Reading()
+        reading.at = at
+        at += 300
+        return reading
+    }
+    await helper.tick()
+    for _ in 0..<7 { _ = helper.closedReading() }
+    // seven readings 5 minutes apart: the newest and the four within 20 minutes of it
+    let history = try #require(helper.fanState?.history)
+    #expect(history.map { $0[0] } == [1_800_000_600, 1_800_000_900, 1_800_001_200, 1_800_001_500, 1_800_001_800])
+}
+
+@Test("two readings in the same second make one chart row, the later one")
+func rootHelperOneRowPerSecond() async throws {
+    let machine = try Machine()
+    defer { machine.server.cancel() }
+    var cpu = 60.0
+    let helper = machine.podMenu {
+        var reading = Reading()
+        reading.at = 1_800_000_000.2
+        reading.cpu = cpu
+        cpu += 1
+        return reading
+    }
+    await helper.tick()
+    _ = helper.closedReading()
+    _ = helper.closedReading()
+    let history = try #require(helper.fanState?.history)
+    #expect(history.count == 1)
+    #expect(history.first?[1] == 61)
 }

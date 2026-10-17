@@ -71,6 +71,9 @@ STATE="$HOME/.local/share/claude-acc"
 AGENTS="$HOME/Library/LaunchAgents"
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 JOBS="com.filip.claude-acc com.filip.claude-acc.janitor com.filip.claude-acc.devguard com.filip.claude-acc.perf com.filip.claude-acc.updates com.filip.claude-acc.jobs com.filip.claude-acc.hotspot-user"
+# automaty tylko dla Pod (scripts/pod_agents.py bierze je razem z JOBS): setup.sh nie kładzie ich w
+# ~/Library/LaunchAgents, bo taki agent to osobna tożsamość TCC, a admitd wchodzi do katalogów agentów
+POD_JOBS="com.filip.claude-acc.admit"
 
 APP_SRC=""
 FANCTL=""
@@ -319,6 +322,9 @@ case "$1" in
   credits) shift; exec "$PY" "$RUN" credits "$@" ;;
   # biegi blogów bez człowieka: płatnik z puli, licznik, limity czuwania, zapis biegu (jobs.py)
   jobs) shift; exec "$PY" "$RUN" jobs "$@" ;;
+  # research słów kluczowych, audyt SEO i radar tematów blogów: keywords.json, audit.json i radar.json
+  # w ~/.local/share/claude-acc/seo/<blog> (seo.py, seoaudit.py, seoradar.py)
+  seo) shift; exec "$PY" "$RUN" seo "$@" ;;
   # wspólne serwery MCP: jeden proces stdio dla wszystkich sesji Claude Code
   mcp) shift; exec "$PY" "$RUN" mcpshare "$@" ;;
   perf-root)

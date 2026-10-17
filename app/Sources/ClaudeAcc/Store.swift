@@ -284,8 +284,10 @@ final class Store {
     func readSamples() {
         let live = panelOpen || isPreview
         if RootHelper.shared.owns {
-            // Pod's root helper drives the fans; the readings come from the SMC in this app
-            if let fresh = RootHelper.shared.fanState, fresh.at != latestFan?.at {
+            // Pod's root helper drives the fans; the readings come from the SMC in this app, closed
+            // only when this poll asks
+            let reading = live ? RootHelper.shared.fanState : RootHelper.shared.closedReading()
+            if let fresh = reading, fresh.at != latestFan?.at {
                 latestFan = fresh
                 if live { fanState = latestFan }
             }
@@ -391,8 +393,9 @@ final class Store {
     func panelAppeared() {
         panelOpen = true
         RootHelper.shared.panelOpen = true
-        // what came in while it was closed
+        // what came in while it was closed; the root helper's fans were read just now
         if let latestSnapshot { snapshot = latestSnapshot }
+        if RootHelper.shared.owns, let fresh = RootHelper.shared.fanState { latestFan = fresh }
         fanState = latestFan
         guardState = latestGuard
         refreshDisk(force: true)

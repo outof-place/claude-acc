@@ -155,6 +155,9 @@ FULL_RECHECK = 3 * 3600
 PEAK_BURN = {"five_hour": 5.0, "seven_day": 1.0}
 # odczyt aktywnego konta: najczęściej co przebieg automatu (launchd co 120 s), najrzadziej co kwadrans
 ACTIVE_MAX_AGE = (100, 900)
+# Status subskrypcji konta pominiętego (canceled itp.) sprawdzamy w profilu, który nie dławi.
+# Co godzinę to było za rzadko: odnowione konto wisiało w panelu jako pominięte
+LAPSED_RECHECK = 600
 
 DEPOT_SECRET = "CLAUDE_CODE_OAUTH_TOKEN"
 DEPOT_FALLBACK_SERVICE = "Claude Acc Depot fallback token"
@@ -337,11 +340,42 @@ def kc_read_many(keys, batch=8):
                     proc.wait()
 
 
-def kc_write(service, account, contents):
+# `security -i` czyta polecenie przez fgets do bufora 4096 bajtów, czyli 4095 znaków: dłuższa linia idzie
+# dalej jako drugie polecenie, a pierwsze zapisałoby ucięty sekret (zmierzone na /usr/bin/security,
+# macOS 27). Linia dokładnie 4095 + `\n` wchodzi cała, ale `\n` zostaje na puste polecenie z kodem 0,
+# a `security -i` kończy się kodem OSTATNIEGO polecenia: nieudany zapis wyglądałby na udany
+SECURITY_LINE_MAX = 4094
+
+
+def kc_write(service, account, contents, timeout=30):
+    """Zapis wpisu przez stdin `security -i` z danymi szesnastkowo (-X), jak credits.py i runenv.py:
+    sekret nie trafia do argumentów procesu (ps widzi tylko `security -i`), a zapis szesnastkowy nie
+    wymaga ucieczek w linii polecenia.
+
+    Wpis, którego linia nie przeniesie (blob z wieloma mcpOAuth dłuższy niż SECURITY_LINE_MAX po
+    zamianie na szesnastkowy albo nazwa z cudzysłowem, backslashem, końcem linii), idzie jak przed
+    1.31.13, w argumentach: ucięty zapis albo odmowa zgubiłyby świeżo wydaną parę tokenów."""
     _KC_SEEN.pop((service, account), None)  # po nieudanym albo przerwanym zapisie nie wiadomo, co tam leży
-    r = spawn(["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], timeout=30)
-    if r.returncode != 0:
-        raise RuntimeError(f"zapis do Keychain nieudany ({service}): {r.stderr.strip()}")
+    secret = contents.encode().hex()
+    line = f'add-generic-password -U -s "{service}" -a "{account}" -X {secret}'
+    if len(line.encode()) <= SECURITY_LINE_MAX and not any(c in service + account for c in '"\\\n\r\0'):
+        argv, stdin = ["security", "-i"], line + "\n"
+    else:
+        log(f"zapis do Keychain ({service}) w argumentach `security`: {len(contents.encode())} B, linia `security -i` go nie przeniesie")
+        argv, stdin, secret = ["security", "add-generic-password", "-U", "-s", service, "-a", account, "-w", contents], None, contents
+    try:
+        r = spawn(argv, input=stdin, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # TimeoutExpired niesie argumenty i to, co proces zdążył wypisać: main() wpisałby jego tekst do
+        # logu i na stderr, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
+        raise RuntimeError(f"zapis do Keychain nieudany ({service}): brak odpowiedzi po {timeout:.0f} s") from None
+    # `security` nie powtarza polecenia przy błędzie, ale komunikat i tak idzie do logu: bez sekretu.
+    # Linia rozcięta mimo limitu (mniejszy bufor niż zmierzony) puściłaby resztę jako polecenie,
+    # które `security` nazywa na stderr: znika też każdy ciąg szesnastkowy od 16 znaków
+    error = re.sub(r"[0-9a-fA-F]{16,}", "<hex>", (r.stderr or "").replace(secret, "<sekret>")).strip()
+    # nieudane polecenie `security -i` pisze "<polecenie>: returned <kod>" (bez słowa "error")
+    if r.returncode != 0 or "error" in error.lower() or ": returned " in error:
+        raise RuntimeError(f"zapis do Keychain nieudany ({service}): {error[:200]}")
     _KC_SEEN[(service, account)] = contents
 
 
@@ -788,6 +822,11 @@ def identity(account, cfg, max_age=12 * 3600, refresh=True):
     profile = fetch_profile(oauth_of(creds)["accessToken"])
     if not profile:
         return hit
+    return remember_identity(account, profile)
+
+
+def remember_identity(account, profile):
+    """Zapisuje, kim jest konto według odpowiedzi API profilu."""
     org = profile.get("organization") or {}
     info = {
         "ts": int(time.time()),
@@ -1273,9 +1312,10 @@ def cmd_heal(cfg, args):
     return 0 if fixed else 1
 
 
-def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
+def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True, in_use_id=None):
     """Limity wszystkich kont z oceną przydatności. Błąd odczytu to nie to samo,
-    co wypalone konto, więc niesie osobną etykietę."""
+    co wypalone konto, więc niesie osobną etykietę. in_use_id to konto, na którym
+    pracują teraz sesje: jego pominięty status sprawdzamy częściej (niżej)."""
     rows = []
     for a in accounts:
         if a.id == exclude_id or a.email in cfg["never"]:
@@ -1287,11 +1327,15 @@ def survey(accounts, cfg, exclude_id=None, max_age=90, refresh=True):
         may_refresh = refresh(a) if callable(refresh) else refresh
         # Anulowane konto automat pomija. Limitów o nie nie pytamy: API odpowiada
         # 403, a panel pytał co minutę i przybliżał 429 dla reszty kont. Status
-        # sprawdzamy w profilu co godzinę (ten endpoint nie dławi), więc po
-        # odnowieniu konto szybko samo wraca do rotacji.
+        # sprawdzamy w profilu co LAPSED_RECHECK, więc po odnowieniu konto szybko
+        # samo wraca do rotacji. Konto w użyciu (in_use_id) sprawdzamy w rytmie
+        # odczytu aktywnego konta: sesje na nim pracują, więc "canceled" z pamięci
+        # najpewniej przeżyło odnowienie zrobione w przeglądarce, a panel nie może
+        # przez 10 minut pokazywać używanego konta jako pominiętego.
         status = (load_state().get("identity", {}).get(a.id) or {}).get("status")
         if status and status != "active":
-            status = (identity(a, cfg, max_age=3600, refresh=may_refresh) or {}).get("status")
+            recheck = ACTIVE_MAX_AGE[0] if a.id == in_use_id else LAPSED_RECHECK
+            status = (identity(a, cfg, max_age=recheck, refresh=may_refresh) or {}).get("status")
         if status and status != "active":
             rows.append({"account": a, "data": None, "why": f"subskrypcja: {status}, automat pomija",
                          "usable": False, "error": True, "skipped": True})
@@ -1377,10 +1421,16 @@ def depot_bin(cfg):
     return next((p for p in ("/opt/homebrew/bin/depot", "/usr/local/bin/depot") if os.path.exists(p)), None)
 
 
-def depot_push(depot, token):
-    r = subprocess.run([depot, "claude", "secrets", "add", DEPOT_SECRET, "--value", token],
-                       capture_output=True, text=True, timeout=60)
-    return r.returncode == 0, (r.stderr or r.stdout or "").strip()[:200]
+def depot_push(depot, token, timeout=60):
+    try:
+        r = subprocess.run([depot, "claude", "secrets", "add", DEPOT_SECRET, "--value", token],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # tekst TimeoutExpired niesie argumenty, a w nich token (--value): depot_sync_safe wpisałby go
+        # do switch.log, więc ani on, ani łańcuch wyjątków (from None) nie wychodzą poza tę funkcję
+        raise RuntimeError(f"depot claude secrets add: brak odpowiedzi po {timeout:.0f} s") from None
+    # komunikat idzie do logu: bez tokenu, gdyby CLI go powtórzył
+    return r.returncode == 0, (r.stderr or r.stdout or "").replace(token, "<token>").strip()[:200]
 
 
 def token_hash(token):
@@ -1521,11 +1571,12 @@ def snapshot(cfg, accounts=None):
     # tego panel pokazywał dane sprzed kilkunastu godzin.
     held = {oauth_of(kc_read(s, KEYCHAIN_USER)).get("refreshToken") for s in runtime_services(cfg)}
     idle = lambda a: not orca and a.seen_oauth.get("refreshToken") not in held
-    rows = survey(accounts, cfg, max_age=IDLE_MAX_AGE, refresh=idle)
+    rows = survey(accounts, cfg, max_age=IDLE_MAX_AGE, refresh=idle, in_use_id=active.id if active else None)
     if active and all(r["account"].id != active.id for r in rows):
         # konto z listy "never" też bywa aktywne (np. wybrane ręcznie): pokazujemy je,
         # tylko automat nigdy na nie nie przełącza
-        rows += survey([active], dict(cfg, never=[]), max_age=active_max_age(active, cfg), refresh=False)
+        rows += survey([active], dict(cfg, never=[]), max_age=active_max_age(active, cfg), refresh=False,
+                       in_use_id=active.id)
         rows[-1]["usable"] = False
     cache = load_json(USAGE_CACHE_PATH, {})
     order = {r["account"].id: i for i, r in enumerate(queue(rows), 1)}
@@ -1908,6 +1959,8 @@ def cmd_login(cfg, args):
             kc_write(runtime, KEYCHAIN_USER, with_oauth(current, fresh))
             log(f"login: nowy token {email} wpisany do {runtime}")
     clear_needs_login(target)
+    # profil z tego logowania jest świeży: odnowioną subskrypcję widać od razu, nie po LAPSED_RECHECK
+    remember_identity(target, profile)
     cache = load_json(USAGE_CACHE_PATH, {})
     if cache.pop(email, None) is not None:
         write_json(USAGE_CACHE_PATH, cache)

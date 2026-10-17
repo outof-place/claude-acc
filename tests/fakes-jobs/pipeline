@@ -124,6 +124,8 @@ def entry():
     outcome = os.environ.get("FAKE_JOB_OUTCOME") or CONTRACT.get(code, "BŁĄD")
     urls = [u for u in os.environ.get("FAKE_JOB_URLS", "").split(",") if u]
     print("autopilot: start", flush=True)
+    if os.environ.get("FAKE_JOB_SAY"):
+        print(os.environ["FAKE_JOB_SAY"], flush=True)  # linia na stdout, np. zdarzenie stream-json sesji
     if os.environ.get("FAKE_JOB_EARLY_MARKER"):
         write_result({"phase": "side-effect"})
         time.sleep(1.0)  # runner widzi znacznik, zanim przyjdzie drogie zapytanie

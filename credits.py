@@ -107,6 +107,39 @@ PURPOSE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}")
 API_KEY_RE = re.compile(r"sk-ant-(?:api|usr)[0-9A-Za-z_-]+")
 # komunikat API ("Your credit balance is too low...") i Claude Code ("Credit balance is too low")
 EXHAUSTED_RE = re.compile(rb"credit balance (?:is )?too low", re.IGNORECASE)
+# zdarzenia stream-json Claude Code, które niosą treść sesji: to, co przeczytała, napisała albo zobaczyła
+SESSION_EVENT_RE = re.compile(rb'\{\s*"type"\s*:\s*"(?:user|assistant|system|stream_event|tool_progress)"')
+
+
+class ExhaustionScan:
+    """Czy wyjście komendy powiedziało, że kredyt się skończył; strumień przychodzi kawałkami.
+
+    Nie liczy się zdanie w linii zdarzenia sesji Claude Code (`user`, `assistant`, `system`,
+    `stream_event`, `tool_progress` na początku linii): te zdarzenia niosą też to, co sesja przeczytała
+    albo napisała. 15.10 bieg v1-radar miał na stdout README claude-acc z tym zdaniem, zabity z innego
+    powodu skończył się kodem 143, a organizacja 3@ została oznaczona jako pusta przy $112 kredytu.
+    Liczy się każda inna linia: tekst `claude -p`, logi przebiegów, zdarzenie `result` Claude Code
+    (2.1.299 zaczyna je od `{"duration_api_ms":`, z `"type":"result"` w środku) i ciało błędu API
+    (`{"type":"error",...}`). Nowy typ zdarzenia liczy się jak dotąd, więc w razie wątpliwości bieg
+    raczej oznaczy organizację, niż przegapi koniec kredytu. `--output-format json --verbose` wypisuje
+    całą sesję jako jedną tablicę w jednej linii i liczy się w całości. Zdanie nie ma końca linii,
+    więc wystarczy pamiętać początek i ogon bieżącej linii."""
+
+    KEEP = 64
+
+    def __init__(self):
+        self.head, self.tail, self.seen = b"", b"", False
+
+    def feed(self, chunk):
+        for i, part in enumerate(chunk.split(b"\n")):
+            if i:  # nowa linia
+                self.head, self.tail = b"", b""
+            if len(self.head) < self.KEEP:
+                self.head = (self.head + part[: self.KEEP])[: self.KEEP]
+            if not self.seen and EXHAUSTED_RE.search(self.tail + part):
+                self.seen = not SESSION_EVENT_RE.match(self.head)
+            self.tail = (self.tail + part)[-self.KEEP :]
+        return self.seen
 
 
 class CreditsError(Exception):
@@ -867,19 +900,17 @@ def run_watched(command, env):
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda signum, _frame: proc.send_signal(signum))
     sel = selectors.DefaultSelector()
-    tails, gone, seen = {}, set(), False
+    scans, gone, seen = {}, set(), False
     for pipe, target in ((proc.stdout, 1), (proc.stderr, 2)):
         sel.register(pipe, selectors.EVENT_READ, target)
-        tails[target] = b""
+        scans[target] = ExhaustionScan()  # zdanie rozcięte między dwa kawałki też się znajdzie
     while sel.get_map():
         for item, _ in sel.select():
             chunk = os.read(item.fileobj.fileno(), 65536)
             if not chunk:
                 sel.unregister(item.fileobj)
                 continue
-            window = tails[item.data] + chunk
-            seen = seen or bool(EXHAUSTED_RE.search(window))
-            tails[item.data] = window[-64:]  # zdanie rozcięte między dwa kawałki też się znajdzie
+            seen = scans[item.data].feed(chunk) or seen
             if item.data not in gone:
                 try:
                     write_all(item.data, chunk)

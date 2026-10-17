@@ -571,6 +571,17 @@ class Metering(unittest.TestCase):
         r, s2 = self.w.go()  # następny bieg: inna organizacja, nie ta wyczerpana
         self.assertEqual(s2["payer"]["org_id"], "org-a", r.stderr)
 
+    def test_phrase_in_a_tool_result_of_a_failed_run_does_not_mark_the_org_empty(self):
+        # 15.10, bieg v1-radar: `claude -p --output-format stream-json` niósł na stdout README z tym zdaniem,
+        # a bieg skończył się kodem różnym od 0 z innego powodu; organizacja nie jest przez to pusta
+        self.w.pool()
+        line = json.dumps({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "content": "requests fail with *credit balance is too low* until the next cycle"}]}})
+        r, s = self.w.go(cmd=("sh", "-c", f"printf '%s\\n' {shlex.quote(line)}; exit 1"))
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertFalse(s["exhausted"])
+        self.assertEqual(self.w.account("d@example.com")["remaining_usd"], 200.0)
+
     def test_missing_session_or_cost_makes_metering_incomplete_and_the_payer_unverified(self):
         self.w.pool()
         cases = (
