@@ -36,6 +36,9 @@ def run(args):
         _store.save("keychain.json", kc)
         return 0
     if cmd == "delete-generic-password":
+        if os.environ.get("FAKE_FAIL_DELETE_SERVICE") == opt("-s"):
+            print("security: SecKeychainItemDelete: fake failure", file=sys.stderr)
+            return 1
         existed = kc.pop(key, None) is not None
         _store.save("keychain.json", kc)
         return 0 if existed else 44
