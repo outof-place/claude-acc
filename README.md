@@ -10,7 +10,7 @@ It rotates your Claude subscriptions before one hits the wall, keeps the agents'
 
 [Install](#install) · [What it does](#what-it-does) · [How it works](#how-it-works) · [Numbers](#numbers) · [Command line](#command-line)
 
-![macOS 26+](https://img.shields.io/badge/macOS-26%2B-111?logo=apple) ![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white) ![Python](https://img.shields.io/badge/Python-stdlib%20only-3776AB?logo=python&logoColor=white) ![License MIT](https://img.shields.io/badge/license-MIT-2ea44f)
+![macOS 26+](https://img.shields.io/badge/macOS-26%2B-111?logo=apple) ![Swift 6.2](https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white) ![Python](https://img.shields.io/badge/Python-stdlib%20only-3776AB?logo=python&logoColor=white) ![License proprietary](https://img.shields.io/badge/license-proprietary-555)
 
 </div>
 
@@ -1109,4 +1109,4 @@ With `--snapshot` the clock stops at the moment the snapshot was taken, and `dem
 
 ## License
 
-MIT
+Proprietary. Copyright (c) 2026 Filip Maszota. All rights reserved. See [LICENSE](LICENSE).
