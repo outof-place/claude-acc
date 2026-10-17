@@ -10,6 +10,10 @@ let usage = """
            acc-cored sockets              listening ports and loopback links as JSON (parity)
            acc-cored regex-check [--patterns]   the guard's patterns on lines from stdin (parity)
            acc-cored cache-check [ROUNDS] [SECONDS]   the process cache against fresh reads
+           acc-cored guard [--shadow FILE] [--for SECONDS] [--profile]   the dev-server guard (devguard run)
+           acc-cored guard-replay F.jsonl [--show N]   the native guard tick on parity fixtures
+           acc-cored guard-bench [N]      N ticks back to back, CPU per phase
+           acc-cored orca-read            the host's four reads over its socket, timed
     """
 
 func json(_ value: Any) -> String {
@@ -20,6 +24,13 @@ func json(_ value: Any) -> String {
 func fail(_ text: String, _ code: Int32 = 64) -> Never {
     FileHandle.standardError.write(Data((text + "\n").utf8))
     exit(code)
+}
+
+/// The value after `flag`, nil without the flag; a flag given last is a usage error.
+func value(_ flag: String, in args: [String]) -> String? {
+    guard let i = args.firstIndex(of: flag) else { return nil }
+    guard i + 1 < args.count else { fail("\(flag) needs a value\n" + usage) }
+    return args[i + 1]
 }
 
 var args = Array(CommandLine.arguments.dropFirst())
@@ -97,6 +108,84 @@ case "cache-check":
                  Double(cache.argvReads) * 100 / Double(max(total, 1))))
     examples.forEach { print("  " + $0) }
     exit(wrong == 0 ? 0 : 1)
+case "guard-replay":
+    guard let path = args.first, let data = Files.read(path) else { fail(usage) }
+    let show = value("--show", in: args).flatMap { Int($0) } ?? 3
+    var same = 0, different = 0, incomplete = 0, shown = 0, config = 0
+    for line in String(decoding: data, as: UTF8.self).split(separator: "\n") where !line.isEmpty {
+        guard let fixture = (try? PyJSON.loads(String(line)))?.object else { fail("unreadable fixture") }
+        let outcome = GuardReplay.run(fixture)
+        if !outcome.missing.isEmpty { incomplete += 1 }
+        if outcome.configHandedOver {
+            config += 1
+        } else if outcome.differences.isEmpty {
+            same += 1
+        } else {
+            different += 1
+            if shown < show {
+                shown += 1
+                print("fixture \(same + different): \(outcome.differences.count) differences")
+                for d in outcome.differences.prefix(12) { print("  " + d) }
+                if !outcome.missing.isEmpty { print("  missing readings: " + outcome.missing.prefix(8).joined(separator: ", ")) }
+            }
+        }
+    }
+    print("same \(same), different \(different), fixtures with readings Python never made \(incomplete), handed to Python (config types) \(config)")
+    exit(different == 0 ? 0 : 1)
+case "orca-read":
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? "/"
+    let state = GuardPaths.state(home)
+    guard let client = HostResolver.resolve(python: [state + "/python", "-B", state + "/acc.py"], home: home) else { fail("no host") }
+    for read in OrcaRead.allCases {
+        let t0 = Kernel.wall()
+        let viaSocket = client.rpc(OrcaClient.methods[read]!.0, OrcaClient.methods[read]!.1, timeout: 10)
+        let t1 = Kernel.wall()
+        print("\(read.rawValue): socket \(viaSocket == nil ? "failed" : "ok \(viaSocket!.dumps().utf8.count) B") in \(GuardText.fixed((t1 - t0) * 1000, 1)) ms")
+    }
+    exit(0)
+case "guard-bench":
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let n = args.first.flatMap(Int.init) ?? 20
+    let engine = GuardEngine(.init(home: home, shadow: true, shadowPath: "/tmp/acc-cored-bench-state.json"))
+    _ = engine.start()
+    engine.benchTick()  // warm: host, caches
+    Profile.on = true
+    let t0 = clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID)
+    for _ in 0..<n { engine.benchTick() }
+    let t1 = clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID)
+    print("ticks \(n), process CPU \(GuardText.fixed(Double(t1 - t0) / 1e6 / Double(n), 3)) ms/tick")
+    print(Profile.report(ticks: n))
+    exit(0)
+case "guard":
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? String(cString: getpwuid(getuid())!.pointee.pw_dir)
+    let shadow = value("--shadow", in: args)
+    let seconds = value("--for", in: args).flatMap { Double($0) }
+    let engine = GuardEngine(.init(home: home, shadow: shadow != nil, shadowPath: shadow))
+    Profile.on = args.contains("--profile")
+    guard engine.start() else {
+        print("strażnik już działa")
+        exit(0)
+    }
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGINT, SIG_IGN)
+    let stop = { (code: Int32) in
+        engine.stop()
+        if Profile.on {
+            let cpu = (Double(clock_gettime_nsec_np(CLOCK_PROCESS_CPUTIME_ID)) - Profile.resetAt) / 1e6
+            let ticks = max(engine.ticks - 1, 1)
+            print("ticks after the first \(ticks), handovers \(engine.handovers), process CPU since \(GuardText.fixed(cpu, 1)) ms (\(GuardText.fixed(cpu / Double(ticks), 2)) ms/tick)")
+            print(Profile.report(ticks: ticks))
+        }
+        exit(code)
+    }
+    let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+    term.setEventHandler { stop(0) }
+    term.resume()
+    let int = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    int.setEventHandler { stop(0) }
+    int.resume()
+    if let seconds { DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { stop(0) } }
+    dispatchMain()
 case "-h", "--help", "help":
     print(usage)
 default:
