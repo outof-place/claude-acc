@@ -633,6 +633,13 @@ def synthetic_agent(test, mb):
     return agent, shell, child, table
 
 
+# proces joba (perl pod inną nazwą, jak wyżej) i jego dziecko, które zakłada własną sesję, a z nią grupę
+# procesów (setsid(2), jak os.setsid() w Pythonie); oba wypisują pid i grupę, potem śpią
+GROUPS_PL = ('use POSIX (); $| = 1; my $pid = fork(); '
+             'if ($pid == 0) { POSIX::setsid(); print "child $$ ", getpgrp(), "\\n"; sleep 120; exit 0; } '
+             'print "parent $$ ", getpgrp(), "\\n"; sleep 120;\n')
+
+
 class BrakeOnRealProcessesTest(unittest.TestCase):
     """Hamulec na prawdziwym drzewie: udawany agent, jego powłoka i proces z balastem, który
     ignoruje SIGTERM. Błąd, który łapie: „nie chcą zginąć” przy procesie, który ginie po
@@ -663,6 +670,43 @@ class BrakeOnRealProcessesTest(unittest.TestCase):
         # wiersz rejestru na prawdziwym drzewie: grupa procesów policzona, zanim drzewo zginęło
         (row,) = [r for r in read_events(dg.STATE_DIR) if r["pid"] == child]
         self.assertEqual((row["ev"], row["tree_n"], row["pgid_n"], row["level"]), ("runaway", 1, 1, 3))
+
+    def test_job_tree_with_its_own_session_counts_two_process_groups(self):
+        """B-4: pauza schedulera (SIGSTOP grupy joba) nie sięga potomka, który założył własną sesję, a
+        `pgid_n` w wierszu `kill` mówi, ile grup miało drzewo. Prawdziwe drzewo joba: powłoka joba
+        (własna grupa, jak child_pgid schedulera), jej dziecko w tej grupie i wnuk po setsid(). Pomyłka,
+        którą łapie: grupy liczone po zabiciu drzewa (0) albo jedna grupa na drzewo (1)."""
+        import tempfile
+
+        d = tempfile.mkdtemp(prefix="brake-groups-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", d])
+        worker = os.path.join(d, "worker")
+        os.symlink("/usr/bin/perl", worker)  # /usr/bin/perl to NEVER (^/usr/bin/): hamulec go nie weźmie
+        with open(os.path.join(d, "groups.pl"), "w") as f:
+            f.write(GROUPS_PL)
+        # stderr bez powłoki: `Terminated: 15` po zabiciu dziecka to szum
+        shell = subprocess.Popen(["/bin/sh", "-c", f"{worker} {d}/groups.pl; true"], stdout=subprocess.PIPE,
+                                 stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+                                 start_new_session=True)
+        self.addCleanup(lambda: (subprocess.run(["pkill", "-9", "-f", d]), shell.wait(), shell.stdout.close()))
+        seen = dict(shell.stdout.readline().split(" ", 1) for _ in range(2))
+        parent, parent_group = (int(x) for x in seen["parent"].split())
+        child, child_group = (int(x) for x in seen["child"].split())
+        self.assertEqual((parent_group, child_group), (shell.pid, child))  # dwie grupy naprawdę
+        table = {pid: (ppid, command) for pid, ppid, command in dg.processes() if pid in (shell.pid, parent, child)}
+        job = {"id": "j-groups", "pid": os.getpid(), "child_pgid": shell.pid, "cmd": "./scripts/e2e.sh",
+               "label": "./scripts/e2e.sh", "agent": {}}
+        world = types.SimpleNamespace(table=table, units=[], now=NOW, pressure=types.SimpleNamespace())
+        # próg klasy `job` (1 GB, 1 min) zdjęty: test liczy grupy, a nie wybiera ofiarę po rozmiarze
+        classes = tuple(("job", c[1], None, 0, 2) if c[0] == "job" else c for c in lr.CLASSES)
+        with mock.patch.object(dg, "log", lambda line: None), mock.patch.object(dg, "notify_quiet", mock.Mock()), \
+                mock.patch.object(lr, "sched_jobs", lambda core: [job]), mock.patch.object(lr, "CLASSES", classes):
+            line = lr.reap(world, {}, dg, level=2, cfg={"brake": {"brake_grace_seconds": 1}})
+        self.assertIn("zatrzymany", line)
+        (row,) = [r for r in read_events(dg.STATE_DIR) if r["job"] == "j-groups"]
+        self.assertEqual((row["ev"], row["code"], row["pid"]), ("kill", "job", parent))
+        self.assertEqual((row["tree_n"], row["pgid_n"]), (2, 2))
+        self.assertEqual(shell.wait(timeout=10), 0)  # powłoka joba nietknięta, skończyła sama
 
 
 if __name__ == "__main__":
