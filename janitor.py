@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
     # cache kompilacji Go czyszczony dopiero powyżej tylu GB
     "go_cache_max_gb": 20,
     "go_cache_keep_percent": 60,
+    "go_cache_min_idle_minutes": 90,
     # Xcode DerivedData bez zmian od tylu dni; wspólne cache (XCODE_SHARED_CACHES) zostają
     "derived_data_idle_days": 14,
     # symulatory agentów (pula portivo-mobile) i ich dzierżawy; te same wartości co w devguard.json.
@@ -725,12 +726,16 @@ def task_tmp(sw, _scan):
             sw.remove("tmp", path, tmp_leftover)
 
 
-def trim_oldest(root, keep_bytes, dry_run=False):
-    """Usuwa najdawniej używane wpisy cache Go (podkatalogi 00..ff), aż zostanie keep_bytes.
+def trim_oldest(root, keep_bytes, dry_run=False, min_idle=0):
+    """Usuwa najdawniej używane wpisy cache Go (podkatalogi 00..ff), aż zostanie keep_bytes,
+    ale żadnego używanego w ostatnich min_idle sekundach.
 
-    Go odświeża mtime wpisu przy użyciu (najwyżej raz na godzinę), więc mtime to czas
-    ostatniego użycia. Brak pliku wyjścia przy zachowanym wpisie akcji Go traktuje jak
-    chybienie i buduje ponownie, więc kolejność kasowania niczego nie psuje."""
+    Go odświeża mtime wpisu przy użyciu najwyżej raz na godzinę, więc wpis czytany właśnie
+    teraz może mieć mtime sprzed prawie godziny. Brak pliku wyjścia przy zachowanym wpisie akcji
+    Go traktuje jak chybienie i buduje ponownie, ale golangci-lint czyta export data przez cały
+    bieg i na zniknięciu pliku pada ("could not load export data ... no such file", 2026-10-17),
+    a sam nie jest procesem `go build|test|...`, który task_go_cache rozpoznaje. Stąd podłoga
+    wieku zamiast listy procesów."""
     entries, total = [], 0
     for sub in os.listdir(root):
         path = os.path.join(root, sub)
@@ -745,8 +750,9 @@ def trim_oldest(root, keep_bytes, dry_run=False):
             entries.append((st.st_mtime, st.st_blocks * 512, full))
             total += st.st_blocks * 512
     freed = 0
-    for _mtime, size, full in sorted(entries):
-        if total - freed <= keep_bytes:
+    cutoff = time.time() - min_idle
+    for entry_mtime, size, full in sorted(entries):
+        if total - freed <= keep_bytes or entry_mtime > cutoff:
             break
         if not dry_run:
             try:
@@ -776,7 +782,9 @@ def task_go_cache(sw, _scan):
     # nie całość: `go clean -cache` zmuszał każdego agenta do budowania wszystkiego od zera
     # (10-03 poleciało 87,5 GB naraz); zostaje świeża część, najstarsze wpisy idą
     keep = sw.cfg["go_cache_max_gb"] * GB * sw.cfg["go_cache_keep_percent"] / 100
-    freed = trim_oldest(cache, keep, dry_run=sw.dry_run)
+    freed = trim_oldest(
+        cache, keep, dry_run=sw.dry_run, min_idle=sw.cfg["go_cache_min_idle_minutes"] * 60
+    )
     sw.record("go", "najstarsze wpisy cache kompilacji Go", freed)
 
 

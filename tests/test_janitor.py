@@ -133,6 +133,26 @@ class GoCacheTrimTest(unittest.TestCase):
         self.assertEqual(janitor.trim_oldest(root, keep_bytes=0, dry_run=True), 4 * block)
         self.assertEqual(len([a for a, p in paths if os.path.exists(p)]), 4)
 
+    def test_entries_used_within_min_idle_stay_whatever_the_size(self):
+        # golangci-lint czyta export data z wpisów, których mtime Go odświeża raz na godzinę;
+        # skasowany w trakcie wpis kładzie lint, więc nawet keep_bytes=0 nie schodzi poniżej podłogi
+        import sys
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+        root = tempfile.mkdtemp(prefix="gocache-test-")
+        self.addCleanup(shutil.rmtree, root, True)
+        os.makedirs(os.path.join(root, "0d"))
+        now = time.time()
+        ages = {"used-5m": 300, "used-59m": 3540, "used-2h": 7200, "used-3h": 10800}
+        for name, age in ages.items():
+            path = os.path.join(root, "0d", name)
+            with open(path, "wb") as f:
+                f.write(b"x" * 8192)
+            os.utime(path, (now - age, now - age))
+        janitor.trim_oldest(root, keep_bytes=0, min_idle=90 * 60)
+        self.assertEqual(sorted(os.listdir(os.path.join(root, "0d"))), ["used-59m", "used-5m"])
+        self.assertEqual(janitor.DEFAULT_CONFIG["go_cache_min_idle_minutes"], 90)
+
 
 class NoRealBannerTest(unittest.TestCase):
     """Przebieg z mało miejsca woła atrapę osascript, nigdy prawdziwego: inaczej każdy przebieg
