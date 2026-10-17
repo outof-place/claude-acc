@@ -33,6 +33,7 @@ os.environ["PATH"] = os.pathsep.join(
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SCRIPT = os.path.join(ROOT, "sched.py")
+DEVGUARD = os.path.join(ROOT, "devguard.py")
 
 _spec = importlib.util.spec_from_file_location("acc_sched", SCRIPT)
 S = importlib.util.module_from_spec(_spec)
@@ -115,6 +116,27 @@ def make_repo(root, depot=True, depot_exec=True):
         write(os.path.join(root, "scripts/depot-exec.sh"), FAKE_DEPOT_EXEC, 0o755)
 
 
+def read_events(state_dir):
+    """Wiersze rejestru decyzji ($STATE/events.jsonl) albo []."""
+    path = os.path.join(state_dir, "events.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f]
+
+
+def real_clock():
+    """(ściana, uptime bez snu, identyfikator rozruchu) tej chwili, bez kodu schedulera: CLOCK_UPTIME_RAW i
+    `sysctl -n kern.bootsessionuuid`."""
+    boot = subprocess.run(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], capture_output=True, text=True,
+                          check=True).stdout.strip()
+    return time.time(), time.clock_gettime(time.CLOCK_UPTIME_RAW), boot
+
+
+# skrypt stosu e2e projektu (Portivo: scripts/e2e/stack.sh), którego lekkie podkomendy idą przez plock
+STACK = "scripts/e2e/" + "stack.sh"
+
+
 class Paths(unittest.TestCase):
     """Moduł z wszystkimi ścieżkami w katalogu testu i pamięcią z pliku."""
 
@@ -164,6 +186,18 @@ class Paths(unittest.TestCase):
         j = S.classify(command, self.repo)
         self.assertIsNotNone(j, command)
         return j
+
+    def guard_snapshot(self, stage, reasons, age_s):
+        """Migawka strażnika w devguard-state.json: stopień hamulca z powodami, sprzed `age_s` sekund."""
+        # budżet strażnika na jeden dev serwer: rezerwa na dev serwery jak bez migawki (4 GB)
+        with open(S.DEVGUARD_STATE, "w") as f:
+            json.dump({"snapshot": {"at": time.time() - age_s, "budget": 4 * S.GB, "total": 0,
+                                    "pressure": {"stage": stage, "stage_reasons": reasons, "level": 1}}}, f)
+
+    def assert_guard_view(self, row, stage, reasons, age_s):
+        """Wiersz rejestru niesie stopień hamulca, jego powody i wiek migawki (N1)."""
+        self.assertEqual((row["guard_stage"], row["guard_stage_reasons"]), (stage, reasons), row["ev"])
+        self.assertAlmostEqual(row["guard_age_s"], age_s, delta=3)
 
     def state(self):
         st = S.load_state(self.cfg)
@@ -227,6 +261,52 @@ class ClassifyTest(Paths):
             "cd /tmp && go test ./...",  # bez go.mod
         ):
             self.assertIsNone(S.classify(command, self.repo), command)
+
+    def test_wrapper_flag_table(self):
+        """raport:J:A3, M20: opakowania z flagami (`nice -n 5`, `env -u`, `timeout 300`, nawias
+        podpowłoki) dawały None, więc ciężka komenda szła obok kolejki. Opakowanie, które zmienia
+        znaczenie komendy (limit `timeout`, `env -u/-i/-C`, `command -p`, `exec -a`), daje simple=False:
+        na Depot poszłoby samo `go test` i zgubiło na przykład limit czasu."""
+        pkg = "./internal/money/"
+        shapes = {
+            f"nice -n 5 go test {pkg}": True,
+            f"env -u FOO go test {pkg}": False,
+            f"env -i PATH=/usr/bin go test {pkg}": False,
+            f"command -p go test {pkg}": False,
+            f"time -p go test {pkg}": True,
+            f"time -o /tmp/t go test {pkg}": True,
+            f"timeout 300 go test {pkg}": False,
+            f"timeout -k 10 300 go test {pkg}": False,
+            f"timeout --signal=KILL 5m go test {pkg}": False,
+            f"gtimeout 300 go test {pkg}": False,
+            f"caffeinate -t 600 go test {pkg}": True,
+            f"exec -a x go test {pkg}": False,
+            f"(go test {pkg}) > /tmp/f 2>&1": True,
+            f"rtk proxy nice -n 5 go test {pkg}": True,
+        }
+        for command, simple in shapes.items():
+            job = S.classify(command, self.charter)
+            self.assertIsNotNone(job, command)
+            self.assertEqual(job["class"], "charter-service:test:pkg:internal/money", command)
+            self.assertEqual(job["simple"], simple, command)
+        # env -C: katalog modułu z flagi, komenda z korzenia repo
+        job = S.classify(f"env -C apps/charter-service go test {pkg}", self.repo)
+        self.assertEqual((job["class"], job["simple"]), ("charter-service:test:pkg:internal/money", False))
+        # tylko wypisuje, komenda w napisie, lekki program albo nie praca: dalej None
+        for command in ("command -v go", "env -S 'go test ./...'", "nice -n 5 rg x", "timeout 5 sleep 1"):
+            self.assertIsNone(S.classify(command, self.charter), command)
+
+    def test_subshell_cd_stays_inside_the_parens(self):
+        """`cd` w nawiasie podpowłoki zmienia katalog tylko w nim: człon po nawiasie biegnie z cwd.
+        Po zdjęciu nawiasu `cd apps/auth-service` liczyłby się od apps/charter-service, a `go vet`
+        trafiłby do złego modułu (albo do żadnego)."""
+        job = S.classify(
+            "(cd apps/charter-service && go test ./internal/money/) && cd apps/auth-service && go vet ./...",
+            self.repo,
+        )
+        self.assertEqual(job["class"], "charter-service:test:pkg:internal/money")
+        vet = [p for p in job.get("parts") or [] if p["kind"] == "vet"]
+        self.assertEqual([p["module_dir"] for p in vet], [os.path.join(self.repo, "apps/auth-service")])
 
     def test_argv_forms(self):
         j = S.classify(None, self.charter, argv=["go", "vet", "./..."])
@@ -1944,6 +2024,28 @@ class StateTest(Paths):
                                     "units": units}}, f)
         self.assertEqual(S.devserver_reserve_gb(), 5.0)  # 4 (max_server_gb) + 1
 
+    def test_dead_waiter_reaped_writes_dequeue_event(self):
+        """Wydanie A (A3, N1): czekający, którego wrapper zginął (np. agent przerwał komendę albo jego
+        sesja się skończyła), znikał z kolejki bez śladu; teraz wiersz `dequeue` z przyczyną `reap`,
+        zegarami, powodem czekania i stopniem hamulca z migawki strażnika razem z jej wiekiem."""
+        self.guard_snapshot(2, ["swap 12.0 GB i rośnie"], 4)
+        st = self.state()
+        now = time.time()
+        st["queue"] = [
+            {"id": "j-dead", "pid": 999999, "class": "charter-service:vet:tree", "label": "go vet ./...",
+             "via": "hook", "enqueued_at": now - 30, "reason": {"text": "waiting for 8.3 GB, 2.0 free"}},
+            {"id": "j-live", "pid": os.getpid(), "class": "x", "label": "x", "via": "cli", "enqueued_at": now},
+        ]
+        S.reap(st)
+        self.assertEqual([j["id"] for j in st["queue"]], ["j-live"])
+        rows = read_events(S.STATE_DIR)
+        self.assertEqual([(r["ev"], r["cause"], r["job"]) for r in rows], [("dequeue", "reap", "j-dead")])
+        row = rows[0]
+        self.assertEqual((row["via"], row["class"]), ("hook", "charter-service:vet:tree"))
+        self.assertEqual(row["wait_reason"], "waiting for 8.3 GB, 2.0 free")
+        self.assertAlmostEqual(row["wait_wall_s"], 30, delta=2)
+        self.assert_guard_view(row, 2, ["swap 12.0 GB i rośnie"], 4)
+
     def test_today_rolls_over_and_reap(self):
         st = self.state()
         st["today"]["date"] = "2000-01-01"
@@ -1959,6 +2061,150 @@ class StateTest(Paths):
         S.reap(st)
         self.assertEqual(st["running"], [])
         self.assertIsNotNone(sleeper.wait(timeout=5))  # sierota zabita
+
+
+class SafetyTest(Paths):
+    def test_pause_and_resume_write_events(self):
+        """Wydanie A (A3): pauza i wznowienie schedulera (SIGSTOP i SIGCONT grupy joba) mają wiersze
+        `pause` i `resume`; licznik `today.pauses` zeruje się co dobę, więc bez nich nie da się
+        policzyć pauz z 7 dób (T12). Reguła pauzy bez zmian. Oba wiersze niosą stopień hamulca z
+        migawki strażnika i jej wiek (N1): pauza schedulera przy stopniu 2 to co innego niż przy 0."""
+        self.guard_snapshot(1, ["kompresor 20.0 GB (42% RAM)"], 6)
+        st = self.state()
+        now = time.time()
+        st["running"] = [
+            {"id": "a", "where": "local", "child_pgid": 11111, "started_at": now - 100, "class": "m:vet:tree",
+             "label": "go vet ./...", "via": "hook"},
+            {"id": "b", "where": "local", "child_pgid": 22222, "started_at": now - 50, "class": "m:build:tree",
+             "label": "go build ./...", "via": "plock"},
+        ]
+        st["memory"].update(swap_growth_2m_gb=1.2, level_pct=20, pressure="normal")
+        sent = []
+        with mock.patch.object(os, "killpg", lambda pgid, sig: sent.append((pgid, sig))):
+            S.safety(st, self.cfg)
+            st["memory"].update(swap_growth_2m_gb=0.0, level_pct=40)
+            st["running"][1]["paused_at"] -= 31
+            S.safety(st, self.cfg)
+        self.assertEqual(sent, [(22222, signal.SIGSTOP), (22222, signal.SIGCONT)])
+        rows = read_events(S.STATE_DIR)
+        self.assertEqual([(r["ev"], r["job"]) for r in rows], [("pause", "b"), ("resume", "b")])
+        pause, resume = rows
+        self.assertEqual((pause["reason"], pause["swap_growth_2m_gb"], pause["level_pct"]),
+                         ("swap +1.2 GB in 2 min", 1.2, 20))
+        self.assertEqual((pause["via"], pause["class"], pause["pauses_today"]), ("plock", "m:build:tree", 1))
+        self.assertAlmostEqual(resume["paused_s"], 31, delta=2)
+        for row in rows:
+            self.assert_guard_view(row, 1, ["kompresor 20.0 GB (42% RAM)"], 6)
+
+
+class SleepTest(Paths):
+    """Mac śpi (pokrywa zamknięta), a zegar ścienny idzie dalej. Kolejka liczy czekanie, --timeout,
+    aging i rezerwy uptime'em bez snu (CLOCK_UPTIME_RAW). Pomyłka, którą łapie: 2026-10-13 15:47 trzy
+    joby po pobudce miały po 13 872-14 091 s „czekania” ściany (M19): --timeout odpalał od razu kodem
+    75, a aging i „sam na Macu” wpuszczały wszystko naraz."""
+
+    JUMP = 13512.0
+
+    def wait_queued(self, jid, timeout=10):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                with open(S.STATE_PATH) as f:
+                    if any(j["id"] == jid for j in json.load(f)["queue"]):
+                        return
+            except (OSError, ValueError, KeyError):
+                pass
+            time.sleep(0.05)
+        self.fail("job nie stanął w kolejce")
+
+    def run_through_jump(self):
+        """Job (opaque, 8 GB) czeka przy 0,96 GB; po kilku obrotach ściana skacze o 13 512 s, a uptime
+        nie (sen), potem jeszcze kilka obrotów. Zwraca kod, wpis w kolejce po pobudce i rejestr."""
+        self.set_memory(2)
+        argv = ["./scripts/heavy.sh"]
+        job = S.opaque_job(argv, self.repo)
+        real, jump, out = time.time, [0.0], {}
+        with mock.patch.object(time, "time", lambda: real() + jump[0]), contextlib.redirect_stderr(io.StringIO()):
+            entry = S.new_entry(job, None, argv, {"via": "plock"})
+            opts = {"timeout": "1800", "via": "plock"}
+            worker = threading.Thread(target=lambda: out.setdefault(
+                "rc", S.schedule(entry, job, None, argv, opts, self.cfg, [], {})))
+            worker.start()
+            self.wait_queued(entry["id"])
+            time.sleep(1.2)
+            jump[0] = self.JUMP
+            time.sleep(2.0)
+            with S.Locked():
+                st = S.load_state(self.cfg)
+                out["queued"] = next((dict(j) for j in st["queue"] if j["id"] == entry["id"]), None)
+                out["running"] = [j["id"] for j in st["running"]]
+                for j in st["queue"]:
+                    j["cancelled"] = time.time()
+                S.save_state(st)
+            worker.join(15)
+        out["events"] = read_events(S.STATE_DIR)
+        return out
+
+    def test_wall_jump_is_not_waiting(self):
+        out = self.run_through_jump()
+        # dziś: po pobudce 13 5xx s „czekania”, --timeout 1800 odpala, kod 75
+        self.assertIsNotNone(out["queued"], f"job zdjęty z kolejki po pobudce, kod {out.get('rc')}")
+        self.assertLess(out["queued"]["waited_s"], 60)
+        self.assertEqual(out["running"], [])  # ani aging, ani „sam na Macu po 30 s czekania”
+        self.assertEqual(out["rc"], S.EXIT_CANCELLED)
+
+    def test_wall_jump_writes_wake_event(self):
+        out = self.run_through_jump()
+        wakes = [r for r in out["events"] if r["ev"] == "wake"]
+        self.assertEqual(len(wakes), 1, out["events"])
+        self.assertAlmostEqual(wakes[0]["slept_s"], self.JUMP, delta=5)
+
+    def test_uptime_is_system_wide_across_interpreters(self):
+        """Plock uruchamia sched.py pod /usr/bin/python3 3.9.6, hak pod Pythonem z $STATE, a oba
+        piszą ten sam state.json. time.monotonic() na 3.9.6 liczy od startu procesu (M1: 0,02 s przy
+        uptime 93 085 s), więc dziecko 3.9.6 wypadłoby poza przedział rodzica."""
+        code = ("import sys\nfrom importlib.machinery import SourceFileLoader\n"
+                "m = type(sys)('acc_sched'); m.__file__ = sys.argv[1]\n"
+                "SourceFileLoader('acc_sched', sys.argv[1]).exec_module(m)\n"
+                "c = m.clock_now(); print(c['up'], c['boot'], sys.version.split()[0])\n")
+        before = S.clock_now()
+        out = subprocess.run(["/usr/bin/python3", "-I", "-c", code, SCRIPT], capture_output=True, text=True,
+                             check=True).stdout.split()
+        after = S.clock_now()
+        child_up, child_boot, version = float(out[0]), out[1], out[2]
+        self.assertTrue(version.startswith("3.9"), version)
+        self.assertLessEqual(before["up"], child_up)
+        self.assertLessEqual(child_up, after["up"])
+        self.assertLess(after["up"] - before["up"], 5)
+        self.assertEqual(child_boot, before["boot"])
+        self.assertEqual(before["boot"], real_clock()[2])
+
+    def test_entry_from_before_install_uses_wall(self):
+        """Wpis bez `enqueued_up` (sprzed instalacji) albo z innym `boot` (sprzed restartu) liczy się
+        po ścianie jak dotąd; wpis z tego rozruchu po uptime, choć jego ściana mówi 13 572 s."""
+        ts, up, boot = real_clock()
+        st = self.state()
+
+        def queued(jid, **extra):
+            return dict({"id": jid, "label": jid, "mem_predicted_gb": 1.0, "route": {"choice": "local"}}, **extra)
+
+        # coś biegnie lokalnie: głowa nie startuje „sama na Macu”
+        st["running"] = [{"id": "r", "where": "local", "label": "r", "mem_now_gb": 1.0, "mem_predicted_gb": 1.0,
+                          "predicted_wall_s": 600, "started_at": ts - 10}]
+        st["queue"] = [
+            queued("head", mem_predicted_gb=60.0, enqueued_at=ts - 20000),
+            queued("legacy", enqueued_at=ts - 400),
+            queued("reboot", enqueued_at=ts - 500, enqueued_up=up - 20, boot="00000000-0000-0000-0000-000000000000"),
+            queued("slept", enqueued_at=ts - 13572, enqueued_up=up - 60, boot=boot),
+        ]
+        S.update_queue_view(st, self.cfg)
+        waited = {j["id"]: j["waited_s"] for j in st["queue"]}
+        self.assertAlmostEqual(waited["legacy"], 400, delta=2)
+        self.assertAlmostEqual(waited["reboot"], 500, delta=2)
+        self.assertAlmostEqual(waited["slept"], 60, delta=2)
+        # aging (300 s) za głową, która się nie mieści: wpis sprzed instalacji tak, przespany nie
+        admitted = S.plan(st, self.cfg, ts, clock=S.clock_now())
+        self.assertEqual(admitted, {"legacy": ("overtake", "head"), "reboot": ("overtake", "head")})
 
 
 FAKE_DEPOT_API = r"""#!%s
@@ -2359,6 +2605,186 @@ class RunTest(unittest.TestCase):
         self.assertIn("timeout", err)
         self.assertEqual(self.state()["queue"], [])
         self.done(first)
+
+    def events(self):
+        return read_events(os.path.join(self.home, ".local/share/claude-acc"))
+
+    def test_queue_timeout_writes_dequeue_event(self):
+        """Wydanie A (A3, A4): zdjęcie z kolejki (timeout, cancel) ma wiersz `dequeue` z czekaniem
+        po uptime i po ścianie i ze stopniem hamulca z migawki strażnika razem z jej wiekiem (N1).
+        Obalenie A4: `dequeue` z przyczyną `timeout` i `wait_up_s` krótszym od --timeout znaczyłoby,
+        że kolejka liczy sen jako czekanie."""
+        state_dir = os.path.join(self.home, ".local/share/claude-acc")
+        os.makedirs(state_dir, exist_ok=True)
+        # budżet strażnika na jeden dev serwer: rezerwa na dev serwery jak bez migawki (4 GB), więc drugi
+        # `go vet` dalej czeka
+        with open(os.path.join(state_dir, "devguard-state.json"), "w") as f:
+            json.dump({"snapshot": {"at": time.time() - 4, "budget": 4 * 1024**3, "total": 0, "pressure": {
+                "stage": 1, "stage_reasons": ["kompresor 20.0 GB (42% RAM)"], "level": 1}}}, f)
+        first = self.start("cd apps/charter-service && go vet ./...", sleep="5")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        late = self.start("cd apps/charter-service && go vet ./...", via="hook", extra=("--timeout", "1"))
+        self.assertEqual(self.done(late)[0], 75)
+        rows = [r for r in self.events() if r["ev"] == "dequeue"]
+        self.assertEqual([(r["cause"], r["via"], r["timeout"]) for r in rows], [("timeout", "hook", 1.0)])
+        row = rows[0]
+        self.assertGreaterEqual(row["wait_up_s"], 1.0)
+        self.assertLess(row["wait_up_s"], 5)
+        self.assertAlmostEqual(row["wait_wall_s"], row["wait_up_s"], delta=0.5)
+        self.assertEqual(row["class"], "charter-service:vet:tree")
+        self.assertIn("waiting for", row["wait_reason"])
+        # cancel: ten sam wiersz z przyczyną `cancel`
+        queued = self.start("cd apps/charter-service && go vet ./...")
+        self.wait_for(lambda: len(self.state()["queue"]) == 1)
+        jid = self.state()["queue"][0]["id"]
+        self.assertEqual(self.cancel(jid)[0], 0)
+        self.assertEqual(self.done(queued)[0], 130)
+        rows = [r for r in self.events() if r["ev"] == "dequeue"]
+        self.assertEqual([(r["cause"], r["job"]) for r in rows[1:]], [("cancel", jid)])
+        for row in rows:
+            self.assertEqual((row["guard_stage"], row["guard_stage_reasons"]), (1, ["kompresor 20.0 GB (42% RAM)"]))
+            self.assertGreaterEqual(row["guard_age_s"], 4)
+            self.assertLess(row["guard_age_s"], 30)
+        self.done(first)
+
+    def hooked(self, event, *flags, **env):
+        """Wyjście prawdziwego haka `devguard.py admit` (z `flags`, np. --codex) na tym HOME, ze
+        zdarzeniem JSON na stdin; PATH bez rtk, więc komenda w środku opakowania zostaje bez jego
+        przepisania. Opakowanie woła sched.py z $STATE, jak po instalacji: tu dowiązanie do tego z repo."""
+        installed = os.path.join(self.home, ".local/share/claude-acc/sched.py")
+        if not os.path.exists(installed):
+            os.makedirs(os.path.dirname(installed), exist_ok=True)
+            os.symlink(SCRIPT, installed)
+        done = subprocess.run(["/usr/bin/python3", DEVGUARD, "admit", *flags], input=json.dumps(event),
+                              env=dict(self.env, PATH=self.bin + os.pathsep + "/usr/bin:/bin", **env),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout)["hookSpecificOutput"]
+
+    def run_hooked(self, command):
+        """Owinięta komenda tak, jak uruchamia ją narzędzie powłoki agenta: zsh -c w katalogu zdarzenia."""
+        p = subprocess.Popen(["/bin/zsh", "-c", command], cwd=self.repo, env=dict(self.env, FAKE_GO_SLEEP="0.3"),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.procs.append(p)
+        return p
+
+    def test_hook_command_outwaits_its_bash_limit_in_the_queue(self):
+        """Claude Code 2.1.302 nie zabija komendy po limicie narzędzia Bash, tylko przenosi ją w tło
+        (schemat: `timedOutAfterMs` "Set when the command hit its timeout and was auto-backgrounded";
+        sonda: `time.sleep(6)` przy timeout 2000 skończyła się w tle kodem 0). Kolejka, która kończyła
+        się kodem 75 o 15 s przed tym limitem (507fce6), odbierała czekającemu miejsce w kolejce i
+        aging. Komenda z haka czeka więc, ile trzeba; limit Basha idzie tylko do wierszy rejestru
+        (`bash_limit_s`): ile z czekania agent miał na pierwszym planie."""
+        first = self.start("cd apps/charter-service && go vet ./...", sleep="5")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        out = self.hooked({"tool_name": "Bash", "session_id": "s-hook", "cwd": self.repo,
+                           "tool_input": {"command": "cd apps/charter-service && go vet ./...", "timeout": 2000}})
+        self.assertEqual(out["updatedInput"]["timeout"], 2000)  # limit narzędzia zostaje agenta
+        rc, _, err = self.done(self.run_hooked(out["updatedInput"]["command"]))
+        self.assertEqual(rc, 0, err)  # nie 75: kolejka nie poddaje się przed limitem Basha
+        self.assertEqual(self.done(first)[0], 0)
+        (row,) = [r for r in self.history() if r.get("via") == "hook"]
+        self.assertGreater(row["up_wait_s"], 2.0)  # czekał dłużej niż limit Basha
+        (admit,) = [r for r in self.events() if r["ev"] == "admit" and r["via"] == "hook"]
+        self.assertEqual(admit["bash_limit_s"], 2.0)
+        self.assertGreater(admit["wait_up_s"], admit["bash_limit_s"])
+        self.assertEqual([r for r in self.events() if r["ev"] == "dequeue"], [])
+
+    def test_codex_command_outwaits_the_default_bash_limit(self):
+        """Codex 0.159 (`devguard.py admit --codex`) nie podaje `timeout` wcale, więc 507fce6 dawało jego
+        komendzie domyślne 120 s Basha minus 15 i po 105 s w kolejce kod 75. Tu BASH_DEFAULT_TIMEOUT_MS
+        16000 skraca ten domyślny limit do 1 s kolejki (bez tego test czekałby 105 s). Komenda czeka i
+        biegnie, a wiersz `admit` nie ma limitu Basha: narzędzie powłoki Codeksa go nie ma."""
+        first = self.start("cd apps/charter-service && go vet ./...", sleep="5")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        out = self.hooked({"tool_name": "shell", "session_id": "s-codex", "cwd": self.repo,
+                           "tool_input": {"command": ["bash", "-lc", "cd apps/charter-service && go vet ./..."]}},
+                          "--codex", BASH_DEFAULT_TIMEOUT_MS="16000")
+        self.assertEqual(out["permissionDecision"], "allow")
+        rc, _, err = self.done(self.run_hooked(out["updatedInput"]["command"]))
+        self.assertEqual(rc, 0, err)  # nie 75 po domyślnym limicie Basha
+        self.assertEqual(self.done(first)[0], 0)
+        (row,) = [r for r in self.history() if r.get("via") == "hook"]
+        self.assertGreater(row["up_wait_s"], 1.0)
+        (admit,) = [r for r in self.events() if r["ev"] == "admit" and r["via"] == "hook"]
+        self.assertIsNone(admit["bash_limit_s"])
+        self.assertEqual([r for r in self.events() if r["ev"] == "dequeue"], [])
+
+    def test_history_row_has_via_and_wait_reason(self):
+        """Wydanie A (A3): wiersz historii mówi, którędy job przyszedł (hook, plock, cli), na co
+        czekał i ile czekał i biegł bez snu Maca (T3: 0 z 23 165 wierszy miało `via`)."""
+        first = self.start("cd apps/charter-service && go vet ./...", sleep="2.5")
+        self.wait_for(lambda: len(self.state()["running"]) == 1)
+        second = self.start("cd apps/charter-service && go vet ./...", via="hook", sleep="0.3")
+        for p in (first, second):
+            self.assertEqual(self.done(p)[0], 0)
+        _, _, boot = real_clock()
+        rows = self.history()
+        self.assertEqual([r.get("via") for r in rows], ["cli", "hook"])
+        fast, waited = rows
+        self.assertIsNone(fast["wait_reason"])  # wpuszczony od razu, bez czekania
+        self.assertIn("waiting for 8.3 GB", waited["wait_reason"])
+        self.assertGreater(waited["up_wait_s"], 1.0)
+        self.assertAlmostEqual(waited["up_wait_s"], waited["wait_s"], delta=0.5)
+        self.assertAlmostEqual(waited["up_wall_s"], waited["wall_s"], delta=0.5)
+        self.assertEqual((fast["boot"], waited["boot"]), (boot, boot))
+
+    def test_admit_event_has_via_and_guard_stage(self):
+        """Wydanie A (A3, N1): każde wpuszczenie ma wiersz `admit` z drogą, sposobem, prognozą,
+        pamięcią i stopniem hamulca z migawki strażnika razem z jej wiekiem (scheduler stopnia sam
+        nie liczy). Bez niego G-B4 nie ma par `admit` przy stopniu 2 i `stage` 3 po nich."""
+        state_dir = os.path.join(self.home, ".local/share/claude-acc")
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, "devguard-state.json"), "w") as f:
+            json.dump({"snapshot": {"at": time.time(), "pressure": {
+                "stage": 1, "stage_reasons": ["kompresor 20.0 GB (42% RAM)"], "level": 1}}}, f)
+        rc, _, err = self.done(self.start("cd apps/charter-service && go test ./internal/moneyfmt/", via="plock"))
+        self.assertEqual(rc, 0, err)
+        rows = [r for r in self.events() if r["ev"] == "admit"]
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        hist = self.history()[-1]
+        self.assertEqual((row["job"], row["class"], row["via"], row["how"]),
+                         (hist["id"], hist["class"], "plock", "fits"))
+        self.assertEqual((row["guard_stage"], row["guard_stage_reasons"]), (1, ["kompresor 20.0 GB (42% RAM)"]))
+        self.assertLess(row["guard_age_s"], 30)
+        self.assertEqual((row["where"], row["route_text"], row["simple"]), ("local", "local, fits", True))
+        self.assertGreater(row["available_gb"], 20)
+        for key in ("predicted_gb", "predicted_from", "free_for_admission_gb", "wait_up_s", "wait_wall_s",
+                    "wait_reason", "depot_blocker", "ts", "up", "boot"):
+            self.assertIn(key, row)
+
+    def test_plock_light_subcommand_skips_the_queue(self):
+        """T11, M3, M4: plock owija cały skrypt (`stack.sh down`), classify nie widzi w nim pracy, więc
+        lekka podkomenda czekała jako opaque_job z priorem 8 GB (10-05..10-17: `down` 57 razy, 0,73 h;
+        `env` 33 razy, 0,75 h; szczyt najwyżej 0,03 GB). Teraz biegnie od razu, bez kolejki i historii;
+        `up` i `reset` (szczyt 0,85 GB) dalej czekają."""
+        stack = STACK
+        write(os.path.join(self.repo, stack), '#!/bin/sh\necho "stack $1"\n', 0o755)
+        self.set_memory(2)  # 0,96 GB dostępne: 8 GB nie mieści się nawet na pustym Macu
+
+        def plock(*argv, timeout="5"):
+            p = subprocess.Popen(["/usr/bin/python3", SCRIPT, "run", "--via", "plock", "--timeout", timeout, "--", *argv],
+                                 cwd=self.repo, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.procs.append(p)
+            return p
+
+        for argv in (
+            [stack, "down"],
+            ["bash", stack, "status"],
+            ["env", "E2E_STACK_OFFSET=3", "bash", stack, "env"],
+            ["env", "E2E_GO_WRAPPER=x", "E2E_STACK_OFFSET=3", "bash", stack, "down"],
+        ):
+            began = time.time()
+            rc, out, err = self.done(plock(*argv))
+            self.assertEqual((rc, out.strip()), (0, f"stack {argv[-1]}"), (argv, err))
+            self.assertLess(time.time() - began, 3, argv)
+        self.assertEqual(self.history(), [])
+        state = os.path.join(self.sched_dir, "state.json")
+        self.assertFalse(os.path.exists(state) and self.state()["queue"])
+        for sub in ("up", "reset"):
+            rc, _, err = self.done(plock("bash", stack, sub, timeout="1"))
+            self.assertEqual(rc, 75, (sub, err))
 
     def cancel(self, *args):
         done = subprocess.run(

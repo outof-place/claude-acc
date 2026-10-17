@@ -398,6 +398,9 @@ def admit_codex(raw):
         command = command[2] if len(command) == 3 and command[1] in ("-c", "-lc") else shlex.join(command)
     event["tool_name"] = "Bash"
     event["tool_input"] = dict(tool_input, command=command)
+    # narzędzie powłoki Codeksa nie ma limitu Basha Claude Code: sched.hook_rewrite go nie zapisze
+    # (sched.CODEX_EVENT_KEY; sched.py wczytuje się dopiero w sched_rewrite, więc tu jego wartość)
+    event["claude_acc_codex"] = True
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         admit(json.dumps(event))

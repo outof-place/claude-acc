@@ -3,7 +3,7 @@
 zamka na wszystko. Natywne to buildy iOS i Androida (xcodebuild, expo run, eas build --local,
 gradle, pod install) i start symulatora; jeden taki build to 6-12 GB, więc czeka jak ciężki Go.
 
-  sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli]
+  sched.py run [--timeout S] [--session ID] [--agent NAME] [--via hook|plock|cli] [--bash-limit S]
                (--shell 'KOMENDA' | -- ARGV...)
   sched.py status [--json]
   sched.py cancel <job-id|pane> [--queued] [--kill] [--json]
@@ -212,6 +212,95 @@ def load_config():
     except (OSError, ValueError):
         pass
     return cfg
+
+
+# ---------- zegar bez snu i rejestr decyzji (events.py) ----------
+
+# events.py obok tego pliku ładuje się przy pierwszym zegarze albo wierszu: hook (hook_rewrite) go nie
+# potrzebuje, a sched.py wczytany sam, bez sąsiadów, działa dalej, tylko po ścianie i bez rejestru
+_events = types.SimpleNamespace(module=None)
+# ściana poszła o tyle dalej niż uptime między obrotami kolejki: Mac spał (wiersz `wake`, pomiar pod
+# B6, bez reakcji)
+WAKE_GAP_S = 60
+
+
+def events_module():
+    """events.py obok tego pliku albo None."""
+    if _events.module is None:
+        try:
+            import events
+
+            _events.module = events
+        except ImportError:
+            _events.module = False
+    return _events.module or None
+
+
+def clock_now():
+    """Zegary tej chwili {"ts": ściana, "up": uptime bez snu, "boot": identyfikator rozruchu} (events.now).
+    Uptime to CLOCK_UPTIME_RAW, wspólny dla plocka (/usr/bin/python3 3.9.6) i haka (Python z $STATE):
+    time.monotonic() na 3.9.6 liczy od startu procesu. Bez events.py sama ściana."""
+    module = events_module()
+    return module.now() if module else {"ts": time.time(), "up": None, "boot": None}
+
+
+def elapsed(at, up, boot, now, clock=None):
+    """Sekundy od chwili zapisanej jako (ściana `at`, uptime `up`, rozruch `boot`) do teraz bez snu
+    Maca: po uptime, gdy obie chwile mają uptime z tego samego rozruchu, inaczej po ścianie (`now -
+    at`), jak przed wydaniem A: wpis sprzed instalacji, sprzed restartu albo wywołanie bez zegara."""
+    if clock and up is not None and boot is not None and clock.get("up") is not None and clock.get("boot") == boot:
+        return clock["up"] - up
+    return now - (at or now)
+
+
+def since(job, what, now, clock=None):
+    """Sekundy od `what` wpisu ("enqueued", "started", "routed") bez snu: pola `{what}_at`,
+    `{what}_up` i `boot` (elapsed)."""
+    return elapsed(job.get(what + "_at"), job.get(what + "_up"), job.get("boot"), now, clock)
+
+
+def record(ev, *parts, **fields):
+    """Wiersz rejestru decyzji ($STATE/events.jsonl): pola z kolejnych słowników `parts`, potem `fields`.
+    Bez events.py nic; nigdy nie rzuca (events.append)."""
+    module = events_module()
+    if module:
+        row = {}
+        for part in parts:
+            row.update(part)
+        row.update(fields)
+        module.append(STATE_DIR, ev, **row)
+
+
+def job_fields(job):
+    """Kto: id, klasa, droga (hook, plock, cli) i etykieta wpisu."""
+    return {"job": job.get("id"), "class": job.get("class"), "via": job.get("via"),
+            "label": (job.get("label") or "")[:200]}
+
+
+def wait_fields(job, clock):
+    """Ile i na co wpis czekał: bez snu (`wait_up_s`; wpis sprzed wydania A: po ścianie), po ścianie,
+    ostatni powód z widoku kolejki i limit narzędzia Bash komendy z haka (`bash_limit_s`, null poza
+    hakiem Claude Code): `wait_up_s` ponad nim to komenda przeniesiona w tło jeszcze w kolejce."""
+    return {
+        "wait_up_s": round(since(job, "enqueued", clock["ts"], clock), 1),
+        "wait_wall_s": round(clock["ts"] - (job.get("enqueued_at") or clock["ts"]), 1),
+        "wait_reason": (job.get("reason") or {}).get("text"),
+        "bash_limit_s": job.get("bash_limit_s"),
+    }
+
+
+def note_clock(state, clock):
+    """Zegar obrotu kolejki w stanie ([ściana, uptime, rozruch]); gdy od poprzedniego obrotu ściana
+    poszła o ponad WAKE_GAP_S dalej niż uptime, Mac spał między nimi: wiersz `wake` z czasem snu."""
+    if clock.get("up") is None:
+        return
+    prev = state.get("clock")
+    state["clock"] = [clock["ts"], clock["up"], clock["boot"]]
+    if isinstance(prev, list) and len(prev) == 3 and prev[2] == clock["boot"]:
+        slept = (clock["ts"] - prev[0]) - (clock["up"] - prev[1])
+        if slept > WAKE_GAP_S:
+            record("wake", slept_s=round(slept, 1), since_ts=prev[0], queued=len(state.get("queue") or []),
+                   running=len(state.get("running") or []))
 
 
 # ---------- pamięć i procesy (ctypes, bez importu perf.py: hook musi być szybki) ----------
@@ -624,7 +713,31 @@ STAGE_TEXT = ("normal", "tight", "brake", "emergency")
 
 # ---------- klasyfikacja komendy ----------
 
-WRAPPERS = {"rtk", "time", "nice", "env", "caffeinate", "command", "exec", "nohup"}
+# opakowania komendy i ich flagi (man env, nice, time, caffeinate na macOS; GNU timeout z Homebrew).
+# plain: flagi bez argumentu; valued: z argumentem (także --flaga=wartość); positional: słowa przed
+# komendą (czas `timeout`); changes: flagi, które zmieniają znaczenie komendy (True: samo opakowanie),
+# więc na Depot poszłoby co innego (simple=False); none: flagi, po których nie ma komendy do
+# wpuszczenia (`env -S 'go test'` trzyma ją w napisie, `command -v` tylko wypisuje). Nieznana flaga to
+# jedno słowo, jak dotąd. `rtk proxy` zdejmuje strip_prefix osobno
+TIMEOUT_FLAGS = {
+    "plain": ("-f", "-p", "-v", "--foreground", "--preserve-status", "--verbose"),
+    "valued": ("-k", "-s", "--kill-after", "--signal"),
+    "positional": 1,
+    "changes": True,  # limit czasu i sygnał zostałyby na tym Macu
+}
+WRAPPER_FLAGS = {
+    "time": {"plain": ("-a", "-l", "-h", "-p"), "valued": ("-o",)},
+    "nice": {"valued": ("-n",)},
+    "env": {"plain": ("-0", "-i", "-v", "-"), "valued": ("-u", "-P", "-C"), "changes": ("-i", "-u", "-C", "-"),
+            "none": ("-S",)},
+    "command": {"plain": ("-p",), "changes": ("-p",), "none": ("-v", "-V")},
+    "exec": {"plain": ("-c", "-l"), "valued": ("-a",), "changes": ("-c", "-l", "-a")},
+    "nohup": {},
+    "caffeinate": {"plain": ("-d", "-i", "-m", "-s", "-u"), "valued": ("-t", "-w")},
+    "timeout": TIMEOUT_FLAGS,
+    "gtimeout": TIMEOUT_FLAGS,
+}  # fmt: skip
+WRAPPERS = {"rtk", *WRAPPER_FLAGS}
 GO_VERBS = {"build", "test", "vet", "run", "install", "generate"}
 # "acc.py' sched": ta sama komenda, gdy katalog domowy ma spację, a ścieżka idzie w cudzysłowie
 SKIP_MARKERS = (
@@ -667,8 +780,11 @@ def split_segments(command):
 
 
 def strip_prefix(words):
-    """Zdejmuje przypisania VAR=wartość i opakowania (rtk proxy, time, env, nice)."""
-    env = {}
+    """Zdejmuje przypisania VAR=wartość i opakowania z WRAPPER_FLAGS (rtk proxy, time, nice, env,
+    timeout, ...) razem z ich flagami: (env, słowa komendy, opakowanie). Opakowanie to {"dir": katalog
+    z `env -C` albo None, "changes": opakowanie zmienia znaczenie komendy}. Komenda w napisie
+    (`env -S`) albo tylko wypisana (`command -v`) daje puste słowa: nie ma w niej pracy."""
+    env, wrap = {}, {"dir": None, "changes": False}
     i = 0
     while i < len(words):
         w = words[i]
@@ -678,19 +794,61 @@ def strip_prefix(words):
             i += 1
             continue
         base = os.path.basename(w)
-        if base in WRAPPERS:
-            i += 1
-            if base == "rtk" and i < len(words) and words[i] == "proxy":
-                i += 1
-            while (
-                base in ("nice", "caffeinate", "env")
-                and i < len(words)
-                and words[i].startswith("-")
-            ):
+        if base not in WRAPPERS:
+            break
+        i += 1
+        if base == "rtk":
+            if i < len(words) and words[i] == "proxy":
                 i += 1
             continue
-        break
-    return env, words[i:]
+        spec = WRAPPER_FLAGS[base]
+        changing = spec.get("changes") or ()
+        if changing is True:
+            wrap["changes"], changing = True, ()
+        while i < len(words) and words[i].startswith("-"):
+            flag, eq, value = words[i].partition("=")
+            i += 1
+            if flag == "--":
+                break
+            if flag in spec.get("none", ()):
+                return env, [], wrap
+            if flag in spec.get("valued", ()) and not eq:
+                value = words[i] if i < len(words) else ""
+                i += 1
+            if base == "env" and flag == "-C":
+                wrap["dir"] = value
+            if flag in changing:
+                wrap["changes"] = True
+        i += spec.get("positional", 0)
+    return env, words[i:], wrap
+
+
+def unwrap_subshell(command):
+    """Jeden poziom nawiasu podpowłoki na początku komendy: (komenda bez nawiasu, wnętrze nawiasu albo
+    None). `(cd x && go test ./...) > f 2>&1` to dla klasyfikacji `cd x && go test ./...  > f 2>&1`
+    z wnętrzem `cd x && go test ./...`. Arytmetyka `((...))` i komenda bez nawiasu bez zmian;
+    cudzysłowy i znaki po \\ nie liczą się do nawiasów."""
+    text = command.lstrip()
+    if not text.startswith("(") or text.startswith("(("):
+        return command, None
+    depth, quote, i = 0, None, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[1:i] + " " + text[i + 1 :], text[1:i]
+        i += 1
+    return command, None
 
 
 def find_up(path, marker, stop_at_git=False):
@@ -1212,7 +1370,9 @@ GENERIC_NEVER = re.compile(
     r"|(serve|server|watch|daemon)$"
 )
 # podkomendy skryptu, które tylko pytają albo sprzątają (`stack.sh status`, `cli.js help`)
-LIGHT_SUBCOMMANDS = re.compile(r"^(status|stop|down|kill|ps|ls|list|help|version|show|whoami|info)$")
+# (`env`: `stack.sh env` wypisuje zmienne stosu, 33 biegi przez plock, szczyt najwyżej 0,03 GB, M3; `reset`
+# nie: 0,85 GB szczytu, ponad LIGHT_PRIOR)
+LIGHT_SUBCOMMANDS = re.compile(r"^(status|stop|down|kill|ps|ls|list|help|version|show|whoami|info|env)$")
 # programy po pełnej ścieżce spoza projektu: systemowe, z Homebrew, aplikacje; tę samą listę ma
 # bramka hooka (devguard.HOOK_GATE)
 SYSTEM_PATHS = ("/usr/", "/bin/", "/sbin/", "/System/", "/opt/homebrew/", "/Library/", "/Applications/")
@@ -1495,21 +1655,28 @@ def classify(command, cwd, argv=None):
             return classify(argv[2], cwd)
         segments = [(list(argv), "")]
         command = " ".join(shlex.quote(a) for a in argv)
+        scoped = None
     else:
         if any(m in command for m in SKIP_MARKERS):
             return None
-        segments = split_segments(command)
+        text, inner = unwrap_subshell(command)
+        segments = split_segments(text)
         if segments is None:
             return None
+        # człony wnętrza nawiasu idą pierwsze; `cd` w nim działa tylko w podpowłoce, więc od członu
+        # po nawiasie katalog wraca do cwd
+        scoped = len(split_segments(inner) or ()) if inner is not None else None
     here = cwd
     found, nested = [], []
     cfg = load_config()
     node_on, native_on = bool(cfg.get("node", True)), bool(cfg.get("native", True))
     generic_on = bool(cfg.get("generic", True))
-    for words, _sep in segments:
+    for n, (words, _sep) in enumerate(segments):
+        if n == scoped:
+            here = cwd
         if not words:
             continue
-        env, words = strip_prefix(words)
+        env, words, wrap = strip_prefix(words)
         if not words:
             continue
         prog = os.path.basename(words[0])
@@ -1517,8 +1684,10 @@ def classify(command, cwd, argv=None):
         if prog == "cd" and len(words) >= 2:
             here = os.path.normpath(os.path.join(here, os.path.expanduser(words[1])))
             continue
+        # `env -C dir` zmienia katalog tylko tej komendy, nie następnych członów
+        at = os.path.normpath(os.path.join(here, os.path.expanduser(wrap["dir"]))) if wrap["dir"] else here
         if prog in ("bash", "sh", "zsh") and len(words) >= 3 and words[1] == "-c":
-            inner = classify(words[2], here)
+            inner = classify(words[2], at)
             if inner:
                 nested.append(inner)
             continue
@@ -1526,19 +1695,19 @@ def classify(command, cwd, argv=None):
             parsed = parse_go(words)
             if parsed:
                 verb, flags, pkgs, cdir = parsed
-                d = os.path.normpath(os.path.join(here, cdir)) if cdir else here
+                d = os.path.normpath(os.path.join(at, cdir)) if cdir else at
                 job = {"kind": verb, "flags": flags, "pkgs": pkgs, "dir": d}
         elif prog == "golangci-lint" and len(words) > 1 and words[1] == "run":
-            job = {"kind": "lint", "flags": {}, "pkgs": [], "dir": here}
+            job = {"kind": "lint", "flags": {}, "pkgs": [], "dir": at}
             for w in words[2:]:
                 m = re.match(r"--concurrency[= ]?(\d+)$", w)
                 if m:
                     job["flags"]["-p"] = m.group(1)
         elif prog == "make":
-            d, targets, k = here, [], 1
+            d, targets, k = at, [], 1
             while k < len(words):
                 if words[k] == "-C" and k + 1 < len(words):
-                    d = os.path.normpath(os.path.join(here, words[k + 1]))
+                    d = os.path.normpath(os.path.join(at, words[k + 1]))
                     k += 2
                     continue
                 if not words[k].startswith("-") and "=" not in words[k]:
@@ -1557,14 +1726,14 @@ def classify(command, cwd, argv=None):
                 "kind": "vet",
                 "flags": {},
                 "pkgs": [w for w in words[1:] if not w.startswith("-")],
-                "dir": here,
+                "dir": at,
             }
         else:
-            job = parse_native(words, here) if native_on else None
+            job = parse_native(words, at) if native_on else None
             if job is None and node_on:
-                job = parse_node(words, here)
+                job = parse_node(words, at)
         if job is None and generic_on and prog not in ("go", "golangci-lint", "govulncheck"):
-            job = parse_generic(words, here)
+            job = parse_generic(words, at)
             if job and job["kind"] == "script" and not heavy_sig(job["sig"]):
                 job = None  # skrypt, program projektu albo cel make bez czasownika pracy: od razu
             if job:
@@ -1596,9 +1765,13 @@ def classify(command, cwd, argv=None):
 
 
 def simple_command(segments):
-    """Sama praca Go (z cd, rtk proxy, ogonem | tail): tylko taką da się wysłać na Depot jako argv."""
+    """Sama praca Go (z cd, rtk proxy, ogonem | tail): tylko taką da się wysłać na Depot jako argv.
+    Opakowanie, które zmienia znaczenie komendy (timeout, env -i/-u/-C, command -p, exec z flagą),
+    zostałoby na tym Macu, więc taka komenda nie jest prosta."""
     for words, _sep in segments:
-        _, w = strip_prefix(words)
+        _, w, wrap = strip_prefix(words)
+        if wrap["changes"]:
+            return False
         if not w:
             continue
         if (
@@ -1680,6 +1853,37 @@ def finish_job(raw):
         "env": raw["env"],
         "label": label,
     }
+
+
+# interpreter powłoki przed skryptem i jego flagi z argumentem (`bash -o pipefail x.sh down`)
+SHELL_PROGRAMS = ("bash", "sh", "zsh")
+SHELL_VALUE_FLAGS = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
+
+
+def light_script(argv, cwd):
+    """Czy argv z plocka to lekka podkomenda skryptu projektu (`stack.sh down`, `bash stack.sh status`,
+    `env E2E_STACK_OFFSET=3 bash stack.sh env`): po zdjęciu opakowań z WRAPPER_FLAGS, słów VAR= i
+    interpretera powłoki z flagami zostaje plik skryptu w cwd (.sh albo ze /), a po nim podkomenda z
+    LIGHT_SUBCOMMANDS. Plock owija cały skrypt, a classify nie widzi w nim pracy, więc taka komenda
+    czekała jako opaque_job z priorem 8 GB (T11)."""
+    _env, words, _wrap = strip_prefix(list(argv))
+    if words and os.path.basename(words[0]) in SHELL_PROGRAMS:
+        words = words[1:]
+        while words and words[0][:1] in ("-", "+") and words[0] != "--":
+            flag = words[0]
+            if not flag.startswith("--") and set(flag[1:]) & {"c", "s"}:
+                return False  # komenda w napisie (-c) albo ze stdin (-s): nie plik skryptu
+            words = words[2:] if flag in SHELL_VALUE_FLAGS else words[1:]
+        if words[:1] == ["--"]:
+            words = words[1:]
+    if len(words) < 2:
+        return False
+    script = words[0]
+    if not (script.endswith(".sh") or "/" in script):
+        return False
+    if not os.path.isfile(os.path.join(cwd, os.path.expanduser(script))):
+        return False
+    return bool(LIGHT_SUBCOMMANDS.match(words[1]))
 
 
 def opaque_job(argv, cwd):
@@ -2499,7 +2703,9 @@ def save_cache(cache):
 
 
 def reap(state):
-    """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM."""
+    """Wpisy po martwych wrapperach znikają; ich dziecko (sierota) dostaje SIGTERM, a martwy
+    czekający (wrapper przerwany przez agenta albo zabity z końcem jego sesji) zostawia wiersz
+    `dequeue` z przyczyną `reap`."""
     keep = []
     for job in state["running"]:
         if alive(job.get("pid")):
@@ -2515,7 +2721,12 @@ def reap(state):
                 except OSError:
                     pass
     state["running"] = keep
-    state["queue"] = [j for j in state["queue"] if alive(j.get("pid"))]
+    dead = [j for j in state["queue"] if not alive(j.get("pid"))]
+    if dead:
+        state["queue"] = [j for j in state["queue"] if j not in dead]
+        clock, guard = clock_now(), guard_fields()
+        for j in dead:
+            record("dequeue", job_fields(j), wait_fields(j, clock), guard, cause="reap")
 
 
 # rezerwa po rozgrzewce: job, który przebiegł max(60 s, połowę prognozy czasu), najwyżej 300 s,
@@ -2525,12 +2736,13 @@ RESERVE_WARMUP = (60.0, 0.5, 300.0)
 RESERVE_GROWTH = (1.5, 1.0)
 
 
-def reserve_target(job, now):
-    """Do ilu GB lokalny job jeszcze urośnie według rezerwy (prognoza albo zmierzony szczyt)."""
+def reserve_target(job, now, clock=None):
+    """Do ilu GB lokalny job jeszcze urośnie według rezerwy (prognoza albo zmierzony szczyt).
+    `clock` (clock_now): czas biegu bez snu Maca; bez niego po ścianie."""
     predicted = job.get("mem_predicted_gb") or 0.0
     if job.get("lang") == "native" or job.get("outside"):
         return predicted  # pamięć poza drzewem procesów: zmierzony szczyt to tylko jej część
-    elapsed = now - (job.get("started_at") or now)
+    elapsed = since(job, "started", now, clock)
     lo, share, hi = RESERVE_WARMUP
     if elapsed < min(hi, max(lo, share * (job.get("predicted_wall_s") or 0))):
         return predicted
@@ -2538,38 +2750,39 @@ def reserve_target(job, now):
     return min(predicted, seen * RESERVE_GROWTH[0] + RESERVE_GROWTH[1])
 
 
-def growth_left(job, now):
+def growth_left(job, now, clock=None):
     """O ile lokalny job jeszcze urośnie: rezerwa (reserve_target) minus teraz. Zero dla joba, który
     biegnie dużo dłużej, niż miał (serwer albo watcher, który skrypt zostawił na pierwszym planie):
     jego pamięć jest już w tym, co widzi jądro, a rezerwa na wzrost, który nie przyjdzie, blokowałaby
     kolejkę. Zero też dla wstrzymanego (SIGSTOP) i stojącego (stalled: bez CPU i wyjścia)."""
     if job.get("paused") or job.get("stalled_s"):
         return 0.0
-    elapsed = now - (job.get("started_at") or now)
+    elapsed = since(job, "started", now, clock)
     if elapsed > max(600.0, 3 * (job.get("predicted_wall_s") or 0)):
         return 0.0
-    return max(0.0, reserve_target(job, now) - (job.get("mem_now_gb") or 0))
+    return max(0.0, reserve_target(job, now, clock) - (job.get("mem_now_gb") or 0))
 
 
-def time_left(job, now):
+def time_left(job, now, clock=None):
     """Ile lokalny job jeszcze pobiegnie: prognoza minus czas biegu, a po jej przekroczeniu połowa tego,
     co już biegnie (kto przeciągnął, zwykle przeciąga dalej), najmniej 5 s. 2026-10-09 kolejka przez
     20 minut pisała „about 5s” za rerun-failed.sh z prognozą 5 min. Przed końcem prognozy liczy się
     ona sama: job w 1700. sekundzie z 1800 skończy się za 100 s, a nie za 850."""
     wall = job.get("predicted_wall_s") or 60
-    elapsed = now - (job.get("started_at") or now)
+    elapsed = since(job, "started", now, clock)
     left = wall - elapsed
     return max(left, 5.0) if left >= 0 else max(0.5 * elapsed, 5.0)
 
 
 def refresh_memory(state, cfg, mem=None):
     mem = mem or probe_memory()
-    now = time.time()
+    clock = clock_now()
+    now = clock["ts"]
     ram = mem["ram_gb"]
     available = mem["level"] / 100 * ram
     local = [j for j in state["running"] if j["where"] == "local"]
     jobs_now = sum(j.get("mem_now_gb") or 0 for j in local)
-    reserved = sum(growth_left(j, now) for j in local)
+    reserved = sum(growth_left(j, now, clock) for j in local)
     snap = devguard_snapshot()
     dev = devserver_reserve_gb(snap)
     stage, long_lived, families = guard_view(snap)
@@ -2728,8 +2941,13 @@ def queue_order(state):
     return sorted(state["queue"], key=lambda j: j["enqueued_at"])
 
 
-def plan(state, cfg, now):
+def plan(state, cfg, now, clock=None, detail=None):
     """Kto z kolejki startuje teraz: {id: ("fits"|"overtake", id wyprzedzonego)}.
+
+    `clock` (clock_now): czekanie (starve_s, aging_s, „sam na Macu” po 30 s) i czasy biegnących
+    jobów liczą się bez snu Maca; bez niego po ścianie. `detail` (słownik): dostaje {id: jak} dla
+    każdego wpuszczonego, do wiersza `admit`: fits, quick, alone, overcommit, ends, beside, short,
+    aged albo small.
 
     FIFO; głowa startuje, gdy się mieści, a gdy lokalnie nic nie biegnie: bez rezerwy na dev
     serwer, po 30 s czekania w ogóle. Za zablokowaną głową startują małe joby, które się mieszczą,
@@ -2754,8 +2972,9 @@ def plan(state, cfg, now):
     mem = state["memory"]
     free = mem["free_for_admission_gb"]
     now_free = mem["available_gb"] - cfg["headroom_gb"] - sum(
-        growth_left(j, now) for j in state["running"] if j["where"] == "local" and j.get("small")
+        growth_left(j, now, clock) for j in state["running"] if j["where"] == "local" and j.get("small")
     )
+    detail = {} if detail is None else detail
     any_local = any(j["where"] == "local" for j in state["running"])
     pressure = mem.get("pressure", "normal")
     guard_critical = mem.get("guard_level") == 2
@@ -2784,6 +3003,7 @@ def plan(state, cfg, now):
         native = job.get("lang") == "native"
         held = native and guard_critical
         quick = bool(job.get("small")) and not strict and not native and need <= now_free - reserve
+        waited = since(job, "enqueued", now, clock)
         if blocked is None:
             spare = mem["available_gb"] - cfg["headroom_gb"]
             alone = not any_local and not admitted and brake != "brake"
@@ -2791,9 +3011,12 @@ def plan(state, cfg, now):
             # (job bez trasy na Depot; nic innego niż on nie zwolni pamięci, pilnuje go SIGSTOP).
             # Przy „warn” bez tego ostatniego: macOS trzyma go tu godzinami przy połowie wolnej
             # pamięci, więc startuje to, co się mieści, ale nic ponad dostępną pamięć.
-            overcommit = pressure != "warn" and not native and now - job["enqueued_at"] >= 30
+            overcommit = pressure != "warn" and not native and waited >= 30
             if not held and (need <= free or quick or (alone and (need <= spare or overcommit))):
                 admitted[job["id"]] = ("fits", None)
+                detail[job["id"]] = (
+                    "fits" if need <= free else "quick" if quick else "alone" if need <= spare else "overcommit"
+                )
                 ahead.append((job["id"], need, job.get("predicted_wall_s"), measured(job)))
                 free -= need
                 now_free -= need
@@ -2801,13 +3024,13 @@ def plan(state, cfg, now):
                 slot = slot or bool(job.get("exclusive"))
                 continue
             blocked = job
-            if now - job["enqueued_at"] > cfg["starve_s"]:
+            if waited > cfg["starve_s"]:
                 reserve = need
-                strict = now - job["enqueued_at"] > 2 * cfg["starve_s"]
+                strict = waited > 2 * cfg["starve_s"]
             if not held:
                 lone = (spare, overcommit) if brake != "brake" else None
-                shade = shadow(state, need, free, now, ahead, lone)
-                stuck = not head_fits_without_passers(state, job, free, now, ahead, lone)
+                shade = shadow(state, need, free, now, ahead, lone, clock)
+                stuck = not head_fits_without_passers(state, job, free, now, ahead, lone, clock)
             continue
         how = None
         if shade is not None and not native:
@@ -2815,13 +3038,14 @@ def plan(state, cfg, now):
         # aging: job, który się mieści, nie czeka w nieskończoność za głową, której nic nie wpuszcza;
         # po aging_s startuje mimo jej rezerwy (lekki także w pamięci dostępnej teraz)
         aged = (
-            not native and not held and now - job["enqueued_at"] >= cfg["aging_s"]
+            not native and not held and waited >= cfg["aging_s"]
             and (need <= free or (need <= cfg["small_gb"] and need <= now_free))
         )
         if aged and not how:
             how = "aged"
         if how or (job.get("small") and not held and (need <= free - reserve or quick)):
             admitted[job["id"]] = ("overtake", blocked["id"])
+            detail[job["id"]] = how or ("small" if need <= free - reserve else "quick")
             free -= need
             now_free -= need
             slot = slot or bool(job.get("exclusive"))
@@ -2882,7 +3106,7 @@ def backfill(job, free, now_free, shade, stuck, cfg):
     return None
 
 
-def shadow(state, need, free, now, ahead=(), lone=None):
+def shadow(state, need, free, now, ahead=(), lone=None, clock=None):
     """Kiedy job, który się nie mieści, zmieści się według prognoz lokalnych jobów, i ile miejsca
     zostanie wtedy obok niego. Biegnące joby kończą się w kolejności prognoz (najwcześniej za 5 s)
     i każdy zwalnia to, co trzyma, i swoją rezerwę na wzrost; `ahead` to joby wpuszczone w tym
@@ -2906,12 +3130,12 @@ def shadow(state, need, free, now, ahead=(), lone=None):
         if r["where"] != "local":
             continue
         wall = r.get("predicted_wall_s") or 60
-        over = wall - (now - r.get("started_at", now)) < 0
+        over = wall - since(r, "started", now, clock) < 0
         held = r.get("mem_now_gb") or 0.0
         sure = measured(r) and not over and not r.get("stalled_s")
         if not measured(r) or r.get("stalled_s"):
             guessed.add(r["id"])
-        ends.append((time_left(r, now), i, r["id"], held + growth_left(r, now), held, sure))
+        ends.append((time_left(r, now, clock), i, r["id"], held + growth_left(r, now, clock), held, sure))
     for k, (jid, gb, wall, sure) in enumerate(ahead):
         if not sure:
             guessed.add(jid)
@@ -2944,14 +3168,14 @@ def shadow(state, need, free, now, ahead=(), lone=None):
     return out
 
 
-def head_fits_without_passers(state, head, free, now, ahead, lone):
+def head_fits_without_passers(state, head, free, now, ahead, lone, clock=None):
     """Czy głowa wystartowałaby teraz, gdyby nie joby, które ją wyprzedziły (`passed`): wtedy to one
     ją opóźniają i nikt więcej nie powinien wchodzić. Sama na Macu tylko wtedy, gdy poza nimi
     lokalnie nic nie biegnie i nic nie weszło w tym przebiegu."""
     need = head["mem_predicted_gb"]
     local = [r for r in state["running"] if r["where"] == "local"]
     passers = [r for r in local if r.get("passed") == head["id"]]
-    gb = sum((r.get("mem_now_gb") or 0.0) + growth_left(r, now) for r in passers)
+    gb = sum((r.get("mem_now_gb") or 0.0) + growth_left(r, now, clock) for r in passers)
     if need <= free + gb:
         return True
     others = bool(ahead) or len(passers) < len(local)
@@ -2959,9 +3183,11 @@ def head_fits_without_passers(state, head, free, now, ahead, lone):
     return lone is not None and not others and (lone[1] or need <= lone[0] + held)
 
 
-def blockers_eta(state, job):
-    """(sekundy do chwili, gdy job się zmieści, id jobów, na których koniec czeka)."""
-    s = shadow(state, job["mem_predicted_gb"], state["memory"]["free_for_admission_gb"], time.time())
+def blockers_eta(state, job, clock=None):
+    """(sekundy do chwili, gdy job się zmieści, id jobów, na których koniec czeka); czasy biegnących
+    jobów bez snu Maca."""
+    clock = clock or clock_now()
+    s = shadow(state, job["mem_predicted_gb"], state["memory"]["free_for_admission_gb"], clock["ts"], clock=clock)
     return (3600.0 if s["wait_s"] is None else s["wait_s"]), s["after"]
 
 
@@ -3057,7 +3283,8 @@ def update_queue_view(state, cfg):
     """Pozycje, powody czekania i ETA startu w kolejce (dla karty)."""
     mem = state["memory"]
     labels = {j["id"]: j["label"] for j in state["running"] + state["queue"]}
-    now = time.time()
+    clock = clock_now()
+    now = clock["ts"]
     head_blocked = None
     owner = native_owner(state)
     native = mem.get("native") or {}
@@ -3069,8 +3296,8 @@ def update_queue_view(state, cfg):
     )
     for pos, job in enumerate(queue_order(state), start=1):
         job["position"] = pos
-        job["waited_s"] = round(now - job["enqueued_at"], 1)
-        wait, after = blockers_eta(state, job)
+        job["waited_s"] = round(since(job, "enqueued", now, clock), 1)
+        wait, after = blockers_eta(state, job, clock)
         job["eta_start_s"] = round(wait) if wait < 3600 else None
         free = max(0.0, mem["free_for_admission_gb"])
         waits_turn = False  # czeka na kolej, nie na pamięć: nie rezerwuje jej dla siebie
@@ -3083,7 +3310,7 @@ def update_queue_view(state, cfg):
         elif job.get("exclusive") and (owner or native.get("outside")):
             waits_turn, code = True, "native"
             if owner:
-                job["eta_start_s"] = round(time_left(dict(owner, predicted_wall_s=owner.get("predicted_wall_s") or 600), now))
+                job["eta_start_s"] = round(time_left(dict(owner, predicted_wall_s=owner.get("predicted_wall_s") or 600), now, clock))
                 after = [owner["id"]]
                 text = f"waiting: one native build at a time, {owner['label']} is building"
             else:
@@ -3103,7 +3330,7 @@ def update_queue_view(state, cfg):
             )
         elif (
             head_blocked is not None
-            and now - head_blocked["enqueued_at"] > cfg["starve_s"]
+            and since(head_blocked, "enqueued", now, clock) > cfg["starve_s"]
             and job["mem_predicted_gb"] <= free
         ):
             # mieści się, ale plan go nie wpuścił: mógłby opóźnić start głowy (backfill)
@@ -3165,6 +3392,9 @@ def safety(state, cfg):
             victim["paused_at"] = time.time()
             victim["pause_reason"] = f"swap +{growth:.1f} GB in 2 min"
             state["today"]["pauses"] += 1
+            record("pause", job_fields(victim), guard_fields(), reason=victim["pause_reason"],
+                   swap_growth_2m_gb=growth, level_pct=mem["level_pct"], pressure=mem.get("pressure"),
+                   pauses_today=state["today"]["pauses"], local_jobs=len(local))
     elif paused and growth < 0.1 and mem["level_pct"] >= 30:
         job = min(paused, key=lambda j: j.get("paused_at", 0))
         if time.time() - job.get("paused_at", 0) >= 30:
@@ -3174,6 +3404,9 @@ def safety(state, cfg):
                 pass
             job["paused"] = False
             job["pause_reason"] = None
+            record("resume", job_fields(job), guard_fields(),
+                   paused_s=round(time.time() - job.get("paused_at", 0), 1), swap_growth_2m_gb=growth,
+                   level_pct=mem["level_pct"])
 
 
 # ---------- run ----------
@@ -3258,7 +3491,7 @@ def parse_run_args(args):
             command = args[i + 1]
             i += 2
             continue
-        if a in ("--timeout", "--session", "--agent", "--via") and i + 1 < len(args):
+        if a in ("--timeout", "--session", "--agent", "--via", "--bash-limit") and i + 1 < len(args):
             opts[a[2:]] = args[i + 1]
             i += 2
             continue
@@ -3281,7 +3514,16 @@ def exec_plain(command, argv):
     return 127
 
 
+def number(text):
+    """Liczba z argumentu albo None."""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def new_entry(job, command, argv, opts):
+    clock = clock_now()
     return {
         "id": new_id(),
         "class": job["class"],
@@ -3310,7 +3552,12 @@ def new_entry(job, command, argv, opts):
         "outside": bool(job.get("outside") or job.get("floor_gb")),
         "pid": os.getpid(),
         "via": opts.get("via", "cli"),
-        "enqueued_at": time.time(),
+        # limit narzędzia Bash komendy z haka: tylko pomiar, kolejka się na nim nie kończy (bash_limit_s)
+        "bash_limit_s": number(opts.get("bash-limit")),
+        "enqueued_at": clock["ts"],
+        # ten sam moment bez snu Maca; wpis bez nich (sprzed wydania A) liczy się po ścianie
+        "enqueued_up": clock["up"],
+        "boot": clock["boot"],
     }
 
 
@@ -3327,6 +3574,9 @@ def cmd_run(args):
     cwd = os.getcwd()
     job = classify(command, cwd, argv=argv)
     if job is None and argv and opts.get("via") == "plock":
+        if light_script(argv, cwd):
+            # lekka podkomenda skryptu (`stack.sh down`): od razu, bez kolejki i historii
+            return exec_plain(command, argv)
         job = opaque_job(argv, cwd)
     if job is None:
         return exec_plain(command, argv)
@@ -3366,10 +3616,16 @@ def cmd_run(args):
 def schedule(entry, job, command, argv, opts, cfg, history, cache):
     jid = entry["id"]
     timeout = float(opts.get("timeout") or 0)
-    start = time.time()
+    begin = clock_now()  # --timeout i czekanie w logu liczą się bez snu Maca
+
+    def waited(clock):
+        return elapsed(begin["ts"], begin["up"], begin["boot"], clock["ts"], clock)
+
     target = None
     with Locked():
         state = load_state(cfg)
+        clock = clock_now()
+        note_clock(state, clock)
         reap(state)
         refresh_memory(state, cfg)
         p, p_by, gb, wall, src = choose_p(
@@ -3384,14 +3640,15 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
         )
         entry["small"] = gb <= cfg["small_gb"] and wall <= cfg["small_wall_s"]
         entry["route"], target = decide_route(state, job, gb, wall, cfg, cache)
-        entry["routed_at"] = time.time()
+        entry["routed_at"], entry["routed_up"] = clock["ts"], clock["up"]
         state["queue"].append(entry)
         if target and entry["route"]["choice"] == "depot":
-            start_depot(state, entry, target)
+            start_depot(state, entry, target, job, clock)
         else:
-            admitted = plan(state, cfg, time.time())
+            how = {}
+            admitted = plan(state, cfg, clock["ts"], clock, how)
             if jid in admitted:
-                start_local(state, entry, admitted[jid])
+                start_local(state, entry, admitted[jid], job, how.get(jid), clock)
         update_queue_view(state, cfg)
         save_state(state)
     if entry.get("where") is None:
@@ -3406,15 +3663,20 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
         cancelled = False
         while entry.get("where") is None:
             time.sleep(0.5)
-            if timeout and time.time() - start > timeout:
+            clock = clock_now()
+            if timeout and waited(clock) > timeout:
                 with Locked():
                     state = load_state(cfg)
                     state["queue"] = [j for j in state["queue"] if j["id"] != jid]
                     save_state(state)
+                record("dequeue", job_fields(entry), wait_fields(entry, clock), guard_fields(), cause="timeout",
+                       timeout=timeout)
                 log(f"timeout {timeout:.0f}s w kolejce")
                 return EXIT_TIMEOUT
             with Locked():
                 state = load_state(cfg)
+                clock = clock_now()
+                note_clock(state, clock)
                 reap(state)
                 refresh_memory(state, cfg)
                 me = next((j for j in state["queue"] if j["id"] == jid), None)
@@ -3422,12 +3684,13 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                     state["queue"] = [j for j in state["queue"] if j["id"] != jid]
                     update_queue_view(state, cfg)
                     save_state(state)
+                    record("dequeue", job_fields(me), wait_fields(me, clock), guard_fields(), cause="cancel")
                     cancelled = True
                     break
                 if me is None:
                     me = entry
                     state["queue"].append(me)
-                if time.time() - me.get("routed_at", 0) > 15:
+                if since(me, "routed", clock["ts"], clock) > 15:
                     me["route"], target = decide_route(
                         state,
                         job,
@@ -3436,11 +3699,12 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                         cfg,
                         cache,
                     )
-                    me["routed_at"] = time.time()
+                    me["routed_at"], me["routed_up"] = clock["ts"], clock["up"]
                     if target and me["route"]["choice"] == "depot":
-                        start_depot(state, me, target)
+                        start_depot(state, me, target, job, clock)
                 if me.get("where") is None:
-                    admitted = plan(state, cfg, time.time())
+                    how = {}
+                    admitted = plan(state, cfg, clock["ts"], clock, how)
                     if jid in admitted:
                         if me.get("p_by") == "scheduler":
                             p, _, gb, wall, src = choose_p(
@@ -3456,15 +3720,15 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
                                     predicted_wall_s=wall,
                                     predicted_from=src,
                                 )
-                        start_local(state, me, admitted[jid])
+                        start_local(state, me, admitted[jid], job, how.get(jid), clock)
                 update_queue_view(state, cfg)
                 save_state(state)
                 entry = me
         if cancelled:
-            log(f"anulowane po {human_s(time.time() - start)} w kolejce (claude-acc sched cancel)")
+            log(f"anulowane po {human_s(waited(clock_now()))} w kolejce (claude-acc sched cancel)")
             return EXIT_CANCELLED
         log(
-            f"start po {human_s(time.time() - start)} czekania, {entry['where']}"
+            f"start po {human_s(waited(clock_now()))} czekania, {entry['where']}"
             + (f", -p {entry['p']}" if entry.get("p") else "")
         )
     if entry["where"] == "depot":
@@ -3472,13 +3736,61 @@ def schedule(entry, job, command, argv, opts, cfg, history, cache):
     return run_local(entry, job, command, argv, cfg)
 
 
-def start_local(state, entry, why):
-    reason, passed = why
-    now = time.time()
+def guard_stage_view(snap=None):
+    """(stopień hamulca, jego powody, wiek migawki w s) z migawki strażnika, bez progu świeżości:
+    wiersz `admit` niesie wiek, a czytający sam ocenia, czy migawka była świeża (N1)."""
+    snap = devguard_snapshot() if snap is None else snap
+    try:
+        pressure = snap.get("pressure") or {}
+        at = snap.get("at")
+        return pressure.get("stage"), pressure.get("stage_reasons"), (round(time.time() - float(at), 1) if at else None)
+    except (TypeError, ValueError, AttributeError):
+        return None, None, None
+
+
+def guard_fields():
+    """Pola stopnia hamulca do wiersza rejestru (N1): `guard_stage`, `guard_stage_reasons` i
+    `guard_age_s` z migawki strażnika (guard_stage_view). Niosą je `admit`, `dequeue`, `pause` i
+    `resume`: decyzja schedulera przy stopniu 2 to co innego niż przy 0."""
+    stage, reasons, age = guard_stage_view()
+    return {"guard_stage": stage, "guard_stage_reasons": reasons, "guard_age_s": age}
+
+
+def admitted_entry(state, entry, clock):
+    """Wspólne dla startu lokalnego i na Depot: zegar startu, czekanie po ścianie (`waited_s`, jak
+    dotąd) i bez snu (`waited_up_s`), ostatni powód czekania; wpis wychodzi z kolejki. Zwraca
+    pola czekania do wiersza `admit`, zanim widok kolejki zdejmie z wpisu jego powód."""
+    waits = wait_fields(entry, clock)
     state["queue"] = [j for j in state["queue"] if j["id"] != entry["id"]]
+    entry["started_at"], entry["started_up"] = clock["ts"], clock["up"]
+    entry["waited_s"] = round(clock["ts"] - entry["enqueued_at"], 1)
+    entry["waited_up_s"] = waits["wait_up_s"]
+    entry["wait_reason"] = waits["wait_reason"]
+    return waits
+
+
+def record_admit(state, entry, job, how, waits):
+    """Wiersz `admit`: kto, którędy, jak wpuszczony, prognoza, pamięć i stopień hamulca z migawki
+    strażnika razem z jej wiekiem (scheduler stopnia sam nie liczy)."""
+    mem = state.get("memory") or {}
+    route = entry.get("route") or {}
+    record("admit", job_fields(entry), waits, guard_fields(), how=how, where=entry["where"],
+           passed=entry.get("passed"),
+           predicted_gb=entry.get("mem_predicted_gb"), predicted_wall_s=entry.get("predicted_wall_s"),
+           predicted_from=entry.get("predicted_from"), p=entry.get("p"),
+           free_for_admission_gb=mem.get("free_for_admission_gb"), available_gb=mem.get("available_gb"),
+           simple=(job or {}).get("simple"), depot_blocker=(job or {}).get("depot_blocker"),
+           route_text=route.get("text"), route_why=route.get("why"))
+
+
+def start_local(state, entry, why, job=None, how=None, clock=None):
+    """Lokalny start wpisu z planu (`why`: (fits|overtake, id wyprzedzonego)); `how`: sposób
+    wpuszczenia z planu (detail) do wiersza `admit`."""
+    reason, passed = why
+    clock = clock or clock_now()
+    now = clock["ts"]
+    waits = admitted_entry(state, entry, clock)
     entry["where"] = "local"
-    entry["started_at"] = now
-    entry["waited_s"] = round(now - entry["enqueued_at"], 1)
     entry.update(
         elapsed_s=0.0,
         eta_s=entry["predicted_wall_s"],
@@ -3511,14 +3823,13 @@ def start_local(state, entry, why):
             ]
         )[-10:]
         state["today"]["overtakes"] += 1
+    record_admit(state, entry, job, how or reason, waits)
 
 
-def start_depot(state, entry, target):
-    now = time.time()
-    state["queue"] = [j for j in state["queue"] if j["id"] != entry["id"]]
+def start_depot(state, entry, target, job=None, clock=None):
+    clock = clock or clock_now()
+    waits = admitted_entry(state, entry, clock)
     entry["where"] = "depot"
-    entry["started_at"] = now
-    entry["waited_s"] = round(now - entry["enqueued_at"], 1)
     entry["p"] = target["cores"]
     entry["p_by"] = "depot"
     entry["local_wall_s"] = entry.get("predicted_wall_s")
@@ -3545,6 +3856,7 @@ def start_depot(state, entry, target):
     for key in ("position", "eta_start_s", "reason"):
         entry.pop(key, None)
     state["running"].append(entry)
+    record_admit(state, entry, job, f"depot:{target['target']}", waits)
 
 
 JOB_QOS = ("utility", "background")
@@ -3798,6 +4110,7 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
         internal = state["_internal"]
         where = me["where"]
         waited = me.get("waited_s") or 0.0
+        clock = clock_now()
         if me.get("native_seen"):
             # szczyt z drzewami xcodebuild: z tego scheduler przewiduje każdy natywny build
             internal["native_peaks"] = (internal.get("native_peaks", []) + [round(peak, 2)])[-10:]
@@ -3879,6 +4192,12 @@ def finish(jid, cfg, rc, wall, peak, cpu, depot_info=None):
             "cancelled": bool(me.get("cancelled")),
             "multi": bool(me.get("multi")),
             "stalled_s": me.get("stalled_s"),
+            # skąd przyszedł, na co czekał i ile czekał i biegł bez snu Maca; predict tych pól nie czyta
+            "via": me.get("via"),
+            "wait_reason": me.get("wait_reason"),
+            "up_wait_s": me.get("waited_up_s", waited),
+            "up_wall_s": round(min(wall, since(me, "started", clock["ts"], clock)), 1),
+            "boot": me.get("boot"),
         }
         if me.get("lang") == "native":
             row["native_built"] = bool(me.get("native_seen"))
@@ -4154,8 +4473,36 @@ def runner():
     return ["/usr/bin/python3", SELF]
 
 
+# limit narzędzia Bash Claude Code, gdy tool_input nie ma `timeout` (schemat narzędzia: "default 120000,
+# max 3600000"; inny domyślny daje BASH_DEFAULT_TIMEOUT_MS z env ustawień). Po limicie Claude Code
+# (2.1.302) komendy nie zabija, tylko przenosi ją w tło (`timedOutAfterMs`: "Set when the command hit
+# its timeout and was auto-backgrounded"), więc czekający zostaje w kolejce na swoim miejscu, a limit
+# idzie tylko do pomiaru (bash_limit_s). Kolejka nigdy się na nim nie kończy: kod 75 przed limitem
+# odbierałby czekającemu miejsce i aging, a komendzie Codeksa (bez `timeout`) dawałby 105 s
+BASH_DEFAULT_TIMEOUT_MS = 120000
+# klucz, który devguard.admit_codex dokłada do zdarzenia: komenda Codeksa, którego narzędzie powłoki nie
+# ma limitu Basha
+CODEX_EVENT_KEY = "claude_acc_codex"
+
+
+def bash_limit_s(event):
+    """Limit narzędzia Bash tej komendy w sekundach, tylko do pomiaru: wpis kolejki i wiersze `admit` i
+    `dequeue` (`bash_limit_s`) mówią, ile z czekania agent miał na pierwszym planie, zanim Claude Code
+    przeniósł komendę w tło. None dla komendy w tle (run_in_background), dla Codeksa (CODEX_EVENT_KEY)
+    i dla `timeout`, którego nie da się przeczytać."""
+    tool_input = event.get("tool_input") or {}
+    if tool_input.get("run_in_background") or event.get(CODEX_EVENT_KEY):
+        return None
+    try:
+        ms = float(tool_input.get("timeout") or os.environ.get("BASH_DEFAULT_TIMEOUT_MS") or BASH_DEFAULT_TIMEOUT_MS)
+    except (TypeError, ValueError):
+        return None
+    return round(ms / 1000, 1)
+
+
 def hook_rewrite(event):
-    """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run."""
+    """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run, z limitem
+    Basha do pomiaru (--bash-limit, bash_limit_s), nigdy z --timeout kolejki."""
     if event.get("tool_name") != "Bash":
         return None
     tool_input = event.get("tool_input") or {}
@@ -4184,6 +4531,9 @@ def hook_rewrite(event):
         }
     command = fixed
     parts = runner() + ["run", "--via", "hook"]
+    limit = bash_limit_s(event)
+    if limit is not None:
+        parts += ["--bash-limit", f"{limit:g}"]
     if event.get("session_id"):
         parts += ["--session", str(event["session_id"])]
     agent = event.get("agent_type") or event.get("subagent_type")

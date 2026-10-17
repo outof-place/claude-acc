@@ -290,7 +290,17 @@ def step_brew(st, cfg, dry):
     formulae = [n for n, i in todo.items() if i["kind"] == "formulae"]
     if formulae:
         ok, _, err = call(["brew", "upgrade", "--formula", *formulae], timeout=2 * HOUR)
-        errors.update({n: err for n in formulae if not ok})
+        if not ok:
+            # brew przerywa całe polecenie na jednej formule (bez butelki i za stary Xcode),
+            # więc to, co zostało, idzie po jednej: każda formuła dostaje swój wynik i swój błąd
+            try:
+                left = [n for n in formulae if n in brew_outdated()]
+            except StepError:
+                left = formulae
+            for name in left:
+                ok, _, err = call(["brew", "upgrade", "--formula", name], timeout=HOUR)
+                if not ok:
+                    errors[name] = err
     # aplikacje po jednej: ta, która chce hasła administratora, nie blokuje reszty
     for name in [n for n, i in todo.items() if i["kind"] == "casks"]:
         ok, _, err = call(["brew", "upgrade", "--cask", name], timeout=HOUR)

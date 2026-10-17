@@ -41,6 +41,17 @@ GB = 1024**3
 NOW = 1_800_000_000.0
 
 
+def setUpModule():
+    # tick, brake i reap piszą rejestr decyzji do devguard_core.STATE_DIR: w tych testach do katalogu
+    # tymczasowego, nigdy do prawdziwego ~/.local/share/claude-acc
+    global _STATE_PATCH
+    tmp = tempfile.mkdtemp(prefix="devguard-state-")
+    _STATE_PATCH = mock.patch.object(dg, "STATE_DIR", tmp)
+    _STATE_PATCH.start()
+    unittest.addModuleCleanup(shutil.rmtree, tmp, True)
+    unittest.addModuleCleanup(_STATE_PATCH.stop)
+
+
 def cfg(**extra):
     out = dict(dg.DEFAULT_CONFIG)
     out.update(extra)
@@ -1830,21 +1841,106 @@ class TerminateTest(unittest.TestCase):
 class BrakeTickTest(unittest.TestCase):
     """tick() i hamulec: kiedy gasi drzewo mimo akcji strażnika, kiedy czeka, kiedy nigdy."""
 
-    def run_tick(self, stage, plans=(), brake_at=0, last_action=0, inventory=None, **extra):
+    def setUp(self):
+        self.state_dir = tempfile.mkdtemp(prefix="brake-tick-")
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
+
+    def run_tick(self, stage, plans=(), brake_at=0, last_action=0, inventory=None, previous=None, reasons=(),
+                 stage_reasons=(), inventory_now=None, ring=None, dry_run=False, **extra):
         import lastresort as lr
 
         cfg = dict(dg.DEFAULT_CONFIG, **extra)
-        pressure = types.SimpleNamespace(level=min(stage, 2), stage=stage, stage_reasons=[], ram=48 * GB,
-                                         swap_used=0, compressed=0, summary=lambda: {"stage": stage})
-        world = types.SimpleNamespace(now=NOW_T, units=[], table={}, pressure=pressure, orca=None)
+        pressure = types.SimpleNamespace(level=min(stage, 2), stage=stage, stage_reasons=list(stage_reasons),
+                                         reasons=list(reasons), ram=48 * GB, swap_used=0, compressed=0,
+                                         summary=lambda: {"stage": stage})
+        world = types.SimpleNamespace(now=NOW_T, units=[], table={1: (0, "launchd")} if inventory_now else {},
+                                      pressure=pressure, orca=None)
         state = {"brake_at": brake_at, "last_action": last_action, "inventory": inventory or {},
                  "swap_history": [[NOW_T, 1, 1]]}
+        if previous is not None:
+            state["snapshot"] = {"pressure": {"stage": previous}}
+        if ring is not None:
+            state["inventory_ring"] = [dict(r) for r in ring]
         reap = mock.Mock(return_value="ostatnia linia: test")
         with mock.patch.object(dg, "World", return_value=world), mock.patch.object(dg, "check_pending"), \
                 mock.patch.object(dg, "decide", return_value=list(plans)), mock.patch.object(dg, "execute"), \
-                mock.patch.object(lr, "reap", reap):
-            dg.tick(cfg, state, orca=None, now=NOW_T)
+                mock.patch.object(dg, "inventory", return_value=inventory_now), \
+                mock.patch.object(dg, "STATE_DIR", self.state_dir), mock.patch.object(lr, "reap", reap):
+            dg.tick(cfg, state, orca=None, now=NOW_T, dry_run=dry_run)
         return reap, state
+
+    def events(self):
+        path = os.path.join(self.state_dir, "events.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return [json.loads(line) for line in f]
+
+    def test_stage_change_writes_stage_event_with_families(self):
+        """Wydanie A (A2), R1: wiersz `stage` przy każdej zmianie stopnia, z jego powodami, sygnałami,
+        rodzinami pamięci teraz i najstarszą próbką pierścienia (ok. 2 min wstecz), żeby policzyć, czy
+        przed hamulcem rosła ciężka praca, czy pamięć długo żyjąca."""
+        fams = {"dev": {"count": 2, "footprint": 6 * GB, "top": [1, 4 * GB, "next dev"]},
+                "jobs": {"count": 9, "footprint": 9 * GB, "top": [2, 5 * GB, "go test"]}}
+        inv = {"at": NOW_T, "families": fams, "long_lived": 6 * GB, "biggest": [2, 5 * GB, "go test"]}
+        ring = [{"at": NOW_T - 120 + 30 * i, "families": {"dev": 5 * GB, "jobs": (i + 1) * GB}} for i in range(4)]
+        _, state = self.run_tick(2, previous=0, stage_reasons=["kompresor 25.0 GB (52% RAM)"],
+                                 reasons=["swap 10.0 GB i rośnie"], inventory_now=inv, ring=ring)
+        rows = [r for r in self.events() if r["ev"] == "stage"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["stage"], row["previous"]), (2, 0))
+        self.assertEqual(row["stage_reasons"], ["kompresor 25.0 GB (52% RAM)"])
+        self.assertEqual((row["guard_level"], row["guard_reasons"]), (2, ["swap 10.0 GB i rośnie"]))
+        self.assertEqual(row["families"], {"dev": 6 * GB, "jobs": 9 * GB})
+        self.assertEqual(row["ring_oldest"], ring[0])
+        self.assertIn("swap_window_s", row)
+        self.assertIn("disk_free_gb", row)
+        # pierścień: próbka co 30 s, najwyżej pięć (ok. 2 min)
+        self.assertEqual([r["at"] for r in state["inventory_ring"]], [r["at"] for r in ring] + [NOW_T])
+        self.assertEqual(state["inventory_ring"][-1]["families"], {"dev": 6 * GB, "jobs": 9 * GB})
+        # ten sam stopień: bez wiersza
+        self.run_tick(2, previous=2, inventory_now=inv, ring=ring)
+        self.assertEqual(len([r for r in self.events() if r["ev"] == "stage"]), 1)
+        # zejście na spokój też jest zmianą
+        self.run_tick(0, previous=2)
+        self.assertEqual([(r["stage"], r["previous"]) for r in self.events() if r["ev"] == "stage"], [(2, 0), (0, 2)])
+
+    def test_dry_run_tick_writes_no_stage_row(self):
+        """`guard status` bez świeżej migawki i `once --dry-run` liczą tick na próbę (dry_run) i nie
+        zapisują stanu, więc ich „poprzedni stopień” to stara migawka z dysku: wiersz `stage` z takiego
+        ticku byłby zmianą, której strażnik nie przeszedł. Próba nie pisze do rejestru nic."""
+        self.run_tick(2, previous=0, stage_reasons=["kompresor 25.0 GB (52% RAM)"], dry_run=True)
+        self.assertEqual(self.events(), [])
+        # ten sam tick naprawdę: jeden wiersz `stage`
+        self.run_tick(2, previous=0, stage_reasons=["kompresor 25.0 GB (52% RAM)"])
+        self.assertEqual([(r["ev"], r["stage"], r["previous"]) for r in self.events()], [("stage", 2, 0)])
+
+    def test_plan_action_writes_stop_event_with_window_reset(self):
+        """Wydanie A (A2), B-3: akcja strażnika inna niż ostrzeżenie zeruje okno przyrostu swapu;
+        wiersz `stop` mówi to wprost (`swap_window_reset`), tak jak wiersz `kill` hamulca."""
+        server = types.SimpleNamespace(label=":3000 /w/app", footprint=6 * GB, ports=[3000], key="u")
+        stop = types.SimpleNamespace(action="stop", unit=server, reason="swap rośnie", code="pressure",
+                                     data={}, summary=lambda: {})
+        _, state = self.run_tick(1, plans=[stop], reasons=["swap 10.0 GB i rośnie"], cooldown_seconds=0)
+        self.assertEqual(state["swap_history"], [])
+        rows = [r for r in self.events() if r["ev"] == "stop"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["plan"], row["code"], row["reason"]), ("stop", "pressure", "swap rośnie"))
+        self.assertEqual((row["unit"], row["ports"], row["size"]), (":3000 /w/app", [3000], 6 * GB))
+        self.assertEqual(row["guard_reasons"], ["swap 10.0 GB i rośnie"])
+        self.assertTrue(row["swap_window_reset"])
+        # ostrzeżenie okna nie zeruje i wiersza `stop` nie ma
+        warn = types.SimpleNamespace(action="warn", unit=server, reason="puchnie", code="bloat", data={},
+                                     summary=lambda: {})
+        _, state = self.run_tick(1, plans=[warn], cooldown_seconds=0)
+        self.assertEqual(state["swap_history"], [[NOW_T, 1, 1]])
+        self.assertEqual(len([r for r in self.events() if r["ev"] == "stop"]), 1)
+        # hamulec: zabicie zeruje okno, a jego wiersz `kill` ma to samo pole (reap je dopisuje)
+        reap, state = self.run_tick(3)
+        self.assertEqual(reap.call_args.kwargs.get("event_fields"), {"swap_window_reset": True})
+        self.assertEqual(state["swap_history"], [])
 
     def test_emergency_acts_even_after_a_guard_action(self):
         plan = types.SimpleNamespace(action="stop", summary=lambda: {})

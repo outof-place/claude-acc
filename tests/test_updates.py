@@ -251,6 +251,23 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(sum(c == "brew update --quiet" for c in env.calls()), 2)
         self.assertEqual(len(env.notifications()), 1)
 
+    def test_a_formula_brew_refuses_to_build_does_not_hold_back_the_others(self):
+        # 16.10: macOS 27 z Xcode 26.6, formuła z tapu bez butelki przerwała całe brew upgrade
+        def tap_formula(world):
+            world["brew"]["formulae"]["depot/tap/depot"] = {"installed": "2.102.21", "latest": "2.102.23", "fatal": True}
+
+        env = Env(self, edit=tap_formula)
+        env.run("run", "--force")
+        world = env.world()
+        self.assertEqual(world["brew"]["formulae"]["railway"]["installed"], "5.63.3")
+        self.assertEqual(world["brew"]["formulae"]["depot/tap/depot"]["installed"], "2.102.21")
+
+        brew = step(env.state(), "brew")
+        self.assertEqual(names(brew["updated"]), ["railway", "ngrok"])
+        [depot] = brew["failed"]
+        self.assertEqual(depot["name"], "depot")
+        self.assertIn("Xcode", depot["error"])
+
     def test_an_npm_package_whose_command_breaks_is_rolled_back(self):
         # npm 12 nie uruchamia skryptów instalacyjnych: paczka się instaluje, a komenda nie działa
         def breaks(world):

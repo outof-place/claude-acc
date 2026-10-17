@@ -1105,7 +1105,7 @@ class Attempt:
         sel = selectors.DefaultSelector()
         sel.register(proc.stdout, selectors.EVENT_READ, 1)
         sel.register(proc.stderr, selectors.EVENT_READ, 2)
-        out, tails, exhausted = bytearray(), {1: b"", 2: b""}, False
+        out, scans, exhausted = bytearray(), {1: credits.ExhaustionScan(), 2: credits.ExhaustionScan()}, False
         queued, stopped, stop_at, exited_at = 0.0, None, None, None
         limit = float(self.job["budget_usd"]) * runenv.STOP_FACTOR
         grace = float(self.job["limits"]["grace_s"])
@@ -1116,9 +1116,7 @@ class Attempt:
                     sel.unregister(key.fileobj)
                     continue
                 self.write(chunk)
-                window = tails[key.data] + chunk
-                exhausted = exhausted or bool(credits.EXHAUSTED_RE.search(window))
-                tails[key.data] = window[-64:]
+                exhausted = scans[key.data].feed(chunk) or exhausted
                 if key.data == 1:
                     out += chunk
                     del out[:-262144]
