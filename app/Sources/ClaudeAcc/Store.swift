@@ -86,6 +86,8 @@ final class Store {
     @ObservationIgnored private var loginCancelled = false
     @ObservationIgnored private var refreshAgain = false
     @ObservationIgnored private var poller: Task<Void, Never>?
+    /// pod-services.json for Pod's Settings, asked again at every minute's poll (live app only).
+    @ObservationIgnored private var services: ServicesReport?
     @ObservationIgnored private var depotSyncing = false
     @ObservationIgnored private var browserSyncing = false
     @ObservationIgnored private var browserSyncedAt = Date.distantPast
@@ -157,9 +159,11 @@ final class Store {
         }
         if sideEffects { registerLoginItemUnlessTurnedOff() }
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        services = ServicesReport()
         poller = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.poll()
+                await self?.services?.refresh()
                 // a baseline, so the panel opens with the last minute's load instead of a dash
                 self?.sampleLoad()
                 try? await Task.sleep(for: .seconds(60))
