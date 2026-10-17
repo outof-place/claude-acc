@@ -42,7 +42,7 @@ public enum GuardPatterns {
         ("metro", PyRegex(#"/expo(/bin/cli)?\s+start\b|/metro\b|react-native\s+start\b"#, anyOf: ["/expo", "/metro", "react-native"])),
         ("watchers", PyRegex(#"--watch(All)?\b|(^|/)nodemon(\s|$)|(^|\s)-w(\s|$)|/vitest(\.mjs)?\s+(watch|dev)\b"#, anyOf: ["--watch", "nodemon", "-w", "/vitest"])),
         ("lsp", PyRegex(#"(^|/)gopls(\s|$)|tsserver\.js|typescript-language-server|rust-analyzer|sourcekit-lsp|clangd|pyright-langserver"#, anyOf: ["gopls", "tsserver.js", "typescript-language-server", "rust-analyzer", "sourcekit-lsp", "clangd", "pyright-langserver"])),
-        ("docker", PyRegex(#"com\.docker|Docker\.app|com\.apple\.Virtualization"#, anyOf: ["com.docker", "Docker.app", "com.apple.Virtualization"])),
+        ("docker", PyRegex(#"com\.docker|Docker\.app|OrbStack\.app|com\.apple\.Virtualization"#, anyOf: ["com.docker", "Docker.app", "OrbStack.app", "com.apple.Virtualization"])),
         ("git", PyRegex(#"^(\S*/)?git(\s|$)"#, anyOf: ["git"])),
         ("agents", agent),
         ("browsers", browser),
