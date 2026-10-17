@@ -711,7 +711,31 @@ STAGE_TEXT = ("normal", "tight", "brake", "emergency")
 
 # ---------- klasyfikacja komendy ----------
 
-WRAPPERS = {"rtk", "time", "nice", "env", "caffeinate", "command", "exec", "nohup"}
+# opakowania komendy i ich flagi (man env, nice, time, caffeinate na macOS; GNU timeout z Homebrew).
+# plain: flagi bez argumentu; valued: z argumentem (także --flaga=wartość); positional: słowa przed
+# komendą (czas `timeout`); changes: flagi, które zmieniają znaczenie komendy (True: samo opakowanie),
+# więc na Depot poszłoby co innego (simple=False); none: flagi, po których nie ma komendy do
+# wpuszczenia (`env -S 'go test'` trzyma ją w napisie, `command -v` tylko wypisuje). Nieznana flaga to
+# jedno słowo, jak dotąd. `rtk proxy` zdejmuje strip_prefix osobno
+TIMEOUT_FLAGS = {
+    "plain": ("-f", "-p", "-v", "--foreground", "--preserve-status", "--verbose"),
+    "valued": ("-k", "-s", "--kill-after", "--signal"),
+    "positional": 1,
+    "changes": True,  # limit czasu i sygnał zostałyby na tym Macu
+}
+WRAPPER_FLAGS = {
+    "time": {"plain": ("-a", "-l", "-h", "-p"), "valued": ("-o",)},
+    "nice": {"valued": ("-n",)},
+    "env": {"plain": ("-0", "-i", "-v", "-"), "valued": ("-u", "-P", "-C"), "changes": ("-i", "-u", "-C", "-"),
+            "none": ("-S",)},
+    "command": {"plain": ("-p",), "changes": ("-p",), "none": ("-v", "-V")},
+    "exec": {"plain": ("-c", "-l"), "valued": ("-a",), "changes": ("-c", "-l", "-a")},
+    "nohup": {},
+    "caffeinate": {"plain": ("-d", "-i", "-m", "-s", "-u"), "valued": ("-t", "-w")},
+    "timeout": TIMEOUT_FLAGS,
+    "gtimeout": TIMEOUT_FLAGS,
+}  # fmt: skip
+WRAPPERS = {"rtk", *WRAPPER_FLAGS}
 GO_VERBS = {"build", "test", "vet", "run", "install", "generate"}
 # "acc.py' sched": ta sama komenda, gdy katalog domowy ma spację, a ścieżka idzie w cudzysłowie
 SKIP_MARKERS = (
@@ -754,8 +778,11 @@ def split_segments(command):
 
 
 def strip_prefix(words):
-    """Zdejmuje przypisania VAR=wartość i opakowania (rtk proxy, time, env, nice)."""
-    env = {}
+    """Zdejmuje przypisania VAR=wartość i opakowania z WRAPPER_FLAGS (rtk proxy, time, nice, env,
+    timeout, ...) razem z ich flagami: (env, słowa komendy, opakowanie). Opakowanie to {"dir": katalog
+    z `env -C` albo None, "changes": opakowanie zmienia znaczenie komendy}. Komenda w napisie
+    (`env -S`) albo tylko wypisana (`command -v`) daje puste słowa: nie ma w niej pracy."""
+    env, wrap = {}, {"dir": None, "changes": False}
     i = 0
     while i < len(words):
         w = words[i]
@@ -765,19 +792,60 @@ def strip_prefix(words):
             i += 1
             continue
         base = os.path.basename(w)
-        if base in WRAPPERS:
-            i += 1
-            if base == "rtk" and i < len(words) and words[i] == "proxy":
-                i += 1
-            while (
-                base in ("nice", "caffeinate", "env")
-                and i < len(words)
-                and words[i].startswith("-")
-            ):
+        if base not in WRAPPERS:
+            break
+        i += 1
+        if base == "rtk":
+            if i < len(words) and words[i] == "proxy":
                 i += 1
             continue
-        break
-    return env, words[i:]
+        spec = WRAPPER_FLAGS[base]
+        changing = spec.get("changes") or ()
+        if changing is True:
+            wrap["changes"], changing = True, ()
+        while i < len(words) and words[i].startswith("-"):
+            flag, eq, value = words[i].partition("=")
+            i += 1
+            if flag == "--":
+                break
+            if flag in spec.get("none", ()):
+                return env, [], wrap
+            if flag in spec.get("valued", ()) and not eq:
+                value = words[i] if i < len(words) else ""
+                i += 1
+            if base == "env" and flag == "-C":
+                wrap["dir"] = value
+            if flag in changing:
+                wrap["changes"] = True
+        i += spec.get("positional", 0)
+    return env, words[i:], wrap
+
+
+def unwrap_subshell(command):
+    """Jeden poziom nawiasu podpowłoki na początku komendy: `(cd x && go test ./...) > f 2>&1` to dla
+    klasyfikacji `cd x && go test ./...  > f 2>&1`. Arytmetyka `((...))` i komenda bez nawiasu bez
+    zmian; cudzysłowy i znaki po \\ nie liczą się do nawiasów."""
+    text = command.lstrip()
+    if not text.startswith("(") or text.startswith("(("):
+        return command
+    depth, quote, i = 0, None, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[1:i] + " " + text[i + 1 :]
+        i += 1
+    return command
 
 
 def find_up(path, marker, stop_at_git=False):
@@ -1585,7 +1653,7 @@ def classify(command, cwd, argv=None):
     else:
         if any(m in command for m in SKIP_MARKERS):
             return None
-        segments = split_segments(command)
+        segments = split_segments(unwrap_subshell(command))
         if segments is None:
             return None
     here = cwd
@@ -1596,7 +1664,7 @@ def classify(command, cwd, argv=None):
     for words, _sep in segments:
         if not words:
             continue
-        env, words = strip_prefix(words)
+        env, words, wrap = strip_prefix(words)
         if not words:
             continue
         prog = os.path.basename(words[0])
@@ -1604,8 +1672,10 @@ def classify(command, cwd, argv=None):
         if prog == "cd" and len(words) >= 2:
             here = os.path.normpath(os.path.join(here, os.path.expanduser(words[1])))
             continue
+        # `env -C dir` zmienia katalog tylko tej komendy, nie następnych członów
+        at = os.path.normpath(os.path.join(here, os.path.expanduser(wrap["dir"]))) if wrap["dir"] else here
         if prog in ("bash", "sh", "zsh") and len(words) >= 3 and words[1] == "-c":
-            inner = classify(words[2], here)
+            inner = classify(words[2], at)
             if inner:
                 nested.append(inner)
             continue
@@ -1613,19 +1683,19 @@ def classify(command, cwd, argv=None):
             parsed = parse_go(words)
             if parsed:
                 verb, flags, pkgs, cdir = parsed
-                d = os.path.normpath(os.path.join(here, cdir)) if cdir else here
+                d = os.path.normpath(os.path.join(at, cdir)) if cdir else at
                 job = {"kind": verb, "flags": flags, "pkgs": pkgs, "dir": d}
         elif prog == "golangci-lint" and len(words) > 1 and words[1] == "run":
-            job = {"kind": "lint", "flags": {}, "pkgs": [], "dir": here}
+            job = {"kind": "lint", "flags": {}, "pkgs": [], "dir": at}
             for w in words[2:]:
                 m = re.match(r"--concurrency[= ]?(\d+)$", w)
                 if m:
                     job["flags"]["-p"] = m.group(1)
         elif prog == "make":
-            d, targets, k = here, [], 1
+            d, targets, k = at, [], 1
             while k < len(words):
                 if words[k] == "-C" and k + 1 < len(words):
-                    d = os.path.normpath(os.path.join(here, words[k + 1]))
+                    d = os.path.normpath(os.path.join(at, words[k + 1]))
                     k += 2
                     continue
                 if not words[k].startswith("-") and "=" not in words[k]:
@@ -1644,14 +1714,14 @@ def classify(command, cwd, argv=None):
                 "kind": "vet",
                 "flags": {},
                 "pkgs": [w for w in words[1:] if not w.startswith("-")],
-                "dir": here,
+                "dir": at,
             }
         else:
-            job = parse_native(words, here) if native_on else None
+            job = parse_native(words, at) if native_on else None
             if job is None and node_on:
-                job = parse_node(words, here)
+                job = parse_node(words, at)
         if job is None and generic_on and prog not in ("go", "golangci-lint", "govulncheck"):
-            job = parse_generic(words, here)
+            job = parse_generic(words, at)
             if job and job["kind"] == "script" and not heavy_sig(job["sig"]):
                 job = None  # skrypt, program projektu albo cel make bez czasownika pracy: od razu
             if job:
@@ -1683,9 +1753,13 @@ def classify(command, cwd, argv=None):
 
 
 def simple_command(segments):
-    """Sama praca Go (z cd, rtk proxy, ogonem | tail): tylko taką da się wysłać na Depot jako argv."""
+    """Sama praca Go (z cd, rtk proxy, ogonem | tail): tylko taką da się wysłać na Depot jako argv.
+    Opakowanie, które zmienia znaczenie komendy (timeout, env -i/-u/-C, command -p, exec z flagą),
+    zostałoby na tym Macu, więc taka komenda nie jest prosta."""
     for words, _sep in segments:
-        _, w = strip_prefix(words)
+        _, w, wrap = strip_prefix(words)
+        if wrap["changes"]:
+            return False
         if not w:
             continue
         if (

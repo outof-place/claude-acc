@@ -244,6 +244,40 @@ class ClassifyTest(Paths):
         ):
             self.assertIsNone(S.classify(command, self.repo), command)
 
+    def test_wrapper_flag_table(self):
+        """raport:J:A3, M20: opakowania z flagami (`nice -n 5`, `env -u`, `timeout 300`, nawias
+        podpowłoki) dawały None, więc ciężka komenda szła obok kolejki. Opakowanie, które zmienia
+        znaczenie komendy (limit `timeout`, `env -u/-i/-C`, `command -p`, `exec -a`), daje simple=False:
+        na Depot poszłoby samo `go test` i zgubiło na przykład limit czasu."""
+        pkg = "./internal/money/"
+        shapes = {
+            f"nice -n 5 go test {pkg}": True,
+            f"env -u FOO go test {pkg}": False,
+            f"env -i PATH=/usr/bin go test {pkg}": False,
+            f"command -p go test {pkg}": False,
+            f"time -p go test {pkg}": True,
+            f"time -o /tmp/t go test {pkg}": True,
+            f"timeout 300 go test {pkg}": False,
+            f"timeout -k 10 300 go test {pkg}": False,
+            f"timeout --signal=KILL 5m go test {pkg}": False,
+            f"gtimeout 300 go test {pkg}": False,
+            f"caffeinate -t 600 go test {pkg}": True,
+            f"exec -a x go test {pkg}": False,
+            f"(go test {pkg}) > /tmp/f 2>&1": True,
+            f"rtk proxy nice -n 5 go test {pkg}": True,
+        }
+        for command, simple in shapes.items():
+            job = S.classify(command, self.charter)
+            self.assertIsNotNone(job, command)
+            self.assertEqual(job["class"], "charter-service:test:pkg:internal/money", command)
+            self.assertEqual(job["simple"], simple, command)
+        # env -C: katalog modułu z flagi, komenda z korzenia repo
+        job = S.classify(f"env -C apps/charter-service go test {pkg}", self.repo)
+        self.assertEqual((job["class"], job["simple"]), ("charter-service:test:pkg:internal/money", False))
+        # tylko wypisuje, komenda w napisie, lekki program albo nie praca: dalej None
+        for command in ("command -v go", "env -S 'go test ./...'", "nice -n 5 rg x", "timeout 5 sleep 1"):
+            self.assertIsNone(S.classify(command, self.charter), command)
+
     def test_argv_forms(self):
         j = S.classify(None, self.charter, argv=["go", "vet", "./..."])
         self.assertEqual(j["class"], "charter-service:vet:tree")
