@@ -822,12 +822,13 @@ def strip_prefix(words):
 
 
 def unwrap_subshell(command):
-    """Jeden poziom nawiasu podpowłoki na początku komendy: `(cd x && go test ./...) > f 2>&1` to dla
-    klasyfikacji `cd x && go test ./...  > f 2>&1`. Arytmetyka `((...))` i komenda bez nawiasu bez
-    zmian; cudzysłowy i znaki po \\ nie liczą się do nawiasów."""
+    """Jeden poziom nawiasu podpowłoki na początku komendy: (komenda bez nawiasu, wnętrze nawiasu albo
+    None). `(cd x && go test ./...) > f 2>&1` to dla klasyfikacji `cd x && go test ./...  > f 2>&1`
+    z wnętrzem `cd x && go test ./...`. Arytmetyka `((...))` i komenda bez nawiasu bez zmian;
+    cudzysłowy i znaki po \\ nie liczą się do nawiasów."""
     text = command.lstrip()
     if not text.startswith("(") or text.startswith("(("):
-        return command
+        return command, None
     depth, quote, i = 0, None, 0
     while i < len(text):
         ch = text[i]
@@ -843,9 +844,9 @@ def unwrap_subshell(command):
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                return text[1:i] + " " + text[i + 1 :]
+                return text[1:i] + " " + text[i + 1 :], text[1:i]
         i += 1
-    return command
+    return command, None
 
 
 def find_up(path, marker, stop_at_git=False):
@@ -1652,18 +1653,25 @@ def classify(command, cwd, argv=None):
             return classify(argv[2], cwd)
         segments = [(list(argv), "")]
         command = " ".join(shlex.quote(a) for a in argv)
+        scoped = None
     else:
         if any(m in command for m in SKIP_MARKERS):
             return None
-        segments = split_segments(unwrap_subshell(command))
+        text, inner = unwrap_subshell(command)
+        segments = split_segments(text)
         if segments is None:
             return None
+        # człony wnętrza nawiasu idą pierwsze; `cd` w nim działa tylko w podpowłoce, więc od członu
+        # po nawiasie katalog wraca do cwd
+        scoped = len(split_segments(inner) or ()) if inner is not None else None
     here = cwd
     found, nested = [], []
     cfg = load_config()
     node_on, native_on = bool(cfg.get("node", True)), bool(cfg.get("native", True))
     generic_on = bool(cfg.get("generic", True))
-    for words, _sep in segments:
+    for n, (words, _sep) in enumerate(segments):
+        if n == scoped:
+            here = cwd
         if not words:
             continue
         env, words, wrap = strip_prefix(words)

@@ -282,6 +282,18 @@ class ClassifyTest(Paths):
         for command in ("command -v go", "env -S 'go test ./...'", "nice -n 5 rg x", "timeout 5 sleep 1"):
             self.assertIsNone(S.classify(command, self.charter), command)
 
+    def test_subshell_cd_stays_inside_the_parens(self):
+        """`cd` w nawiasie podpowłoki zmienia katalog tylko w nim: człon po nawiasie biegnie z cwd.
+        Po zdjęciu nawiasu `cd apps/auth-service` liczyłby się od apps/charter-service, a `go vet`
+        trafiłby do złego modułu (albo do żadnego)."""
+        job = S.classify(
+            "(cd apps/charter-service && go test ./internal/money/) && cd apps/auth-service && go vet ./...",
+            self.repo,
+        )
+        self.assertEqual(job["class"], "charter-service:test:pkg:internal/money")
+        vet = [p for p in job.get("parts") or [] if p["kind"] == "vet"]
+        self.assertEqual([p["module_dir"] for p in vet], [os.path.join(self.repo, "apps/auth-service")])
+
     def test_argv_forms(self):
         j = S.classify(None, self.charter, argv=["go", "vet", "./..."])
         self.assertEqual(j["class"], "charter-service:vet:tree")
