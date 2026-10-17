@@ -272,6 +272,29 @@ class RemoveTest(RemoveWorld):
         self.assert_nothing_changed(w, before, kc_before)
 
 
+class StatusTest(RemoveWorld):
+    """Co Pod czyta ze `status --json`, zanim pokaże Usuń: czy ta wersja w ogóle umie remove
+    (capabilities) i które wiersze da się usunąć (removable), żeby nie pokazywać przycisku, który
+    zawsze skończy się odmową not_owned."""
+
+    def test_status_says_remove_is_there_and_which_rows_it_can_remove(self):
+        w = self.world(pod=True)
+        w.runtime(w.account("a@x"))  # konto z folderu danych Poda, aktywne
+        w.account("b@x")  # drugie konto Poda
+        self.own(w, "c@x")  # konto claude-acc
+        add_profile(w, "p@x")  # profil Poda
+        w.write()
+
+        r = w.run("status", "--json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        status = json.loads(r.stdout)
+        self.assertIn("remove", status["capabilities"])
+        removable = {row["email"]: row["removable"] for row in status["accounts"]}
+        self.assertEqual(removable, {"a@x": False, "b@x": False, "c@x": True, "p@x": False})
+        # to samo, co remove powie po kliknięciu: wiersz z removable false odmawia not_owned
+        self.refusal(self.run_remove(w, "b@x", "--json"), "not_owned")
+
+
 class RefusalsTest(RemoveWorld):
     def test_the_account_sessions_use_now_is_refused_with_a_way_out(self):
         w = self.world()

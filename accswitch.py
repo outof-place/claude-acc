@@ -1028,6 +1028,7 @@ def profile_items(accounts):
             "subscription_status": None,
             "subscription_since": p.since,
             "source": "profile",
+            "removable": False,
             "stale": stale,
             "host_selected": in_use,
         })
@@ -1705,6 +1706,8 @@ def snapshot(cfg, accounts=None):
     cache = load_json(USAGE_CACHE_PATH, {})
     order = {r["account"].id: i for i, r in enumerate(queue(rows), 1)}
     now = time.time()
+    # `remove` usuwa tylko konta dodane w claude-acc (add, adopt); konto z folderu aplikacji odrzuca (not_owned)
+    own = set(os.listdir(OWN_ACCOUNTS_DIR)) if os.path.isdir(OWN_ACCOUNTS_DIR) else set()
     items = []
     for r in rows:
         a = r["account"]
@@ -1735,6 +1738,7 @@ def snapshot(cfg, accounts=None):
             "renews_at": renewal.timestamp() if renewal else None,
             "subscription_status": who.get("status"),
             "subscription_since": who.get("subscription_since") or None,
+            "removable": a.id in own,
         })
     # najpierw kolejka automatu, potem wypalone od najbliższego resetu tygodnia
     items.sort(key=lambda i: (not i["active"], i["queue"] or 99, i["status"] != "ok",
@@ -1762,6 +1766,8 @@ def snapshot(cfg, accounts=None):
         "limit_pause": bool(cfg["limit_pause"]),
         "drain": bool(cfg["drain"]),
         "credits": credits_summary(),
+        # co umie ta wersja: aplikacja (Ustawienia Poda) pokazuje Usuń tylko, gdy jest tu "remove"
+        "capabilities": ["remove"],
         "accounts": items,
     }
 
