@@ -1846,7 +1846,7 @@ class BrakeTickTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.state_dir, True)
 
     def run_tick(self, stage, plans=(), brake_at=0, last_action=0, inventory=None, previous=None, reasons=(),
-                 stage_reasons=(), inventory_now=None, ring=None, **extra):
+                 stage_reasons=(), inventory_now=None, ring=None, dry_run=False, **extra):
         import lastresort as lr
 
         cfg = dict(dg.DEFAULT_CONFIG, **extra)
@@ -1866,7 +1866,7 @@ class BrakeTickTest(unittest.TestCase):
                 mock.patch.object(dg, "decide", return_value=list(plans)), mock.patch.object(dg, "execute"), \
                 mock.patch.object(dg, "inventory", return_value=inventory_now), \
                 mock.patch.object(dg, "STATE_DIR", self.state_dir), mock.patch.object(lr, "reap", reap):
-            dg.tick(cfg, state, orca=None, now=NOW_T)
+            dg.tick(cfg, state, orca=None, now=NOW_T, dry_run=dry_run)
         return reap, state
 
     def events(self):
@@ -1905,6 +1905,16 @@ class BrakeTickTest(unittest.TestCase):
         # zejście na spokój też jest zmianą
         self.run_tick(0, previous=2)
         self.assertEqual([(r["stage"], r["previous"]) for r in self.events() if r["ev"] == "stage"], [(2, 0), (0, 2)])
+
+    def test_dry_run_tick_writes_no_stage_row(self):
+        """`guard status` bez świeżej migawki i `once --dry-run` liczą tick na próbę (dry_run) i nie
+        zapisują stanu, więc ich „poprzedni stopień” to stara migawka z dysku: wiersz `stage` z takiego
+        ticku byłby zmianą, której strażnik nie przeszedł. Próba nie pisze do rejestru nic."""
+        self.run_tick(2, previous=0, stage_reasons=["kompresor 25.0 GB (52% RAM)"], dry_run=True)
+        self.assertEqual(self.events(), [])
+        # ten sam tick naprawdę: jeden wiersz `stage`
+        self.run_tick(2, previous=0, stage_reasons=["kompresor 25.0 GB (52% RAM)"])
+        self.assertEqual([(r["ev"], r["stage"], r["previous"]) for r in self.events()], [("stage", 2, 0)])
 
     def test_plan_action_writes_stop_event_with_window_reset(self):
         """Wydanie A (A2), B-3: akcja strażnika inna niż ostrzeżenie zeruje okno przyrostu swapu;

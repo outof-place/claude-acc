@@ -2270,11 +2270,14 @@ def tick(cfg, state, orca, dry_run=False, now=None, qos=False):
     if hasattr(world, "table") and world.table and (stage >= 1 or now - inv.get("at", 0) >= 30):
         state["inventory"] = inventory(world.table, world.units, now)
         remember_inventory(state, now)
-    if stage != previous:
+    reaped = brake(cfg, world, state, now, enforce, acted)
+    # po hamulcu: odczyt dysku i zapis wiersza nie opóźniają zabicia przy awarii. Tick na próbę (`guard
+    # status` bez świeżej migawki, `once --dry-run`) stanu nie zapisuje, a jego „poprzedni stopień” to
+    # stara migawka z dysku: jego zmiana stopnia nie jest zmianą, którą strażnik przeszedł
+    if stage != previous and not dry_run:
         ring = state.get("inventory_ring") or []
         record("stage", world, stage=stage, previous=previous, families=family_sizes(state.get("inventory")),
                families_at=(state.get("inventory") or {}).get("at"), ring_oldest=ring[0] if ring else None)
-    reaped = brake(cfg, world, state, now, enforce, acted)
     history = state.setdefault("history", [])
     if not history or now - history[-1][0] >= 30:
         p = world.pressure
