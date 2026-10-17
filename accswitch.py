@@ -2388,7 +2388,9 @@ def remove_account(acct_id, email):
     if os.path.islink(folder) or os.path.realpath(os.path.dirname(folder)) != os.path.realpath(OWN_ACCOUNTS_DIR):
         raise Refusal("failed", f"{folder} is not a plain folder of claude-acc. Nothing was removed.")
     kc_delete(MANAGED_SERVICE, acct_id)
-    if kc_read(MANAGED_SERVICE, acct_id) is not None:
+    # dowodem jest tylko 44 (errSecItemNotFound): zablokowany Pęk kluczy też nie da odczytu, a wpis zostaje
+    probe = spawn(["security", "find-generic-password", "-s", MANAGED_SERVICE, "-a", acct_id], timeout=30)
+    if probe.returncode != 44:
         raise Refusal("failed", f"Could not delete the Keychain item of {email}. Nothing else was removed.")
     forget_account(acct_id, email)
     shutil.rmtree(folder)

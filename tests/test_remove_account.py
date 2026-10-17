@@ -510,6 +510,20 @@ class FailureTest(RemoveWorld):
         self.assert_nothing_changed(w, before, kc_before)
         self.assertEqual(list(self.own_accounts(w)), ["c@x"])  # dalej na liście, można spróbować jeszcze raz
 
+    def test_a_locked_keychain_is_not_taken_for_a_deleted_item(self):
+        # zablokowany Pęk kluczy nie usuwa wpisu i nie daje go odczytać; to nie dowód, że wpisu nie ma
+        w = self.world()
+        w.runtime(w.account("a@x"))
+        self.own(w, "c@x")
+        w.write()
+        self.edit_state(w, lambda s: s.update(needs_login={"c@x": 1}))
+        before, kc_before = self.tree(w), self.keychain(w)
+
+        r = self.run_remove(w, "c@x", "--json", FAKE_LOCKED_SERVICE=w.service)
+
+        self.assertIn("Keychain", self.refusal(r, "failed"))
+        self.assert_nothing_changed(w, before, kc_before)
+
     def test_an_interrupted_remove_is_finished_by_the_next_one(self):
         # wpis w Pęku kluczy zniknął, katalog i stan zostały: konto jest już niewidoczne, ale remove je dokończy
         w = self.world()
