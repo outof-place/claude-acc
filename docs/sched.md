@@ -507,6 +507,20 @@ ani `--binary-files`. 2026-10-08 pętla agenta z `git grep -nE ... <commit>` w r
 i obrazów w historii urosła do 10 GB w 2 sekundy: wyrażenie `-E` idzie przez regex macOS, a plik
 binarny to dla niego jedna linia długości megabajtów. Z `-I` ta sama komenda ma szczyt ~270 MB.
 
+### Wspólne cache Go
+
+Poza odczytem sekretów bramki pocztowej (`SECRET_DENY` w devguard.py) hook odmawia tylko tego (`go_cache_wipe`, `permissionDecision: "deny"` z powodem, który mówi, co zrobić
+zamiast): `go clean -cache`, `rm` i `find -delete`/`-exec rm` na `~/Library/Caches/go-build` (także
+`$GOCACHE`, `$(go env GOCACHE)` i `GOCACHE` z env hooka) oraz `go clean -modcache`. Cache kompilacji
+dzielą wszystkie sesje: 10-03 `go clean -cache` agenta zabrał 87,5 GB i każda budowała potem od zera
+(zimny charter-service: 412 s, 4,9 GB), a plik zniknięty w trakcie kładzie golangci-lint. Odmowa jest
+zawsze, nie tylko przy właścicielu pod-gocache, bo szkoda dla innych sesji jest ta sama. Przechodzą:
+`go clean -testcache` (tylko zapisuje `testexpire.txt`), `go clean -n` (tylko wypisuje), katalog
+nadany w tej samej komendzie (`GOCACHE=$(mktemp -d) go clean -cache`, `export GOCACHE=...;`) i tekst,
+którego powłoka nie wykona (cudzysłów, heredoc, komentarz). Komendy bez słów `go-build`, `GOCACHE`
+ani `clean` (np. `rm -rf ~/Library/Caches/go-*`) `go_cache_wipe` nie ogląda, a bramka natywnego frontu
+budzi dla `rm` Pythona tylko przy tych słowach: inaczej płaciłaby za to każda komenda z `rm`.
+
 ### Codex
 
 `sched.py codex install` dopisuje do `~/.codex/hooks.json` (albo `$CODEX_HOME/hooks.json`) hook

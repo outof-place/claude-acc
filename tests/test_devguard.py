@@ -962,6 +962,15 @@ SCHEDULED = (
     "portivo-mobile up mobile",
     "open -a Simulator",
 )
+# ...albo czyszczą wspólny cache Go (sched.go_cache_wipe): odmowa
+GO_CACHE_WIPES = (
+    "go clean -cache",
+    "go clean -modcache",
+    "rm -rf ~/Library/Caches/go-build",
+    'rm -rf "$GOCACHE"',
+    "find ~/Library/Caches/go-build -type f -delete",
+    "cd /tmp && go clean -cache 2>&1 | tail -1",
+)
 # słowa w ścieżkach i innych słowach: Python nic tu nie robi, więc nie ma po co startować
 QUIET = (
     "ls -la 2>/dev/null",
@@ -1041,9 +1050,9 @@ class HookGateTest(unittest.TestCase):
             f.write('{"name": "shop"}')
         self.gate = __import__("re").compile(entry.HOOK_GATE)
 
-    def admit(self, command):
+    def admit(self, command, cwd=None):
         """Wyjście prawdziwego `devguard.py admit` na tym HOME, jak w sesji."""
-        event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": self.project}
+        event = {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd or self.project}
         done = subprocess.run(
             ["/usr/bin/python3", SCRIPT, "admit"],
             input=json.dumps(event),
@@ -1091,6 +1100,34 @@ class HookGateTest(unittest.TestCase):
         self.assertIn('git grep -I -nE "<$n" HEAD', command)
         self.assertEqual(self.admit("git grep -a needle"), "")  # agent chce binarek: zostaje
 
+    def test_agent_cannot_wipe_the_shared_go_cache(self):
+        """`go clean -cache` agenta (i rm/find na katalogu) kasował cache wszystkim sesjom: hook odmawia z
+        powodem, który mówi, co zrobić zamiast; reszta pracy Go idzie jak dotąd."""
+        for command in GO_CACHE_WIPES:
+            self.assertTrue(self.gate.search(command), command)  # natywny front oddaje ją Pythonowi
+            out = json.loads(self.admit(command))["hookSpecificOutput"]
+            self.assertEqual(out["permissionDecision"], "deny", command)
+            self.assertNotIn("updatedInput", out, command)
+            self.assertIn("claude-acc: nie puszczam", out["permissionDecisionReason"], command)
+        self.assertIn("cache kompilacji Go (~/Library/Caches/go-build)",
+                      json.loads(self.admit("go clean -cache"))["hookSpecificOutput"]["permissionDecisionReason"])
+        # względna nazwa z katalogu Caches: w komendzie nie ma "/" ani innego słowa schedulera oprócz go-build
+        out = json.loads(self.admit("rm -rf go-build", os.path.join(self.home, "Library/Caches")))["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        for command in ("go clean -testcache", "go clean -n -cache", "GOCACHE=$(mktemp -d) go clean -cache",
+                        "cat > Makefile <<'EOF'\nclean:\n\tgo clean -cache\nEOF"):
+            self.assertEqual(self.admit(command), "", command)
+        for command in ("go build ./...", "go test ./..."):
+            out = json.loads(self.admit(command))["hookSpecificOutput"]
+            self.assertNotIn("permissionDecision", out, command)
+            self.assertIn("updatedInput", out, command)  # scheduler owija jak dotąd
+        # Codex: ta sama odmowa, bez dokładanego "allow"
+        event = {"tool_name": "exec_command", "tool_input": {"cmd": "go clean -cache"}, "cwd": self.project}
+        done = subprocess.run(["/usr/bin/python3", SCRIPT, "admit", "--codex"], input=json.dumps(event),
+                              capture_output=True, text=True, env=dict(os.environ, HOME=self.home, DEVGUARD_ORCA=""),
+                              timeout=60)
+        self.assertEqual(json.loads(done.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_every_program_the_scheduler_knows_is_in_the_gate(self):
         import sched as scheduler
 
@@ -1116,7 +1153,7 @@ class HookGateTest(unittest.TestCase):
             return subprocess.run([BUILT_HOOK], input=json.dumps(event), capture_output=True,
                                   text=True, env={"HOME": self.home}, timeout=30).stdout.strip()
 
-        for command in DEV_STARTS + SCHEDULED + GENERIC:
+        for command in DEV_STARTS + SCHEDULED + GENERIC + GO_CACHE_WIPES:
             self.assertEqual(front(command), "python", command)
         for command in QUIET:
             self.assertEqual(front(command), "", command)
