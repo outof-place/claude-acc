@@ -82,6 +82,8 @@ SCHED_WORDS = (
     "tsup", "astro", "nuxt", "nuxi", "svelte-check", "cypress", "mocha", "ava ", "lighthouse",
     "expo", "react-native", "storybook", "just ", "task ", "python", "node ", "tsx", "ts-node",
     "uv ", "bash ", "sh ", "zsh ", ".sh", "/", "grep",
+    # odmowa czyszczenia wspólnego cache Go (sched.go_cache_wipe): `rm -rf "$GOCACHE"` nie ma "/"
+    "GOCACHE", "go-build",
 )  # fmt: skip
 # Bramka natywnego frontu (claude-acc-hook): komenda idzie do Pythona tylko wtedy, gdy słowo
 # stoi w niej jako całe słowo, a nie kawałek ścieżki albo innego słowa. Scheduler rozpoznaje
@@ -137,6 +139,8 @@ HOOK_GATE = (
     r"|(?:^|[;&|(\n])\s*" + COMMAND_PREFIX + r"(?!/(?:usr|bin|sbin|opt/homebrew|System|Library|Applications)/)[~.\w-]*/[\w.-]"
     r"|(?:^|[;&|(\n])\s*" + COMMAND_PREFIX + r"[\w.-]+\.sh(?![\w.-])"
     r"|(?<![\w.-])git(?:\s+-[Cc]\s+\S+)*\s+grep(?![\w.-])"
+    # rm i find -delete na cache Go (sched.go_cache_wipe); `go clean` bramka łapie już po słowie go
+    r"|(?<![\w.-])(?:go-build|GOCACHE)(?![\w.-])"
     r"|" + GATE_NATIVE +
     r"|(?<![\w.-])(?:" + "|".join(SECRET_WORDS) + r")(?![\w.-])"
 )
@@ -217,7 +221,8 @@ NESTED = r"""(?:--command|\b(?:ba|z)?sh\s+-c)[\s=](?:"((?:[^"\\]|\\.)*)"|'([^']*
 
 def sched_rewrite(event):
     """Komenda Go albo JS agenta owinięta w scheduler (sched.py obok tego pliku): wyjście hooka z
-    updatedInput albo None. Jedyny hook, który przepisuje komendy Bash; nigdy nie blokuje."""
+    updatedInput albo None. Jedyny hook, który przepisuje komendy Bash; blokuje tylko czyszczenie
+    wspólnego cache Go (sched.go_cache_wipe)."""
     try:
         from importlib.machinery import SourceFileLoader
 
