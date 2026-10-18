@@ -4441,6 +4441,214 @@ def git_grep_text_only(command):
     out.append(command[pos:])
     return "".join(out)
 
+
+# Wspólne cache Go, których agent nie czyści wszystkim sesjom naraz (go_cache_wipe, odmowa w hook_rewrite).
+# `go clean -cache` agenta zabrał 10-03 87,5 GB cache kompilacji i każda sesja budowała potem od zera
+# (zimny charter-service: 412 s, 4,9 GB), a plik zniknięty w trakcie kładzie trwający golangci-lint
+# ("could not load export data"); rm i find -delete na katalogu cache robią to samo. `go clean -modcache`
+# psuje trwające buildy i każe każdej sesji pobrać wszystkie moduły od nowa. Odmowa zawsze, nie tylko
+# przy właścicielu pod-gocache: szkoda dla innych sesji jest ta sama, a rozmiarem cache i tak zarządza
+# pod-gocache albo janitor. Katalog nadany w samej komendzie (`GOCACHE=$(mktemp -d) go clean -cache`) wolno.
+GO_BUILD_CACHE = os.path.join(HOME, "Library/Caches/go-build")
+GO_CACHE_HINT = re.compile(r"go-build|GOCACHE|(?<![\w.-])clean(?![\w.-])")
+# odwołania do katalogu cache i podstawienia komend zamieniane przed shlex na znaczniki: bez cudzysłowu
+# shlex dzieli `$(go env GOCACHE)` i `$(mktemp -d)` na kilka słów
+GO_CACHE_REF = re.compile(r"\$\(\s*go\s+env\s+GOCACHE\s*\)|`\s*go\s+env\s+GOCACHE\s*`|\$\{GOCACHE\}|\$GOCACHE(?!\w)")
+GO_CACHE_MARK = "\x01GOCACHE\x01"
+COMMAND_SUBST = re.compile(r"\$\([^()]*\)|`[^`]*`")
+GO_CACHE_DENY = (
+    "claude-acc: nie puszczam tej komendy, bo kasuje wspólny cache kompilacji Go ({path}). Korzystają z niego "
+    "wszystkie sesje agentów na tym Macu: po wyczyszczeniu każda buduje wszystko od zera (duży projekt Go: "
+    "kilka minut i kilka GB pamięci), a trwające buildy i golangci-lint padają na brakujących plikach. "
+    "Rozmiarem cache zarządza pod-gocache albo janitor claude-acc, więc ręcznie nie ma czego zwalniać. "
+    "Go zapisuje każdy wpis pod skrótem wszystkich jego wejść, więc czysty cache prawie nigdy nie naprawia "
+    "buildu. Testy od nowa: `go test -count=1` albo `go clean -testcache`. Własny, pusty cache: poprzedź "
+    "komendę `GOCACHE=$(mktemp -d)` i skasuj ten katalog na końcu. Błąd „could not load export data” znika "
+    "przy następnym uruchomieniu."
+)
+GO_MODCACHE_DENY = (
+    "claude-acc: nie puszczam `go clean -modcache`, bo kasuje wspólny cache modułów Go ({path}). Korzystają z "
+    "niego wszystkie sesje agentów na tym Macu: trwające buildy padają na brakujących plikach, a każda sesja "
+    "pobiera potem wszystkie moduły od nowa. Brakujące moduły: `go mod download`. Sprawdzenie cache z go.sum: "
+    "`go mod verify`. Własny cache modułów: poprzedź komendę `GOMODCACHE=$(mktemp -d)`."
+)
+
+
+def code_commands(command):
+    """(słowa, otwarte, zamknięte) każdej prostej komendy, którą powłoka wykona: człony między ;, &, |,
+    nową linią czytanymi jako kod (shell_code). Człon, który zaczyna się poza kodem (treść heredoca,
+    komentarz, słowo w cudzysłowie), wypada; podstawienia `$(...)` są w słowach znacznikami. `otwarte` to
+    liczba `(` przed komendą, `zamknięte` liczba `)` po niej: tyle podpowłok zaczyna się i kończy."""
+    code = shell_code(command)
+    n, bounds, start = len(command), [], 0
+    for i, ch in enumerate(command):
+        if not code[i]:
+            continue
+        if i and not code[i - 1] and command[i - 1] == "\n":
+            bounds.append((start, i))  # pierwsza linia po heredocu: jego koniec rozdziela komendy
+            start = i
+        if ch in ";|\n" and not (ch == "\n" and command[i - 1 : i] == "\\") or (
+            ch == "&" and command[i - 1 : i] not in ("<", ">") and command[i + 1 : i + 2] != ">"
+        ):
+            bounds.append((start, i))
+            start = i + 1
+    bounds.append((start, n))
+    out = []
+    for a, b in bounds:
+        a0 = a
+        while a < b and command[a] in " \t({":
+            a += 1
+        if a >= b or not code[a]:
+            continue
+        text = COMMAND_SUBST.sub("\x02", GO_CACHE_REF.sub(GO_CACHE_MARK, command[a:b]))
+        opened = command[a0:a].count("(")
+        closed = text[len(text.rstrip(" \t)}")) :].count(")")
+        text = text.rstrip(" \t)}")
+        try:
+            words = shlex.split(text, comments=True)
+        except ValueError:
+            continue
+        while words and words[0] in ("do", "then", "else", "!", "sudo"):
+            words = words[1:]
+        if words or opened or closed:
+            out.append((words, opened, closed))
+    return out
+
+
+def shell_path(arg, here, env):
+    """Ścieżka z argumentu komendy: ~ i zmienne znane z env rozwinięte, względna od katalogu `here`;
+    None, gdy względna, a `here` nieznany (po `cd -` albo `cd` do nieznanej zmiennej)."""
+    arg = re.sub(r"\$(?:(\w+)|\{(\w+)\})", lambda m: env.get(m.group(1) or m.group(2), m.group(0)), arg)
+    if arg == "~" or arg.startswith("~/"):
+        arg = (env.get("HOME") or HOME) + arg[1:]
+    if here is None and not os.path.isabs(arg):
+        return None
+    return os.path.realpath(os.path.join(here or "/", arg))
+
+
+def cd_target(args, here, env):
+    """Katalog po `cd args`; None, gdy go nie znamy (`cd -`, nierozwinięta zmienna albo podstawienie)."""
+    operands = [a for a in args if a == "-" or not a.startswith("-")]
+    arg = operands[0] if operands else "~"
+    if arg == "-":
+        return None
+    path = shell_path(arg, here, env)
+    return None if path is None or re.search(r"[$`\x01\x02]", path) else path
+
+
+def in_dirs(path, dirs):
+    """Czy ścieżka, także wzorzec glob (go-build/*, Library/*/go-build), to któryś z katalogów `dirs` albo coś w nim."""
+    import fnmatch
+
+    parts = path.split("/")
+    for folder in dirs:
+        want = folder.split("/")
+        if len(parts) >= len(want) and all(fnmatch.fnmatchcase(w, p) for w, p in zip(want, parts)):
+            return True
+    return False
+
+
+def go_clean_flags(args):
+    """Flagi `go clean` z argumentów po `go` ({"cache", "n", ...}); pusty zbiór dla innego polecenia go."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] == "-C" else 1
+    if i >= len(args) or args[i] != "clean":
+        return set()
+    on = set()
+    for a in args[i + 1 :]:
+        if a == "--":
+            break
+        if a.startswith("-"):
+            name, eq, value = a.lstrip("-").partition("=")
+            # flaga bool Go: -cache=false wyłącza (strconv.ParseBool)
+            (on.discard if eq and value.lower() in ("false", "f", "0") else on.add)(name)
+    return on
+
+
+def home_short(path):
+    """Ścieżka z ~ zamiast katalogu domowego (także po realpath: /tmp to /private/tmp)."""
+    for home in (HOME, os.path.realpath(HOME)):
+        if path == home or path.startswith(home + "/"):
+            return "~" + path[len(home) :]
+    return path
+
+
+def go_modcache(env):
+    """Katalog cache modułów Go dla zmiennych `env`: GOMODCACHE, inaczej pierwszy GOPATH (albo ~/go) + pkg/mod."""
+    return env.get("GOMODCACHE") or os.path.join((env.get("GOPATH") or os.path.join(HOME, "go")).split(":")[0], "pkg/mod")
+
+
+def go_cache_wipe(command, cwd, env=None, depth=0):
+    """Powód odmowy (GO_CACHE_DENY albo GO_MODCACHE_DENY) dla komendy, która czyści wspólny cache Go:
+    `go clean -cache`, `go clean -modcache`, rm albo find -delete na katalogu cache kompilacji; None dla
+    każdej innej, także dla `go clean -n` (tylko wypisuje) i dla katalogu nadanego w tej samej komendzie
+    (VAR=... przed komendą, samo przypisanie albo export we wcześniejszym członie)."""
+    if depth > 3 or not GO_CACHE_HINT.search(command):
+        return None
+    env = dict(os.environ if env is None else env)
+    shared = [os.path.realpath(GO_BUILD_CACHE)]
+    if os.path.isabs(os.environ.get("GOCACHE") or ""):
+        shared.append(os.path.realpath(os.environ["GOCACHE"]))
+    shared_mod = os.path.realpath(go_modcache(os.environ))
+    here = cwd
+    scopes, closing = [], 0  # (here, env) sprzed każdej otwartej podpowłoki: cd i export nie wychodzą z niej
+    for words, opened, closed in code_commands(command):
+        for _ in range(min(closing, len(scopes))):
+            here, env = scopes.pop()  # podpowłoka z poprzedniego członu się zamknęła
+        scopes.extend([(here, dict(env))] * opened)
+        closing = closed
+        assigned, words, _wrap = strip_prefix(words) if words else ({}, [], None)
+        if not words:
+            env.update(assigned)  # samo przypisanie: zmienna powłoki dla dalszych członów
+            continue
+        seg = dict(env, **assigned)
+        # $GOCACHE w słowach rozwija powłoka, zanim przypisanie przed komendą zadziała; go czyta je z seg
+        ref = env.get("GOCACHE") or GO_BUILD_CACHE
+        prog, args = os.path.basename(words[0]), [w.replace(GO_CACHE_MARK, ref) for w in words[1:]]
+        targets = []
+        if prog == "cd":
+            here = cd_target(args, here, seg)
+        elif prog == "export":
+            env.update(a.split("=", 1) for a in args if "=" in a)
+        elif prog == "go":
+            flags = go_clean_flags(args)
+            if "n" in flags:
+                flags = set()  # -n tylko wypisuje, co by skasował
+            if "cache" in flags:
+                targets = [seg.get("GOCACHE") or GO_BUILD_CACHE]
+            if "modcache" in flags and shell_path(go_modcache(seg), here, seg) == shared_mod:
+                return GO_MODCACHE_DENY.format(path=home_short(shared_mod))
+        elif prog == "rm":
+            targets = [a for a in args if a == "-" or not a.startswith("-")]
+        elif prog == "find" and ("-delete" in args or any(
+            a in ("-exec", "-execdir", "-ok", "-okdir") and os.path.basename(b) in ("rm", "unlink")
+            for a, b in zip(args, args[1:])
+        )):
+            for a in args:
+                if a.startswith("-") or a in ("(", "!"):
+                    if targets:
+                        break
+                    continue  # -H, -L, -x... przed ścieżkami
+                targets.append(a)
+        elif prog in ("bash", "sh", "zsh") and "-c" in args[:-1]:
+            reason = go_cache_wipe(args[args.index("-c") + 1], here, env, depth + 1)
+            if reason:
+                return reason
+        elif prog == "claude-acc" and args[:1] == ["run"] and "--" in args:
+            reason = go_cache_wipe(shlex.join(args[args.index("--") + 1 :]), here, env, depth + 1)
+            if reason:
+                return reason
+        for target in targets:
+            path = shell_path(target, here, env)
+            if path is None:
+                continue  # względny cel, a katalogu po `cd -` nie znamy: nie zgadujemy
+            hit = next((d for d in shared if in_dirs(path, [d])), None)
+            if hit:
+                return GO_CACHE_DENY.format(path=home_short(hit))
+    return None
+
+
 def with_rtk(command):
     """Komenda tak, jak przepisałby ją hook rtk bez naszych wyjątków: komendy schedulera są w jego
     exclude_commands (dwa hooki z updatedInput na tej samej komendzie dają losowy wynik), więc
@@ -4512,13 +4720,26 @@ def bash_limit_s(event):
 
 def hook_rewrite(event):
     """updatedInput dla PreToolUse Bash: cały tool_input z komendą owiniętą w sched.py run, z limitem
-    Basha do pomiaru (--bash-limit, bash_limit_s), nigdy z --timeout kolejki."""
+    Basha do pomiaru (--bash-limit, bash_limit_s), nigdy z --timeout kolejki. Jedyna odmowa: czyszczenie
+    wspólnego cache Go (go_cache_wipe)."""
     if event.get("tool_name") != "Bash":
         return None
     tool_input = event.get("tool_input") or {}
     command = tool_input.get("command") or ""
     if not command.strip():
         return None
+    try:
+        reason = go_cache_wipe(command, event.get("cwd") or os.getcwd())
+    except Exception:  # hook nigdy nie blokuje agenta przez własny błąd
+        reason = None
+    if reason:
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
     if RECURSIVE_GREP.search(command):
         return None  # tę komendę przepisuje rg-rewrite.sh; dwa updatedInput to wynik losowy
     fixed = git_grep_text_only(command) if "grep" in command else command

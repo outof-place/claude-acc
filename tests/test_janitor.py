@@ -154,6 +154,170 @@ class GoCacheTrimTest(unittest.TestCase):
         self.assertEqual(janitor.DEFAULT_CONFIG["go_cache_min_idle_minutes"], 90)
 
 
+class GoCacheOwnerTest(unittest.TestCase):
+    """pod-gocache jako właściciel cache Go (owner.json): janitor nic tam nie kasuje, ani zadaniem `go`,
+    ani żadną inną drogą przez Sweep.remove (np. `caps`, które devguard puszcza co kilka minut). Bez
+    ważnego właściciela wszystko jak dotąd. Przypadki jak w gocache_owned z go-cache-trim.sh."""
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.j = janitor
+        # w katalogu tymczasowym użytkownika: tylko tam i w domu Sweep.remove w ogóle kasuje
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="gocache-owner-test-", dir=janitor.user_tmpdir()))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.cache = os.path.join(self.root, "Caches/go-build")
+        self.other = os.path.join(self.root, "other-cache")
+        os.makedirs(self.other)
+        self.link = os.path.join(self.root, "cache-link")
+        self.owner = os.path.join(self.root, ".pod/gocache/owner.json")
+        os.makedirs(os.path.dirname(self.owner))
+        self.fill_cache()
+        os.symlink(self.cache, self.link)
+        self.logged = []
+        for name, value in (("GOCACHE_OWNER_PATH", self.owner), ("log", self.logged.append)):
+            patcher = mock.patch.object(janitor, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fill_cache(self):
+        """16 wpisów po 8 KB, wszystkie używane 2 dni temu, plus pliki w korzeniu, które zostają zawsze."""
+        old = time.time() - 2 * 86400
+        os.makedirs(self.cache, exist_ok=True)
+        for i in range(16):
+            sub = os.path.join(self.cache, f"{i:02x}")
+            os.makedirs(sub, exist_ok=True)
+            path = os.path.join(sub, f"{i:02x}entry-d")
+            with open(path, "wb") as f:
+                f.write(b"x" * 8192)
+            os.utime(path, (old, old))
+        with open(os.path.join(self.cache, "trim.txt"), "w") as f:
+            f.write("1")
+
+    def entries(self):
+        return sorted(
+            os.path.join(self.cache, sub, name)
+            for sub in os.listdir(self.cache)
+            if len(sub) == 2
+            for name in os.listdir(os.path.join(self.cache, sub))
+        )
+
+    def write_owner(self, **change):
+        data = {"schema": 1, "version": "1.0.0", "pid": 4242, "startedAt": int(time.time()) - 600,
+                "heartbeatAt": int(time.time()), "mode": "owner", "cacheDir": self.cache,
+                "budgetBytes": 30 * 10**9, "targetBytes": None}
+        data.update(change)
+        with open(self.owner, "w") as f:
+            json.dump(data, f)
+
+    def invalid(self):
+        """(nazwa, zmiana w owner.json albo surowy tekst) każdego przypadku bez właściciela; czas z chwili
+        wywołania, nie importu: pełny przebieg testów dochodzi tu po kilku minutach."""
+        now = int(time.time())
+        return (
+            ("stale", {"heartbeatAt": now - 121}),
+            ("future", {"heartbeatAt": now + 200}),
+            ("observe", {"mode": "observe"}),
+            ("schema2", {"schema": 2}),
+            ("missing dir", {"cacheDir": "/nonexistent/go-build"}),
+            ("relative dir", {"cacheDir": "Caches/go-build"}),
+            ("string heartbeat", {"heartbeatAt": str(now)}),
+            ("float heartbeat", {"heartbeatAt": time.time()}),
+            ("string schema", {"schema": "1"}),
+            ("bool schema", {"schema": True}),
+            ("garbage", "{not json"),
+        )
+
+    def set_case(self, change):
+        if isinstance(change, str):
+            with open(self.owner, "w") as f:
+                f.write(change)
+        else:
+            self.write_owner(**change)
+
+    def test_reader_follows_the_frozen_contract(self):
+        self.assertIsNone(self.j.gocache_owner())  # brak pliku
+        self.write_owner()
+        self.assertEqual(self.j.gocache_owner(), self.cache)
+        self.write_owner(cacheDir=self.link)  # symlink po stronie właściciela
+        self.assertEqual(self.j.gocache_owner(), self.cache)
+        self.write_owner(heartbeatAt=int(time.time()) - 119)
+        self.assertEqual(self.j.gocache_owner(), self.cache)
+        # granica z zamrożonym zegarem: 120 s to jeszcze właściciel, 121 s już nie (w obie strony)
+        now = int(time.time())
+        with mock.patch.object(self.j.time, "time", return_value=float(now)):
+            for age, owned in ((120, True), (121, False), (-120, True), (-121, False)):
+                self.write_owner(heartbeatAt=now - age)
+                self.assertEqual(self.j.gocache_owner(), self.cache if owned else None, age)
+        for name, change in self.invalid():
+            self.set_case(change)
+            self.assertIsNone(self.j.gocache_owner(), name)
+
+    def go_task(self, cache=None):
+        """task_go_cache na tymczasowym cache ponad limitem: `go env GOCACHE` z atrapy, bez lsof i ps."""
+        real_run = self.j.run
+        reported = cache or self.cache
+
+        def run(cmd, timeout=600):
+            return reported + "\n" if cmd[0] == "/fake/go" else real_run(cmd, timeout)
+
+        size = len(self.entries()) * os.lstat(self.entries()[0]).st_blocks * 512
+        cfg = dict(self.j.DEFAULT_CONFIG, go_cache_max_gb=size / 2 / self.j.GB, go_cache_keep_percent=50)
+        sw = self.j.Sweep(cfg, dry_run=False)
+        sw._usage = mock.Mock(commands=[], ok=True)
+        with mock.patch.object(self.j, "which", lambda name: "/fake/go"), mock.patch.object(self.j, "run", run):
+            self.j.task_go_cache(sw, None)
+        return sw
+
+    def test_fresh_owner_stops_the_go_task_and_logs_why(self):
+        before = self.entries()
+        for owned in (self.cache, self.link):
+            self.write_owner(cacheDir=owned)
+            sw = self.go_task()
+            self.assertEqual(self.entries(), before, owned)
+            self.assertEqual(sw.items, [])
+            self.assertEqual(sw.skipped, [("go", self.cache, "cache Go należy do pod-gocache")])
+            self.assertTrue(self.logged and "pod-gocache" in self.logged[-1], self.logged)
+        # janitor widzi swój cache przez symlink: ten sam katalog, dalej właściciel
+        self.go_task(cache=self.link)
+        self.assertEqual(self.entries(), before)
+
+    def test_without_a_valid_owner_the_go_task_trims_as_before(self):
+        if os.path.exists(self.owner):
+            os.remove(self.owner)
+        self.go_task()
+        expected = self.entries()  # tyle zostaje bez owner.json: odniesienie dla każdego przypadku
+        self.assertLess(len(expected), 16)
+        self.assertGreater(len(expected), 0)
+        cases = self.invalid() + (("other dir", {"cacheDir": self.other}),)
+        for name, change in cases:
+            shutil.rmtree(self.cache)
+            self.fill_cache()
+            self.set_case(change)
+            self.go_task()
+            self.assertEqual(self.entries(), expected, name)
+
+    def caps(self):
+        """Wpis `caps` w samym cache Go, tak jak devguard puszcza go co kilka minut."""
+        cfg = dict(self.j.DEFAULT_CONFIG, caps=[{"path": self.cache, "max_gb": 0, "keep": 0, "fresh_minutes": 0}])
+        sw = self.j.Sweep(cfg, dry_run=False)
+        sw._usage = mock.Mock(commands=[], ok=True, busy=lambda path: False)
+        self.j.task_caps(sw, None)
+        return sw
+
+    def test_fresh_owner_protects_the_cache_from_every_sweep_path(self):
+        before = sorted(os.listdir(self.cache))
+        self.write_owner()
+        sw = self.caps()
+        self.assertEqual(sorted(os.listdir(self.cache)), before)
+        self.assertEqual(sw.freed, 0)
+        self.assertEqual({r for _, _, r in sw.skipped}, {"cache Go należy do pod-gocache"})
+        self.write_owner(mode="observe")
+        self.caps()
+        self.assertEqual(os.listdir(self.cache), [])  # bez właściciela `caps` kasuje jak dotąd
+
+
 class NoRealBannerTest(unittest.TestCase):
     """Przebieg z mało miejsca woła atrapę osascript, nigdy prawdziwego: inaczej każdy przebieg
     testów (nowy $HOME, więc nowa deduplikacja) pokazywałby Filipowi prawdziwy baner."""

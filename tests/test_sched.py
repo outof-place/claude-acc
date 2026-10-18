@@ -3459,6 +3459,109 @@ class GitGrepTest(unittest.TestCase):
             self.assertEqual(S.git_grep_text_only(command), want, command)
 
 
+class GoCacheWipeTest(unittest.TestCase):
+    """Agent nie czyści wspólnego cache Go wszystkim sesjom naraz (10-03: `go clean -cache` zabrał 87,5 GB,
+    a każda sesja budowała potem od zera); własny katalog z tej samej komendy wolno."""
+
+    WIPES = (
+        "go clean -cache",
+        "go clean -cache -testcache",
+        "go clean --cache",
+        "go clean -i -cache=true",
+        "rtk proxy go clean -cache",
+        "cd apps/charter-service && go clean -cache 2>&1 | tail -3",
+        "sudo go clean -cache",
+        "(cd x && go clean -cache)",
+        "env GOFLAGS=-x go clean -cache",
+        "bash -c 'go clean -cache'",
+        "claude-acc run -- go clean -cache",
+        "echo start\ngo clean -cache",
+        "cat > f <<'EOF'\nx\nEOF\ngo clean -cache",
+        "export GOCACHE=~/Library/Caches/go-build; go clean -cache",
+        "rm -rf ~/Library/Caches/go-build",
+        "rm -rf ~/Library/Caches/go-build/",
+        "rm -rf ~/Library/Caches/go-build/*",
+        'rm -rf "$HOME/Library/Caches/go-build"',
+        'rm -rf "$(go env GOCACHE)"',
+        "rm -rf $(go env GOCACHE)/*",
+        "rm -rf `go env GOCACHE`",
+        'rm -rf "$GOCACHE"',
+        "rm -rf ${GOCACHE}/*",
+        "rm ~/Library/Caches/go-build/0a/0a12-d",
+        "cd ~/Library/Caches && rm -rf go-build",
+        "rm -rf ~/Library/*/go-build",
+        "find ~/Library/Caches/go-build -type f -mmin +60 -delete",
+        "find -L ~/Library/Caches/go-build -name '*-d' -exec rm {} +",
+    )
+    ALLOWED = (
+        "go clean -testcache",
+        "go clean -fuzzcache",
+        "go clean -n -cache",
+        "go clean -cache=false",
+        "go clean",
+        "go build ./...",
+        "go test -count=1 ./...",
+        "go env GOCACHE",
+        "make clean",
+        "GOCACHE=$(mktemp -d) go clean -cache",
+        "GOCACHE=/tmp/own go clean -cache",
+        "export GOCACHE=/tmp/own; go clean -cache",
+        "GOCACHE=/tmp/own; go clean -cache",
+        "GOMODCACHE=/tmp/mod go clean -modcache",
+        "GOPATH=/tmp/gp go clean -modcache",
+        'git commit -m "stop running go clean -cache"',
+        "cat > Makefile <<'EOF'\nclean:\n\tgo clean -cache\nEOF",
+        "# go clean -cache",
+        "echo 'rm -rf ~/Library/Caches/go-build'",
+        "ls ~/Library/Caches/go-build",
+        "du -sh ~/Library/Caches/go-build",
+        "find ~/Library/Caches/go-build -type f | wc -l",
+        "rm -rf $TMPDIR/go-build123",
+        "rm -rf ~/Library/Caches/go-build-old",
+        "rm -rf ~/Library/Caches/ms-playwright",
+        "rm -rf /tmp/own && GOCACHE=/tmp/own go build ./...",
+        # katalog zmieniony w podpowłoce nie wycieka na zewnątrz, `cd -` nie jest katalogiem "-"
+        "(cd ~/Library/Caches/go-build && du -sh .) && rm -rf dist",
+        "cd ~/Library/Caches/go-build && ls | head; cd - && rm -rf dist",
+        "cd $UNKNOWN_DIR && rm -rf dist",
+    )
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {"HOME": S.HOME})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("GOCACHE", "GOMODCACHE", "GOPATH"):
+            os.environ.pop(name, None)
+        self.cwd = os.path.join(S.HOME, "Desktop/projekty/portivo")
+
+    def test_every_wipe_of_the_shared_cache_is_refused_with_what_to_do(self):
+        for command in self.WIPES:
+            reason = S.go_cache_wipe(command, self.cwd)
+            self.assertIsNotNone(reason, command)
+            self.assertIn("cache kompilacji Go (~/Library/Caches/go-build)", reason, command)
+            self.assertIn("GOCACHE=$(mktemp -d)", reason, command)
+        reason = S.go_cache_wipe("go clean -modcache", self.cwd)
+        self.assertIn("cache modułów Go (~/go/pkg/mod)", reason)
+        self.assertIn("GOMODCACHE=$(mktemp -d)", reason)
+
+    def test_other_commands_and_own_caches_pass(self):
+        for command in self.ALLOWED:
+            self.assertIsNone(S.go_cache_wipe(command, self.cwd), command)
+
+    def test_gocache_from_the_environment_is_shared_too(self):
+        with mock.patch.dict(os.environ, {"GOCACHE": "/Volumes/fast/gocache"}):
+            self.assertIn("/Volumes/fast/gocache", S.go_cache_wipe("go clean -cache", self.cwd))
+            self.assertIsNotNone(S.go_cache_wipe('rm -rf "$GOCACHE"/*', self.cwd))
+            self.assertIsNotNone(S.go_cache_wipe("rm -rf ~/Library/Caches/go-build", self.cwd))
+
+    def test_hook_denies_and_leaves_the_command_alone(self):
+        event = {"tool_name": "Bash", "cwd": self.cwd, "tool_input": {"command": "go clean -cache"}}
+        out = S.hook_rewrite(event)["hookSpecificOutput"]
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertNotIn("updatedInput", out)
+        self.assertIn("go test -count=1", out["permissionDecisionReason"])
+
+
 class RtkExcludesTest(unittest.TestCase):
     """Hook rtk i hook schedulera nie mogą przepisywać tej samej komendy (wynik losowy): rtk
     zostawia to, co owija scheduler, i nic więcej. Sprawdza samo rtk, bo ono normalizuje komendy
