@@ -254,7 +254,7 @@ class GoCacheOwnerTest(unittest.TestCase):
             self.set_case(change)
             self.assertIsNone(self.j.gocache_owner(), name)
 
-    def go_task(self, cache=None):
+    def go_task(self, cache=None, commands=()):
         """task_go_cache na tymczasowym cache ponad limitem: `go env GOCACHE` z atrapy, bez lsof i ps."""
         real_run = self.j.run
         reported = cache or self.cache
@@ -265,7 +265,7 @@ class GoCacheOwnerTest(unittest.TestCase):
         size = len(self.entries()) * os.lstat(self.entries()[0]).st_blocks * 512
         cfg = dict(self.j.DEFAULT_CONFIG, go_cache_max_gb=size / 2 / self.j.GB, go_cache_keep_percent=50)
         sw = self.j.Sweep(cfg, dry_run=False)
-        sw._usage = mock.Mock(commands=[], ok=True)
+        sw._usage = mock.Mock(commands=list(commands), ok=True)
         with mock.patch.object(self.j, "which", lambda name: "/fake/go"), mock.patch.object(self.j, "run", run):
             self.j.task_go_cache(sw, None)
         return sw
@@ -282,6 +282,27 @@ class GoCacheOwnerTest(unittest.TestCase):
         # janitor widzi swój cache przez symlink: ten sam katalog, dalej właściciel
         self.go_task(cache=self.link)
         self.assertEqual(self.entries(), before)
+
+    def test_a_running_go_build_does_not_stop_the_trim_of_idle_entries(self):
+        # 10-18: sesje z `go test` bez przerwy trzymały pomijanie i cache Marcela urósł do 98 GB
+        if os.path.exists(self.owner):
+            os.remove(self.owner)
+        self.go_task()
+        expected = self.entries()
+        shutil.rmtree(self.cache)
+        self.fill_cache()
+        sw = self.go_task(commands=["/opt/homebrew/bin/go test ./internal/..."])
+        self.assertEqual(self.entries(), expected)
+        self.assertEqual(sw.skipped, [])
+
+    def test_a_short_idle_floor_still_waits_for_running_go_builds(self):
+        if os.path.exists(self.owner):
+            os.remove(self.owner)
+        before = self.entries()
+        with mock.patch.dict(self.j.DEFAULT_CONFIG, go_cache_min_idle_minutes=30):
+            sw = self.go_task(commands=["go build ./..."])
+        self.assertEqual(self.entries(), before)
+        self.assertEqual(sw.skipped, [("go", self.cache, "kompilacja w toku")])
 
     def test_without_a_valid_owner_the_go_task_trims_as_before(self):
         if os.path.exists(self.owner):

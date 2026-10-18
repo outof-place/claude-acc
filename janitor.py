@@ -809,7 +809,9 @@ def task_go_cache(sw, _scan):
     size = du_bytes(cache)
     if size < sw.cfg["go_cache_max_gb"] * GB:
         return
-    if any(
+    # Go odświeża mtime raz na godzinę: od tej podłogi wieku trwający build nie czyta tego, co
+    # tniemy, a pomijanie przy każdym `go test` zostawiło 10-18 cache Marcela na 98 GB
+    if sw.cfg["go_cache_min_idle_minutes"] < 60 and any(
         re.search(r"(^|/)go (build|test|run|install|vet)\b", c)
         for c in sw.usage.commands
     ):
