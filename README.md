@@ -330,7 +330,7 @@ Before removing anything it checks, with one `lsof` over your processes, that no
 | `node_modules` | every `node_modules` of a project where no file changed and git didn't move for 30 days | daily |
 | `tmp` | `go-build*` and `go-link-*` dirs and `instruments*.ktrace` traces in `$TMPDIR`, untouched for 6 hours | every run |
 | `caps` | the oldest entries of folders listed in `caps` once a folder is over its limit (the guard also runs it every 10 minutes) | every run |
-| `go` | the least recently used entries of the Go build cache once it's over 20 GB, down to 12 GB, so agents keep their warm builds, never an entry used in the last 90 minutes (Go refreshes an entry's time at most hourly, and golangci-lint fails when an entry it reads disappears) (Go trims entries unused for 5 days on its own) | daily |
+| `go` | the least recently used entries of the Go build cache once it's over 20 GB, down to 12 GB, so agents keep their warm builds, never an entry used in the last 90 minutes (Go refreshes an entry's time at most hourly, and golangci-lint fails when an entry it reads disappears) (Go trims entries unused for 5 days on its own); skipped, with a line in `janitor.log`, while Pod's pod-gocache daemon owns the cache (a fresh heartbeat in `~/.pod/gocache/owner.json`), and then no other task deletes inside it either | daily |
 | `npm` | `npm cache verify`, npx packages unused for 30 days (not the ones a running process uses, like MCP servers), npm logs older than a week | daily |
 | `pnpm` | `pnpm store prune`, and after every run that removed a `node_modules` | weekly |
 | `docker` | dangling images and build cache older than a week, only when the engine is already running | daily |

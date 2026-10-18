@@ -56,6 +56,10 @@ LOG_MAX_BYTES = 512 * 1024
 DATA_VOLUME = "/System/Volumes/Data" if os.path.isdir("/System/Volumes/Data") else "/"
 # katalog w trakcie kasowania; przerwany przebieg zostawia go następnemu
 TRASH_PREFIX = ".janitor-trash-"
+# demon pod-gocache (Pod) ogłasza tu, że jest jedynym, który kasuje w swoim katalogu cache Go;
+# kontrakt i reguła czytelnika: Pod native/pod-gocache-macos/README.md, sekcja owner.json (frozen)
+GOCACHE_OWNER_PATH = os.path.join(HOME, ".pod/gocache/owner.json")
+GOCACHE_OWNER_FRESH_S = 120
 
 GB = 1024**3
 HOUR = 3600
@@ -492,6 +496,11 @@ class Sweep:
         if not expect(name) or os.path.islink(path):
             log(f"{task}: odmawiam, nieoczekiwana ścieżka {path}")
             return 0
+        owned = gocache_owner()
+        if owned and (real == owned or real.startswith(owned + "/")):
+            # np. wpis `caps` w cache Go: póki pod-gocache jest właścicielem, kasuje tam tylko on
+            self.skip(task, path, "cache Go należy do pod-gocache")
+            return 0
         if not any(real.startswith(base) for base in self.allowed) or self.protected(
             path
         ):
@@ -521,7 +530,7 @@ class Sweep:
         return size
 
     def record(self, task, what, size):
-        """Wynik polecenia, które samo sprząta (docker, brew, go clean)."""
+        """Wynik sprzątania liczonego w całości (docker, brew, uv, cięcie cache Go), nie po ścieżkach."""
         if size > 0:
             self.items.append((task, what, size))
 
@@ -763,12 +772,39 @@ def trim_oldest(root, keep_bytes, dry_run=False, min_idle=0):
     return freed
 
 
+def gocache_owner():
+    """Katalog cache Go (po rozwinięciu symlinków), którego właścicielem jest teraz pod-gocache, albo None.
+
+    Właściciel to owner.json ze schema 1, mode "owner", heartbeatAt najwyżej 120 s od teraz w obie
+    strony i istniejącym katalogiem cacheDir. Wszystko inne (brak pliku, śmieci, observe, stary albo
+    przyszły heartbeat, liczba w napisie) to brak właściciela: sprzątanie jak dotąd. To, czy to nasz
+    katalog, sprawdza wołający (reguła: ten sam katalog po rozwinięciu symlinków po obu stronach)."""
+    data = load_json(GOCACHE_OWNER_PATH, None)
+    if not isinstance(data, dict):
+        return None
+    schema, beat, folder = data.get("schema"), data.get("heartbeatAt"), data.get("cacheDir")
+    # type() is int: JSON-owe true to w Pythonie też 1, a kontrakt mówi o liczbach całkowitych
+    if type(schema) is not int or schema != 1 or data.get("mode") != "owner":
+        return None
+    if type(beat) is not int or abs(time.time() - beat) > GOCACHE_OWNER_FRESH_S:
+        return None
+    if not isinstance(folder, str) or not os.path.isabs(folder) or not os.path.isdir(folder):
+        return None
+    return os.path.realpath(folder)
+
+
 def task_go_cache(sw, _scan):
     go = which("go")
     if not go:
         return
     cache = (run([go, "env", "GOCACHE"]) or "").strip()
     if not cache or not os.path.isdir(cache):
+        return
+    if gocache_owner() == os.path.realpath(cache):
+        # pod-gocache kasuje tylko to, czego żaden trwający build już nie przeczyta; cięcie po mtime
+        # (Go odświeża go raz na godzinę) zabierałoby mu spod ręki wpisy, które chroni
+        log(f"go: pomijam {short(cache)}: należy do pod-gocache (świeży heartbeat w {short(GOCACHE_OWNER_PATH)})")
+        sw.skip("go", cache, "cache Go należy do pod-gocache")
         return
     size = du_bytes(cache)
     if size < sw.cfg["go_cache_max_gb"] * GB:
