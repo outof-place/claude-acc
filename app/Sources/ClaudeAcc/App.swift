@@ -1,6 +1,15 @@
 import SwiftUI
 
+/// `--browser-hub` hosts browser.py's daemon before SwiftUI starts anything (BrowserHubHost); everything
+/// else is the menu bar app.
 @main
+enum Entry {
+    static func main() {
+        if BrowserHubHost.requested(CommandLine.arguments) { BrowserHubHost.run() }
+        ClaudeAccApp.main()
+    }
+}
+
 struct ClaudeAccApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
 

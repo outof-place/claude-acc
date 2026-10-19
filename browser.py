@@ -497,15 +497,89 @@ def system_browser():
     return None
 
 
+class ProfileBlocked(BrowserError):
+    """macOS (TCC) nie dał przeczytać pliku z profilu przeglądarki: zgody nie ma aplikacja, którą sprawdza
+    dla tego procesu (access_app). To nie wyłączone debugowanie i nie zamknięta przeglądarka."""
+
+    def __init__(self, name):
+        title = BROWSERS[name]["title"]
+        app = access_app()
+        who = f"{app['name']} ({app['path']})" if app else "the app this agent runs in"
+        super().__init__(
+            f"macOS blocks the browser gateway from reading {title}'s profile folder, where {title} writes the port "
+            f"its remote debugging listens on, so the gateway can't reach {title}. The user turns on Full Disk Access "
+            f"for {who} once, in System Settings > Privacy & Security > Full Disk Access (the Browser card in the "
+            "claude-acc panel opens that pane), then retry."
+        )
+
+
+def app_of(path):
+    """Aplikacja tak, jak ją pokazują Ustawienia systemowe: pakiet nad Contents/MacOS z nazwą z Info.plist,
+    a goła binarka (python3.14) pod własną nazwą."""
+    import plistlib
+
+    if "/Contents/MacOS/" not in path:
+        return {"name": os.path.basename(path), "path": path}
+    bundle = path.rsplit("/Contents/MacOS/", 1)[0]
+    try:
+        with open(os.path.join(bundle, "Contents/Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        info = {}
+    name = info.get("CFBundleDisplayName") or info.get("CFBundleName") or os.path.basename(bundle)
+    return {"name": re.sub(r"\.app$", "", str(name)), "path": bundle}
+
+
+_ACCESS_APP = []
+
+
+def access_app():
+    """Aplikacja, której zgody macOS (TCC) sprawdza, gdy ten proces czyta cudze pliki: jego proces odpowiedzialny.
+    Demon pod gospodarzem (hub_host) to aplikacja paska menu, a bez niego terminal agenta, który go uruchomił.
+    None poza macOS albo bez tej funkcji systemu."""
+    if not _ACCESS_APP:
+        _ACCESS_APP.append(_responsible_app())
+    return _ACCESS_APP[0]
+
+
+def _responsible_app():
+    if sys.platform != "darwin":
+        return None
+    import ctypes
+
+    try:
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        responsible = lib.responsibility_get_pid_responsible_for_pid
+    except (OSError, AttributeError):
+        return None
+    responsible.restype, responsible.argtypes = ctypes.c_int, [ctypes.c_int]
+    buf = ctypes.create_string_buffer(4096)
+    if lib.proc_pidpath(responsible(os.getpid()), buf, ctypes.c_uint32(len(buf))) <= 0:
+        return None
+    return app_of(os.fsdecode(buf.value))
+
+
 def active_port(cfg, name):
-    """(port, ścieżka WS) z DevToolsActivePort; plik potrafi zostać po zamknięciu przeglądarki."""
+    """(port, ścieżka WS) z DevToolsActivePort; plik potrafi zostać po zamknięciu przeglądarki.
+    ProfileBlocked, gdy macOS go nie daje przeczytać: wtedy nie wiadomo, czy przeglądarka słucha."""
     path = os.path.join(cfg["browsers"][name]["user_data"], "DevToolsActivePort")
     try:
         with open(path) as f:
             lines = f.read().split("\n")
         return int(lines[0]), lines[1].strip()
+    except PermissionError:
+        raise ProfileBlocked(name) from None
     except (OSError, ValueError, IndexError):
         return None
+
+
+def live_port(cfg, name):
+    """(port, ścieżka WS) przeglądarki, która teraz słucha; None także przy profilu zablokowanym przez macOS."""
+    try:
+        found = active_port(cfg, name)
+    except ProfileBlocked:
+        return None
+    return found if found and port_alive(found[0]) else None
 
 
 def port_alive(port):
@@ -576,10 +650,12 @@ def auto_allow_worker(pid, stop):
 
 
 def pref_enabled(cfg, name):
-    """Przełącznik z chrome://inspect (Local State: devtools.remote_debugging.user-enabled)."""
+    """Przełącznik z chrome://inspect (Local State: devtools.remote_debugging.user-enabled); ProfileBlocked jak active_port."""
     try:
         with open(os.path.join(cfg["browsers"][name]["user_data"], "Local State")) as f:
             state = json.load(f)
+    except PermissionError:
+        raise ProfileBlocked(name) from None
     except (OSError, ValueError):
         return None
     return bool(((state.get("devtools") or {}).get("remote_debugging") or {}).get("user-enabled"))
@@ -595,7 +671,7 @@ def pick_browser(cfg, wanted=None):
         return env
     if cfg["default"] in BROWSERS:
         return cfg["default"]
-    live = [n for n in BROWSERS if (p := active_port(cfg, n)) and port_alive(p[0])]
+    live = [n for n in BROWSERS if live_port(cfg, n)]
     if len(live) == 1:
         return live[0]
     return system_browser() or "chrome"
@@ -1123,6 +1199,9 @@ class Hub:
         self.stop = threading.Event()
         self.code = code_stamp()
         self.empty_since = time.time()
+        # macOS nie dał czytać profilu: odmowę może pamiętać do końca życia procesu, więc zgoda z Ustawień
+        # zadziała dopiero w nowym demonie
+        self.blocked = False
 
     def agent(self, owner):
         with self.lock:
@@ -1142,10 +1221,17 @@ class Hub:
         with c.lock:
             if c.live:
                 return c
-            found = active_port(cfg, name)
-            if not found or not port_alive(found[0]):
+            try:
+                found = active_port(cfg, name)
+                alive = bool(found and port_alive(found[0]))
+                enabled = alive or pref_enabled(cfg, name)
+            except ProfileBlocked:
+                c.state, c.error, self.blocked = "off", None, True
+                self.publish()  # panel pokazuje blokadę zaraz po próbie agenta, nie po minucie
+                raise
+            if not alive:
                 c.state, c.error = "off", None
-                if pref_enabled(cfg, name):
+                if enabled:
                     raise BrowserError(f"{title} is not running. Ask the user to start it (claude-acc never starts it, to keep their focus).")
                 raise BrowserError(
                     f"{title} doesn't allow remote debugging. The user ticks 'Allow remote debugging for this browser "
@@ -2257,6 +2343,9 @@ class Hub:
             self.empty_since = now
         elif now - self.empty_since > HUB_IDLE_EXIT:
             self.stop.set()
+        if self.blocked and not self.tabs and self.busy == 0 and not any(c.live for c in self.conns.values()):
+            log("macOS nie dał czytać profilu przeglądarki: demon kończy, następny sprawdzi zgodę od nowa")
+            self.stop.set()
         if not self.tabs and self.busy == 0 and code_stamp() != self.code:
             log("nowa wersja browser.py: demon kończy, następny wstanie z nowym kodem")
             self.disconnect()
@@ -2358,7 +2447,10 @@ def panel_dict(hub=None):
     browsers = []
     for name, spec in BROWSERS.items():
         b = cfg["browsers"][name]
-        found = active_port(cfg, name)
+        try:
+            found, blocked = active_port(cfg, name), False
+        except ProfileBlocked:
+            found, blocked = None, True
         alive = bool(found and port_alive(found[0]))
         installed = os.path.exists(b["app"]) or alive
         conn = hub.conns[name] if hub is not None else None
@@ -2369,7 +2461,12 @@ def panel_dict(hub=None):
             elif not installed:
                 state = "missing"
             else:
-                state = "closed" if pref_enabled(cfg, name) else "disabled"
+                try:
+                    state = "blocked" if blocked else "closed" if pref_enabled(cfg, name) else "disabled"
+                except ProfileBlocked:
+                    state = "blocked"
+                if state == "blocked" and hub is not None:
+                    hub.blocked = True
         browsers.append(
             {
                 "name": name,
@@ -2409,6 +2506,8 @@ def panel_dict(hub=None):
         "tabs_mode": cfg["tabs"],
         "mode": cfg["mode"],
         "idle_minutes": cfg["idle_minutes"],
+        # komu dać Pełny dostęp do dysku, gdy stan to "blocked": aplikacja, którą macOS sprawdza dla piszącego
+        "access_app": access_app(),
         "browsers": browsers,
         "tabs": tabs,
         "clients": sum(1 for e in hub.clients.values() if e["connected"] and e["persistent"]) if hub is not None else 0,
@@ -2445,7 +2544,9 @@ class HubServer:
             os.umask(old)
         srv.listen(32)
         srv.settimeout(1)
-        log(f"demon słucha na {path} (pid {os.getpid()})")
+        app = access_app()
+        whose = f"{app['name']}, {app['path']}" if app else "?"
+        log(f"demon słucha na {path} (pid {os.getpid()}; macOS sprawdza zgody: {whose})")
         threading.Thread(target=self.hub.monitor, daemon=True, name="tick").start()
         self.hub.publish()
         while not self.hub.stop.is_set():
@@ -2524,6 +2625,7 @@ class HubClient:
         self.next_id = 0
 
     def _connect(self, spawn=True):
+        host = None
         for attempt in range(80):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
@@ -2534,7 +2636,11 @@ class HubClient:
                 if not spawn:
                     raise BrowserError("demon przeglądarki nie działa")
                 if attempt == 0:
-                    spawn_hub()
+                    host = spawn_hub()
+                elif host is not None and host.poll() not in (None, 0):
+                    # 0 to demon, który już działał (blokada hub.lock); inny kod: gospodarz nie wystartował demona
+                    hub_log(f"gospodarz demona skończył z kodem {host.returncode}, zanim demon wstał: start bez niego")
+                    host = spawn_hub(hosted=False)
                 time.sleep(0.1)
         else:
             raise BrowserError(f"demon przeglądarki nie wstał: {os.path.join(BROWSER_DIR, 'hub.log')}")
@@ -2595,19 +2701,79 @@ class HubClient:
                 pass
 
 
-def spawn_hub():
+HUB_HOST_ARG = "--browser-hub"
+# klucz w Info.plist aplikacji paska menu, która zna HUB_HOST_ARG; starsza uruchomiłaby z nim drugi pasek menu
+HUB_HOST_KEY = "ClaudeAccBrowserHubHost"
+# argv[0] gospodarza: `pgrep -x ClaudeAcc` Poda i `pkill -x ClaudeAcc` setup.sh szukają samej aplikacji paska menu
+HUB_HOST_NAME = "claude-acc-browser-hub"
+
+
+def hub_host():
+    """Plik wykonywalny aplikacji paska menu, gdy ma być gospodarzem demona, albo None.
+
+    macOS ocenia odczyt profilu Chrome i Brave (DevToolsActivePort, Local State) zgodami procesu
+    odpowiedzialnego. Demon uruchomiony wprost dziedziczył go po sesji agenta, która wołała pierwsza
+    (w Podzie: demon terminali w katalogu zmienianym przy każdej aktualizacji Poda), więc Pełny dostęp do
+    dysku trzeba było dawać od nowa. Gospodarz (`ClaudeAcc --browser-hub`, app/Sources/ClaudeAcc/
+    BrowserHubHost.swift) odpowiada sam za siebie i uruchamia zainstalowany browser.py: zgoda należy do
+    aplikacji paska menu, raz. Poza macOS, przy CLAUDE_ACC_BROWSER_HOST=0, z kopii ze źródeł i ze starszą
+    aplikacją demon startuje jak dotąd."""
+    if sys.platform != "darwin" or os.environ.get("CLAUDE_ACC_BROWSER_HOST") == "0":
+        return None
+    if os.path.realpath(__file__) != os.path.realpath(os.path.join(STATE, "browser.py")):
+        return None
+    import plistlib
+
+    import owner
+
+    app = owner.menu_app()
+    try:
+        with open(os.path.join(app, "Contents/Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return None
+    exe = os.path.join(app, "Contents/MacOS", str(info.get("CFBundleExecutable") or ""))
+    if info.get(HUB_HOST_KEY) is not True or not (os.path.isfile(exe) and os.access(exe, os.X_OK)):
+        return None
+    return exe
+
+
+def hub_log(text):
+    try:
+        os.makedirs(BROWSER_DIR, mode=0o700, exist_ok=True)
+        with open(os.path.join(BROWSER_DIR, "hub.log"), "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+    except OSError:
+        pass
+
+
+def spawn_hub(hosted=True):
+    """Demon w tle, pod gospodarzem (hub_host), gdy jest. Zwraca proces gospodarza, żeby klient zauważył,
+    że padł, zanim demon wstał, albo None przy starcie wprost."""
     os.makedirs(BROWSER_DIR, mode=0o700, exist_ok=True)
+    host = hub_host() if hosted else None
     fd = os.open(os.path.join(BROWSER_DIR, "hub.log"), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    subprocess.Popen(
-        [sys.executable, os.path.realpath(__file__), "serve"],
-        stdin=subprocess.DEVNULL,
-        stdout=fd,
-        stderr=fd,
-        start_new_session=True,
-        close_fds=True,
-        cwd=BROWSER_DIR,
-    )
-    os.close(fd)
+    try:
+        while True:
+            try:
+                proc = subprocess.Popen(
+                    [HUB_HOST_NAME, HUB_HOST_ARG] if host else [sys.executable, os.path.realpath(__file__), "serve"],
+                    executable=host,
+                    stdin=subprocess.DEVNULL,
+                    stdout=fd,
+                    stderr=fd,
+                    start_new_session=True,
+                    close_fds=True,
+                    cwd=BROWSER_DIR,
+                )
+                return proc if host else None
+            except OSError as exc:
+                if not host:
+                    raise
+                hub_log(f"gospodarz demona {host} nie wystartował ({exc}): start bez niego")
+                host = None
+    finally:
+        os.close(fd)
 
 
 def hub_call(op, args=None, timeout=5):
@@ -2933,6 +3099,7 @@ STATE_TEXT = {
     "ready": "gotowa (połączy się przy pierwszym narzędziu)",
     "closed": "debugowanie włączone, przeglądarka nie działa",
     "disabled": "debugowanie wyłączone",
+    "blocked": "macOS nie daje czytać profilu przeglądarki",
     "missing": "nie zainstalowana",
     "error": "błąd",
 }
@@ -2982,6 +3149,10 @@ def cmd_doctor(args):
             line += f". Raz: wpisz {b['inspect']} w pasek adresu (link go nie otworzy) i zaznacz 'Allow remote debugging for this browser instance'; albo claude-acc browser setup {b['name']}"
         elif b["state"] == "closed":
             line += ". Uruchom przeglądarkę; przy pierwszym narzędziu kliknij Allow"
+        elif b["state"] == "blocked":
+            app = out.get("access_app") or {}
+            who = f"{app['name']} ({app['path']})" if app else "aplikacji, w której działa agent"
+            line += f". Raz: Ustawienia systemowe > Prywatność i ochrona > Pełny dostęp do dysku, włącz {who}"
         elif b["state"] in ("ready", "connected", "connecting"):
             ok = ok or b["name"] == out["default"]
         print(line)

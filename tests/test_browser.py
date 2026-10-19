@@ -686,11 +686,11 @@ class Hint(unittest.TestCase):
         ],
     }
 
-    def run_hint(self, prompt, session):
+    def run_hint(self, prompt, session, panel=None):
         folder = os.path.join(TMP, "hint")
         os.makedirs(folder, exist_ok=True)
         with open(os.path.join(folder, "panel.json"), "w") as f:
-            json.dump(self.PANEL, f)
+            json.dump(panel or self.PANEL, f)
         out = io.StringIO()
         with (
             mock.patch.object(hint, "BROWSER_DIR", folder),
@@ -712,6 +712,15 @@ class Hint(unittest.TestCase):
             "mcp__browser__navigate",
             self.run_hint("wejdź na console.aws.amazon.com", "b2"),
         )
+
+    def test_a_blocked_profile_hints_the_grant_not_the_checkbox(self):
+        panel = json.loads(json.dumps(self.PANEL))
+        panel["browsers"][1]["state"] = "blocked"
+        panel["access_app"] = {"name": "Claude Acc", "path": "/Users/x/Applications/Claude Acc.app"}
+        text = self.run_hint("otwórz w przeglądarce panel AWS", "b-blocked", panel)
+        self.assertIn("Full Disk Access", text)
+        self.assertIn("Claude Acc", text)
+        self.assertNotIn("brave://inspect", text)
 
     def test_quiet_on_unrelated_prompts(self):
         for i, prompt in enumerate(
@@ -763,6 +772,236 @@ class Hint(unittest.TestCase):
             self.assertIn(
                 "mcp__browser__navigate", self.run_hint(prompt, f"bi{i}"), prompt
             )
+
+
+def menu_app_bundle(marker=True, display="Claude Acc"):
+    """Aplikacja paska menu na niby: Info.plist z kluczem gospodarza demona albo bez (starsza wersja)."""
+    import plistlib
+
+    app = os.path.join(tempfile.mkdtemp(dir=TMP), "Claude Acc.app")
+    os.makedirs(os.path.join(app, "Contents/MacOS"))
+    exe = os.path.join(app, "Contents/MacOS/ClaudeAcc")
+    with open(exe, "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(exe, 0o755)
+    info = {"CFBundleExecutable": "ClaudeAcc", "CFBundleIdentifier": "com.filip.claude-acc.menubar",
+            "CFBundleDisplayName": display}
+    if marker:
+        info["ClaudeAccBrowserHubHost"] = True
+    with open(os.path.join(app, "Contents/Info.plist"), "wb") as f:
+        plistlib.dump(info, f)
+    return app, exe
+
+
+@unittest.skipIf(os.geteuid() == 0, "root czyta pliki z prawami 000")
+class BlockedProfile(unittest.TestCase):
+    """macOS (TCC) nie pozwala czytać profilu przeglądarki: to nie jest wyłączone debugowanie i panel ma to powiedzieć."""
+
+    APP = {"name": "Claude Acc", "path": "/Users/x/Applications/Claude Acc.app"}
+
+    def setUp(self):
+        self.profile = tempfile.mkdtemp(dir=TMP)
+        for name, body in (("DevToolsActivePort", "9222\n/devtools/browser/x\n"),
+                           ("Local State", json.dumps({"devtools": {"remote_debugging": {"user-enabled": True}}}))):
+            path = os.path.join(self.profile, name)
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0)  # odczyt kończy się PermissionError, jak przy odmowie TCC (EPERM)
+        self.addCleanup(shutil.rmtree, self.profile, True)
+        self.addCleanup(lambda: [os.chmod(os.path.join(self.profile, n), 0o600) for n in os.listdir(self.profile)])
+        self.cfg_path = os.path.join(self.profile, "..", os.path.basename(self.profile) + ".json")
+        with open(self.cfg_path, "w") as f:
+            json.dump({"default": "brave", "browsers": {"brave": {"user_data": self.profile, "app": TMP}}}, f)
+        for patch in (mock.patch.object(browser, "CONFIG_PATH", self.cfg_path),
+                      mock.patch.object(browser, "access_app", lambda: self.APP)):  # fmt: skip
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_the_panel_says_macos_blocks_the_profile_and_which_app_needs_the_grant(self):
+        panel = browser.panel_dict()
+        brave = next(b for b in panel["browsers"] if b["name"] == "brave")
+        self.assertEqual(brave["state"], "blocked")  # dawniej "disabled": debugowanie wyłączone, a było włączone
+        self.assertEqual(panel["access_app"], self.APP)
+
+    def test_an_agent_hears_what_to_grant_instead_of_remote_debugging_off(self):
+        hub = browser.Hub(cfg_loader=lambda: browser.load_config(self.cfg_path))
+        hub.publish = lambda: None
+        with self.assertRaises(browser.BrowserError) as ctx:
+            hub.connect(browser.load_config(self.cfg_path), "brave")
+        message = str(ctx.exception)
+        self.assertIn("Full Disk Access", message)
+        self.assertIn("Claude Acc", message)
+        self.assertNotIn("doesn't allow remote debugging", message)
+
+    def test_after_a_blocked_read_an_idle_daemon_ends_so_a_grant_takes_effect(self):
+        # macOS może trzymać odmowę w procesie do końca jego życia, a sesje agentów trzymają demona przy życiu
+        hub = browser.Hub(cfg_loader=lambda: browser.load_config(self.cfg_path))
+        hub.publish = lambda: None
+        hub.client_seen("mcp:1", "test", True)
+        with self.assertRaises(browser.ProfileBlocked):
+            hub.connect(browser.load_config(self.cfg_path), "brave")
+        hub.tabs["tab-1"] = browser.Tab("tab-1", "chrome", "T1", "mcp:1", "hidden")
+        hub.tick()
+        self.assertFalse(hub.stop.is_set())  # karty agenta zostają
+        hub.tabs.clear()
+        with mock.patch.object(browser, "log", lambda text: None):
+            hub.tick()
+        self.assertTrue(hub.stop.is_set())
+
+    def test_doctor_names_the_setting_in_polish(self):
+        out = io.StringIO()
+        with mock.patch.object(browser, "hub_call", lambda *a, **k: None), mock.patch("sys.stdout", out), \
+                mock.patch.object(browser, "panel_path", lambda: os.path.join(self.profile, "..", "panel-blocked.json")):
+            browser.cmd_doctor([])
+        line = next(l for l in out.getvalue().splitlines() if l.startswith("Brave"))
+        self.assertIn("Pełny dostęp do dysku", line)
+        self.assertIn("Claude Acc", line)
+        self.assertNotIn("debugowanie wyłączone", line)
+
+    def test_the_app_is_named_as_system_settings_lists_it(self):
+        app, exe = menu_app_bundle(display="Pod Menu")
+        self.assertEqual(browser.app_of(exe), {"name": "Pod Menu", "path": app})
+        self.assertEqual(browser.app_of("/opt/py/bin/python3.14"), {"name": "python3.14", "path": "/opt/py/bin/python3.14"})
+
+
+@unittest.skipUnless(sys.platform == "darwin", "gospodarz demona to aplikacja paska menu na macOS")
+class HubSpawn(unittest.TestCase):
+    """Demon wstaje pod aplikacją paska menu, gdy ta to umie: macOS sprawdza wtedy jej zgody, nie terminala agenta."""
+
+    def spawned(self, app, env=None, state=ROOT):
+        calls = []
+
+        class Proc:
+            def __init__(self, args, **kw):
+                calls.append((args, kw.get("executable")))
+
+            def poll(self):
+                return None
+
+        with mock.patch.object(browser.subprocess, "Popen", Proc), mock.patch.object(browser, "STATE", state), \
+                mock.patch("owner.menu_app", return_value=app), mock.patch.dict(os.environ, env or {}):
+            browser.spawn_hub()
+        return calls
+
+    def test_the_daemon_starts_under_the_menu_app_when_it_can_host_it(self):
+        app, exe = menu_app_bundle()
+        self.assertEqual(self.spawned(app), [(["claude-acc-browser-hub", "--browser-hub"], exe)])
+
+    def test_without_a_hosting_menu_app_the_daemon_starts_as_before(self):
+        direct = [([sys.executable, os.path.realpath(browser.__file__), "serve"], None)]
+        old, _ = menu_app_bundle(marker=False)  # starsza aplikacja nie zna --browser-hub: uruchomiłaby drugi pasek menu
+        self.assertEqual(self.spawned(old), direct)
+        app, _ = menu_app_bundle()
+        self.assertEqual(self.spawned(app, env={"CLAUDE_ACC_BROWSER_HOST": "0"}), direct)
+        self.assertEqual(self.spawned(app, state=TMP), direct)  # kopia ze źródeł: gospodarz uruchamia tylko zainstalowany plik
+
+    def test_a_host_that_exits_before_the_socket_falls_back_to_a_direct_start(self):
+        starts = []
+
+        class DeadHost:
+            returncode = 70
+
+            def poll(self):
+                return 70
+
+        def spawn(hosted=True):
+            starts.append(hosted)
+            return DeadHost() if hosted else None
+
+        client = browser.HubClient("t", "test", False)
+        with mock.patch.object(browser, "spawn_hub", spawn), mock.patch.object(browser.time, "sleep", lambda s: None), \
+                mock.patch.object(browser, "sock_path", lambda: os.path.join(TMP, "no-hub.sock")):
+            with self.assertRaises(browser.BrowserError):
+                client._connect()
+        self.assertEqual(starts, [True, False])
+
+
+def built_app_binary():
+    """ClaudeAcc z `swift build` w app/ (albo CLAUDE_ACC_TEST_APP_BINARY); None, gdy go nie ma."""
+    path = os.environ.get("CLAUDE_ACC_TEST_APP_BINARY")
+    if path:
+        return path if os.access(path, os.X_OK) else None
+    for rel in ("out/Products/Debug", "out/Products/Release", "arm64-apple-macosx/debug", "arm64-apple-macosx/release",
+                "x86_64-apple-macosx/debug", "x86_64-apple-macosx/release"):  # fmt: skip
+        path = os.path.join(ROOT, "app", ".build", rel, "ClaudeAcc")
+        if os.access(path, os.X_OK):
+            return path
+    return None
+
+
+# browser.py na niby: zapisuje, komu macOS przypisuje proces demona, czeka i kończy z zadanym kodem
+RESPONSIBILITY_REPORT = r'''
+import ctypes, json, os, sys, time
+lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+lib.responsibility_get_pid_responsible_for_pid.restype = ctypes.c_int
+lib.responsibility_get_pid_responsible_for_pid.argtypes = [ctypes.c_int]
+buf = ctypes.create_string_buffer(4096)
+lib.proc_pidpath(os.getppid(), buf, 4096)
+report = {"argv": sys.argv[1:], "pid": os.getpid(), "ppid": os.getppid(), "parent_path": buf.value.decode(),
+          "responsible": lib.responsibility_get_pid_responsible_for_pid(os.getpid())}
+with open(os.environ["HUB_REPORT"] + ".tmp", "w") as f:
+    json.dump(report, f)
+os.rename(os.environ["HUB_REPORT"] + ".tmp", os.environ["HUB_REPORT"])
+time.sleep(float(os.environ.get("HUB_SLEEP", "0")))
+sys.exit(int(os.environ.get("HUB_EXIT", "0")))
+'''
+
+
+def responsible_pid(pid):
+    import ctypes
+
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    lib.responsibility_get_pid_responsible_for_pid.restype = ctypes.c_int
+    lib.responsibility_get_pid_responsible_for_pid.argtypes = [ctypes.c_int]
+    return lib.responsibility_get_pid_responsible_for_pid(pid)
+
+
+@unittest.skipUnless(sys.platform == "darwin" and built_app_binary(), "potrzebny ClaudeAcc z `swift build` w app/")
+class HubHost(unittest.TestCase):
+    """`ClaudeAcc --browser-hub`: demon jako dziecko pliku wykonywalnego aplikacji, który odpowiada sam za siebie,
+    więc macOS sprawdza zgody aplikacji, a nie sesji agenta, która wołała. HOME i CFFIXED_USER_HOME (NSHomeDirectory)
+    wskazują katalog tymczasowy: zainstalowany claude-acc zostaje nietknięty."""
+
+    def start(self, **env):
+        home = tempfile.mkdtemp(dir=TMP)
+        state = os.path.join(home, ".local/share/claude-acc")
+        os.makedirs(state)
+        os.symlink(sys.executable, os.path.join(state, "python"))
+        with open(os.path.join(state, "browser.py"), "w") as f:
+            f.write(RESPONSIBILITY_REPORT)
+        self.report = os.path.join(home, "report.json")
+        env = dict(os.environ, HOME=home, CFFIXED_USER_HOME=home, HUB_REPORT=self.report, **env)
+        host = subprocess.Popen([browser.HUB_HOST_NAME, browser.HUB_HOST_ARG], executable=built_app_binary(), env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)  # fmt: skip
+        self.addCleanup(host.stderr.close)
+        return host
+
+    def read_report(self):
+        for _ in range(100):
+            if os.path.exists(self.report):
+                with open(self.report) as f:
+                    return json.load(f)
+            time.sleep(0.05)
+        self.fail("demon na niby nie wystartował")
+
+    def test_the_daemon_answers_to_the_app_not_to_the_session_that_started_it(self):
+        host = self.start()
+        report = self.read_report()
+        self.assertEqual(host.wait(10), 0, host.stderr.read())
+        self.assertEqual(report["argv"], ["serve"])
+        self.assertEqual(os.path.realpath(report["parent_path"]), os.path.realpath(built_app_binary()))
+        self.assertEqual(report["responsible"], report["ppid"])  # macOS sprawdza gospodarza, czyli aplikację
+        self.assertNotEqual(report["responsible"], responsible_pid(os.getpid()))  # a nie tego, kto go uruchomił
+
+    def test_the_host_hides_from_the_menu_app_lookups_and_passes_signals_and_exit_codes(self):
+        host = self.start(HUB_SLEEP="30")
+        report = self.read_report()
+        found = subprocess.run(["pgrep", "-x", "ClaudeAcc"], capture_output=True, text=True).stdout.split()
+        self.assertNotIn(str(host.pid), found)  # Pod schowałby swoją ikonę, a setup.sh zabiłby demona
+        host.send_signal(15)
+        self.assertEqual(host.wait(10), 128 + 15)
+        self.assertFalse(browser.pid_alive(report["pid"]))
+        self.assertEqual(self.start(HUB_EXIT="7").wait(10), 7)
 
 
 class SecretGuard(unittest.TestCase):

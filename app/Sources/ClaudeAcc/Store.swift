@@ -746,6 +746,15 @@ final class Store {
             : Notice(text: result.message.isEmpty ? "Couldn't open \(browser.title)" : result.message, isError: true)
     }
 
+    /// The Full Disk Access pane, where the user turns on the app macOS checks for the browser daemon.
+    func openFullDiskAccess(for app: BrowserPanel.AccessApp?) {
+        browserWaitUntil = .now + Self.userStepWait
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+        notice = Notice(text: "Turn on \(app?.name ?? "the app agents run in") in Full Disk Access")
+    }
+
     /// Lists the projects Spotlight indexes and opens the pane that excludes them.
     func openSpotlightSettings() async {
         _ = await CLI.run(["spotlight"], script: CLI.janitor)
