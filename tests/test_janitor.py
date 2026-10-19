@@ -630,6 +630,37 @@ class JanitorTest(unittest.TestCase):
         self.env.sweep()
         self.assertTrue(self.env.exists("repo/node_modules"))
 
+    def test_worktree_git_activity_keeps_node_modules(self):
+        # w worktree .git to plik "gitdir: ..."; ruch w gicie jest w katalogu, na który wskazuje
+        gitdir = os.path.join(self.env.home, "main-repo/.git/worktrees/wt")
+        os.makedirs(gitdir)
+        with open(os.path.join(gitdir, "HEAD"), "w") as f:
+            f.write("ref: refs/heads/wt\n")
+        self.env.file("wt/package.json", OLD, "{}")
+        self.env.file("wt/node_modules/dep/index.js", OLD)
+        dotgit = os.path.join(self.env.work, "wt/.git")
+        with open(dotgit, "w") as f:
+            f.write(f"gitdir: {gitdir}\n")
+        stamp = time.time() - OLD * 86400
+        os.utime(dotgit, (stamp, stamp))  # plik .git powstaje raz, przy git worktree add
+        self.env.sweep()
+        self.assertTrue(self.env.exists("wt/node_modules"))
+
+    def test_job_runner_keeps_node_modules(self):
+        # 17.10 i 18.10: runner bloga, który pracuje co 2 dni albo raz w tygodniu, stracił
+        # node_modules tuż przed slotem i job padł na brakującej paczce
+        self.env.config(node_modules_idle_days=3)
+        self.env.file("runner/package.json", OLD, "{}")
+        self.env.file("runner/node_modules/dep/index.js", OLD)
+        self.env.file("idle/package.json", OLD, "{}")
+        self.env.file("idle/node_modules/dep/index.js", OLD)
+        os.makedirs(os.path.join(self.env.state_dir, "jobs"))
+        with open(os.path.join(self.env.state_dir, "jobs/jobs.json"), "w") as f:
+            json.dump({"jobs": {"blog": {"cwd": os.path.join(self.env.work, "runner")}, "zly": "nie obiekt"}}, f)
+        self.env.sweep()
+        self.assertTrue(self.env.exists("runner/node_modules"))
+        self.assertFalse(self.env.exists("idle/node_modules"))
+
     def test_idle_caches_go(self):
         self.env.file("mono/package.json", 0, "{}")
         self.env.file("mono/node_modules/dep/index.js", 0)

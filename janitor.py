@@ -53,6 +53,8 @@ STATE_PATH = os.path.join(STATE_DIR, "janitor-state.json")
 LOG_PATH = os.path.join(STATE_DIR, "janitor.log")
 LOCK_PATH = os.path.join(STATE_DIR, "janitor.lock")
 BACKUP_PATH = os.path.join(STATE_DIR, "janitor-optimize.json")
+# definicje jobów claude-acc (jobs.py): ich katalogi robocze są w użyciu z definicji
+JOBS_PATH = os.path.join(STATE_DIR, "jobs", "jobs.json")
 LOG_MAX_BYTES = 512 * 1024
 DATA_VOLUME = "/System/Volumes/Data" if os.path.isdir("/System/Volumes/Data") else "/"
 # katalog w trakcie kasowania; przerwany przebieg zostawia go następnemu
@@ -232,6 +234,17 @@ def load_config():
 
 def expand(path):
     return os.path.realpath(os.path.expanduser(path))
+
+
+def job_dirs():
+    """Katalogi robocze jobów claude-acc. Job pracuje w swoim checkoucie co dzień, co 2 dni albo
+    raz w tygodniu, a w przerwie nic się tam nie zmienia: bez tego porządki brały go za porzucony
+    projekt i kasowały mu node_modules tuż przed slotem (17.10 i 18.10 joby blogowe padły na
+    brakującej paczce)."""
+    jobs = load_json(JOBS_PATH, {}).get("jobs")
+    if not isinstance(jobs, dict):
+        return []
+    return [job["cwd"] for job in jobs.values() if isinstance(job, dict) and isinstance(job.get("cwd"), str)]
 
 
 def tool_path():
@@ -475,6 +488,7 @@ class Sweep:
         self.warnings = []
         self.failures = []  # (zadanie, błąd) dla panelu
         self.protect = [expand(p) for p in cfg["protect"]]
+        self.runners = [expand(p) for p in job_dirs()]
         # kasujemy tylko w domu i w katalogu tymczasowym użytkownika
         self.allowed = [
             os.path.realpath(HOME) + "/",
@@ -493,6 +507,10 @@ class Sweep:
         """`real=True` dla ścieżek ze skanu: już są rzeczywiste, realpath tylko spowalnia spacer."""
         path = path if real else os.path.realpath(path)
         return any(path == p or path.startswith(p + "/") for p in self.protect)
+
+    def job_runner(self, path):
+        """Czy ścieżka leży w katalogu roboczym joba claude-acc (job_dirs)."""
+        return any(path == p or path.startswith(p + "/") for p in self.runners)
 
     def skip(self, task, path, reason):
         self.skipped.append((task, path, reason))
@@ -691,10 +709,25 @@ def task_project_caches(sw, scan):
             sw.remove("caches", path, lambda n, want=name: n == want)
 
 
+def git_dir(project):
+    """Katalog gita projektu; w worktree .git to plik "gitdir: <ścieżka>"."""
+    git = os.path.join(project, ".git")
+    if os.path.isfile(git):
+        try:
+            with open(git) as f:
+                line = f.readline().strip()
+        except OSError:
+            return None
+        if not line.startswith("gitdir:"):
+            return None
+        git = os.path.join(project, line.removeprefix("gitdir:").strip())
+    return git if os.path.isdir(git) else None
+
+
 def project_active(project, since):
     """Czy w projekcie ktoś pracował: zmieniony plik poza zależnościami albo ruch w gicie."""
-    git = os.path.join(project, ".git")
-    if os.path.isdir(git):
+    git = git_dir(project)
+    if git:
         for marker in ("index", "HEAD", "logs/HEAD"):
             if mtime(os.path.join(git, marker)) > since:
                 return True
@@ -711,6 +744,9 @@ def task_node_modules(sw, scan):
             continue
         if sw.usage.busy(project):
             sw.skip("node_modules", project, "w użyciu")
+            continue
+        if sw.job_runner(project):
+            sw.skip("node_modules", project, "katalog joba")
             continue
         if project_active(project, since):
             continue
