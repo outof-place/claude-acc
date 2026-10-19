@@ -34,6 +34,7 @@ import sys
 if not os.path.realpath(__file__).startswith(os.path.realpath(os.path.expanduser("~/.local/share/claude-acc")) + "/"):
     sys.dont_write_bytecode = True
 
+import contextlib
 import fcntl
 import glob
 import json
@@ -60,6 +61,13 @@ TRASH_PREFIX = ".janitor-trash-"
 # kontrakt i reguła czytelnika: Pod native/pod-gocache-macos/README.md, sekcja owner.json (frozen)
 GOCACHE_OWNER_PATH = os.path.join(HOME, ".pod/gocache/owner.json")
 GOCACHE_OWNER_FRESH_S = 120
+# jobs.py: jeden ciężki bieg naraz, flock na heavy.lock przez cały bieg, heavy.json mówi, kto go trzyma
+JOBS_DIR = os.path.join(STATE_DIR, "jobs")
+HEAVY_LOCK = os.path.join(JOBS_DIR, "heavy.lock")
+HEAVY_PATH = os.path.join(JOBS_DIR, "heavy.json")
+# install pnpm w każdej postaci, też pnpm 11 z `packageManager` i z verifyDepsBeforeRun:
+# `node …/pnpm/bin/pnpm.mjs install`
+PNPM_INSTALLING = re.compile(r"\bpnpm(\.[cm]?js)?\s+(install|i|add|update|up|remove|rm|fetch|import|dlx)\b")
 
 GB = 1024**3
 HOUR = 3600
@@ -809,7 +817,9 @@ def task_go_cache(sw, _scan):
     size = du_bytes(cache)
     if size < sw.cfg["go_cache_max_gb"] * GB:
         return
-    if any(
+    # Go odświeża mtime raz na godzinę: od tej podłogi wieku trwający build nie czyta tego, co
+    # tniemy, a pomijanie przy każdym `go test` zostawiło 10-18 cache Marcela na 98 GB
+    if sw.cfg["go_cache_min_idle_minutes"] < 60 and any(
         re.search(r"(^|/)go (build|test|run|install|vet)\b", c)
         for c in sw.usage.commands
     ):
@@ -863,21 +873,50 @@ def task_npm(sw, _scan):
             sw.remove("npm", path, lambda n: n.endswith(".log"))
 
 
+@contextlib.contextmanager
+def heavy_jobs_paused(holder):
+    """Na czas `with` żaden ciężki job (jobs.py) nie wystartuje: janitor trzyma ich heavy.lock, a heavy.json
+    go nazywa, więc tik czeka, a próba, która właśnie rusza, kończy się POMINIĘTO bez zjedzenia próby.
+    Daje nazwę joba, który już biegnie (wtedy niczego nie trzyma), inaczej None."""
+    os.makedirs(JOBS_DIR, mode=0o700, exist_ok=True)
+    fd = os.open(HEAVY_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield (load_json(HEAVY_PATH, {}) or {}).get("job") or "?"
+            return
+        write_json(HEAVY_PATH, {"job": holder, "pid": os.getpid(), "since": time.time()})
+        try:
+            yield None
+        finally:
+            try:
+                os.unlink(HEAVY_PATH)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
+
+
 def task_pnpm(sw, _scan):
+    """`pnpm store prune` kasuje z magazynu, z którego linkuje każdy install na tym Macu, a install w trakcie
+    przycinania pada (18.10: job matura, „Worker pnpm#13 exited with code 1”). Przycinanie idzie więc tylko
+    bez ciężkiego joba i bez installu w tej chwili, a w jego trakcie żaden ciężki job nie startuje."""
     pnpm = which("pnpm")
     if not pnpm:
         return
-    installing = re.compile(
-        r"\bpnpm(\.cjs)?\s+(install|i|add|update|up|remove|rm|fetch|import|dlx)\b"
-    )
-    if any(installing.search(c) for c in sw.usage.commands):
-        sw.skip("pnpm", "store", "pnpm instaluje")
-        return
     store = (run([pnpm, "store", "path"]) or "").strip()
-    if not store or not os.path.isdir(store):
+    if not store or not os.path.isdir(store) or sw.dry_run:
         return
     before = du_bytes(store)
-    if not sw.dry_run:
+    with heavy_jobs_paused("janitor: pnpm store prune") as busy:
+        if busy:
+            sw.skip("pnpm", "store", f"ciężki job w toku: {busy}")
+            return
+        # procesy z tej chwili, nie obraz z początku przebiegu (sw.usage): install mógł ruszyć w międzyczasie
+        if any(PNPM_INSTALLING.search(row[5]) for row in processes()):
+            sw.skip("pnpm", "store", "pnpm instaluje")
+            return
         run([pnpm, "store", "prune"], timeout=1800)
     sw.record("pnpm", "pnpm store prune", before - du_bytes(store))
 

@@ -7,6 +7,7 @@ systemu (docker, brew, npm, go...), są wyłączone w konfiguracji testu.
 Uruchomienie: /usr/bin/python3 -m unittest discover -s tests
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -254,7 +255,7 @@ class GoCacheOwnerTest(unittest.TestCase):
             self.set_case(change)
             self.assertIsNone(self.j.gocache_owner(), name)
 
-    def go_task(self, cache=None):
+    def go_task(self, cache=None, commands=()):
         """task_go_cache na tymczasowym cache ponad limitem: `go env GOCACHE` z atrapy, bez lsof i ps."""
         real_run = self.j.run
         reported = cache or self.cache
@@ -265,7 +266,7 @@ class GoCacheOwnerTest(unittest.TestCase):
         size = len(self.entries()) * os.lstat(self.entries()[0]).st_blocks * 512
         cfg = dict(self.j.DEFAULT_CONFIG, go_cache_max_gb=size / 2 / self.j.GB, go_cache_keep_percent=50)
         sw = self.j.Sweep(cfg, dry_run=False)
-        sw._usage = mock.Mock(commands=[], ok=True)
+        sw._usage = mock.Mock(commands=list(commands), ok=True)
         with mock.patch.object(self.j, "which", lambda name: "/fake/go"), mock.patch.object(self.j, "run", run):
             self.j.task_go_cache(sw, None)
         return sw
@@ -282,6 +283,27 @@ class GoCacheOwnerTest(unittest.TestCase):
         # janitor widzi swój cache przez symlink: ten sam katalog, dalej właściciel
         self.go_task(cache=self.link)
         self.assertEqual(self.entries(), before)
+
+    def test_a_running_go_build_does_not_stop_the_trim_of_idle_entries(self):
+        # 10-18: sesje z `go test` bez przerwy trzymały pomijanie i cache Marcela urósł do 98 GB
+        if os.path.exists(self.owner):
+            os.remove(self.owner)
+        self.go_task()
+        expected = self.entries()
+        shutil.rmtree(self.cache)
+        self.fill_cache()
+        sw = self.go_task(commands=["/opt/homebrew/bin/go test ./internal/..."])
+        self.assertEqual(self.entries(), expected)
+        self.assertEqual(sw.skipped, [])
+
+    def test_a_short_idle_floor_still_waits_for_running_go_builds(self):
+        if os.path.exists(self.owner):
+            os.remove(self.owner)
+        before = self.entries()
+        with mock.patch.dict(self.j.DEFAULT_CONFIG, go_cache_min_idle_minutes=30):
+            sw = self.go_task(commands=["go build ./..."])
+        self.assertEqual(self.entries(), before)
+        self.assertEqual(sw.skipped, [("go", self.cache, "kompilacja w toku")])
 
     def test_without_a_valid_owner_the_go_task_trims_as_before(self):
         if os.path.exists(self.owner):
@@ -316,6 +338,123 @@ class GoCacheOwnerTest(unittest.TestCase):
         self.write_owner(mode="observe")
         self.caps()
         self.assertEqual(os.listdir(self.cache), [])  # bez właściciela `caps` kasuje jak dotąd
+
+
+class PnpmPruneTest(unittest.TestCase):
+    """`pnpm store prune` kasuje ze wspólnego magazynu, z którego linkuje każdy install na tym Macu.
+    18.10 09:22 przycinanie (3,5 min) szło razem z `pnpm install` joba matura i install padł
+    („Worker pnpm#13 exited with code 1”): obraz procesów był sprzed startu joba, a pnpm 11 instaluje
+    jako `node …/pnpm/bin/pnpm.mjs install`, czego wzorzec nie łapał."""
+
+    PNPM_11_INSTALL = (
+        "/opt/homebrew/Cellar/node/26.12.0/bin/node /Users/x/Library/pnpm/store/v11/links/@/pnpm/11.24.0/"
+        "cbaef4a8/node_modules/pnpm/bin/pnpm.mjs install"
+    )
+
+    def setUp(self):
+        sys.path.insert(0, os.path.dirname(SCRIPT))
+        import janitor
+
+        self.j = janitor
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="pnpm-prune-test-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.store = os.path.join(self.root, "store/v11")
+        os.makedirs(self.store)
+        jobs = os.path.join(self.root, "jobs")
+        self.ps = []  # komendy procesów, które biegną teraz
+        self.calls = []  # komendy pnpm janitora
+        self.during = []  # (czy ciężki job może ruszyć, heavy.json) w trakcie przycinania
+        for name, value in (
+            ("JOBS_DIR", jobs),
+            ("HEAVY_LOCK", os.path.join(jobs, "heavy.lock")),
+            ("HEAVY_PATH", os.path.join(jobs, "heavy.json")),
+            ("which", lambda tool: "/opt/homebrew/bin/pnpm"),
+            ("run", self.fake_run),
+            ("processes", lambda: [(100 + i, 1, 5, 0.0, 0, c) for i, c in enumerate(self.ps)]),
+        ):
+            patcher = mock.patch.object(janitor, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fake_run(self, cmd, timeout=600):
+        self.calls.append(cmd[1:])
+        if cmd[1:] == ["store", "path"]:
+            return self.store + "\n"
+        if cmd[1:] == ["store", "prune"]:
+            self.during.append((self.heavy_free(), self.j.load_json(self.j.HEAVY_PATH, None)))
+        return ""
+
+    def heavy_free(self):
+        """Czy job wziąłby teraz heavy.lock (osobny deskryptor: flock blokuje go także w tym procesie)."""
+        os.makedirs(os.path.dirname(self.j.HEAVY_LOCK), exist_ok=True)
+        fd = os.open(self.j.HEAVY_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+
+    def prune(self, snapshot=None):
+        """task_pnpm, gdy obraz procesów z początku przebiegu (sw.usage) to `snapshot`, a teraz biegnie self.ps."""
+        sw = self.j.Sweep(dict(self.j.DEFAULT_CONFIG), dry_run=False)
+        sw._usage = mock.Mock(commands=list(self.ps if snapshot is None else snapshot))
+        self.j.task_pnpm(sw, None)
+        return sw
+
+    def pruned(self):
+        return ["store", "prune"] in self.calls
+
+    def test_the_lock_is_the_one_jobs_take(self):
+        # inna ścieżka niż w jobs.py: przycinanie znowu idzie razem z jobem, a testy wyżej dalej zielone
+        code = "import janitor, jobs; print(janitor.HEAVY_LOCK == jobs.HEAVY_LOCK, janitor.HEAVY_PATH == jobs.HEAVY_PATH)"
+        done = subprocess.run(
+            ["/usr/bin/python3", "-c", code],
+            cwd=os.path.dirname(SCRIPT),
+            env=dict(os.environ, HOME=self.root),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(done.stdout.strip(), "True True", done.stderr)
+
+    def test_install_started_after_the_sweep_began_stops_the_prune(self):
+        self.ps = ["/opt/homebrew/bin/pnpm install --frozen-lockfile --prefer-offline"]
+        sw = self.prune(snapshot=[])
+        self.assertFalse(self.pruned())
+        self.assertEqual(sw.skipped, [("pnpm", "store", "pnpm instaluje")])
+
+    def test_pnpm_11_install_through_pnpm_mjs_stops_the_prune(self):
+        self.ps = [self.PNPM_11_INSTALL]
+        sw = self.prune()
+        self.assertFalse(self.pruned())
+        self.assertEqual(sw.skipped, [("pnpm", "store", "pnpm instaluje")])
+
+    def test_running_heavy_job_stops_the_prune(self):
+        os.makedirs(os.path.dirname(self.j.HEAVY_LOCK))
+        held = os.open(self.j.HEAVY_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(self.j.HEAVY_PATH, "w") as f:
+            json.dump({"job": "matura", "pid": os.getpid(), "since": time.time()}, f)
+        sw = self.prune()
+        self.assertFalse(self.pruned())
+        self.assertEqual(sw.skipped, [("pnpm", "store", "ciężki job w toku: matura")])
+        self.assertEqual(self.j.load_json(self.j.HEAVY_PATH, None)["job"], "matura")  # cudzy wpis zostaje
+
+    def test_no_heavy_job_starts_while_the_store_is_pruned(self):
+        # dev serwer, build i exec nie linkują z magazynu: przycinanie idzie
+        self.ps = ["node /opt/homebrew/bin/pnpm dev", "pnpm run build", "pnpm exec tsx scripts/x.ts"]
+        sw = self.prune()
+        self.assertTrue(self.pruned())
+        self.assertEqual(sw.skipped, [])
+        [(free, holder)] = self.during
+        self.assertFalse(free)
+        self.assertEqual((holder or {}).get("pid"), os.getpid())
+        self.assertIn("janitor", (holder or {}).get("job", ""))
+        self.assertTrue(self.heavy_free())  # po przycinaniu joby startują jak dotąd
+        self.assertFalse(os.path.exists(self.j.HEAVY_PATH))
 
 
 class NoRealBannerTest(unittest.TestCase):
