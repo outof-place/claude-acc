@@ -23,7 +23,7 @@ func statusIntervals() {
 func browserWaitsOnlyForAllow() throws {
     #expect(Store.browserWaits(try browserPanel([(true, "connecting")])))
     #expect(Store.browserWaits(try browserPanel([(true, "ready"), (true, "connecting")])))
-    for state in ["connected", "ready", "closed", "disabled", "missing", "error"] {
+    for state in ["connected", "ready", "closed", "disabled", "blocked", "missing", "error"] {
         #expect(!Store.browserWaits(try browserPanel([(true, state)])), "\(state)")
     }
     // an uninstalled browser can't be asking for anything
@@ -35,4 +35,21 @@ func browserWaitsOnlyForAllow() throws {
 func browserBundles() {
     #expect(Store.browserBundles == ["com.google.chrome", "com.brave.browser"])
     #expect(Store.browserBundles.contains("com.google.Chrome".lowercased()))
+}
+
+@Test("a browser macOS keeps closed asks for Full Disk Access, not for the remote debugging checkbox")
+func blockedBrowserAsksForTheGrant() throws {
+    #expect(BrowserCard.headline(try browserPanel([(true, "blocked"), (false, "missing")])) == "Needs Full Disk Access")
+    #expect(BrowserCard.headline(try browserPanel([(true, "blocked"), (true, "closed")])) == "Needs Full Disk Access")
+    // another browser that works stays the headline; the blocked one says so on its own row
+    #expect(BrowserCard.headline(try browserPanel([(true, "blocked"), (true, "ready")])) == "Ready")
+    #expect(BrowserCard.headline(try browserPanel([(true, "disabled")])) == "Remote debugging off")
+}
+
+@Test("the panel names the app to give Full Disk Access, as browser.py found it")
+func accessAppDecodes() throws {
+    let json = #"{"installed": true, "mcp_registered": true, "hub": true, "access_app": {"name": "Pod Menu", "path": "/Users/x/Applications/Claude Acc.app"}, "tabs_mode": "hidden", "idle_minutes": 20, "browsers": [], "tabs": [], "clients": 0, "recent": []}"#
+    let panel = try #require(Store.decode(BrowserPanel.self, from: Data(json.utf8)))
+    #expect(panel.accessApp?.name == "Pod Menu")
+    #expect(panel.accessApp?.path == "/Users/x/Applications/Claude Acc.app")
 }

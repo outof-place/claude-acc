@@ -664,7 +664,8 @@ struct BrowserPanel: Decodable {
         let name: String
         let title: String
         let installed: Bool
-        /// connected, connecting (the browser asks for Allow), ready, closed, disabled, missing or error
+        /// connected, connecting (the browser asks for Allow), ready, closed, disabled, blocked (macOS won't
+        /// let the daemon read the browser's profile), missing or error
         let state: String
         let error: String?
         let since: Double?
@@ -699,11 +700,19 @@ struct BrowserPanel: Decodable {
         var id: String { "\(at)-\(op)-\(tab ?? "")" }
     }
 
+    /// The app macOS checks when the daemon reads a browser's profile: the one to give Full Disk Access
+    /// when a browser is blocked (this app, when it hosts the daemon).
+    struct AccessApp: Decodable {
+        let name: String
+        let path: String
+    }
+
     let error: String?
     let installed: Bool
     let mcpRegistered: Bool
     let hub: Bool
     let `default`: String?
+    let accessApp: AccessApp?
     let tabsMode: String
     let idleMinutes: Int
     let browsers: [Browser]

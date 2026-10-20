@@ -25,6 +25,8 @@
 			</array>
 		</dict>
 	</array>
+	<key>ClaudeAccBrowserHubHost</key>
+	<true/>
 	<key>CFBundleVersion</key>
 	<string>79</string>
 	<key>LSMinimumSystemVersion</key>
