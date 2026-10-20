@@ -80,6 +80,12 @@ let package = Package(
         .testTarget(
             name: "PodRootdTests", dependencies: ["PodRootdCore", "PodRootdClient"], path: "Tests/PodRootdTests",
             swiftSettings: settings),
+        // acc-cored (docs/acc-cored.md): the resident and periodic loops in one native, event-driven
+        // daemon; the kernel readings and the loops' logic in AccCore, the private kernel structs in C
+        .target(name: "CAccCore", path: "Sources/CAccCore"),
+        .target(name: "AccCore", dependencies: ["CAccCore"], path: "Sources/AccCore", swiftSettings: core),
+        .executableTarget(name: "acc-cored", dependencies: ["AccCore"], path: "Sources/acc-cored", swiftSettings: core),
+        .testTarget(name: "AccCoreTests", dependencies: ["AccCore"], path: "Tests/AccCoreTests", swiftSettings: core),
     ],
     swiftLanguageModes: [.v6]
 )
