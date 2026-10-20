@@ -9,7 +9,8 @@ Co aktualizuje, do najnowszej wersji:
 - Homebrew: `brew update`, potem formuły i aplikacje (casks). Bez --greedy: aplikacje
   z własnym aktualizatorem (Chrome, Claude) robią to same. Przypięte (`brew pin`) zostają;
 - npm: globalne paczki, także o wersję główną wyżej. `npm_pins` w updates.json trzyma
-  paczkę w jednej wersji głównej, np. {"pnpm": "11"};
+  paczkę w jednej wersji głównej, np. {"pnpm": "11"}; `npm_allow_git` wymienia paczki, którym wolno
+  ciągnąć zależności z gita (npm 12 domyślnie odmawia, np. @probelabs/probe);
 - Go: programy postawione przez `go install` w GOBIN;
 - Python: paczki pip w każdym Pythonie z PYTHONS (domyślny od uv, python.org, Homebrew). Dzielą
   zależności, więc idą razem: jedno `pip install -U --upgrade-strategy eager` po paczkach, których
@@ -17,7 +18,8 @@ Co aktualizuje, do najnowszej wersji:
   Przed i po: `pip check` i import każdej paczki, której nic nie wymaga. Nowa niezgodność albo paczka,
   która przestała się importować, cofa tego Pythona do wersji sprzed przebiegu. Paczka, której
   resolver nie podbił, bo inna trzyma ją niżej, jest przytrzymana, nie nieudana; `pip_pins` trzyma
-  paczkę przy specyfikatorze ({"fb-idb": "==1.1.7"}). Nowy playwright dostaje swoje przeglądarki.
+  paczkę przy specyfikatorze ({"fb-idb": "==1.1.7"}). Paczki postawione przez brew (certifi) zostają
+  Homebrew. Nowy playwright dostaje swoje przeglądarki.
   Nowszą wersję poprawkową Pythona z python.org automat pobiera i sprawdza podpis, a instaluje
   człowiek przyciskiem w panelu (hasło administratora). Pythony z uv idą `uv python upgrade`;
 - Claude Code: `claude update`, katalogi wtyczek, wtyczki w każdym zakresie (user, project,
@@ -83,6 +85,8 @@ DEFAULT_CONFIG = {
     "skip": [],
     # paczka npm -> zakres, w którym ma zostać ("11" to każda 11.x)
     "npm_pins": {},
+    # paczki npm, którym wolno ciągnąć zależności z gita (npm 12 domyślnie ich odmawia: EALLOWGIT)
+    "npm_allow_git": [],
     # paczka pip -> specyfikator, przy którym ma zostać ("==1.1.7", "<2")
     "pip_pins": {},
     # Python (ścieżka albo lista), którego paczki aktualizować; domyślnie PYTHONS
@@ -382,18 +386,20 @@ def working(commands):
     return alive
 
 
-def npm_install(name, old, new, prefix):
+def npm_install(name, old, new, prefix, allow_git=False):
     """Instaluje i sprawdza, czy komendy paczki dalej działają; jeśli któraś przestała, wraca stara
     wersja. Zwraca (błąd albo None, komenda do ponowienia albo None)."""
     commands = npm_commands(prefix, name) if prefix else []
     alive = working(commands)
-    ok, out, err = call(["npm", "install", "-g", f"{name}@{new}"], timeout=1200, merge=True)
+    # cofnięcie też: stara wersja ma te same zależności z gita
+    git = ["--allow-git=all"] if allow_git else []
+    ok, out, err = call(["npm", "install", "-g", *git, f"{name}@{new}"], timeout=1200, merge=True)
     if not ok:
         return err, None
     broken = alive - working(npm_commands(prefix, name) if prefix else [])
     if not broken:
         return None, None
-    call(["npm", "install", "-g", f"{name}@{old}"], timeout=1200)
+    call(["npm", "install", "-g", *git, f"{name}@{old}"], timeout=1200)
     blocked = sorted(set(BLOCKED.findall(out)))
     error = f"{', '.join(sorted(broken))} stopped working after {new}, rolled back"
     if blocked:
@@ -407,6 +413,7 @@ def step_npm(st, cfg, dry):
         return False
     before = npm_outdated()
     pins = cfg.get("npm_pins") or {}
+    allow_git = set(cfg.get("npm_allow_git") or [])
     todo = []
     # npm na końcu: podmienia samego siebie
     for name, info in sorted(before.items(), key=lambda kv: (kv[0] == "npm", kv[0])):
@@ -424,7 +431,7 @@ def step_npm(st, cfg, dry):
     prefix = out.strip() if ok and out.strip() else None
     errors, retries = {}, {}
     for name, old, new in todo:
-        error, retry = npm_install(name, old, new, prefix)
+        error, retry = npm_install(name, old, new, prefix, name in allow_git)
         if error:
             errors[name] = error
         if retry:
@@ -521,12 +528,14 @@ PYTHONS = (
     "/opt/homebrew/bin/python3",
 )
 
-# Wersja, prefiks (po nim odpada drugi link do tego samego Pythona), user site i paczki spoza indeksu
-# (katalog, git, -e): `pip install -U nazwa` podmieniłby je obcą paczką o tej nazwie z PyPI.
+# Wersja, prefiks (po nim odpada drugi link do tego samego Pythona), user site i paczki, których pip nie
+# zna: spoza indeksu (katalog, git, -e), `pip install -U nazwa` podmieniłby je obcą paczką o tej nazwie z PyPI;
+# postawione przez brew (formuła certifi, bez RECORD), pip nie umie ich odinstalować, a aktualizuje je brew.
 PYTHON_INFO = """
 import json, site, sys
 from importlib import metadata
-local = [d.metadata["Name"] for d in metadata.distributions() if d.read_text("direct_url.json")]
+local = [d.metadata["Name"] for d in metadata.distributions()
+         if d.read_text("direct_url.json") or (d.read_text("INSTALLER") or "pip").strip() not in ("pip", "uv")]
 print(json.dumps({"version": "%d.%d" % sys.version_info[:2], "patch": "%d.%d.%d" % sys.version_info[:3],
                   "prefix": sys.prefix,
                   "user_site": site.getusersitepackages(), "local": [n for n in local if n]}))
