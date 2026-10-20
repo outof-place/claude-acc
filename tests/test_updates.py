@@ -283,6 +283,22 @@ class UpdatesTest(unittest.TestCase):
         self.assertIn("npm blocked install scripts of @vercel/fun", vercel["error"])
         self.assertEqual(vercel["retry"], "npm install -g --allow-scripts=@vercel/fun vercel@62.4.0")
 
+    def test_an_npm_package_with_a_git_dependency_installs_only_when_allowed(self):
+        def gitdep(world):
+            world["npm"]["vercel"]["gitdep"] = True
+
+        env = Env(self, edit=gitdep)
+        env.run("run", "--force")
+        [vercel] = step(env.state(), "npm")["failed"]
+        self.assertIn("Fetching packages of type", vercel["error"])
+        self.assertEqual(env.world()["npm"]["vercel"]["installed"], "59.16.0")
+
+        env.config(npm_pins={"pnpm": "11"}, npm_allow_git=["vercel"], python=os.path.join(FAKES, "python3"))
+        env.run("run", "--force")
+        self.assertEqual(env.world()["npm"]["vercel"]["installed"], "62.4.0")
+        self.assertEqual(env.world()["npm"]["pnpm"]["installed"], "11.28.5")
+        self.assertNotIn("--allow-git=all pnpm", " ".join(env.calls()))
+
     def test_runs_every_three_days_and_retries_a_failure_the_next_night(self):
         env = Env(self)
         now = time.time()
@@ -378,6 +394,26 @@ class UpdatesTest(unittest.TestCase):
         self.assertTrue(base.endswith(" attrs llama-cpp-python pydantic-core"), base)
         self.assertNotIn("--user", base)
         self.assertTrue(user.endswith(" openpyxl") and "--user" in user, user)
+
+    def test_pip_leaves_packages_installed_by_brew_to_brew(self):
+        # brew stawia certifi bez RECORD i z INSTALLER "brew": pip nie umie jej odinstalować
+        site = tempfile.mkdtemp(prefix="updates-site-")
+        self.addCleanup(shutil.rmtree, site, True)
+        for name, installer in (("certifi", "brew"), ("attrs", "pip"), ("fastmod", "uv")):
+            info = os.path.join(site, f"{name}-1.0.dist-info")
+            os.makedirs(info)
+            with open(os.path.join(info, "METADATA"), "w") as f:
+                f.write(f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n")
+            with open(os.path.join(info, "INSTALLER"), "w") as f:
+                f.write(installer + "\n")
+        script = (f"import sys, json; sys.path.insert(0, {os.path.dirname(HERE)!r}); import updates; "
+                  "exec(updates.PYTHON_INFO)")
+        done = subprocess.run(["/usr/bin/python3", "-c", script], env={"PYTHONPATH": site, "PATH": "/usr/bin"},
+                              capture_output=True, text=True, timeout=60)
+        local = json.loads(done.stdout)["local"]
+        self.assertIn("certifi", local, done.stderr)
+        self.assertNotIn("attrs", local)
+        self.assertNotIn("fastmod", local)
 
     def test_a_python_upgrade_that_breaks_a_dependency_is_rolled_back(self):
         broken = "cattrs 24.1.0 has requirement attrs<26, but you have attrs 26.1.0."
